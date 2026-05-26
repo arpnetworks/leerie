@@ -284,6 +284,92 @@ SCHEMAS: dict[str, dict] = {
             },
         },
     },
+    "reconciler": {
+        # Output of the reconciler worker (DESIGN §5 / §14). Spawned by
+        # phase_reconcile after phase_plan when the merged planner output
+        # has `requires` capability tags with no matching `provides`. The
+        # worker reasons over the full task + merged subtasks + the list
+        # of unresolved tags, and emits one of four actions per tag.
+        # Each of the four output arrays is optional (any can be empty).
+        # The orchestrator applies renames/added_provides/added_subtasks
+        # mechanically; any `unresolvable` entry dies the run with the
+        # worker's stated reason.
+        "type": "object",
+        "required": ["renames", "added_provides", "added_subtasks",
+                     "unresolvable"],
+        "properties": {
+            "renames": {
+                # Rewrite a `requires` tag on one subtask to match an
+                # existing `provides` tag on another. The single most
+                # common case (planners picked different words for the
+                # same thing).
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["sid", "from", "to"],
+                    "properties": {
+                        "sid": {"type": "string"},
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                    },
+                },
+            },
+            "added_provides": {
+                # A subtask actually produces the needed capability but
+                # didn't declare the tag. Add it to that subtask's
+                # `provides`.
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["sid", "tag"],
+                    "properties": {
+                        "sid": {"type": "string"},
+                        "tag": {"type": "string"},
+                    },
+                },
+            },
+            "added_subtasks": {
+                # Genuine gap — propose a new subtask to fill it. Shape
+                # mirrors planner-output subtasks (same required fields)
+                # plus the `_added_by_reconciler` traceability flag.
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["id", "title", "success_criteria_seed",
+                                 "_added_by_reconciler"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "intent": {"type": "string"},
+                        "scope_note": {"type": "string"},
+                        "files_likely_touched": {
+                            "type": "array", "items": {"type": "string"}},
+                        "depends_on": {"type": "array", "items": {"type": "string"}},
+                        "requires": {"type": "array", "items": {"type": "string"}},
+                        "provides": {"type": "array", "items": {"type": "string"}},
+                        "success_criteria_seed": {"type": "string"},
+                        "size": {"type": "string"},
+                        "investigation_notes": {"type": "string"},
+                        "_added_by_reconciler": {"type": "boolean"},
+                    },
+                },
+            },
+            "unresolvable": {
+                # Gap with no plausible resolution. The orchestrator dies
+                # with the worker's `reason` shown verbatim.
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["sid", "tag", "reason"],
+                    "properties": {
+                        "sid": {"type": "string"},
+                        "tag": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
     "implementer": {
         "type": "object",
         "required": ["subtask_id", "status", "confidence"],
@@ -2710,6 +2796,177 @@ async def phase_plan(task: str, st: State, caps: dict,
         else:
             log(f"  {category}: {n} subtask(s)")
     return list(plans)
+
+
+def _compute_unresolved_requires(plans: list[dict]) -> list[dict]:
+    """Pure-Python lookup: every (sid, tag) where a subtask `requires` a
+    capability tag that no subtask in the merged plan `provides`. Mirrors
+    the set logic in validate_plan() but emits the data rather than
+    raising. Used by phase_reconcile to assemble the reconciler worker's
+    input and (after the worker applies its resolutions) to verify the
+    output actually closed every gap."""
+    all_provides: set[str] = set()
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            all_provides.update(s.get("provides", []))
+    unresolved: list[dict] = []
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            for cap in s.get("requires", []):
+                if cap not in all_provides:
+                    unresolved.append({"sid": s["id"], "tag": cap})
+    return unresolved
+
+
+def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
+    """Mutate `plans` per the reconciler's output. Returns the same
+    `plans` list (with in-place edits on existing subtasks plus an
+    appended `_reconciler` pseudo-plan for any added_subtasks).
+
+    Renames rewrite a single `requires` entry on the named subtask.
+    Added_provides append a tag to the named subtask's `provides`.
+    Added_subtasks become a new domain="_reconciler" plan appended to
+    the list — schedule() flattens by id, so domain only affects the
+    per-domain log line. Each added subtask carries
+    `_added_by_reconciler: true` for downstream traceability.
+
+    The `unresolvable` array is not consumed here — phase_reconcile()
+    inspects it directly before calling this helper."""
+    # Index subtasks by id for O(1) mutation. Modifying the subtask
+    # dict mutates the underlying plan because dicts are shared by
+    # reference; no need to write the plan back.
+    by_id: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            by_id[s["id"]] = s
+
+    for r in output.get("renames", []):
+        s = by_id.get(r["sid"])
+        if s is None:
+            continue  # reconciler named a sid that doesn't exist; ignore
+        reqs = s.get("requires", []) or []
+        s["requires"] = [r["to"] if t == r["from"] else t for t in reqs]
+
+    for ap in output.get("added_provides", []):
+        s = by_id.get(ap["sid"])
+        if s is None:
+            continue
+        provs = s.setdefault("provides", [])
+        if ap["tag"] not in provs:
+            provs.append(ap["tag"])
+
+    added = output.get("added_subtasks", [])
+    if added:
+        plans.append({
+            "domain": "_reconciler",
+            "status": "ready",
+            "subtasks": added,
+        })
+
+    return plans
+
+
+async def phase_reconcile(plans: list[dict], task: str, st: State,
+                          caps: dict, models: dict[str, str]) -> list[dict]:
+    """Phase 2½: reconcile cross-domain capability-tag drift between
+    parallel planners (DESIGN §5, §14). Short-circuits when planners
+    agreed; otherwise runs one reconciler worker whose output is applied
+    mechanically. Genuinely unresolvable gaps die.
+
+    Returns the (possibly mutated) `plans` list, ready for `schedule()`."""
+    unresolved = _compute_unresolved_requires(plans)
+    if not unresolved:
+        # Common-case short-circuit: every `requires` already has a
+        # producer. No worker call needed.
+        return plans
+
+    log(f"phase 2½: reconciling {len(unresolved)} cross-domain "
+        f"capability-tag mismatch(es)")
+
+    # Build the reconciler's input. The worker sees the task, the
+    # categories that contributed subtasks, every subtask's id/title/
+    # intent/provides/requires (omit other fields to keep context small),
+    # and the precomputed unresolved set.
+    categories: list[str] = []
+    subtask_views: list[dict] = []
+    for plan in plans:
+        domain = plan.get("domain")
+        if domain and domain not in categories and domain != "_reconciler":
+            categories.append(domain)
+        for s in plan.get("subtasks", []):
+            subtask_views.append({
+                "id": s.get("id", ""),
+                "title": s.get("title", ""),
+                "intent": s.get("intent", ""),
+                "provides": list(s.get("provides", []) or []),
+                "requires": list(s.get("requires", []) or []),
+            })
+    payload = {
+        "task": task,
+        "categories": categories,
+        "subtasks": subtask_views,
+        "unresolved_requires": unresolved,
+    }
+
+    sys_prompt = (PROMPTS / "reconciler.md").read_text()
+    user_prompt = (
+        "RECONCILER INPUT:\n" + json.dumps(payload, indent=2) +
+        "\n\nResolve every unresolved_requires entry per your "
+        "instructions and emit the four-array JSON output."
+    )
+
+    st.bump_workers(caps)
+    output = await claude_p(
+        user_prompt=user_prompt, system_prompt=sys_prompt,
+        schema_key="reconciler", cwd=os.getcwd(),
+        allowed_tools=READ_TOOLS, max_turns=30,
+        autonomous=False, caps=caps, st=st,
+        model=models["reconciler"], sid="reconciler",
+    )
+
+    # Fail closed on unresolvable BEFORE mutating anything — the user
+    # gets the worker's diagnosis without phantom mutations on disk.
+    unresolvable = output.get("unresolvable", []) or []
+    if unresolvable:
+        bullets = "\n".join(
+            f"  • {u['sid']} requires '{u['tag']}': {u['reason']}"
+            for u in unresolvable
+        )
+        die(
+            f"reconciler could not resolve {len(unresolvable)} "
+            f"capability-tag dependency/dependencies:\n{bullets}\n"
+            "These represent gaps the planners missed and the reconciler "
+            "could not bridge. Refine the task description or pre-declare "
+            "the missing capabilities, then re-run."
+        )
+
+    _apply_reconciler_output(plans, output)
+
+    # Second-pass check: an `added_subtask` may itself have an unresolved
+    # `requires`. If so, the reconciler's output didn't actually close
+    # every gap — fail loud rather than progress to schedule() with a
+    # still-broken graph.
+    still_unresolved = _compute_unresolved_requires(plans)
+    if still_unresolved:
+        bullets = "\n".join(
+            f"  • {u['sid']} requires '{u['tag']}'"
+            for u in still_unresolved
+        )
+        die(
+            "reconciler output left "
+            f"{len(still_unresolved)} cross-domain dependency/dependencies "
+            f"still unresolved after applying its renames / "
+            f"added_provides / added_subtasks:\n{bullets}\n"
+            "This usually means an added_subtask itself requires a "
+            "capability that no other subtask provides. Refine the task "
+            "description and re-run."
+        )
+
+    log(f"phase 2½: reconciled "
+        f"({len(output.get('renames', []))} rename(s), "
+        f"{len(output.get('added_provides', []))} added_provides, "
+        f"{len(output.get('added_subtasks', []))} new subtask(s))")
+    return plans
 
 
 def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:

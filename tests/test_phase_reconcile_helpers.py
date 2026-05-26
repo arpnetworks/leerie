@@ -1,0 +1,236 @@
+"""Tests for the pure-Python helpers behind `phase_reconcile`:
+
+- `_compute_unresolved_requires` — set lookup mirroring `validate_plan`'s
+  cross-domain check, but emitting data instead of raising.
+- `_apply_reconciler_output` — mechanical mutation of the merged plan
+  according to the reconciler worker's output.
+
+The actual LLM-driven reconciler worker is exercised separately (and
+end-to-end at PR-review time); these tests pin the deterministic Python
+that wraps it.
+"""
+from __future__ import annotations
+
+import pytest
+
+
+# --- _compute_unresolved_requires --------------------------------------
+
+def _plan(domain: str, *subtasks: dict) -> dict:
+    """Build a planner-shaped plan dict from a list of subtask dicts."""
+    return {"domain": domain, "status": "ready", "subtasks": list(subtasks)}
+
+
+def test_unresolved_empty_when_plan_has_no_requires(centella):
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "x", "provides": ["a"]})]
+    assert centella._compute_unresolved_requires(plans) == []
+
+
+def test_unresolved_empty_when_every_requires_has_a_provider(centella):
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x", "provides": ["a"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y", "requires": ["a"]}),
+    ]
+    assert centella._compute_unresolved_requires(plans) == []
+
+
+def test_unresolved_lists_missing_tags(centella):
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x", "provides": ["a"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y", "requires": ["a", "missing-1"]}),
+        _plan("testing",
+              {"id": "test-002", "title": "z", "requires": ["missing-2"]}),
+    ]
+    out = centella._compute_unresolved_requires(plans)
+    # Order is by iteration order over plans → subtasks → requires;
+    # we don't pin it tightly but the (sid, tag) pairs are stable.
+    pairs = {(u["sid"], u["tag"]) for u in out}
+    assert pairs == {("test-001", "missing-1"), ("test-002", "missing-2")}
+
+
+def test_unresolved_handles_subtask_with_no_requires_field(centella):
+    """A subtask that omits `requires` entirely (default empty) doesn't
+    crash the lookup."""
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "x"})]
+    assert centella._compute_unresolved_requires(plans) == []
+
+
+def test_unresolved_handles_subtask_with_no_provides_field(centella):
+    """A subtask that omits `provides` entirely doesn't contribute to
+    `all_provides`. The lookup still works."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x"}),
+        _plan("testing",
+              {"id": "test-001", "title": "y", "requires": ["a"]}),
+    ]
+    out = centella._compute_unresolved_requires(plans)
+    assert out == [{"sid": "test-001", "tag": "a"}]
+
+
+def test_unresolved_duplicate_requires_emits_once_per_subtask(centella):
+    """A subtask declaring the same `requires` tag twice should not
+    crash; the duplicate is fine (the scheduler dedup is unaffected by
+    our emit ordering)."""
+    plans = [
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": ["missing-1", "missing-1"]}),
+    ]
+    out = centella._compute_unresolved_requires(plans)
+    # Two entries — same sid + tag, both surfaced. The reconciler
+    # consumes the list as a set internally; preserving duplicates here
+    # is harmless and avoids hiding a planner bug.
+    assert len(out) == 2
+
+
+# --- _apply_reconciler_output ------------------------------------------
+
+def test_apply_empty_output_is_noop(centella):
+    """An all-empty output leaves plans unchanged."""
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "x", "requires": ["foo"]})]
+    out = {"renames": [], "added_provides": [],
+           "added_subtasks": [], "unresolvable": []}
+    centella._apply_reconciler_output(plans, out)
+    # No mutations.
+    assert plans[0]["subtasks"][0]["requires"] == ["foo"]
+    assert len(plans) == 1
+
+
+def test_apply_rename_rewrites_requires_on_named_subtask(centella):
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x", "provides": ["canonical"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "y",
+               "requires": ["old-name", "other-req"]}),
+    ]
+    out = {"renames": [{"sid": "test-001", "from": "old-name",
+                        "to": "canonical"}],
+           "added_provides": [], "added_subtasks": [], "unresolvable": []}
+    centella._apply_reconciler_output(plans, out)
+    # The `from` tag is gone; `to` replaces it; other reqs untouched.
+    assert plans[1]["subtasks"][0]["requires"] == ["canonical", "other-req"]
+
+
+def test_apply_rename_with_nonexistent_sid_is_silently_skipped(centella):
+    """Defensive: if the reconciler emits a rename for a sid that
+    doesn't exist, drop it rather than crash. (The reconciler is told
+    only existing sids; this is belt-and-suspenders.)"""
+    plans = [_plan("testing",
+                   {"id": "test-001", "title": "y", "requires": ["foo"]})]
+    out = {"renames": [{"sid": "nonexistent-001", "from": "foo",
+                        "to": "bar"}],
+           "added_provides": [], "added_subtasks": [], "unresolvable": []}
+    centella._apply_reconciler_output(plans, out)
+    # test-001 was not the target; its requires is unchanged.
+    assert plans[0]["subtasks"][0]["requires"] == ["foo"]
+
+
+def test_apply_added_provides_appends_to_subtask(centella):
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "x", "provides": ["a"]})]
+    out = {"renames": [],
+           "added_provides": [{"sid": "feat-001", "tag": "b"}],
+           "added_subtasks": [], "unresolvable": []}
+    centella._apply_reconciler_output(plans, out)
+    assert plans[0]["subtasks"][0]["provides"] == ["a", "b"]
+
+
+def test_apply_added_provides_idempotent(centella):
+    """If the reconciler emits an already-present tag, don't duplicate it."""
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "x", "provides": ["a"]})]
+    out = {"renames": [],
+           "added_provides": [{"sid": "feat-001", "tag": "a"}],
+           "added_subtasks": [], "unresolvable": []}
+    centella._apply_reconciler_output(plans, out)
+    assert plans[0]["subtasks"][0]["provides"] == ["a"]
+
+
+def test_apply_added_provides_to_subtask_with_no_provides_field(centella):
+    """Subtask missing `provides` entirely → field is added."""
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "x"})]
+    out = {"renames": [],
+           "added_provides": [{"sid": "feat-001", "tag": "b"}],
+           "added_subtasks": [], "unresolvable": []}
+    centella._apply_reconciler_output(plans, out)
+    assert plans[0]["subtasks"][0]["provides"] == ["b"]
+
+
+def test_apply_added_subtasks_appends_reconciler_plan(centella):
+    """Added subtasks land in a new pseudo-plan with domain="_reconciler".
+    The scheduler flattens by id, so the domain only affects logs."""
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "x"})]
+    new_subtask = {
+        "id": "feat-008",
+        "title": "Added connector",
+        "success_criteria_seed": "criterion",
+        "provides": ["new-cap"],
+        "_added_by_reconciler": True,
+    }
+    out = {"renames": [], "added_provides": [],
+           "added_subtasks": [new_subtask],
+           "unresolvable": []}
+    centella._apply_reconciler_output(plans, out)
+    assert len(plans) == 2
+    assert plans[1]["domain"] == "_reconciler"
+    assert plans[1]["subtasks"] == [new_subtask]
+
+
+def test_apply_combined_renames_provides_and_subtasks(centella):
+    """Realistic case: all three mutation types applied in one call."""
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "shim", "provides": ["shim-cap"]}),
+        _plan("testing",
+              {"id": "test-001", "title": "test",
+               "requires": ["wrong-name", "new-cap"]}),
+    ]
+    out = {
+        "renames": [{"sid": "test-001", "from": "wrong-name",
+                     "to": "shim-cap"}],
+        "added_provides": [{"sid": "feat-001", "tag": "extra-cap"}],
+        "added_subtasks": [{
+            "id": "feat-009",
+            "title": "New cap producer",
+            "success_criteria_seed": "x",
+            "provides": ["new-cap"],
+            "_added_by_reconciler": True,
+        }],
+        "unresolvable": [],
+    }
+    centella._apply_reconciler_output(plans, out)
+    # rename applied
+    assert "wrong-name" not in plans[1]["subtasks"][0]["requires"]
+    assert "shim-cap" in plans[1]["subtasks"][0]["requires"]
+    # added_provides applied
+    assert "extra-cap" in plans[0]["subtasks"][0]["provides"]
+    # added_subtasks landed
+    assert len(plans) == 3
+    assert plans[2]["subtasks"][0]["id"] == "feat-009"
+
+
+def test_apply_does_not_consume_unresolvable_array(centella):
+    """`unresolvable` is the orchestrator's responsibility (die() before
+    calling _apply). `_apply_reconciler_output` ignores it — pin so the
+    helper doesn't accidentally swallow unresolvable as a non-failure
+    mutation."""
+    plans = [_plan("testing",
+                   {"id": "test-001", "title": "y", "requires": ["x"]})]
+    out = {"renames": [], "added_provides": [], "added_subtasks": [],
+           "unresolvable": [{"sid": "test-001", "tag": "x",
+                             "reason": "fake reason"}]}
+    centella._apply_reconciler_output(plans, out)
+    # Plans unchanged — unresolvable is not the helper's concern.
+    assert plans[0]["subtasks"][0]["requires"] == ["x"]
+    assert len(plans) == 1
