@@ -97,8 +97,13 @@ orchestrator and not used anywhere in this repo.
 - **Naming:** `snake_case` for functions and variables, `PascalCase` for
   classes, `ALL_CAPS` for module constants.
 - **Logging:** `log("...")` for normal output, `die("...", code=N)` for
-  fatal exits. Never `print(...)`; never `sys.exit(...)` directly (use
-  `die`). Both helpers live in `centella.py`.
+  fatal exits. Never `print(...)` *except* for the interactive question UI in
+  `gather_answers()` — `log()`'s timestamp prefix would mangle a question
+  rendered next to `input("  > ")`. Never `sys.exit(...)` directly (use `die`)
+  *except* for documented non-error structured exits like
+  `EXIT_NEEDS_ANSWERS=10`, where `die()`'s `centella: error:` prefix would
+  mislabel a non-error deferred-clarification signal. Both helpers live in
+  `centella.py`.
 - **Type hints** on every function signature. Use PEP 604 union syntax
   (`str | None`, not `Optional[str]`) — Python 3.10+ is the minimum.
 - **Comments explain *why*, not *what*.** Well-named identifiers
@@ -129,12 +134,34 @@ tests/                      pytest suite
 # Resume after an interruption:
 ./centella --resume
 
-# Set a global source-of-truth preference (otherwise centella asks):
+# Set a global source-of-truth preference (otherwise centella asks)
+# — or pass --source-of-truth for a one-off override:
 export CENTELLA_SOURCE_OF_TRUTH=codebase   # or: research, both, ask
+./centella "task" --source-of-truth codebase
 # …or commit a centella.toml at the repo root with: source_of_truth = codebase
+
+# Choose the model for all workers (default: sonnet). Per-worker
+# overrides exist via --model-<worker> / CENTELLA_MODEL_<WORKER>.
+# See docs/IMPLEMENTATION.md §2 "Model selection" for the full table.
+export CENTELLA_MODEL=sonnet               # or: opus, haiku
+./centella "task" --model opus
+./centella "task" --model-implementer opus --model-classifier haiku
+
+# Dial how persistent each planner/implementer is at building confidence
+# before exiting blocked (default 8 rounds; see DESIGN.md §8). CLI flag,
+# env var, or `confidence_rounds = N` in centella.toml.
+export CENTELLA_CONFIDENCE_ROUNDS=12
+./centella "task" --confidence-rounds 12
 
 # Skip the live `claude -p` smoke test during development:
 ./centella "task" --skip-smoke
+
+# Verbosity: default is `stream` (one-line summary per worker event).
+# Per-worker .centella/logs/<sid>.log files are always written.
+./centella "task" -q       # normal (pre-streaming terse output)
+./centella "task" -qq      # quiet (errors + phase boundaries only)
+./centella "task" -vv      # debug (raw event payloads + tool I/O)
+export CENTELLA_VERBOSITY=normal  # sticky default
 ```
 
 ## Testing

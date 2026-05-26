@@ -1,11 +1,22 @@
 # Centella
 
-Deterministic, headless task orchestrator for Claude Code. Give it one task; it
-classifies it into up to eight categories, decomposes each into granular
-subtasks, schedules them into dependency-ordered waves, and executes each in an
-isolated git worktree under an evidence-gated implement/validate loop.
+**Centella** is an autonomous task driver for Claude Code. One prompt. Finished, committed, validated code. No steering mid-run, no polishing when it's done.
 
-Runs entirely on the Claude Code CLI and your subscription. **No API key.**
+Most tools that call themselves autonomous still require you: to confirm a direction, catch a hallucination, or clean up the result before it's usable. Centella doesn't. It classifies the task, decomposes it, implements each piece in parallel isolated worktrees, validates the integrated result, and merges — beginning to end, unattended.
+
+It runs entirely on the **Claude Code CLI and your existing subscription** — no Anthropic API key, no per-call billing. If you have Claude Code installed and logged in, you have everything it needs.
+
+**Why it actually finishes without you:**
+
+Most AI "orchestrators" let the model pilot: the model decides what to do next, declares when it's done, and judges whether it succeeded. That's where drift, hallucinated completion, and silent failures come from — and why you end up steering.
+
+Centella inverts the relationship. **The model writes code. The program runs everything else.** Phases, wave scheduling, retries, caps, merge logic, and success-criteria enforcement are ordinary Python — real loops and conditionals that cannot drift.
+
+- **No silent failures.** Every worker output is JSON-schema-validated before the orchestrator acts on it. A worker cannot, by malformed output or confident hallucination, cause the system to do something undefined.
+- **Success criteria are locked at implementation time — enforced by the orchestrator, not the worker.** The implementer cannot weaken its own tests to make them pass. The checker and the thing being checked are never the same agent.
+- **Workers must justify confidence with evidence, not feelings.** Before writing code, an implementer clears domain-specific evidence gates — file-and-line citations, reproductions, falsification attempts. A self-reported score without hard artifacts doesn't clear the bar.
+- **Parallel work that's actually safe.** Each implementer gets an isolated git worktree. Parallel writes never collide. Conflicts surface one wave at a time, close to the work that caused them.
+- **Resumable by design.** Interruption (Ctrl-C, reboot, budget cap) loses nothing. The staging branch is the durable record; `--resume` picks up from the last completed wave.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -37,25 +48,6 @@ For the full rationale — why the orchestrator is a script rather than a plugin
 command, all architectural decisions, and the complete enforcement surface —
 read [`docs/DESIGN.md`](docs/DESIGN.md).
 
-## Why Centella
-
-- **Runs on the Claude Code subscription, not the metered API.** Centella
-  shells out to `claude -p`, the headless mode of the Claude Code CLI you
-  already have. No API key, no per-call billing surprise.
-- **Control flow is real Python, not a model interpreting instructions.**
-  Phases, waves, retries, caps, and the source-of-truth check are written as
-  ordinary code that you can read, set a breakpoint in, and reason about
-  with a state machine. See [`docs/DESIGN.md`](docs/DESIGN.md) §2 for why
-  the orchestrator is a subprocess script rather than an in-session agent.
-- **Every worker output is JSON-schema-validated; every cap is a Python
-  counter; prompts are advisory and code enforces.** The mechanical safety
-  surface lives in `orchestrator/centella.py`, not in a prompt that a model
-  might drift away from. See [`docs/DESIGN.md`](docs/DESIGN.md) §12.
-
-If you want an orchestrator you can debug with `print()` and reason about
-with a state machine, this is the right shape. If you want emergent agentic
-behavior, this isn't it.
-
 ## Requirements
 
 - `claude` CLI on `PATH`, logged in interactively
@@ -64,6 +56,11 @@ behavior, this isn't it.
 - A reasonably clean working tree
 
 ## Install and run
+
+```bash
+# Get Centella (no install step — runs directly from the checkout):
+git clone https://github.com/enricai/centella.git
+```
 
 ```bash
 # From the root of the target git repository:
@@ -137,6 +134,9 @@ Complete reference for every CLI flag, environment variable, and
 | `--source-of-truth VALUE` | — | `codebase` / `research` / `both` / `ask`. Overrides `CENTELLA_SOURCE_OF_TRUTH` and `centella.toml`. |
 | `--model ALIAS` | `sonnet` | `sonnet` / `opus` / `haiku`. Model for every worker this run. |
 | `--model-<worker> ALIAS` | inherits `--model` | Per-worker override. `<worker>` is one of `classifier`, `planner`, `implementer`, `integrator`, `validator`. |
+| `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `.centella/logs/<sid>.log`. |
+| `-v` / `-vv` | — | Shortcuts: `-v` = `stream` (default), `-vv` = `debug`. |
+| `-q` / `-qq` | — | Shortcuts: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. |
 
 ### Environment variables and `centella.toml` keys
 
@@ -146,6 +146,7 @@ Complete reference for every CLI flag, environment variable, and
 | `CENTELLA_MODEL` | `model` | Default model alias for all workers. Overridden by `--model`. |
 | `CENTELLA_MODEL_<WORKER>` | `model_<worker>` | Per-worker default (e.g. `CENTELLA_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `implementer`, `integrator`, `validator`. |
 | `CENTELLA_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer, default 8). Overridden by `--confidence-rounds`. |
+| `CENTELLA_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`, default `stream`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. |
 | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | — | **Claude Code CLI variable**, not consumed by centella. Set to `70` to backstop worker auto-compaction. |
 
 ### Precedence
@@ -159,6 +160,10 @@ Complete reference for every CLI flag, environment variable, and
 - **Confidence rounds** (highest first): `--confidence-rounds` →
   `CENTELLA_CONFIDENCE_ROUNDS` → `confidence_rounds` in
   `centella.toml` → default `8`.
+- **Verbosity** (highest first): `--verbosity` → `-v`/`-vv`/`-q`/`-qq`
+  shortcuts (anchored to `normal`, not to the resolved default) →
+  `CENTELLA_VERBOSITY` → `verbosity` in `centella.toml` → default
+  `stream`.
 
 See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §2 for the
 rationale behind these orders and the full validation contract.

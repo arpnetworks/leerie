@@ -110,6 +110,16 @@ convenience entry point from inside Claude Code, but it is only a wrapper — it
 launches the same orchestrator program and adds no logic of its own. All
 control flow lives in the orchestrator regardless of how it was started.
 
+**Observability.** Workers do their work inside a single `claude -p`
+session that takes minutes; the orchestrator surfaces that activity as it
+happens. Each worker's stream of tool calls, text, and intermediate
+results is read line-by-line, written verbatim to a per-worker log file,
+and summarized inline at a user-controllable verbosity level. The
+default level shows one-line summary per worker event; the user can dial
+down to centella's pre-streaming terse output (`-q`) or up to raw event
+payloads (`-vv`). Errors emit at every level. The per-worker file is
+the ground-truth audit trail; the inline view is the live feed.
+
 ---
 
 ## 4. The eight task categories
@@ -337,11 +347,56 @@ this specific bug, a traced symptom-to-cause path, and a mechanistic
 explanation of why the fix addresses the cause. Other domains have their own
 gate sets.
 
+Three further disciplines apply at every scoring step, regardless of domain.
+They are the mechanisms by which the confidence score becomes load-bearing
+rather than ornamental.
+
+- **Falsification.** For each major claim — a chosen root cause, a chosen
+  solution — the worker explicitly looks for evidence that would *disprove*
+  it: a probe, a counter-example, a research source that contradicts. A claim
+  earns high confidence only when its falsifier was tested and failed. Looking
+  only for confirming evidence is how a wrong hypothesis acquires high
+  confidence; the falsification step is the structural defense.
+- **Drift reconciliation.** Before scoring, the worker re-reads its own prior
+  statements in the same session. Any current claim that contradicts an
+  earlier one — or any earlier position the worker has quietly retreated from
+  — is named and resolved with evidence for the kept version. An
+  unreconciled contradiction blocks the high-confidence bar. This is the
+  defense against a worker confidently asserting X early and confidently
+  asserting ¬X later without flagging the change.
+- **Gap surfacing.** When a score is below the bar, the worker must enumerate
+  the specific *artifact* that would raise it — a citation, a measurement, a
+  probe output, a research source — and then go obtain that artifact on the
+  next iteration. A gap phrased as an activity ("look into it more", "verify
+  the design") does not terminate; a gap phrased as an artifact does. This
+  converts an open-ended "try harder" loop into a directed search whose next
+  move is deterministic.
+
 The loop is bounded. If the gates cannot be cleared within the bound, the
 subtask stops and reports itself as *blocked*, stating precisely what evidence
 is missing and whether obtaining it needs something only the user can supply —
 for example a credential that exists nowhere in the codebase. This is the
 narrow, legitimate exception to "never ask the user" (see §11).
+
+### The planner gate
+
+The same discipline applies one layer up. A planner that decomposes a domain
+into subtasks self-gates on two axes — *task understanding* (does the planner
+genuinely understand what the user wants and how it lands in this codebase)
+and *decomposition quality* (are these subtasks the right cut, sized for one
+worker, with real dependencies). The same three disciplines — falsification,
+drift reconciliation, gap surfacing — apply. A planner whose gate cannot
+clear emits `status: "blocked"` with the gap analysis instead of subtasks,
+matching the implementer's blocked-with-evidence exit. The principle is the
+same at both layers: a worker that cannot justify its confidence in evidence
+hands the decision back to a layer that can, rather than fabricating one.
+
+The structural contract of these disciplines is mechanically enforced — the
+worker's output schema requires the falsification, reconciliation, and gap
+fields to be present, so a worker that skipped them fails its own JSON gate
+before the orchestrator ever reads it (see §12). The *quality* of the
+artifacts each field names is model-judged; the *presence* of the discipline
+is not.
 
 ---
 
@@ -441,11 +496,13 @@ When a feature task's request leaves the source of truth ambiguous, centella
 resolves it from a preference: `codebase` (build from existing patterns only),
 `research` (build from researched best-practice standards), `both` (codebase
 first; research only where the codebase is insufficient), or `ask` (surface
-the question to the user). The preference is read
-from a per-repo config file if present, otherwise from an environment
-variable, otherwise defaults to `ask`. When `ask` fires, the question is
-presented with a hint that setting the env var or the per-repo file will skip
-it next time. A request that already names its own source of truth, or a
+the question to the user). The preference is read, in order, from a CLI flag
+on the invocation, from an environment variable, from a per-repo config file
+committed at the repo root, and otherwise defaults to `ask`. The CLI flag and
+env var outrank the file because they are session-scoped knobs — a user
+reaching for either is making a one-off override of the repo default. When
+`ask` fires, the question is presented with a hint listing all three ways to
+skip it next time. A request that already names its own source of truth, or a
 non-feature task where the question does not apply, runs without it.
 Whichever path resolved the preference, its value becomes a setting carried
 to every planner and implementer, so the whole run draws from one consistent
@@ -456,6 +513,47 @@ clarification step is non-blocking: it records the questions, exits with a
 distinct status, and lets the surrounding layer collect answers and resume. A
 mode that skips clarification entirely also exists, for the case where the
 caller has already guaranteed the task is fully specified.
+
+### Mid-execution clarification
+
+The clarification filter runs at Phase 1 — early, before any implementer
+has done work. That is the right time for *most* intent questions: they
+are visible from the task description and the codebase. But some intent
+questions surface only after partial implementation work has narrowed the
+problem to a decision point neither the codebase nor research can resolve
+— for example, whether a refactor should preserve backward compatibility
+with a deprecated client, when both choices exist as patterns elsewhere in
+the codebase and the task description does not say.
+
+Centella treats this as the same kind of question as a Phase-1 clarification,
+not as a different category. The filter is identical: investigate the
+codebase first; treat research as the second-line resolver; ask the user
+only what neither can settle. The only difference is *when* the question
+surfaces. The mechanism reuses the existing handoff infrastructure: the
+implementer writes a checkpoint of its work-in-progress, returns a status
+that carries the question to the orchestrator, and the orchestrator surfaces
+the question through the same interactive/non-interactive paths the Phase-1
+clarification step uses. On the user's answer (delivered either interactively
+or via a re-run with `--answers`), a fresh implementer is spawned with the
+checkpoint as a continuation and the answer added to its clarification
+answers — exactly the channel used by Phase-1 answers.
+
+The same constraint that keeps Phase-1 questions narrow applies here: a
+question's `why_underivable` must be explicit and grounded in what the
+worker tried. Without that gate, a worker is incentivized to ask the user
+rather than do the investigative work the filter requires. The schema
+makes the field required, and the prompt forbids the exit when
+`--no-clarify` is in effect (the worker must make a best-effort decision
+and continue, the same way a Phase-1 run under `--no-clarify` defaults
+its source-of-truth resolution).
+
+A subtask has a single re-spawn budget — `subtask_continuations` — that is
+consumed by *both* context-exhaustion handoffs and mid-execution
+clarifications, with no separate allowance for either. A subtask that
+exhausts the budget on a mix of the two is fundamentally mis-scoped and
+the orchestrator surfaces it as such. The unified cap is a deliberate
+defense against the "ask instead of research" drift: making clarifications
+a free resource would invite the worker to prefer asking over investigating.
 
 ---
 
@@ -508,7 +606,7 @@ principle applied to caps.
 
 ### Code-enforced caps
 
-Some caps are counted by the orchestrator: the number of handoff continuations
+Some caps are counted by the orchestrator: the number of subtask continuations
 for a subtask, the number of corrective retries, re-validation rounds per wave,
 the total number of workers a whole run may spawn, the parallelism within a
 wave, and a per-worker time and turn limit. These are real counters in real
@@ -518,12 +616,21 @@ owns the counter, the cap is a genuine guarantee.
 
 ### Worker-internal caps
 
-Other limits — how many times an implementer re-runs its evidence gate or its
-validation loop — live *inside* a single worker. The orchestrator never sees
-these iterations; it sees only the worker's final result. These limits are
-therefore *prompt-governed*: the worker is instructed to bound itself, and the
-genuine hard backstop is the worker's overall turn limit, which the
-orchestrator does control.
+Other limits — how many times an implementer or planner re-runs its evidence
+gate, how many times an implementer re-runs its validation loop — live
+*inside* a single worker. The orchestrator never sees these iterations; it
+sees only the worker's final result. These limits are therefore
+*prompt-governed*: the worker is instructed to bound itself, and the genuine
+hard backstop is the worker's overall turn limit, which the orchestrator does
+control.
+
+The evidence-gate bound is exposed to users as `--confidence-rounds` (also
+`CENTELLA_CONFIDENCE_ROUNDS` and `centella.toml`); the orchestrator passes the
+resolved value into each worker's prompt. The user-visible knob is real — the
+worker reads it — but the worker is what counts iterations against it, so the
+guarantee is still prompt-governed in the sense above. Surfacing the knob
+lets a user dial how persistent workers are at building confidence without
+changing what kind of guarantee that bound is.
 
 This distinction matters and must not be blurred. Presenting a worker-internal,
 prompt-governed limit as if it were a code-enforced guarantee would mislead

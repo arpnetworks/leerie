@@ -154,8 +154,16 @@ def test_blocked_with_blocker_returns_none(centella):
 
 
 # --- failed status ---------------------------------------------------------
+# A `failed` result must carry a non-empty summary (the worker's diagnosis).
+# The prompt requires it; the code enforces it per DESIGN §12.
 
-def test_failed_status_returns_none(centella):
-    """`failed` has no cross-field invariant; validate_result returns None.
-    The decision to retry vs terminate is _retryable_failure's job."""
-    assert centella.validate_result({"status": "failed"}) is None
+def test_failed_with_empty_summary_returns_error(centella):
+    assert centella.validate_result({"status": "failed"}) is not None
+    assert centella.validate_result({"status": "failed", "summary": ""}) is not None
+    assert centella.validate_result({"status": "failed", "summary": "   "}) is not None
+
+
+def test_failed_with_summary_returns_none(centella):
+    assert centella.validate_result(
+        {"status": "failed", "summary": "tests still red after 5 iterations"}
+    ) is None

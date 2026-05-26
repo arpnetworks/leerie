@@ -34,9 +34,13 @@ clarification step if one occurs.
 3. Write the answers as a JSON object to `.centella/answers.json`, keyed by each
    question's `id`, plus `source_of_truth` set to `codebase`, `research`, or
    `both` if the source-of-truth question was asked. The user can skip this
-   question on future runs by setting `CENTELLA_SOURCE_OF_TRUTH=codebase|research|both`
-   in their environment or by adding `source_of_truth=...` to a `centella.toml`
-   file at the repo root. Then resume:
+   question on future runs by passing `--source-of-truth codebase|research|both`
+   to centella, by setting `CENTELLA_SOURCE_OF_TRUTH=codebase|research|both`
+   in their environment, or by adding `source_of_truth=...` to a `centella.toml`
+   file at the repo root. (Precedence: `--source-of-truth` > env > file.)
+   They can also pin the model with `--model sonnet|opus|haiku` (env:
+   `CENTELLA_MODEL`); per-worker overrides via `--model-<worker>` /
+   `CENTELLA_MODEL_<WORKER>`. Then resume:
 
    ```
    bash "${CLAUDE_PLUGIN_ROOT}/centella" --resume --answers .centella/answers.json
@@ -46,7 +50,10 @@ clarification step if one occurs.
    `--resume`, passing the original task and `--answers .centella/answers.json`.)
 
 4. Relay the orchestrator's final summary to the user. On any non-zero, non-10
-   exit, show the error and point them at `.centella/state.json`.
+   exit, show the error and point them at `.centella/state.json`. If the
+   failure looks like a Centella bug rather than a task-execution problem,
+   point the user at https://github.com/enricai/centella/issues with the
+   contents of `.centella/state.json` (redacted).
 
 For long runs, prefer telling the user to run `centella` directly in a terminal —
 this session's context fills with orchestrator output otherwise.

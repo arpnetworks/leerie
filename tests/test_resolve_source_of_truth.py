@@ -1,7 +1,8 @@
 """Tests for resolve_source_of_truth().
 
-Covers the per-repo file → env var → 'ask' resolution order, the value
-enum, comment/whitespace handling, and the die() path for invalid values.
+Covers the CLI flag → env var → per-repo file → 'ask' resolution order,
+the value enum, comment/whitespace handling, and the die() path for
+invalid values.
 """
 from __future__ import annotations
 
@@ -32,10 +33,26 @@ def test_both_unset_defaults_to_ask(centella, repo_root):
     assert centella.resolve_source_of_truth(repo_root) == "ask"
 
 
-def test_file_wins_over_env(centella, repo_root, monkeypatch):
+def test_env_wins_over_file(centella, repo_root, monkeypatch):
+    # File/env priority was flipped when the --source-of-truth CLI flag
+    # was added: env and CLI are session knobs and outrank the
+    # committed centella.toml default.
     (repo_root / "centella.toml").write_text("source_of_truth = codebase\n")
     monkeypatch.setenv("CENTELLA_SOURCE_OF_TRUTH", "research")
-    assert centella.resolve_source_of_truth(repo_root) == "codebase"
+    assert centella.resolve_source_of_truth(repo_root) == "research"
+
+
+def test_cli_value_wins_over_env_and_file(centella, repo_root, monkeypatch):
+    (repo_root / "centella.toml").write_text("source_of_truth = codebase\n")
+    monkeypatch.setenv("CENTELLA_SOURCE_OF_TRUTH", "research")
+    assert centella.resolve_source_of_truth(repo_root, cli_value="both") == "both"
+
+
+def test_cli_value_none_falls_back(centella, repo_root, monkeypatch):
+    # An unset --source-of-truth flag (None from argparse) is the same
+    # as if the parameter weren't passed at all.
+    monkeypatch.setenv("CENTELLA_SOURCE_OF_TRUTH", "research")
+    assert centella.resolve_source_of_truth(repo_root, cli_value=None) == "research"
 
 
 def test_quoted_file_value(centella, repo_root):
