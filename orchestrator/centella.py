@@ -701,8 +701,7 @@ async def preflight(centella_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         cmd = ["claude", "-p", "respond with the single word ok",
                "--output-format", "stream-json",
                "--verbose",
-               "--json-schema", '{"type":"object"}',
-               "--max-turns", "1"]
+               "--json-schema", '{"type":"object"}']
         try:
             envelope = await _invoke(cmd, cwd=os.getcwd(), timeout=90,
                                      sid="smoke",
