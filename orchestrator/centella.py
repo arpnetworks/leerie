@@ -3795,6 +3795,10 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
         # loop, which is why the lock-free State works.
         gather_answers(st, supplied)
         plans = await phase_plan(task, st, caps, models)
+        # Bridge cross-domain capability-tag mismatches before the
+        # scheduler builds its DAG. Short-circuits with no worker call
+        # when planners agreed on vocabulary (the common case).
+        plans = await phase_reconcile(plans, task, st, caps, models)
         subtasks, waves = schedule(plans)
         validate_plan(subtasks)
         runner = detect_test_runner()

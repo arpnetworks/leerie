@@ -116,6 +116,55 @@ def test_settle_subtask_has_needs_clarification_branch():
         "pending-clarifications.json + EXIT_NEEDS_ANSWERS).")
 
 
+def test_orchestrate_calls_phase_reconcile_between_plan_and_schedule():
+    """The reconciler (DESIGN §5 / §17) bridges cross-domain
+    capability-tag mismatches before the scheduler builds its DAG.
+    Order matters: `phase_reconcile` must run on the output of
+    `phase_plan` and its result must feed `schedule`. If a future
+    refactor swapped the order (schedule → reconcile) the scheduler
+    would build a wave graph over un-reconciled tags and either:
+      - fail with "nothing provides X" (the pre-reconciler behavior), or
+      - silently scatter the dependency that the reconciler should
+        have wired together.
+    Pin the source order so a regression fails here instead of in a
+    real run with mismatched planner vocabulary.
+    """
+    body = _function_body("orchestrate")
+    plan_idx = body.find("await phase_plan(")
+    reconcile_idx = body.find("await phase_reconcile(")
+    schedule_idx = body.find("schedule(plans)")
+    assert plan_idx >= 0, "orchestrate() must call phase_plan()"
+    assert reconcile_idx >= 0, (
+        "orchestrate() must call phase_reconcile() between phase_plan "
+        "and schedule. Without it, cross-domain capability-tag "
+        "mismatches that the planners produce slip through to "
+        "validate_plan and abort the run (DESIGN §5, §17).")
+    assert schedule_idx >= 0, "orchestrate() must call schedule()"
+    assert plan_idx < reconcile_idx < schedule_idx, (
+        "ordering must be: phase_plan → phase_reconcile → schedule. "
+        f"got phase_plan@{plan_idx}, "
+        f"phase_reconcile@{reconcile_idx}, schedule@{schedule_idx}. "
+        "The scheduler's DAG must be built over the reconciled plan, "
+        "not the raw planner output.")
+
+
+def test_orchestrate_reconcile_feeds_schedule_via_plans_var():
+    """The plumbing: phase_reconcile must return into the same `plans`
+    variable that schedule reads. Otherwise the reconciler runs but its
+    output is discarded — a silent regression where the schedule still
+    sees un-reconciled tags. Pin the rebind so a future change can't
+    accidentally split the variables.
+    """
+    body = _function_body("orchestrate")
+    # The exact call shape we want — assignment back to `plans`.
+    assert "plans = await phase_reconcile(plans," in body, (
+        "phase_reconcile must be called as `plans = await "
+        "phase_reconcile(plans, ...)` so its returned (possibly "
+        "mutated) plan list feeds schedule(). A call that throws "
+        "away the return value would leave schedule operating on the "
+        "raw planner output.")
+
+
 def test_settle_subtask_needs_clarification_uses_unified_cap():
     """The unified subtask_continuations cap is the design's defense
     against the worker drifting toward asking instead of researching
