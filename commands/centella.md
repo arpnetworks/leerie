@@ -39,8 +39,8 @@ clarification step if one occurs.
    `both`). They can pin the model with `--model sonnet|opus|haiku` (env:
    `CENTELLA_MODEL`); per-worker overrides via `--model-<worker>` /
    `CENTELLA_MODEL_<WORKER>`. Per-worker defaults: judgment workers
-   (classifier, planner, reconciler, integrator, validator) default to
-   `opus`; acting workers (implementer, conformer) default to `sonnet`.
+   (classifier, planner, reconciler, integrator) default to `opus`;
+   acting workers (implementer, conformer) default to `sonnet`.
    Then resume:
 
    ```

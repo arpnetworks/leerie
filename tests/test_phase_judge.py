@@ -52,7 +52,6 @@ _CAPS = {
 
 _MODELS = {
     "judge": "opus",
-    "validator": "opus",
 }
 
 _CALL_TYPES = ["classifier", "planner", "implementer"]

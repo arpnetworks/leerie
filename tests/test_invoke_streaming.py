@@ -412,7 +412,7 @@ def test_progress_prefix_shown_when_progress_passed(centella, centella_dir,
                                                       monkeypatch, capsys):
     """When progress=(done, total) is passed to _invoke, every inline
     summary line is prefixed with [done/total] before the worker tag.
-    This is the implementer/integrator/validator path once waves exist."""
+    This is the implementer/integrator/conformer path once waves exist."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
         json.dumps({"type": "result", "subtype": "success",

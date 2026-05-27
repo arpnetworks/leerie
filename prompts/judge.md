@@ -8,7 +8,7 @@ verdict.
 
 You will receive:
 - The **call_type** (which worker produced this output: classifier, planner,
-  reconciler, implementer, integrator, or validator)
+  reconciler, implementer, integrator, or conformer)
 - The **system_prompt** (the instructions the worker was given)
 - The **user_content** (the input the worker received)
 - The **response_content** (what the worker produced — typically JSON)
@@ -29,7 +29,7 @@ worker's call_type requires:
   - **reconciler**: `renames`, `added_provides`, `added_subtasks`, `unresolvable` (all arrays)
   - **implementer**: `subtask_id`, `status` (one of: complete|incomplete-handoff|blocked|failed|needs-clarification), `confidence` object
   - **integrator**: `incoming_subtask`, `status` (resolved|design-conflict|failed)
-  - **validator**: `results` (array of objects with `subtask_id` and `all_criteria_met`)
+  - **conformer**: `subtask_id`, `rules_files_read` (array), `rule_violations_fixed`, `rule_violations_residual`, `docs_updates`, `tests_updates` (all arrays), `build`/`lint`/`tests` (each an object), `summary` (string)
 - The `parsed_ok` field being `false` is strong evidence of schema failure, but
   you may still find structural problems even when `parsed_ok` is `true`.
 
@@ -43,7 +43,11 @@ plausible given the inputs:
 
 - Subtask IDs referenced in `depends_on` or `requires` actually appear in the plan.
 - Status values correspond to the described situation (e.g. a worker that
-  says `complete` but also says no criteria were met is self-contradictory).
+  says `complete` but has not committed any code or whose `confidence`
+  scores are well below 9.0 is self-contradictory; unmet entries in
+  `criteria_results` alongside `complete` are *not* contradictory —
+  per DESIGN §8 the criteria file is informational and the confidence
+  gate is the load-bearing signal).
 - Field values don't contradict each other within the response.
 - Confidence scores (when present) are numbers in range [1, 10].
 - The response does not reference artifacts, files, or results that are

@@ -15,7 +15,7 @@ Tests are split in two:
   and the call sits *before* the `if not skip_smoke:` block so the
   version check runs even when `--skip-smoke` is passed.
 
-Same mockless / source-pinning style as `test_validator_tools.py`.
+Same mockless / source-pinning style as `test_inspect_tools.py`.
 """
 from __future__ import annotations
 

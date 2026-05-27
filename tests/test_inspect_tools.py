@@ -91,9 +91,9 @@ def test_inspect_tools_includes_read_tools(centella):
 
 
 def test_classifier_call_site_uses_inspect_tools():
-    """Source-text check (same pattern as test_validator_tools.py): the
-    phase_classify worker invocation must pass allowed_tools=INSPECT_TOOLS,
-    not READ_TOOLS (removed) or ACT_TOOLS (would grant Write/Edit)."""
+    """Source-text check: the phase_classify worker invocation must pass
+    allowed_tools=INSPECT_TOOLS, not READ_TOOLS (removed) or ACT_TOOLS
+    (would grant Write/Edit)."""
     src = CENTELLA_PY.read_text()
     start = src.index("async def phase_classify(")
     end = src.index("\nasync def ", start + 1)

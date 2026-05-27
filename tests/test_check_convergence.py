@@ -432,7 +432,7 @@ _CAPS = {
     "max_parallel": 4,
 }
 
-_MODELS = {"judge": "opus", "validator": "opus"}
+_MODELS = {"judge": "opus"}
 
 
 def _make_state(centella, run_dir: Path):

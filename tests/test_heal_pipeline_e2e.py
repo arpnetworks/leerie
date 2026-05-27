@@ -43,7 +43,6 @@ _CAPS = {
 
 _MODELS = {
     "judge": "opus",
-    "validator": "opus",
 }
 
 # Judge envelopes: one passes, two fail.

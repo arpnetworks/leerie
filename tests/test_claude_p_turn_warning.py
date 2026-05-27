@@ -2,7 +2,7 @@
 
 claude_p shells out to the `claude` CLI and the test suite does not exercise
 the live binary (see CLAUDE.md "Testing"). We pin the warning's presence
-in source the same way `test_validator_tools.py` pins the tool-bucket
+in source the same way `test_inspect_tools.py` pins the tool-bucket
 contract: by checking the function body contains the expected check and
 that it lives in the place where the envelope has been parsed.
 

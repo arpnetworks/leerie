@@ -64,7 +64,6 @@ _CAPS = {
 
 _MODELS = {
     "judge": "opus",
-    "validator": "opus",
     "heal": "sonnet",
 }
 
