@@ -110,9 +110,12 @@ export CENTELLA_CONFIDENCE_ROUNDS=12
 export CENTELLA_SOURCE_OF_TRUTH=codebase    # or: research, both, ask
 /path/to/centella/centella "task" --source-of-truth codebase
 
-# Choose the model for all workers (default: sonnet). Each worker can
-# also be overridden independently — see docs/IMPLEMENTATION.md §2
+# Choose the model. Without overrides, judgment workers (classifier /
+# planner / reconciler / integrator / validator) default to opus and
+# the implementer defaults to sonnet — see docs/IMPLEMENTATION.md §2
 # "Model selection" for the full env-var / CLI-flag / TOML-key table.
+# Set CENTELLA_MODEL=sonnet (or --model sonnet) to restore the
+# pre-0.3 all-sonnet behavior in one knob.
 export CENTELLA_MODEL=sonnet                # or: opus, haiku
 /path/to/centella/centella "task" --model opus
 /path/to/centella/centella "task" --model-implementer opus --model-classifier haiku
@@ -152,7 +155,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--confidence-rounds N` | 8 | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `CENTELLA_CONFIDENCE_ROUNDS` and `centella.toml`. |
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |
 | `--source-of-truth VALUE` | — | `codebase` / `research` / `both` / `ask`. Overrides `CENTELLA_SOURCE_OF_TRUTH` and `centella.toml`. |
-| `--model ALIAS` | `sonnet` | `sonnet` / `opus` / `haiku`. Model for every worker this run. |
+| `--model ALIAS` | per-worker (judgment: `opus`; implementer: `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
 | `--model-<worker> ALIAS` | inherits `--model` | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`. |
 | `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `.centella/logs/<sid>.log`. |
 | `-v` / `-vv` | — | Shortcuts: `-v` = `stream` (default), `-vv` = `debug`. |
@@ -163,7 +166,7 @@ Complete reference for every CLI flag, environment variable, and
 | Env var | `centella.toml` key | Description |
 |---------|---------------------|-------------|
 | `CENTELLA_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both` / `ask`). Overridden by `--source-of-truth`. |
-| `CENTELLA_MODEL` | `model` | Default model alias for all workers. Overridden by `--model`. |
+| `CENTELLA_MODEL` | `model` | Model alias applied to every worker (beats the per-worker defaults). Overridden by `--model` and per-worker overrides. |
 | `CENTELLA_MODEL_<WORKER>` | `model_<worker>` | Per-worker default (e.g. `CENTELLA_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`. |
 | `CENTELLA_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer, default 8). Overridden by `--confidence-rounds`. |
 | `CENTELLA_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`, default `stream`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. |
@@ -177,7 +180,12 @@ Complete reference for every CLI flag, environment variable, and
 - **Model** (per worker, highest first): `--model-<worker>` →
   `--model` → `CENTELLA_MODEL_<WORKER>` → `CENTELLA_MODEL` →
   `model_<worker>` in `centella.toml` → `model` in `centella.toml` →
-  default `sonnet`.
+  per-worker default (`implementer` → `sonnet`; everything else →
+  `opus`). The judgment-vs-implementation split keeps the
+  most-frequently-invoked worker on the lower-cost model while
+  every judgment step gets Opus-grade reasoning. To restore the
+  pre-0.3 all-sonnet behavior in one knob, set `CENTELLA_MODEL=sonnet`
+  or pass `--model sonnet`.
 - **Confidence rounds** (highest first): `--confidence-rounds` →
   `CENTELLA_CONFIDENCE_ROUNDS` → `confidence_rounds` in
   `centella.toml` → default `8`.

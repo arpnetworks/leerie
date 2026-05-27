@@ -140,9 +140,11 @@ export CENTELLA_SOURCE_OF_TRUTH=codebase   # or: research, both, ask
 ./centella "task" --source-of-truth codebase
 # …or commit a centella.toml at the repo root with: source_of_truth = codebase
 
-# Choose the model for all workers (default: sonnet). Per-worker
-# overrides exist via --model-<worker> / CENTELLA_MODEL_<WORKER>.
-# See docs/IMPLEMENTATION.md §2 "Model selection" for the full table.
+# Choose the model. Without overrides: judgment workers (classifier,
+# planner, reconciler, integrator, validator) default to opus;
+# implementer defaults to sonnet. Per-worker overrides exist via
+# --model-<worker> / CENTELLA_MODEL_<WORKER>. See
+# docs/IMPLEMENTATION.md §2 "Model selection" for the full table.
 export CENTELLA_MODEL=sonnet               # or: opus, haiku
 ./centella "task" --model opus
 ./centella "task" --model-implementer opus --model-classifier haiku

@@ -2874,6 +2874,23 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
 
     added = output.get("added_subtasks", [])
     if added:
+        # Fail loud on id collisions. schedule() merges all subtasks
+        # into a single dict keyed by id (centella.py: see `schedule`),
+        # so a duplicate id would silently overwrite a real subtask and
+        # vanish its requires/provides/depends_on from the DAG. The
+        # reconciler's prompt warns against this, but prompts are
+        # advisory per CLAUDE.md "The central principle" — the
+        # mechanical guarantee lives here.
+        existing_ids = {s["id"] for s in by_id.values()}
+        collisions = sorted({s["id"] for s in added if s["id"] in existing_ids})
+        if collisions:
+            die(
+                "reconciler proposed added_subtasks whose id(s) collide "
+                "with existing subtasks: "
+                f"{', '.join(collisions)}. The scheduler merges by id; "
+                "an unchecked collision would silently drop one of the "
+                "subtasks from the DAG. Refine the task or re-run."
+            )
         plans.append({
             "domain": "_reconciler",
             "status": "ready",

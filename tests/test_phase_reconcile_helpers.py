@@ -187,6 +187,69 @@ def test_apply_added_subtasks_appends_reconciler_plan(centella):
     assert plans[1]["subtasks"] == [new_subtask]
 
 
+def test_apply_dies_on_duplicate_added_subtask_id(centella):
+    """If the reconciler emits an added_subtask whose `id` collides with
+    an existing subtask, `_apply_reconciler_output` must die() — not
+    silently append. The scheduler later merges all subtasks into a
+    single dict keyed by id; a collision would silently drop one of
+    them, losing its requires/provides/depends_on from the DAG. This
+    is exactly the kind of mechanical guarantee CLAUDE.md says must
+    live in the code, not the prompt.
+    """
+    plans = [_plan("feature-implementation",
+                   {"id": "feat-001", "title": "shim",
+                    "provides": ["shim-cap"]})]
+    out = {
+        "renames": [], "added_provides": [],
+        "added_subtasks": [{
+            "id": "feat-001",  # collides with the existing subtask
+            "title": "Conflicting reconciler subtask",
+            "success_criteria_seed": "x",
+            "provides": ["new-cap"],
+            "_added_by_reconciler": True,
+        }],
+        "unresolvable": [],
+    }
+    with pytest.raises(SystemExit) as exc:
+        centella._apply_reconciler_output(plans, out)
+    assert exc.value.code != 0
+    # The original subtask is still there — the helper must NOT have
+    # mutated plans before dying. (die() runs at the top of the
+    # added_subtasks branch, before the append.)
+    assert len(plans) == 1
+    assert plans[0]["subtasks"][0]["id"] == "feat-001"
+    assert plans[0]["subtasks"][0]["title"] == "shim"
+
+
+def test_apply_dies_names_colliding_ids_in_error(centella, capsys):
+    """The die() message must name the colliding id(s) so a user reading
+    the error can map straight back to the offending plan. Pin the
+    surface form so a future refactor can't degrade it to a generic
+    'collision detected' message.
+    """
+    plans = [
+        _plan("feature-implementation",
+              {"id": "feat-001", "title": "x"},
+              {"id": "feat-002", "title": "y"}),
+    ]
+    out = {
+        "renames": [], "added_provides": [],
+        "added_subtasks": [
+            {"id": "feat-002", "title": "collision-1",
+             "success_criteria_seed": "x", "_added_by_reconciler": True},
+            {"id": "feat-009", "title": "ok",
+             "success_criteria_seed": "y", "_added_by_reconciler": True},
+        ],
+        "unresolvable": [],
+    }
+    with pytest.raises(SystemExit):
+        centella._apply_reconciler_output(plans, out)
+    err = capsys.readouterr().err
+    # The colliding id is named; the non-colliding one is not.
+    assert "feat-002" in err
+    assert "feat-009" not in err
+
+
 def test_apply_combined_renames_provides_and_subtasks(centella):
     """Realistic case: all three mutation types applied in one call."""
     plans = [

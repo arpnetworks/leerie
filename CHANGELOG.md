@@ -9,7 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `reconciler` worker. Spawned by the orchestrator between `phase_plan`
+  and `schedule` when parallel planners disagree on capability-tag
+  vocabulary across domains. The reconciler resolves the mismatch via
+  renames, added `provides`, or new connector subtasks; genuinely
+  unresolvable gaps abort the run with the worker's diagnosis instead
+  of the prior opaque "nothing provides X" error. Short-circuits with
+  no worker invocation when planners already agreed (DESIGN.md §5,
+  §14). Reconciler-emitted subtask `id` collisions with existing
+  subtasks now fail loud — the prior silent-overwrite path through
+  `schedule()`'s dict-flatten would have lost a subtask from the DAG.
+
 ### Changed
+
+- **Model defaults flipped to a judgment-vs-implementation split.**
+  Judgment workers (`classifier`, `planner`, `reconciler`,
+  `integrator`, `validator`) now default to `opus`; `implementer`
+  defaults to `sonnet`. Previously every worker defaulted to `sonnet`.
+  The split prioritizes Opus-grade reasoning on the steps where a
+  wrong call is most costly (decomposition, conflict resolution,
+  cross-domain wiring, criterion judgment) while keeping the
+  most-frequently-invoked worker on the cheaper model. **Cost note:**
+  Opus is materially more expensive per token than Sonnet; a typical
+  run is meaningfully more expensive than before. To restore the
+  pre-0.3 all-sonnet behavior in one knob, set `--model sonnet`,
+  `CENTELLA_MODEL=sonnet`, or `model = sonnet` in `centella.toml`.
+  Per-worker overrides (`--model-<worker>`, `CENTELLA_MODEL_<WORKER>`,
+  `model_<worker>`) let you dial individual workers independently.
 
 ### Deprecated
 

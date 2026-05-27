@@ -105,8 +105,10 @@ export CENTELLA_VERBOSITY=stream
 export CENTELLA_SOURCE_OF_TRUTH=codebase    # or: research, both, ask
 /path/to/centella/centella "task" --source-of-truth codebase
 
-# Choose the model for all workers (default: sonnet). Use the env var for a
-# sticky preference, the CLI flag for a one-off, or centella.toml for the
+# Choose the model. Without overrides: judgment workers (classifier,
+# planner, reconciler, integrator, validator) default to opus;
+# implementer defaults to sonnet. Use the env var for a sticky
+# preference, the CLI flag for a one-off, or centella.toml for the
 # committed repo default. Per-worker overrides also exist — see §2.
 export CENTELLA_MODEL=sonnet                # or: opus, haiku
 /path/to/centella/centella "task" --model opus
