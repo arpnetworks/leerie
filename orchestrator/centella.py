@@ -42,9 +42,11 @@ SCRIPTS = ROOT / "scripts"
 
 def _read_version() -> str:
     """Single source of truth: `.claude-plugin/plugin.json`'s `version`
-    field. Read at --version time, not at import time, so a missing /
-    malformed manifest produces a clear runtime error rather than
-    blocking the orchestrator from importing."""
+    field. Read at every `main()` invocation (the f-string in the
+    `--version` action evaluates eagerly), not at import time. The
+    manifest is part of the distributed plugin, so a missing /
+    malformed file means the install is broken and a clear runtime
+    error is the right outcome."""
     return json.loads(
         (ROOT / ".claude-plugin" / "plugin.json").read_text()
     )["version"]

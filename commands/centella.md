@@ -58,4 +58,5 @@ clarification step if one occurs.
    contents of `.centella/state.json` (redacted).
 
 For long runs, prefer telling the user to run `centella` directly in a terminal —
-this session's context fills with orchestrator output otherwise.
+this session's context fills with orchestrator output otherwise. (Requires the
+terminal install — see README "From a terminal".)
