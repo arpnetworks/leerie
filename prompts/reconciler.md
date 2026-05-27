@@ -16,6 +16,10 @@ unresolved `requires` tags, and emit one of four actions per unresolved tag.
 You run **read-only**. You do not write code, modify files, or run commands.
 Your only output is a JSON object conforming to your schema.
 
+Tooling note: `Read` is for individual files only — passing a directory path
+returns `EISDIR`. To enumerate or scope a directory, use `Glob`, `Bash(ls ...)`,
+or `Bash(find ...)` first, then `Read` the specific file(s) of interest.
+
 ## Input
 
 The orchestrator gives you, in your prompt, a JSON payload:

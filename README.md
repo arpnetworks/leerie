@@ -282,9 +282,13 @@ via `.git/info/exclude`) and to `centella/runs/<run-id>` plus
 `centella/subtasks/<run-id>/<subtask-id>` branches. Phase 6 (unless
 `--no-push`) pushes the run branch to `origin` and opens a PR against
 your working branch — your working branch itself is never modified
-locally. After a run, the run branches are kept as an audit trail.
-Remove them with `scripts/cleanup.sh --run-id <id> --branches` (or
-`--all-runs --branches` for an audit cleanup across every past run).
+locally. After a run, the run branch (`centella/runs/<run-id>`) is kept
+as an audit trail; per-subtask branches are auto-deleted at finalize,
+but each worker's commits remain reachable from the run branch's
+`--no-ff` merge graph (`git log centella/runs/<run-id> --graph`). Remove
+the run branch (and any leftover subtask branches) with
+`scripts/cleanup.sh --run-id <id> --branches` (or `--all-runs --branches`
+for an audit cleanup across every past run).
 
 ## Troubleshooting
 

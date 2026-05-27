@@ -23,6 +23,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Finalize no longer merges the run branch into the working branch
+  locally.** Phase 6 now verifies the run branch is non-empty, pushes it
+  to `origin`, and opens a PR via `gh pr create --base <working-branch>
+  --head centella/runs/<run-id>`. The working branch is **not** modified
+  locally; the PR is the proposed integration. Previously, a successful
+  run landed a `centella: integrate completed run into <working-branch>`
+  merge commit on the working branch *and* opened a PR with the same
+  base, duplicating the same change in two places. `--no-push` still
+  skips the push + PR step (the run branch is left local-only; the
+  working branch is unchanged). The `scripts/finalize.sh` script is now
+  a thin verifier (no `git checkout`, no `git merge`); the two
+  post-merge sanity checks in `phase_finalize` are removed (they
+  assumed a merge had just happened on HEAD).
+
+- **Per-subtask branches are auto-deleted at finalize.** A new
+  `cleanup.sh --subtask-branches` flag (mutually exclusive with
+  `--branches`) is now invoked from `phase_finalize` after push+PR. It
+  deletes every `centella/subtasks/<run-id>/*` branch and keeps the
+  run branch `centella/runs/<run-id>` (the PR head must outlive the
+  orchestrator). The per-subtask commits remain reachable from the run
+  branch's `--no-ff` merge graph; the per-worker audit trail is now
+  `git log centella/runs/<run-id> --graph`. Previously every successful
+  run left ~17–20 orphan subtask branches that the user had to delete
+  by hand.
+
 - **Model defaults flipped to a judgment-vs-implementation split.**
   Judgment workers (`classifier`, `planner`, `reconciler`,
   `integrator`, `validator`) now default to `opus`; `implementer`
@@ -54,6 +79,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 ### Fixed
+
+- **`phase_finalize` now passes `--run-id` to `cleanup.sh`.** The previous
+  bare `cleanup.sh` invocation hit the script's interactive no-arg path,
+  which scans for the most-recently-failed run and prompts y/N on stdin.
+  The orchestrator runs cleanup non-interactively, so `read -r answer`
+  silently saw EOF, the script exited 0 without doing anything, and the
+  orchestrator continued past it. Every successful run was leaving its
+  full set of subtask worktrees on disk under
+  `.centella/runs/<run-id>/worktrees/` despite the "cleanup ran" log
+  line. A defense-in-depth pin in `phase_finalize` now asserts the
+  invocation includes the run id.
 
 ### Security
 

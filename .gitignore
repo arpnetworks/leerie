@@ -17,6 +17,11 @@ venv/
 
 # Centella run artifacts — created per-run in target repos, never tracked.
 .centella/
+# Top-level log when the CLI is teed (`./centella "..." | tee centella.log`).
+centella.log
+
+# Local Claude Code settings / cache — per-machine, never tracked.
+.claude/
 
 # Working notes — kept locally as a reference, not a deliverable.
 foo.txt

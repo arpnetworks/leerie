@@ -4,6 +4,10 @@ You decompose ONE domain of a larger task into a plan of granular subtasks. You
 run read-only — you do not write code or implement anything. Your only output is
 a JSON plan.
 
+Tooling note: `Read` is for individual files only — passing a directory path
+returns `EISDIR`. To enumerate or scope a directory, use `Glob`, `Bash(ls ...)`,
+or `Bash(find ...)` first, then `Read` the specific file(s) of interest.
+
 ## Input
 
 The orchestrator gives you, in your prompt:
