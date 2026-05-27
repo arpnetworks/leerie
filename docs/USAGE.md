@@ -218,8 +218,10 @@ schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
   [`IMPLEMENTATION.md`](IMPLEMENTATION.md#model-selection). To restore
   the pre-0.3 all-sonnet behavior in one knob, set `--model sonnet` or
   `CENTELLA_MODEL=sonnet`.
-- `--max-workers N` — cap total `claude -p` subprocess count over the run.
-- `--max-parallel N` — cap concurrent implementers per wave.
+- `--max-workers N` — cap total `claude -p` subprocess count over the
+  run. Default: `40` (`DEFAULT_CAPS["max_total_workers"]`).
+- `--max-parallel N` — cap concurrent implementers per wave. Default:
+  `4` (`DEFAULT_CAPS["max_parallel"]`).
 - `--clarify` — opt into surfacing intent questions to the user
   (default: off). Without it the classifier's filter still runs but
   surviving questions are dropped, and the implementer makes a

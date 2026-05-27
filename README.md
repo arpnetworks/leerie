@@ -98,7 +98,7 @@ git clone https://github.com/enricai/centella.git
 # set to "codebase", "research", or "both".
 /path/to/centella/centella "task" --answers answers.json
 
-# Override caps:
+# Override caps (defaults: 40 total workers, 4 in parallel per wave):
 /path/to/centella/centella "task" --max-workers 60 --max-parallel 6
 
 # Dial how persistent the planner and implementer are at building
@@ -148,36 +148,55 @@ Complete reference for every CLI flag, environment variable, and
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `task` (positional) | — | The task description. Required unless `--resume` or `--list` is given. |
-| `--resume` | — | Resume an interrupted run. Auto-picks if exactly one run exists; requires `--run-id` if multiple. |
-| `--run-id ID` | — | Select a specific run by id (e.g., for `--resume` when multiple runs are in flight). |
-| `--list` | — | Enumerate in-flight and completed runs in this repository (run id, started, status, branch). |
+| `task` (positional) | — | The task description (literal string, or path to a `.txt`/`.md` file). Required unless `--resume`, `--list`, or `--phase` is given. |
+| `--resume` | off | Resume an interrupted run. Auto-picks if exactly one run exists; requires `--run-id` if multiple. |
+| `--run-id ID` | — | Select a specific run by id (e.g., for `--resume` or `--phase` when multiple runs are in flight). |
+| `--list` | off | Enumerate in-flight and completed runs in this repository (run id, started, status, branch). |
 | `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `CENTELLA_NO_PUSH` / `centella.toml`. |
 | `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
 | `--clarify` | off | Opt into surfacing intent questions to the user. Default: questions are dropped after the classifier's codebase→research filter, and the implementer makes a documented best-effort decision. Also `CENTELLA_CLARIFY` env var or `clarify = true` in `centella.toml`. |
-| `--max-workers N` | 40 | Cap on total `claude -p` invocations across the run. |
-| `--max-parallel N` | 4 | Cap on concurrent workers within a wave. |
-| `--confidence-rounds N` | 8 | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `CENTELLA_CONFIDENCE_ROUNDS` and `centella.toml`. |
+| `--max-workers N` | `40` | Cap on total `claude -p` invocations across the run. |
+| `--max-parallel N` | `4` | Cap on concurrent workers within a wave. |
+| `--confidence-rounds N` | `8` | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `CENTELLA_CONFIDENCE_ROUNDS` and `centella.toml`. |
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |
 | `--source-of-truth VALUE` | `both` | `codebase` / `research` / `both`. Overrides `CENTELLA_SOURCE_OF_TRUTH` and `centella.toml`. |
-| `--model ALIAS` | per-worker (judgment: `opus`; implementer: `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
-| `--model-<worker> ALIAS` | inherits `--model` | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`. |
+| `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `CENTELLA_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `centella.toml` (comma-separated). |
+| `--model ALIAS` | per-worker (judgment: `opus`; acting workers — implementer, conformer: `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
+| `--model-<worker> ALIAS` | per-worker default (`implementer`, `conformer` → `sonnet`; everything else → `opus`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`, `conformer`. Overrides `--model`, `CENTELLA_MODEL`, and `centella.toml`. |
+| `--judge-model ALIAS` | `sonnet` | Model alias for the post-run judge skill. Also `CENTELLA_MODEL_JUDGE` or `model_judge` in `centella.toml`. |
+| `--heal-model ALIAS` | `sonnet` | Model alias for the post-run self-heal skill. Also `CENTELLA_MODEL_HEAL` or `model_heal` in `centella.toml`. |
+| `--heal-max-rounds N` | `10` | Maximum heal-loop iterations per `call_type`. Also `CENTELLA_HEAL_MAX_ROUNDS` or `heal_max_rounds` in `centella.toml`. |
+| `--heal-success-threshold RATE` | `0.9` | Pass-rate threshold for the heal-loop SUCCESS verdict. Also `CENTELLA_HEAL_SUCCESS_THRESHOLD` or `heal_success_threshold` in `centella.toml`. |
 | `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `.centella/logs/<sid>.log`. |
-| `-v` / `-vv` | — | Shortcuts: `-v` = `stream` (default), `-vv` = `debug`. |
-| `-q` / `-qq` | — | Shortcuts: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. |
+| `-v` / `-vv` | `0` (off) | Shortcuts that anchor to `normal`: `-v` = `stream`, `-vv` = `debug`. With no `-v` and no `--verbosity`, falls through to `CENTELLA_VERBOSITY` / `centella.toml` / default `stream`. |
+| `-q` / `-qq` | `0` (off) | Shortcuts that anchor to `normal`: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. With no `-q` and no `--verbosity`, falls through to the same chain as `-v`. |
+| `--telemetry` / `--no-telemetry` | on | Enable / disable telemetry NDJSON event writing. Also `CENTELLA_TELEMETRY=1`/`0` or `telemetry=true`/`false` in `centella.toml`. |
+| `--telemetry-dir DIR` | `events` | Subdirectory name under the run dir for telemetry NDJSON events. Also `CENTELLA_TELEMETRY_DIR` or `telemetry_dir` in `centella.toml`. |
+| `--judge-dir DIR` | `judge-out` | Subdirectory name under the run dir for LLM judge output. Also `CENTELLA_JUDGE_DIR` or `judge_dir` in `centella.toml`. |
+| `--heal-dir DIR` | `heal-out` | Subdirectory name under the run dir for LLM self-heal output. Also `CENTELLA_HEAL_DIR` or `heal_dir` in `centella.toml`. |
+| `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
 
 ### Environment variables and `centella.toml` keys
 
 | Env var | `centella.toml` key | Description |
 |---------|---------------------|-------------|
 | `CENTELLA_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
-| `CENTELLA_MODEL` | `model` | Model alias applied to every worker (beats the per-worker defaults). Overridden by `--model` and per-worker overrides. |
-| `CENTELLA_MODEL_<WORKER>` | `model_<worker>` | Per-worker default (e.g. `CENTELLA_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`. |
-| `CENTELLA_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer, default 8). Overridden by `--confidence-rounds`. |
-| `CENTELLA_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`, default `stream`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. |
-| `CENTELLA_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. |
-| `CENTELLA_CLARIFY` | `clarify` | Sticky opt-in to surfacing intent questions to the user (truthy → on). Overridden by `--clarify`. |
+| `CENTELLA_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → per-worker defaults (judgment workers `opus`, acting workers — implementer, conformer — `sonnet`). |
+| `CENTELLA_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `CENTELLA_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `validator`, `conformer`. Unset → `implementer` and `conformer` → `sonnet`; everything else → `opus`. |
+| `CENTELLA_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
+| `CENTELLA_INSPECT_DIRS` | `inspect_dirs` | Extra directories the inspect-bucket workers (classifier, planner, reconciler) may read; forwarded as `--add-dir`. Env value is colon-separated; TOML value is comma-separated. Overridden by `--inspect-dir` (repeatable). Unset → none. |
+| `CENTELLA_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. Unset → default `stream`. |
+| `CENTELLA_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. Unset → default `false` (push + PR happen). |
+| `CENTELLA_CLARIFY` | `clarify` | Sticky opt-in to surfacing intent questions to the user (truthy → on). Overridden by `--clarify`. Unset → default `false`. |
+| `CENTELLA_MODEL_JUDGE` | `model_judge` | Model alias for the post-run judge skill. Overridden by `--judge-model`. Unset → default `sonnet`. |
+| `CENTELLA_MODEL_HEAL` | `model_heal` | Model alias for the post-run self-heal skill. Overridden by `--heal-model`. Unset → default `sonnet`. |
+| `CENTELLA_HEAL_MAX_ROUNDS` | `heal_max_rounds` | Maximum heal-loop iterations per `call_type`. Overridden by `--heal-max-rounds`. Unset → default `10`. |
+| `CENTELLA_HEAL_SUCCESS_THRESHOLD` | `heal_success_threshold` | Pass-rate threshold for the heal-loop SUCCESS verdict. Overridden by `--heal-success-threshold`. Unset → default `0.9`. |
+| `CENTELLA_TELEMETRY` | `telemetry` | Enable / disable telemetry NDJSON event writing (boolean). Overridden by `--telemetry` / `--no-telemetry`. Unset → default `true` (telemetry on). |
+| `CENTELLA_TELEMETRY_DIR` | `telemetry_dir` | Subdirectory name under the run dir for telemetry NDJSON events. Overridden by `--telemetry-dir`. Unset → default `events`. |
+| `CENTELLA_JUDGE_DIR` | `judge_dir` | Subdirectory name under the run dir for LLM judge output. Overridden by `--judge-dir`. Unset → default `judge-out`. |
+| `CENTELLA_HEAL_DIR` | `heal_dir` | Subdirectory name under the run dir for LLM self-heal output. Overridden by `--heal-dir`. Unset → default `heal-out`. |
 | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | — | **Claude Code CLI variable**, not consumed by centella. Set to `70` to backstop worker auto-compaction. |
 
 ### Precedence

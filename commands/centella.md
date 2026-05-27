@@ -38,7 +38,10 @@ clarification step if one occurs.
    `research`, or `both` (otherwise the resolved preference applies, default
    `both`). They can pin the model with `--model sonnet|opus|haiku` (env:
    `CENTELLA_MODEL`); per-worker overrides via `--model-<worker>` /
-   `CENTELLA_MODEL_<WORKER>`. Then resume:
+   `CENTELLA_MODEL_<WORKER>`. Per-worker defaults: judgment workers
+   (classifier, planner, reconciler, integrator, validator) default to
+   `opus`; acting workers (implementer, conformer) default to `sonnet`.
+   Then resume:
 
    ```
    bash "${CLAUDE_PLUGIN_ROOT}/centella" --clarify --resume --answers .centella/answers.json

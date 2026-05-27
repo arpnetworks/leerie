@@ -5151,7 +5151,8 @@ def main() -> None:
                          "a .txt/.md file whose contents are the task)")
     ap.add_argument("--resume", action="store_true",
                     help="resume an interrupted run (auto-picks if exactly "
-                         "one run exists under .centella/runs/)")
+                         "one run exists under .centella/runs/). "
+                         "Default: off (start a new run)")
     ap.add_argument("--run-id", metavar="ID",
                     help="select a specific run by id (for --resume when "
                          "multiple runs are in flight). See `--list` to "
@@ -5159,7 +5160,7 @@ def main() -> None:
     ap.add_argument("--list", action="store_true", dest="list_runs",
                     help="enumerate in-flight and completed runs in this "
                          "repository (run id, started, status, branch). "
-                         "Exits without running orchestrate.")
+                         "Exits without running orchestrate. Default: off")
     ap.add_argument("--answers", metavar="FILE",
                     help="JSON file of pre-supplied clarification answers")
     ap.add_argument("--clarify", action="store_true",
@@ -5172,18 +5173,22 @@ def main() -> None:
     ap.add_argument("--no-push", action="store_true",
                     help="skip the push and PR step at finalize. The run "
                          "completes with the run branch local-only; your "
-                         f"working branch is unchanged. Also {NO_PUSH_ENV} "
-                         "env var or no_push in centella.toml.")
+                         "working branch is unchanged. Default: off (push "
+                         f"and PR happen). Also {NO_PUSH_ENV} env var or "
+                         "no_push in centella.toml.")
     ap.add_argument("--no-verify", action="store_true",
                     help="pass --no-verify to the finalize `git push` "
                          "(skips pre-push hooks). Worker commits inside "
-                         "worktrees still run all hooks. CLI flag only "
-                         "(no env/TOML mirror — matches CLAUDE.md's "
-                         "explicit-user-request principle for hook-skipping).")
+                         "worktrees still run all hooks. Default: off "
+                         "(hooks run). CLI flag only (no env/TOML mirror — "
+                         "matches CLAUDE.md's explicit-user-request "
+                         "principle for hook-skipping).")
     ap.add_argument("--max-workers", type=int,
-                    help="override the total worker-invocation budget")
+                    help=f"override the total worker-invocation budget "
+                         f"(default {DEFAULT_CAPS['max_total_workers']})")
     ap.add_argument("--max-parallel", type=int,
-                    help="override concurrent workers per wave")
+                    help=f"override concurrent workers per wave "
+                         f"(default {DEFAULT_CAPS['max_parallel']})")
     ap.add_argument("--confidence-rounds", type=_positive_int, metavar="N",
                     help=f"how many evidence-gate rounds each planner / "
                          f"implementer may run before exiting blocked "
@@ -5191,33 +5196,37 @@ def main() -> None:
                          f"also {CONFIDENCE_ROUNDS_ENV} and "
                          f"confidence_rounds in centella.toml")
     ap.add_argument("--skip-smoke", action="store_true",
-                    help="skip the live claude -p smoke test during preflight")
+                    help="skip the live claude -p smoke test during preflight. "
+                         "Default: off (smoke test runs)")
     ap.add_argument("--source-of-truth", choices=SOURCE_OF_TRUTH_VALUES,
                     metavar="VALUE",
                     help=f"source-of-truth preference "
-                         f"({'|'.join(SOURCE_OF_TRUTH_VALUES)}); overrides "
-                         f"{SOURCE_OF_TRUTH_ENV} and centella.toml")
+                         f"({'|'.join(SOURCE_OF_TRUTH_VALUES)}, default both); "
+                         f"overrides {SOURCE_OF_TRUTH_ENV} and centella.toml")
     ap.add_argument("--inspect-dir", action="append", metavar="PATH",
                     dest="inspect_dir",
                     help="extra directory the inspect-bucket workers "
                          "(classifier, planner, reconciler) may read. "
                          "Forwarded to `claude -p` as --add-dir. Repeatable. "
                          "Use for sibling repos referenced in the task that "
-                         "live outside the current repo cwd. Also "
-                         f"{INSPECT_DIRS_ENV} (colon-separated) or "
+                         "live outside the current repo cwd. Default: none. "
+                         f"Also {INSPECT_DIRS_ENV} (colon-separated) or "
                          "inspect_dirs in centella.toml (comma-separated).")
     ap.add_argument("--model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for all workers "
-                         f"({'|'.join(MODEL_VALUES)}); without an override, "
-                         f"judgment workers default to {MODEL_DEFAULT} and "
-                         f"the implementer defaults to "
+                         f"({'|'.join(MODEL_VALUES)}); no global default — "
+                         f"without an override, judgment workers default to "
+                         f"{MODEL_DEFAULT} and the acting workers "
+                         f"(implementer, conformer) default to "
                          f"{MODEL_DEFAULT_PER_WORKER['implementer']} "
                          "(IMPLEMENTATION.md §2). Per-worker "
                          "--model-<worker> flags override this, as do "
                          "CENTELLA_MODEL[_*] env vars and centella.toml")
     for _w in WORKER_TYPES:
+        _w_default = MODEL_DEFAULT_PER_WORKER.get(_w, MODEL_DEFAULT)
         ap.add_argument(f"--model-{_w}", choices=MODEL_VALUES, metavar="ALIAS",
-                        help=f"model alias for the {_w} worker — overrides "
+                        help=f"model alias for the {_w} worker "
+                             f"(default {_w_default}) — overrides "
                              f"--model, CENTELLA_MODEL, and centella.toml")
     ap.add_argument("--judge-model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for the judge post-run worker "
@@ -5246,10 +5255,12 @@ def main() -> None:
                          f"default {VERBOSITY_DEFAULT}); overrides "
                          f"{VERBOSITY_ENV} and centella.toml")
     ap.add_argument("-v", "--verbose", action="count", default=0,
-                    help="shortcut: -v=stream (default), -vv=debug")
+                    help="shortcut: -v=stream, -vv=debug. Default: 0 "
+                         "(no -v; falls through to --verbosity)")
     ap.add_argument("-q", "--quiet", action="count", default=0,
                     help="shortcut: -q=normal (pre-streaming behavior), "
-                         "-qq=quiet (errors and phase boundaries only)")
+                         "-qq=quiet (errors and phase boundaries only). "
+                         "Default: 0 (no -q; falls through to --verbosity)")
     # Telemetry knobs. --telemetry / --no-telemetry are a mutually exclusive
     # pair; default None means "neither was passed" so the resolver falls
     # through to env / TOML / TELEMETRY_DEFAULT.
@@ -5261,7 +5272,8 @@ def main() -> None:
                                "centella.toml")
     _tel_grp.add_argument("--no-telemetry", dest="telemetry",
                           action="store_false",
-                          help=f"disable telemetry event writing; also "
+                          help=f"disable telemetry event writing "
+                               f"(default: telemetry is on); also "
                                f"{TELEMETRY_ENV}=0 or telemetry=false in "
                                "centella.toml")
     ap.add_argument("--telemetry-dir", metavar="DIR",
