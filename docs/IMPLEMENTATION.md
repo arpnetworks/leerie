@@ -867,13 +867,17 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | turns per `claude -p` call | per worker (below) | worker stops; implementer → `incomplete-handoff` |
 | per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) | worker killed; implementer → `incomplete-handoff` |
 
-`--max-turns` by worker: classifier 20, planner 40, integrator 60,
-implementer 120, conformer 60. For the implementer, 120 turns and 90
-minutes both apply — whichever trips first. The conformer cap is lower
-than the implementer's because its scope is narrower (read a diff, read
-a small set of rules files, update docs/tests, run build/lint/test) and
-the phase is advisory — running out of turns becomes a warning, not a
-failure.
+`--max-turns` by worker: classifier 60, planner 100, integrator 60,
+implementer 120, conformer 60, judge 40, heal patch_generator 40. For
+the implementer, 120 turns and 90 minutes both apply — whichever trips
+first. The conformer cap is lower than the implementer's because its
+scope is narrower (read a diff, read a small set of rules files, update
+docs/tests, run build/lint/test) and the phase is advisory — running
+out of turns becomes a warning, not a failure. The planner cap is the
+largest of the inspect-tool workers because the planner drives the §8
+confidence loop and is the worker most likely to need additional turns
+on heavy domains; a too-tight cap there directly degrades the §8
+confidence signal it emits.
 
 The `wave_revalidation_rounds` and `revision_retries` caps were
 removed when the wave-level LLM validator and the criteria-revision
