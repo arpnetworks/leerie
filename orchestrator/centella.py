@@ -1249,6 +1249,28 @@ def _read_toml_key(path: Path, key: str) -> str | None:
     return None
 
 
+TASK_FILE_SUFFIXES = (".txt", ".md")
+
+
+def resolve_task_argument(raw: str) -> str:
+    """Resolve the positional `task` argument to the task string.
+
+    If `raw` points at an existing .txt or .md file, return its contents
+    (stripped). Otherwise return `raw` unchanged.
+
+    Suffix is restricted (rather than reading any existing file) so a
+    literal task string that happens to match a filename in cwd is not
+    silently swallowed.
+    """
+    p = Path(raw)
+    if p.is_file() and p.suffix.lower() in TASK_FILE_SUFFIXES:
+        contents = p.read_text().strip()
+        if not contents:
+            die(f"task file {raw!r} is empty")
+        return contents
+    return raw
+
+
 def resolve_source_of_truth(repo_root: Path,
                             cli_value: str | None = None) -> str:
     """Resolve the source-of-truth preference. Order:
@@ -5026,7 +5048,7 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
     else:
         if not args.task:
             die("a task description is required (or use --resume)")
-        task = args.task
+        task = resolve_task_argument(args.task)
         st.data = {"task": task, "started_at": now(), "worker_count": 0,
                    "source_of_truth_pref": sot_pref,
                    "verbosity": verbosity,
@@ -5103,7 +5125,9 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
 def main() -> None:
     ap = argparse.ArgumentParser(prog="centella", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("task", nargs="?", help="the task to execute")
+    ap.add_argument("task", nargs="?",
+                    help="the task to execute (literal string, or path to "
+                         "a .txt/.md file whose contents are the task)")
     ap.add_argument("--resume", action="store_true",
                     help="resume an interrupted run (auto-picks if exactly "
                          "one run exists under .centella/runs/)")

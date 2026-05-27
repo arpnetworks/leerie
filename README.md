@@ -70,6 +70,10 @@ git clone https://github.com/enricai/centella.git
 # From the root of the target git repository:
 /path/to/centella/centella "Fix the login timeout bug and add a regression test"
 
+# Or pass a path to a .txt / .md file whose contents are the task —
+# useful for multi-paragraph briefs that are awkward to quote on the shell:
+/path/to/centella/centella path/to/task.md
+
 # Resume an interrupted or budget-capped run. Auto-picks if exactly one
 # in-flight run exists; otherwise requires --run-id (see `--list`).
 /path/to/centella/centella --resume

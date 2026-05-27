@@ -61,6 +61,10 @@ Maps to `DESIGN.md`: §3 (architecture / phases), §2 (why a program, not a skil
 # From the root of the target git repository:
 /path/to/centella/centella "Fix the login timeout bug and add a regression test"
 
+# Or pass a path to a .txt / .md file whose contents are the task — useful
+# for multi-paragraph briefs that are awkward to quote on the shell:
+/path/to/centella/centella path/to/task.md
+
 # Resume an interrupted run. Auto-picks if exactly one in-flight run exists;
 # requires --run-id otherwise (see `centella --list` to enumerate).
 /path/to/centella/centella --resume
