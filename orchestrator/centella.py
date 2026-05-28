@@ -78,7 +78,7 @@ MIN_CLAUDE_CLI = (2, 1, 22)
 
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
-    "max_total_workers": 40,        # hard ceiling on claude -p invocations
+    "max_total_workers": 60,        # hard ceiling on claude -p invocations
     "max_parallel": 4,              # concurrent workers within a wave
     # Per-subtask re-spawn budget. Consumed by BOTH context-exhaustion
     # handoffs and DESIGN §11 mid-execution clarifications — a subtask
@@ -193,6 +193,12 @@ SOURCE_OF_TRUTH_FILE = "centella.toml"
 # resolution.
 CONFIDENCE_ROUNDS_ENV = "CENTELLA_CONFIDENCE_ROUNDS"
 CONFIDENCE_ROUNDS_FILE = SOURCE_OF_TRUTH_FILE
+
+# max-workers preference. Same resolution shape as confidence_rounds.
+# CLI --max-workers wins; then CENTELLA_MAX_WORKERS env; then max_workers
+# in centella.toml; then DEFAULT_CAPS fallback.
+MAX_WORKERS_ENV = "CENTELLA_MAX_WORKERS"
+MAX_WORKERS_FILE = SOURCE_OF_TRUTH_FILE
 
 # --no-push preference (DESIGN §6 "Push + PR"): skip the push + open-PR
 # step at finalize. Resolution order: --no-push CLI flag → CENTELLA_NO_PUSH
@@ -1418,6 +1424,38 @@ def resolve_confidence_rounds(repo_root: Path,
             die(f"{cfg}: confidence_rounds={file_val!r} is not a positive integer")
         return n
     return DEFAULT_CAPS["confidence_rounds"]
+
+
+def resolve_max_workers(repo_root: Path,
+                        cli_value: int | None = None) -> int:
+    """Resolve the max-workers cap. Order:
+    --max-workers CLI flag → CENTELLA_MAX_WORKERS env var → centella.toml →
+    DEFAULT_CAPS["max_total_workers"]. argparse validates `cli_value` is an
+    int via `type=int` so it is trusted when set. env and file values are
+    rejected via die() when not a positive int — bad config caught at
+    startup, not mid-run."""
+    if cli_value is not None:
+        return cli_value
+    env = os.environ.get(MAX_WORKERS_ENV, "").strip()
+    if env:
+        try:
+            n = int(env)
+        except ValueError:
+            die(f"{MAX_WORKERS_ENV}={env!r} is not a positive integer")
+        if n < 1:
+            die(f"{MAX_WORKERS_ENV}={env!r} is not a positive integer")
+        return n
+    cfg = repo_root / MAX_WORKERS_FILE
+    file_val = _read_toml_key(cfg, "max_workers")
+    if file_val is not None:
+        try:
+            n = int(file_val)
+        except ValueError:
+            die(f"{cfg}: max_workers={file_val!r} is not a positive integer")
+        if n < 1:
+            die(f"{cfg}: max_workers={file_val!r} is not a positive integer")
+        return n
+    return DEFAULT_CAPS["max_total_workers"]
 
 
 def resolve_inspect_dirs(repo_root: Path,
@@ -5400,9 +5438,11 @@ def main() -> None:
                          "(hooks run). CLI flag only (no env/TOML mirror — "
                          "matches CLAUDE.md's explicit-user-request "
                          "principle for hook-skipping).")
-    ap.add_argument("--max-workers", type=int,
-                    help=f"override the total worker-invocation budget "
-                         f"(default {DEFAULT_CAPS['max_total_workers']})")
+    ap.add_argument("--max-workers", type=_positive_int, metavar="N",
+                    help=f"total worker-invocation budget "
+                         f"(default {DEFAULT_CAPS['max_total_workers']}); "
+                         f"also {MAX_WORKERS_ENV} and max_workers in "
+                         "centella.toml")
     ap.add_argument("--max-parallel", type=int,
                     help=f"override concurrent workers per wave "
                          f"(default {DEFAULT_CAPS['max_parallel']})")
@@ -5537,8 +5577,11 @@ def main() -> None:
         die("not inside a git repository")
 
     caps = dict(DEFAULT_CAPS)
-    if args.max_workers:
-        caps["max_total_workers"] = args.max_workers
+    # Resolve max_total_workers across CLI / env / TOML / default. The
+    # resolver die()s on a bad env or TOML value; argparse already rejected
+    # a bad --max-workers via _positive_int.
+    caps["max_total_workers"] = resolve_max_workers(
+        Path(os.getcwd()), args.max_workers)
     if args.max_parallel:
         caps["max_parallel"] = args.max_parallel
     # Resolve confidence_rounds across CLI / env / TOML / default. The

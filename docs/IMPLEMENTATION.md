@@ -187,8 +187,10 @@ centella "task" --clarify
 # Pre-supply clarification answers:
 centella "task" --answers answers.json
 
-# Override caps:
-centella "task" --max-workers 60 --max-parallel 6
+# Override caps. --max-workers also reads CENTELLA_MAX_WORKERS env or
+# max_workers in centella.toml; --max-parallel is CLI-only.
+centella "task" --max-workers 80 --max-parallel 6
+export CENTELLA_MAX_WORKERS=80
 
 # Dial how persistent workers are at building confidence before they exit
 # blocked (default: 8 rounds inside each planner / implementer):
@@ -862,7 +864,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | subtask continuations (re-spawns of an implementer for the same subtask — both context-exhaustion handoffs *and* mid-execution clarifications consume from the same budget) | 3 (`subtask_continuations`) | return `blocked`; fatal at wave boundary |
 | corrective retries of a *retryable* failure per subtask (`failed_retries`) | 1 | return `failed` |
 | orchestrator-level conformer rounds per subtask (`conformance_rounds`) | 2 | exit the conformance loop; any residuals become `conformance_warnings` on the subtask result — never `failed` / `blocked` (DESIGN §9 *Post-work conformance*) |
-| total worker invocations per run | 40 (`--max-workers`) | abort, state saved for `--resume` |
+| total worker invocations per run | 60 (`--max-workers`, also `CENTELLA_MAX_WORKERS` env or `max_workers` in `centella.toml`) | abort, state saved for `--resume` |
 | concurrent workers within a wave | 4 (`--max-parallel`) | throughput throttle |
 | turns per `claude -p` call | per worker (below) | worker stops; implementer → `incomplete-handoff` |
 | per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) | worker killed; implementer → `incomplete-handoff` |

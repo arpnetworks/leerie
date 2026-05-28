@@ -228,8 +228,10 @@ schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
   the pre-0.3 all-sonnet behavior in one knob, set `--model sonnet` or
   `CENTELLA_MODEL=sonnet`.
 - `--max-workers N` — cap total `claude -p` subprocess count over the
-  run. Default: `40` (`DEFAULT_CAPS["max_total_workers"]`). Note that
-  the post-work conformance phase (DESIGN §9) spawns up to
+  run. Default: `60` (`DEFAULT_CAPS["max_total_workers"]`). Also
+  `CENTELLA_MAX_WORKERS` env var or `max_workers` in `centella.toml`
+  (same precedence as `--confidence-rounds`: CLI > env > TOML > default).
+  Note that the post-work conformance phase (DESIGN §9) spawns up to
   `conformance_rounds` additional workers per *successful* subtask (default
   2), roughly doubling per-subtask worker usage. For large runs you may
   want to raise this proportionally — a cap-hit during the conformance

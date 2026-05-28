@@ -154,8 +154,11 @@ centella "task" --clarify
 # set to "codebase", "research", or "both".
 centella "task" --answers answers.json
 
-# Override caps (defaults: 40 total workers, 4 in parallel per wave):
-centella "task" --max-workers 60 --max-parallel 6
+# Override caps (defaults: 60 total workers, 4 in parallel per wave).
+# --max-workers also reads CENTELLA_MAX_WORKERS or max_workers in
+# centella.toml; --max-parallel is CLI-only.
+centella "task" --max-workers 80 --max-parallel 6
+export CENTELLA_MAX_WORKERS=80
 
 # Dial how persistent the planner and implementer are at building
 # confidence before they exit blocked (default 8 evidence-gate rounds
@@ -211,7 +214,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
 | `--clarify` | off | Opt into surfacing intent questions to the user. Default: questions are dropped after the classifier's codebase→research filter, and the implementer makes a documented best-effort decision. Also `CENTELLA_CLARIFY` env var or `clarify = true` in `centella.toml`. |
-| `--max-workers N` | `40` | Cap on total `claude -p` invocations across the run. |
+| `--max-workers N` | `60` | Cap on total `claude -p` invocations across the run. Also `CENTELLA_MAX_WORKERS` env var or `max_workers` in `centella.toml`. |
 | `--max-parallel N` | `4` | Cap on concurrent workers within a wave. |
 | `--confidence-rounds N` | `8` | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `CENTELLA_CONFIDENCE_ROUNDS` and `centella.toml`. |
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |

@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **`max_total_workers` default 40 → 60.** Empirically (May 2026)
+  18-subtask runs hit the cap mid-conformance, aborting with
+  `worker budget exhausted`. Structural budget for an 18-subtask plan
+  is ≈ 1 classifier + 2 planners + 1 reconciler + 18 implementers +
+  ~18 conformers + a few continuations / integrators ≈ 45–55 workers
+  worst-case; the new default leaves margin without inviting runaway
+  cost. `CENTELLA_MAX_WORKERS` env var and `max_workers` in
+  `centella.toml` are new escape hatches (same precedence as
+  `--confidence-rounds`: CLI > env > TOML > default).
 - **`--no-clarify` is now `--clarify`; no-questions is the new
   default.** The flag's polarity is inverted: by default centella runs
   without surfacing intent questions to the user. The classifier's
@@ -29,6 +38,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `CENTELLA_MAX_WORKERS` env var and `max_workers` key in
+  `centella.toml` resolve through the new `resolve_max_workers()`
+  helper, mirroring `resolve_confidence_rounds()`'s precedence.
+  `--max-workers` argparse type is now `_positive_int` (was `int`):
+  bad values (0, -1, "nope") are rejected at parse time with a clean
+  argparse error instead of falling through to a downstream default.
 - `CENTELLA_CLARIFY` env var and `clarify` key in `centella.toml`
   (same precedence as `--source-of-truth`: CLI > env > file > default
   `False`). New helper `_resolve_bool_pref` factors the resolution

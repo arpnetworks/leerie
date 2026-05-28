@@ -166,6 +166,11 @@ export CENTELLA_MODEL=sonnet               # or: opus, haiku
 export CENTELLA_CONFIDENCE_ROUNDS=12
 ./centella "task" --confidence-rounds 12
 
+# Raise the per-run worker-invocation budget (default 60). Same precedence
+# as confidence-rounds: CLI > env > centella.toml.
+export CENTELLA_MAX_WORKERS=80
+./centella "task" --max-workers 80
+
 # Skip the live `claude -p` smoke test during development:
 ./centella "task" --skip-smoke
 
