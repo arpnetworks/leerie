@@ -5253,6 +5253,7 @@ async def orchestrate(args, caps: dict, centella_dir: Path, st: State,
         validate_resume_state(st.data)
         task = st.data["task"]
         log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
+        log(f"per-worker logs: {st.run_dir / 'logs'}/")
         if "waves" not in st.data:
             die("cannot resume — run did not reach the scheduling phase")
         # Refresh the preferences in case env vars or centella.toml
