@@ -5229,8 +5229,16 @@ async def phase_finalize(centella_dir: Path, st: State, no_push: bool,
     else:
         await push_and_open_pr(st, no_verify=no_verify)
 
+    pr_url = None
+    sidecar = st.run_dir / "run.json"
+    if sidecar.exists():
+        try:
+            pr_url = json.loads(sidecar.read_text()).get("pr_url")
+        except (OSError, ValueError):
+            pr_url = None
+    pr_suffix = f" PR: {pr_url}." if pr_url else ""
     log(f"done — {nsub} subtasks, {len(st.data['waves'])} waves, "
-        f"{wc} worker invocations. Work is on "
+        f"{wc} worker invocations.{pr_suffix} Work is on "
         f"{compute_run_branch(st.run_id)}; working branch unchanged.")
     if tel:
         log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
