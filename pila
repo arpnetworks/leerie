@@ -462,7 +462,16 @@ if [ ! -f "$HOME/.claude.json" ]; then
   exit 1
 fi
 
-STAGE="$(mktemp -d "${TMPDIR:-/tmp}/pila-cfg-XXXXXX")"
+# Scratch dir lives under ~/.cache/pila/ (not $TMPDIR) so Colima's
+# default mount config auto-shares it on macOS — $TMPDIR resolves to
+# /var/folders/... on Darwin, which is outside the /Users/$USER share
+# Colima exposes by default, and the bind mount would silently appear
+# empty inside the container. Linux is unaffected (any host path is
+# nerdctl-mountable) but the ~/.cache/pila/ home keeps the launcher
+# uniform across platforms and matches the existing cache-dir
+# convention used for mise / pnpm / pip / go / cargo (see below).
+mkdir -p "$HOME/.cache/pila"
+STAGE="$(mktemp -d "$HOME/.cache/pila/cfg-XXXXXX")"
 
 # -- .claude.json: copy with projects[] stripped. --
 # The projects[] block stores prior-session per-project state
