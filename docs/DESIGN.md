@@ -708,11 +708,15 @@ classification and planning, layered top-to-bottom by determinism:
    re-running the install command in worktree N is fast.
 
    This shape has three benefits over an orchestrator-driven
-   install: (a) the host's repo is never mutated by pila; (b) no
-   work is wasted on worktrees whose subtasks don't need built
-   deps; (c) the same `claude -p` event-streaming the workers
-   use for everything else makes install progress visible to
-   the user, without any special orchestrator plumbing.
+   install: (a) the host's checked-out source tree and tracked
+   dep artifacts (`node_modules/`, `.venv/`, `target/`, etc.) are
+   never written to by pila's install path — `.pila-setup.sh`
+   (user-opt-in) and the `.pila/` coordination directory are the
+   only paths pila ever modifies under the host repo; (b) no work
+   is wasted on worktrees whose subtasks don't need built deps;
+   (c) the same `claude -p` event-streaming the workers use for
+   everything else makes install progress visible to the user,
+   without any special orchestrator plumbing.
 
 ### The §12 carve-out
 

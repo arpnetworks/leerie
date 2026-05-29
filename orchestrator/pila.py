@@ -2430,7 +2430,8 @@ async def run_streaming(
     echo = verbosity != "quiet"
 
     async def read_loop() -> None:
-        assert proc.stdout is not None
+        # proc.stdout is guaranteed non-None because we passed
+        # stdout=asyncio.subprocess.PIPE above; no runtime check needed.
         async for raw in proc.stdout:
             line = raw.decode(errors="replace").rstrip("\r\n")
             tail.append(line)
@@ -2464,12 +2465,18 @@ async def run_streaming(
         # their die() message without re-reading the log file.
         exc.output = captured
         if log_fh is not None:
-            log_fh.close()
+            try:
+                log_fh.close()
+            except OSError:
+                pass
         raise exc
     except BaseException:
         await _terminate_proc_tree(proc)
         if log_fh is not None:
-            log_fh.close()
+            try:
+                log_fh.close()
+            except OSError:
+                pass
         raise
 
     if log_fh is not None:
@@ -5099,8 +5106,10 @@ async def phase_heal(call_type: str, failing_records: list[dict],
 
 # Categories that touch only documentation / non-code surfaces. If classify
 # returned *only* these, phase_provision short-circuits to kind:none — no
-# point installing deps for a docs-only run. The check is "are all returned
-# categories in this set?" so a feature+docs task still provisions.
+# point detecting an install recipe for a docs-only run (workers wouldn't
+# need it anyway, and skipping the lockfile-table / LLM-fallback work
+# trims the run time). The check is "are all returned categories in this
+# set?" so a feature+docs task still produces a recipe.
 _DOCS_ONLY_CATEGORIES = frozenset({"documentation"})
 
 
