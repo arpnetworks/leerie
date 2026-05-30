@@ -995,6 +995,79 @@ Resolution order (highest priority first):
 3. **`pila.toml`**, `model_heal = "sonnet"`.
 4. **Default `"sonnet"`** (`MODEL_DEFAULT_PER_WORKER["heal"]`).
 
+### PR-writer model
+
+The `claude` model alias used at finalize time by the `pr_writer` worker
+that composes the PR title and body. The worker reads the target repo's
+PR template (if any), the run's commit log, and a sampled diff, then
+emits a JSON object with `title`, `body`, and `used_template`. The host
+launcher reads the result from `run.json` and passes it to
+`gh pr create`.
+
+Resolution order (highest priority first):
+
+1. **`--pr-writer-model MODEL`** CLI flag.
+2. **`PILA_MODEL_PR_WRITER`** environment variable.
+3. **`pila.toml`**, `model_pr_writer = "sonnet"`.
+4. **Default `"sonnet"`** (`MODEL_DEFAULT_PER_WORKER["pr_writer"]`).
+
+### PR template selector
+
+When the target repo has multiple PR templates inside a
+`PULL_REQUEST_TEMPLATE/` directory, pila picks the alphabetically first
+`.md` by default. A repo-specific override selects a different basename
+(with or without the `.md` suffix). Has no effect when the repo has a
+single top-level template (e.g. `.github/pull_request_template.md`) or
+no template at all.
+
+Resolution order (highest priority first):
+
+1. **`--pr-template NAME`** CLI flag.
+2. **`PILA_PR_TEMPLATE`** environment variable.
+3. **`pila.toml`**, `pr_template = "bug"`.
+4. **Default**: alphabetically first `.md` in the discovered directory.
+
+An override that does not match an existing template is **not fatal** —
+finalize must not block over a cosmetic preference — pila logs a
+warning and falls back to the alphabetical default.
+
+### PR-writer payload caps
+
+The `pr_writer` worker is invoked by passing its entire user prompt
+(task text, classification, subtask titles, full commit log, diff
+stat/dirstat, sampled diff, and the PR template body — all serialized
+as one JSON string) as a single argv element to `claude -p`. Linux
+`ARG_MAX` in the pila container (Debian 12) defaults to ~128 KB; a
+degenerate run with thousands of commits, a huge template, or a
+sprawling diff would silently fail with `E2BIG`.
+
+Three constants in `orchestrator/pila.py` cap the unbounded fields so
+the total payload stays well under that ceiling. Each capped field
+gets an in-band `... [<label> truncated at ~N KB; remainder omitted —
+rely on the commit log] ...` sentinel so the worker can see the
+truncation and avoid fabricating detail past the cut-off.
+
+| Constant | Default | Bounds |
+|----------|---------|--------|
+| `PR_WRITER_COMMIT_LOG_MAX_BYTES` | 80,000 | full `git log --no-merges` between `working_branch` and `run_branch` |
+| `PR_WRITER_TEMPLATE_MAX_BYTES`   | 32,000 | contents of the resolved PR template file |
+| `PR_WRITER_DIFF_SAMPLE_MAX_LINES`| 500    | sampled `git diff` hunks (line-capped because individual diff lines can be long and breaking one mid-line would render the surrounding hunk unreadable) |
+
+These are **module constants, not `DEFAULT_CAPS` entries**, by
+design. `DEFAULT_CAPS` is the surface for run-wide operational caps
+that are intended to be user-tunable through CLI / env / TOML
+(`max_total_workers`, `worker_timeout_sec`, `worker_memory_max_bytes`,
+etc.). The PR-writer caps are internal protocol limits defending a
+single subprocess invocation against an OS-imposed argv ceiling:
+lowering them silently degrades summaries and raising them risks
+`E2BIG`. `tests/test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined`
+pins the values so any future change goes through code review.
+
+Multi-byte UTF-8 safety: `_cap_text` slices at the byte boundary,
+then back-decodes with `errors="ignore"` so the trimmed prefix never
+ends mid-codepoint. Tested with rocket emojis (U+1F680, four UTF-8
+bytes) that would naively split at the chosen byte boundary.
+
 ### Heal-loop convergence parameters
 
 Knobs governing the self-heal loop's iteration limit, pass-rate target, plateau
@@ -1023,12 +1096,13 @@ judgment work and `sonnet` for high-throughput implementation. Valid values:
 `sonnet` | `opus` | `haiku` (aliases — the `claude` CLI resolves them to the
 current model version).
 
-**Per-worker defaults: Opus for judgment, Sonnet for implementation and post-run analysis.**
+**Per-worker defaults: Opus for judgment, Sonnet for implementation, post-run analysis, and finalize-time composition.**
 Workers that exercise broad-context judgment (classify the task, decompose
 into subtasks, reconcile cross-domain coupling, resolve merge conflicts
-behaviorally, check criteria) default to Opus. The implementer, judge, and
-heal workers — which execute concrete tasks with high throughput requirements
-— default to Sonnet.
+behaviorally, check criteria) default to Opus. The implementer, conformer,
+judge, heal, and pr_writer workers — which execute concrete tasks with high
+throughput requirements (implementer, conformer) or run as one-shot
+post-run / finalize calls (judge, heal, pr_writer) — default to Sonnet.
 
 | Worker       | Default | Why |
 |--------------|---------|-----|
@@ -1041,10 +1115,11 @@ heal workers — which execute concrete tasks with high throughput requirements
 | conformer    | sonnet  | reads a diff and runs commands; same throughput-first profile as implementer; the phase is advisory so a borderline judgment call costs at most a warning |
 | judge        | sonnet  | scoring a batch of captured calls; throughput matters more than broad judgment |
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
+| pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise; throughput-shaped one-shot call |
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
-overrides it for specific workers (`implementer`, `conformer`, `judge`, and
-`heal` all default to `sonnet`).
+overrides it for specific workers (`implementer`, `conformer`, `judge`,
+`heal`, and `pr_writer` all default to `sonnet`).
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -1057,7 +1132,7 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Ten worker types, each independently overridable:
+Eleven worker types, each independently overridable:
 
 | Worker       | env var                       | CLI flag                | TOML key            |
 |--------------|-------------------------------|-------------------------|---------------------|
@@ -1071,11 +1146,15 @@ Ten worker types, each independently overridable:
 | conformer    | `PILA_MODEL_CONFORMER`    | `--model-conformer`     | `model_conformer`   |
 | judge        | `PILA_MODEL_JUDGE`        | `--judge-model`         | `model_judge`       |
 | heal         | `PILA_MODEL_HEAL`         | `--heal-model`          | `model_heal`        |
+| pr_writer    | `PILA_MODEL_PR_WRITER`    | `--pr-writer-model`     | `model_pr_writer`   |
 
-Note: `judge` and `heal` use dedicated CLI flags (`--judge-model`, `--heal-model`)
-rather than the `--model-<W>` pattern used by orchestrator workers, because they
-are post-run skill workers invoked outside the main orchestrate loop and do not
-participate in the `--model` global-default resolution path.
+Note: `judge`, `heal`, and `pr_writer` use dedicated CLI flags
+(`--judge-model`, `--heal-model`, `--pr-writer-model`) rather than the
+`--model-<W>` pattern used by orchestrator workers, because they are
+post-run / finalize-time skill workers invoked outside the main
+orchestrate loop and do not participate in the `--model` global-default
+resolution path. They still honor the global `--model` / `PILA_MODEL`
+override.
 
 An invalid value in env or file is rejected at startup via `die()`. CLI
 values are validated by argparse `choices=` and rejected with the standard
@@ -1123,10 +1202,11 @@ keeps acting workers' reasoning bounded by their own evidence gates
 | conformer    | unset   | advisory phase; same reasoning as implementer |
 | judge        | unset   | post-run scoring; no need to pin |
 | heal         | unset   | post-run patch generation; no need to pin |
+| pr_writer    | high    | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the five judgment
-workers above.
+workers above and for the finalize-time `pr_writer` worker.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -2365,6 +2445,9 @@ discovery without parsing the full `state.json`):
 | `fly_machine_id` | str \| null | Fly Machine ID for a remote (`--runtime fly`) run; written by `scripts/remote/provision.sh` immediately after `flyctl machine run` succeeds, so a launcher that crashes before classifying still leaves a recoverable pointer. Null for local runs. |
 | `paused_at` | ISO-8601 str \| null | when the remote run was paused on failure (machine stopped, not destroyed); set by the launcher's EXIT trap on the pause branch. Null for successful runs and for runs the user cancelled. |
 | `pause_reason` | str \| null | short tag identifying which failure path triggered the pause (`worker-error`, `orchestrator-exception`, `finalize-failed`). Null when `paused_at` is null. |
+| `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `pila: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped (`--no-push`), or had not yet run; the launcher uses its deterministic fallback in that case. |
+| `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
+| `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
 
 `_validate_run_json(data)` enforces four invariants on read:
 - `pushed_at` and `push_error` are mutually exclusive (at most one is non-null).
