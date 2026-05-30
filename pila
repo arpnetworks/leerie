@@ -1115,8 +1115,15 @@ else
   # PID 1 → orchestrator exits → kernel reaps the PID namespace (DESIGN §6
   # *Worker subtree termination*). The cleanup guarantee is identical in
   # both modes.
+  # Require BOTH stdin and stdout to be TTYs before asking nerdctl for `-t`.
+  # Stdin alone is not enough: piping pila's output (e.g. `pila ... | tee log`)
+  # leaves stdin a TTY but redirects stdout through a pipe, and nerdctl rejects
+  # `-t` against a non-console stdout with "provided file is not a console"
+  # before the orchestrator gets a chance to run. Plugin mode (Bash tool: no
+  # TTY on stdin) still collapses to `-i`, preserving the EXIT_NEEDS_ANSWERS=10
+  # file-passing contract documented in commands/pila.md.
   TTY_FLAGS="-i"
-  [ -t 0 ] && TTY_FLAGS="-it"
+  [ -t 0 ] && [ -t 1 ] && TTY_FLAGS="-it"
 
   # Use ${arr[@]+"${arr[@]}"} so empty arrays expand to nothing under
   # `set -u` (bash 3.2, the macOS system default, otherwise errors).
