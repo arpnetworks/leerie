@@ -1318,10 +1318,13 @@ sleeps *between* iterations, not before the first — so the effective
 sequence is one immediate retry followed by waits of roughly 15 s,
 30 s, 60 s, 120 s, 120 s up to the 300 s budget. Each `_invoke`
 produces one `calls.ndjson` row, so a single logical `claude_p()`
-call can now write up to ~7 rows when both outer schema-loop
-attempts hit auth/quota and exhaust the budget. The budget resets
-per outer schema-loop attempt; in the rare case where attempt 2 also
-enters backoff, total wait can reach ~10 minutes.
+call can write up to ~7 rows when the first outer schema-loop
+attempt's backoff exhausts the budget (initial `_spawn` + ~6
+tenacity iterations before exhaust), and up to ~13 rows in the rare
+case where the first attempt's backoff resolves to a non-auth error
+and the second outer attempt also enters backoff and exhausts. The
+budget resets per outer schema-loop attempt; in that rare
+double-burst case, total wait can reach ~10 minutes.
 
 The classifier and the budget constant (`auth_retry_max_sec`) live in
 `pila.py`; the budget is in §6 *Code-enforced caps*. The non-auth
