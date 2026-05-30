@@ -66,6 +66,7 @@ _MODELS = {
     "judge": "opus",
     "heal": "sonnet",
 }
+_EFFORTS: dict[str, str | None] = {}
 
 _CALL_TYPES = ["classifier", "planner", "provision"]
 
@@ -244,7 +245,8 @@ def test_request_patch_user_prompt_contains_capture_and_prompt(
     # Fake claude_p: capture the user_prompt arg and return a valid envelope.
     async def fake_claude_p(user_prompt, system_prompt, *, schema_key, cwd,
                             allowed_tools, max_turns, autonomous, caps, st,
-                            model, sid, add_dirs=None, _suppress_capture=False):
+                            model, sid, add_dirs=None, effort=None,
+                            _suppress_capture=False):
         captured_user_prompt.append(user_prompt)
         # Return an envelope whose anchor is present in the real prompt body.
         first_line = real_prompt_body.split("\n")[0].strip()
@@ -266,7 +268,7 @@ def test_request_patch_user_prompt_contains_capture_and_prompt(
     }]
     hs.history = []
 
-    asyncio.run(pila.request_patch(hs, 1, st, _CAPS, _MODELS))
+    asyncio.run(pila.request_patch(hs, 1, st, _CAPS, _MODELS, _EFFORTS))
 
     assert len(captured_user_prompt) == 1, "claude_p was not called exactly once"
     up = captured_user_prompt[0]
@@ -300,7 +302,8 @@ def test_request_patch_anchor_not_in_prompt_sentinel(
 
     async def fake_claude_p(user_prompt, system_prompt, *, schema_key, cwd,
                             allowed_tools, max_turns, autonomous, caps, st,
-                            model, sid, add_dirs=None, _suppress_capture=False):
+                            model, sid, add_dirs=None, effort=None,
+                            _suppress_capture=False):
         return {"anchor": bad_anchor, "replacement": "irrelevant"}
 
     monkeypatch.setattr(pila, "claude_p", fake_claude_p)
@@ -323,7 +326,7 @@ def test_request_patch_anchor_not_in_prompt_sentinel(
     raised_value_error = False
 
     try:
-        result = asyncio.run(pila.request_patch(hs, 1, st, _CAPS, _MODELS))
+        result = asyncio.run(pila.request_patch(hs, 1, st, _CAPS, _MODELS, _EFFORTS))
         # If no exception, the function must have returned a sentinel.
         # A sentinel is indicated by the anchor being empty/None or by
         # the caller receiving something that cannot be applied.
@@ -344,7 +347,7 @@ def test_request_patch_anchor_not_in_prompt_sentinel(
     if raised_value_error:
         # Re-run to capture the exception type.
         with pytest.raises(ValueError):
-            asyncio.run(pila.request_patch(hs, 1, st, _CAPS, _MODELS))
+            asyncio.run(pila.request_patch(hs, 1, st, _CAPS, _MODELS, _EFFORTS))
 
 
 # ---------------------------------------------------------------------------
@@ -372,7 +375,8 @@ def test_phase_heal_with_real_request_patch_runs_cycle(
     # Stub claude_p to return a valid envelope whose anchor IS in the prompt.
     async def fake_claude_p(user_prompt, system_prompt, *, schema_key, cwd,
                             allowed_tools, max_turns, autonomous, caps, st,
-                            model, sid, add_dirs=None, _suppress_capture=False):
+                            model, sid, add_dirs=None, effort=None,
+                            _suppress_capture=False):
         if schema_key == "patch_generator":
             return {
                 "anchor": anchor_text,
@@ -401,7 +405,7 @@ def test_phase_heal_with_real_request_patch_runs_cycle(
 
     verdict = asyncio.run(
         pila.phase_heal(
-            "classifier", records, heal_dir, _CAPS, st, _MODELS,
+            "classifier", records, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
             # No request_patch_fn → uses real request_patch
             n=1, config=config,
         )

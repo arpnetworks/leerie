@@ -373,6 +373,23 @@ MODEL_DEFAULT_PER_WORKER = {
 }
 MODEL_ENV = "PILA_MODEL"
 MODEL_FILE = "pila.toml"
+# Effort selection — see IMPLEMENTATION.md §2 "Effort selection". The
+# `claude -p` CLI exposes `--effort {low,medium,high,xhigh,max}` to dial
+# reasoning depth. The CLI exposes no --temperature and no --seed, so
+# effort is the strongest determinism dial available; pinning it removes
+# the "this run thought harder than that one" axis on judgment workers.
+# A worker that resolves to None gets no --effort flag (inherits Claude's
+# default) — that is the intended behavior for acting workers.
+EFFORT_VALUES = ("low", "medium", "high", "xhigh", "max")
+EFFORT_DEFAULT: str | None = None
+EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
+    "classifier": "high",
+    "planner": "high",
+    "reconciler": "high",
+    "provision": "high",
+    "integrator": "high",
+}
+EFFORT_ENV = "PILA_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "provision",
                 "implementer", "integrator", "conformer")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
@@ -2483,6 +2500,64 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
                       or heal_file or global_file
                       or MODEL_DEFAULT_PER_WORKER.get("heal", MODEL_DEFAULT))
     return models
+
+
+def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
+    """Resolve the --effort value for each worker type. Mirrors
+    resolve_models() rung-for-rung. Per-worker precedence (highest first):
+      1. --effort-<worker> CLI flag
+      2. --effort CLI flag (global default for this run)
+      3. PILA_EFFORT_<WORKER> env var
+      4. PILA_EFFORT env var
+      5. effort_<worker> in pila.toml
+      6. effort in pila.toml
+      7. EFFORT_DEFAULT_PER_WORKER[<worker>] (e.g., planner → "high")
+      8. EFFORT_DEFAULT (None — flag omitted from CLI invocation)
+    A None value means "do not pass --effort"; claude_p's build() omits
+    the flag entirely so the worker inherits Claude's default. CLI values
+    are pre-validated by argparse choices=; env and file values are
+    rejected via die() when not in EFFORT_VALUES."""
+    cfg = repo_root / MODEL_FILE
+
+    def from_env(name: str) -> str | None:
+        v = os.environ.get(name, "").strip()
+        if not v:
+            return None
+        if v not in EFFORT_VALUES:
+            die(f"{name}={v!r} is not one of {EFFORT_VALUES}")
+        return v
+
+    def from_file(key: str) -> str | None:
+        v = _read_toml_key(cfg, key)
+        if v is None:
+            return None
+        if v not in EFFORT_VALUES:
+            die(f"{cfg}: {key}={v!r} is not one of {EFFORT_VALUES}")
+        return v
+
+    global_cli = getattr(args, "effort", None)
+    global_env = from_env(EFFORT_ENV)
+    global_file = from_file("effort")
+
+    efforts: dict[str, str | None] = {}
+    for worker in WORKER_TYPES:
+        per_cli = getattr(args, f"effort_{worker}", None)
+        per_env = from_env(f"{EFFORT_ENV}_{worker.upper()}")
+        per_file = from_file(f"effort_{worker}")
+        per_worker_default = EFFORT_DEFAULT_PER_WORKER.get(worker, EFFORT_DEFAULT)
+        # Explicit-None chain: every rung is either str or None, so we can
+        # collapse with `or` — None falls through to the next rung; the
+        # final fallback is EFFORT_DEFAULT (None), meaning "omit --effort".
+        efforts[worker] = (per_cli or global_cli or per_env or global_env
+                           or per_file or global_file or per_worker_default)
+    # Post-run skill workers (judge, heal) are not in WORKER_TYPES so they
+    # don't get per-worker --effort-<W> flags, but they still honor the
+    # global override so `--effort high` applies everywhere.
+    efforts["judge"] = (global_cli or global_env or global_file
+                        or EFFORT_DEFAULT_PER_WORKER.get("judge", EFFORT_DEFAULT))
+    efforts["heal"] = (global_cli or global_env or global_file
+                       or EFFORT_DEFAULT_PER_WORKER.get("heal", EFFORT_DEFAULT))
+    return efforts
 
 
 def resolve_telemetry_enabled(repo_root: Path,
@@ -4933,6 +5008,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                    cwd: str, allowed_tools: str, max_turns: int, autonomous: bool,
                    caps: dict, st: "State", model: str, sid: str,
                    add_dirs: list[str] | None = None,
+                   effort: str | None = None,
                    _suppress_capture: bool = False) -> dict:
     """Run one headless Claude Code worker and return its validated
     structured output.
@@ -4959,6 +5035,14 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
 
     `model` is a `claude --model` alias (`sonnet` / `opus` / `haiku`);
     resolved per worker-type by `resolve_models()` at startup.
+
+    `effort` is a `claude --effort` level (`low` / `medium` / `high` /
+    `xhigh` / `max`) or `None` to omit the flag entirely (worker
+    inherits Claude's default). Resolved per worker-type by
+    `resolve_efforts()` at startup. The CLI exposes no `--temperature`
+    or `--seed`, so effort is the strongest determinism dial available
+    — pinning it on judgment workers reduces cross-run variance in
+    their structured output (IMPLEMENTATION.md §2 "Effort selection").
 
     `sid` is the worker identifier used in inline log tags and the
     per-worker log filename (e.g. `bugfix-001`, `classifier`,
@@ -4998,6 +5082,12 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             "--max-turns", str(max_turns),
             "--model", model,
         ]
+        # IMPLEMENTATION.md §2 "Effort selection". When effort is None
+        # (unset for this worker, the default for acting workers) the
+        # CLI invocation is byte-identical to the pre-feature behavior;
+        # only opted-in workers carry the flag.
+        if effort is not None:
+            cmd.extend(["--effort", effort])
         for d in (add_dirs or ()):
             cmd.extend(["--add-dir", d])
         skip_perms = autonomous or bool(
@@ -5146,6 +5236,11 @@ async def replay_capture(record: dict, *,
         replay_st = _ReplayState(tmp_run_dir, tmp_state_path)
         caps = dict(DEFAULT_CAPS)
 
+        # Replay deliberately omits `effort=`: captured records don't
+        # store the original `--effort` level, so a faithful replay
+        # would have to guess. Falling through to claude_p's None
+        # default keeps replays shaped like every other
+        # "no-effort-pinned" call.
         structured = await claude_p(
             user_prompt=user_prompt,
             system_prompt=system_prompt,
@@ -5286,6 +5381,7 @@ class State:
 # =========================================================================
 
 async def judge_capture(record: dict, models: dict[str, str],
+                        efforts: dict[str, str | None],
                         caps: dict, st: "State") -> dict:
     """Run a judge worker against one captured call record.
 
@@ -5317,6 +5413,7 @@ async def judge_capture(record: dict, models: dict[str, str],
     )
     # Judge workers are stateless observers — read-only tools only.
     model = models.get("judge", MODEL_DEFAULT)
+    effort = efforts.get("judge")
     st.bump_workers(caps)
     return await claude_p(
         user_prompt=user_prompt,
@@ -5329,6 +5426,7 @@ async def judge_capture(record: dict, models: dict[str, str],
         caps=caps,
         st=st,
         model=model,
+        effort=effort,
         sid=f"judge-{call_type}-{call_id[:8]}",
     )
 
@@ -5336,6 +5434,7 @@ async def judge_capture(record: dict, models: dict[str, str],
 async def phase_judge(run_dir: Path, judge_out_dir: Path,
                       caps: dict, st: "State",
                       models: dict[str, str],
+                      efforts: dict[str, str | None],
                       judge_call_types: list[str] | None = None) -> dict:
     """Judge all captured call records in run_dir/calls.ndjson.
 
@@ -5383,7 +5482,7 @@ async def phase_judge(run_dir: Path, judge_out_dir: Path,
         async with sem:
             call_id = rec.get("call_id", "unknown")
             call_type = rec.get("call_type", "unknown")
-            verdict = await judge_capture(rec, models, caps, st)
+            verdict = await judge_capture(rec, models, efforts, caps, st)
             verdict_path = judge_out_dir / f"{call_id}.json"
             verdict_path.write_text(json.dumps(verdict, indent=2))
             index.append({
@@ -5457,7 +5556,8 @@ class HealState:
 
 async def heal_baseline(call_type: str, failing_records: list[dict], n: int,
                         heal_dir: Path, caps: dict, st: "State",
-                        models: dict[str, str]) -> HealState:
+                        models: dict[str, str],
+                        efforts: dict[str, str | None]) -> HealState:
     """Run n unpatched replays per failing capture to establish a noise-floor.
 
     For each record in failing_records, runs n replay_capture() calls with the
@@ -5493,7 +5593,7 @@ async def heal_baseline(call_type: str, failing_records: list[dict], n: int,
             )
             judge_record["parsed_ok"] = not envelope.get("is_error", True)
             judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await judge_capture(judge_record, models, caps, st)
+            verdict = await judge_capture(judge_record, models, efforts, caps, st)
             # Write verdict file.
             call_id = record["call_id"]
             verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
@@ -5564,7 +5664,8 @@ def heal_apply_patch(call_type: str, iter_n: int, patch_text: str,
 
 async def heal_replay_patched(call_type: str, iter_n: int, n: int,
                               heal_dir: Path, caps: dict, st: "State",
-                              models: dict[str, str]) -> HealState:
+                              models: dict[str, str],
+                              efforts: dict[str, str | None]) -> HealState:
     """Run n patched replays per failing capture and append an iteration record.
 
     Reads HealState from disk. For each failing sample, loads the patched
@@ -5603,7 +5704,7 @@ async def heal_replay_patched(call_type: str, iter_n: int, n: int,
             )
             judge_record["parsed_ok"] = not envelope.get("is_error", True)
             judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await judge_capture(judge_record, models, caps, st)
+            verdict = await judge_capture(judge_record, models, efforts, caps, st)
             call_id = record["call_id"]
             verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
             verdict_path.write_text(json.dumps(verdict, indent=2))
@@ -5783,7 +5884,8 @@ def write_heal_report(call_type: str, state: HealState,
 
 async def request_patch(state: HealState, iter_n: int,
                         st: "State", caps: dict,
-                        models: dict[str, str]) -> tuple[str, str]:
+                        models: dict[str, str],
+                        efforts: dict[str, str | None]) -> tuple[str, str]:
     """Invoke the patch-generator worker to propose a minimal prompt edit.
 
     Builds a user_prompt containing:
@@ -5838,6 +5940,7 @@ async def request_patch(state: HealState, iter_n: int,
     )
 
     model = models.get("heal", MODEL_DEFAULT_PER_WORKER.get("heal", MODEL_DEFAULT))
+    effort = efforts.get("heal")
     st.bump_workers(caps)
     result = await claude_p(
         user_prompt=user_prompt,
@@ -5850,6 +5953,7 @@ async def request_patch(state: HealState, iter_n: int,
         caps=caps,
         st=st,
         model=model,
+        effort=effort,
         sid=f"heal-patch-{call_type}-iter{iter_n}",
     )
 
@@ -5871,6 +5975,7 @@ async def request_patch(state: HealState, iter_n: int,
 async def phase_heal(call_type: str, failing_records: list[dict],
                      heal_dir: Path, caps: dict,
                      st: "State", models: dict[str, str],
+                     efforts: dict[str, str | None],
                      request_patch_fn=None,
                      n: int = HEAL_N_REPLAYS_DEFAULT,
                      config: dict | None = None) -> str:
@@ -5916,7 +6021,8 @@ async def phase_heal(call_type: str, failing_records: list[dict],
         f"threshold={converge_config['success_threshold']:.0%}, "
         f"n={n})")
 
-    hs = await heal_baseline(call_type, failing_records, n, heal_dir, caps, st, models)
+    hs = await heal_baseline(call_type, failing_records, n, heal_dir, caps, st,
+                             models, efforts)
 
     best_patch_text: str = ""
     verdict = "CONTINUE"
@@ -5930,7 +6036,7 @@ async def phase_heal(call_type: str, failing_records: list[dict],
         # Invoke the patch generator: real worker (default) or injected stub.
         if request_patch_fn is None:
             anchor_match, patch_text = await request_patch(
-                hs, iter_n, st, caps, models)
+                hs, iter_n, st, caps, models, efforts)
         elif asyncio.iscoroutinefunction(request_patch_fn):
             anchor_match, patch_text = await request_patch_fn(hs, iter_n)
         else:
@@ -5939,7 +6045,7 @@ async def phase_heal(call_type: str, failing_records: list[dict],
         heal_apply_patch(call_type, iter_n, patch_text, anchor_match,
                          heal_dir, hs.failing_samples)
         hs = await heal_replay_patched(call_type, iter_n, n, heal_dir,
-                                       caps, st, models)
+                                       caps, st, models, efforts)
         converge_config["worker_count"] = st.data.get("worker_count", 0)
         verdict = check_convergence(hs, converge_config)
 
@@ -6468,7 +6574,8 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
 # phases
 # =========================================================================
 async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
-                         models: dict[str, str]) -> dict:
+                         models: dict[str, str],
+                         efforts: dict[str, str | None]) -> dict:
     """Phase 1 (classify), which also produces the Phase 0 clarification
     questions: classify the task and surface only genuinely underivable
     (intent-level) questions."""
@@ -6481,7 +6588,8 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
         user_prompt=f"TASK:\n{task}\n\nClassify it and apply the clarification filter.",
         system_prompt=sys_prompt, schema_key="classifier", cwd=os.getcwd(),
         allowed_tools=INSPECT_TOOLS, max_turns=60, autonomous=False,
-        caps=caps, st=st, model=models["classifier"], sid="classifier",
+        caps=caps, st=st, model=models["classifier"],
+        effort=efforts["classifier"], sid="classifier",
         add_dirs=st.data.get("inspect_dirs") or None,
     )
     cats = [c for c in result.get("categories", []) if c in CATEGORIES]
@@ -6689,7 +6797,8 @@ def _format_provision_user_prompt(fixtures: dict, task: str) -> str:
 
 
 async def phase_provision(repo_root: Path, st: State, caps: dict,
-                           models: dict[str, str]) -> None:
+                           models: dict[str, str],
+                           efforts: dict[str, str | None]) -> None:
     """Phase 1½: per-repo dependency *detection*.
 
     Runs after classify so a docs-only run can short-circuit. Five
@@ -6795,6 +6904,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
             autonomous=False,
             caps=caps, st=st,
             model=models.get("provision", MODEL_DEFAULT),
+            effort=efforts.get("provision"),
             sid="provision",
             add_dirs=st.data.get("inspect_dirs") or None,
         )
@@ -6819,7 +6929,8 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
 
 
 async def phase_plan(task: str, st: State, caps: dict,
-                     models: dict[str, str]) -> list[dict]:
+                     models: dict[str, str],
+                     efforts: dict[str, str | None]) -> list[dict]:
     """Phase 2: one planner per category, run in parallel (bounded by
     max_parallel). Each returns a JSON plan of granular subtasks."""
     log("phase 2: planning")
@@ -6854,6 +6965,7 @@ async def phase_plan(task: str, st: State, caps: dict,
                                   allowed_tools=INSPECT_TOOLS, max_turns=100,
                                   autonomous=False, caps=caps, st=st,
                                   model=models["planner"],
+                                  effort=efforts["planner"],
                                   sid=f"planner-{category}",
                                   add_dirs=st.data.get("inspect_dirs") or None)
 
@@ -7071,7 +7183,8 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
 
 
 async def phase_reconcile(plans: list[dict], task: str, st: State,
-                          caps: dict, models: dict[str, str]) -> list[dict]:
+                          caps: dict, models: dict[str, str],
+                          efforts: dict[str, str | None]) -> list[dict]:
     """Phase 2½: reconcile cross-domain capability-tag drift between
     parallel planners (DESIGN §5, §14). Short-circuits when planners
     agreed; otherwise runs one reconciler worker whose output is applied
@@ -7193,7 +7306,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         schema_key="reconciler", cwd=os.getcwd(),
         allowed_tools=INSPECT_TOOLS, max_turns=30,
         autonomous=False, caps=caps, st=st,
-        model=models["reconciler"], sid="reconciler",
+        model=models["reconciler"], effort=efforts["reconciler"],
+        sid="reconciler",
         add_dirs=st.data.get("inspect_dirs") or None,
     )
 
@@ -7445,6 +7559,7 @@ def _format_provision_recipe_section(recipe: list[dict],
 
 async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
                           models: dict[str, str],
+                          efforts: dict[str, str | None],
                           continuation: bool = False, note: str = "") -> dict:
     """Spawn one implementer for one subtask in its own worktree. Handles
     both kinds of continuation up to the shared `subtask_continuations`
@@ -7502,7 +7617,8 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
                               schema_key="implementer", cwd=worktree,
                               allowed_tools=ACT_TOOLS, max_turns=120,
                               autonomous=True, caps=caps, st=st,
-                              model=models["implementer"], sid=sid)
+                              model=models["implementer"],
+                              effort=efforts["implementer"], sid=sid)
     except WorkerError as e:
         # worker could not return schema-valid output even after a retry
         # (e.g. it hit --max-turns mid-task) -> treat as a handoff so a fresh
@@ -7789,6 +7905,7 @@ async def _unprefixed_conformer_commits(worktree: str, before_sha: str,
 
 async def run_conformer(sid: str, pila_dir: Path, worktree: str,
                         caps: dict, st: State, models: dict[str, str],
+                        efforts: dict[str, str | None],
                         rules_files: list[Path],
                         blt_commands: dict[str, str],
                         diff_base: str) -> dict | None:
@@ -7836,7 +7953,9 @@ async def run_conformer(sid: str, pila_dir: Path, worktree: str,
                               schema_key="conformer", cwd=worktree,
                               allowed_tools=ACT_TOOLS, max_turns=60,
                               autonomous=True, caps=caps, st=st,
-                              model=models["conformer"], sid=f"{sid}-conformer")
+                              model=models["conformer"],
+                              effort=efforts["conformer"],
+                              sid=f"{sid}-conformer")
     except WorkerError as e:
         log(f"  {sid}: conformer crashed: {e}")
         return None
@@ -7881,7 +8000,8 @@ def _conformance_clean(conf_res: dict) -> bool:
 
 async def _run_conformance_phase(sid: str, pila_dir: Path,
                                  worktree: str, subtask: dict, caps: dict,
-                                 st: State, models: dict[str, str]
+                                 st: State, models: dict[str, str],
+                                 efforts: dict[str, str | None]
                                  ) -> tuple[dict | None, list[str]]:
     """Drive the orchestrator-level conformer loop for one subtask.
     Returns `(last_conformer_result, warnings)`. Never raises a workflow
@@ -7898,7 +8018,7 @@ async def _run_conformance_phase(sid: str, pila_dir: Path,
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(worktree)
         last_res = await run_conformer(
-            sid, pila_dir, worktree, caps, st, models,
+            sid, pila_dir, worktree, caps, st, models, efforts,
             rules_files=rules_files, blt_commands=blt, diff_base=run_branch)
 
         if last_res is None:
@@ -7958,7 +8078,8 @@ async def _run_conformance_phase(sid: str, pila_dir: Path,
 
 
 async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
-                         models: dict[str, str]) -> dict:
+                         models: dict[str, str],
+                         efforts: dict[str, str | None]) -> dict:
     """Drive one subtask to a terminal state.
 
     Three bounded escalation paths, all code-enforced:
@@ -8007,7 +8128,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
         return None
 
     while True:
-        res = await run_implementer(sid, pila_dir, caps, st, models,
+        res = await run_implementer(sid, pila_dir, caps, st, models, efforts,
                                     continuation=continuation, note=note)
 
         # cross-field invariant check — catches a worker that lied about
@@ -8074,7 +8195,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             conf_warnings: list[str] = []
             try:
                 conf_res, conf_warnings = await _run_conformance_phase(
-                    sid, pila_dir, worktree, subtask, caps, st, models)
+                    sid, pila_dir, worktree, subtask, caps, st, models, efforts)
             except Exception as e:
                 conf_warnings.append(
                     f"conformance phase raised {type(e).__name__}: {e} — "
@@ -8171,7 +8292,8 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
 
 async def integrate_wave(wave: list[str], results: dict[str, dict],
                          pila_dir: Path, caps: dict, st: State,
-                         models: dict[str, str]) -> list[str]:
+                         models: dict[str, str],
+                         efforts: dict[str, str | None]) -> list[str]:
     """Merge each completed subtask branch into staging (git merge, not
     cherry-pick); resolve conflicts with an integrator worker. Returns the
     list of integrated ids.
@@ -8217,6 +8339,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                               allowed_tools=ACT_TOOLS, max_turns=60,
                               autonomous=True, caps=caps, st=st,
                               model=models["integrator"],
+                              effort=efforts["integrator"],
                               sid=f"integrator-{sid}")
         if ires.get("status") == "resolved":
             # the integrator must have actually committed the merge — a
@@ -8265,7 +8388,8 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
 
 
 async def phase_execute(pila_dir: Path, st: State, caps: dict,
-                        models: dict[str, str]) -> None:
+                        models: dict[str, str],
+                        efforts: dict[str, str | None]) -> None:
     """Phases 4-5: create staging, then run waves sequentially; within a wave,
     subtasks in parallel (bounded by max_parallel)."""
     log("phase 4: creating run-branch worktree")
@@ -8279,7 +8403,7 @@ async def phase_execute(pila_dir: Path, st: State, caps: dict,
 
     async def settle_one(sid: str) -> tuple[str, dict]:
         async with sem:
-            r = await settle_subtask(sid, pila_dir, caps, st, models)
+            r = await settle_subtask(sid, pila_dir, caps, st, models, efforts)
             log(f"  {sid}: {r.get('status')}")
             return sid, r
 
@@ -8301,7 +8425,7 @@ async def phase_execute(pila_dir: Path, st: State, caps: dict,
             die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
                 f"See {st.path}; resolve and re-run with --resume.")
 
-        await integrate_wave(wave, results, pila_dir, caps, st, models)
+        await integrate_wave(wave, results, pila_dir, caps, st, models, efforts)
 
         # Deterministic post-integration safety net: an unresolved
         # conflict marker means integration broke the tree. Per-subtask
@@ -8392,7 +8516,8 @@ async def phase_finalize(pila_dir: Path, st: State, no_push: bool,
 # =========================================================================
 async def orchestrate(args, caps: dict, pila_dir: Path, st: State,
                       sot_pref: str, verbosity: str,
-                      models: dict[str, str]) -> None:
+                      models: dict[str, str],
+                      efforts: dict[str, str | None]) -> None:
     """The async portion of a run: every phase that spawns a `claude -p`
     worker. main() handles sync setup, then drives this with `asyncio.run`."""
     # Memory telemetry: a long-running coroutine that snapshots RSS / phase /
@@ -8403,7 +8528,7 @@ async def orchestrate(args, caps: dict, pila_dir: Path, st: State,
     sampler_task = asyncio.create_task(_memory_sampler(st))
     try:
         await _run_phases(args, caps, pila_dir, st, sot_pref, verbosity,
-                          models)
+                          models, efforts)
     finally:
         sampler_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
@@ -8412,7 +8537,8 @@ async def orchestrate(args, caps: dict, pila_dir: Path, st: State,
 
 async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
                       sot_pref: str, verbosity: str,
-                      models: dict[str, str]) -> None:
+                      models: dict[str, str],
+                      efforts: dict[str, str | None]) -> None:
     """The phase sequence of one run. Split out from `orchestrate()`
     so the latter can wrap it with the memory-sampler try/finally
     without burying the phase calls behind extra indentation. Source-
@@ -8470,7 +8596,7 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
                         no_push=getattr(args, "no_push", False))
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
-        await phase_classify(task, st, caps, args.clarify, models)
+        await phase_classify(task, st, caps, args.clarify, models, efforts)
         # Now that classification has chosen a category, promote the
         # bootstrap dir to its final per-run name (DESIGN §6 "The run
         # identifier"). The rename is atomic on POSIX same-filesystem;
@@ -8512,17 +8638,17 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
         # docs-only run can short-circuit) and after the run-id rename
         # (so state writes go to the final run dir). On `--resume` the
         # entire else-branch is skipped, so phase_provision never re-fires.
-        await phase_provision(Path(os.getcwd()), st, caps, models)
+        await phase_provision(Path(os.getcwd()), st, caps, models, efforts)
         # gather_answers blocks on input(). That's fine here: no concurrent
         # tasks are scheduled yet, so blocking the loop blocks nothing. Kept
         # on the event loop deliberately — every State mutation runs on the
         # loop, which is why the lock-free State works.
         gather_answers(st, supplied)
-        plans = await phase_plan(task, st, caps, models)
+        plans = await phase_plan(task, st, caps, models, efforts)
         # Bridge cross-domain capability-tag mismatches before the
         # scheduler builds its DAG. Short-circuits with no worker call
         # when planners agreed on vocabulary (the common case).
-        plans = await phase_reconcile(plans, task, st, caps, models)
+        plans = await phase_reconcile(plans, task, st, caps, models, efforts)
         # Surface cross-planner file-claim overlaps. Warning only — the
         # reconciler handles capability-tag drift but not file-claim
         # conflicts (yet); empirically these correlate strongly with
@@ -8545,7 +8671,7 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
         st.data["test_runner"] = runner
         write_plan(pila_dir, task, st, subtasks, waves)
 
-    await phase_execute(pila_dir, st, caps, models)
+    await phase_execute(pila_dir, st, caps, models, efforts)
     await phase_finalize(pila_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False))
@@ -8672,6 +8798,27 @@ def main() -> None:
                         help=f"model alias for the {_w} worker "
                              f"(default {_w_default}) — overrides "
                              f"--model, PILA_MODEL, and pila.toml")
+    # Effort selection — see IMPLEMENTATION.md §2 "Effort selection".
+    # Same shape as --model: a global --effort plus per-worker --effort-<W>
+    # overrides. Acting workers (implementer, conformer) have no per-worker
+    # default, so without an override they get no --effort flag at all and
+    # inherit Claude's default — the previous behavior.
+    _judgment_workers = ", ".join(sorted(EFFORT_DEFAULT_PER_WORKER))
+    ap.add_argument("--effort", choices=EFFORT_VALUES, metavar="LEVEL",
+                    help=f"reasoning-depth dial for all workers "
+                         f"({'|'.join(EFFORT_VALUES)}); judgment workers "
+                         f"({_judgment_workers}) default to "
+                         f"{EFFORT_DEFAULT_PER_WORKER['planner']}, acting "
+                         "workers (implementer, conformer) default to unset "
+                         "(IMPLEMENTATION.md §2). Per-worker --effort-<worker> "
+                         "flags override this, as do PILA_EFFORT[_*] env vars "
+                         "and pila.toml")
+    for _w in WORKER_TYPES:
+        _e_default = EFFORT_DEFAULT_PER_WORKER.get(_w, "unset")
+        ap.add_argument(f"--effort-{_w}", choices=EFFORT_VALUES, metavar="LEVEL",
+                        help=f"reasoning depth for the {_w} worker "
+                             f"(default {_e_default}) — overrides "
+                             f"--effort, PILA_EFFORT, and pila.toml")
     ap.add_argument("--judge-model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for the judge post-run worker "
                          f"(default {MODEL_DEFAULT_PER_WORKER['judge']}); "
@@ -8823,6 +8970,14 @@ def main() -> None:
     args.runtime = resolve_runtime(repo_root, args.runtime)
     models = resolve_models(repo_root, args)
     log(f"models: " + ", ".join(f"{w}={models[w]}" for w in WORKER_TYPES))
+    efforts = resolve_efforts(repo_root, args)
+    # Log only workers with a resolved effort — an "unset" worker is
+    # explicitly opting out of the --effort flag and showing it as
+    # "effort=None" in the log would be noise.
+    _e_pairs = [f"{w}={efforts[w]}" for w in WORKER_TYPES
+                if efforts[w] is not None]
+    if _e_pairs:
+        log("efforts: " + ", ".join(_e_pairs))
 
     # Resolve --no-push: CLI flag → PILA_NO_PUSH env → no_push in
     # pila.toml → False. Re-attach to args so orchestrate() /
@@ -8887,7 +9042,7 @@ def main() -> None:
         heal_out_dir = phase_run_dir / args.heal_dir
         if args.phase == "judge":
             asyncio.run(phase_judge(phase_run_dir, judge_out_dir, caps,
-                                    phase_st, models))
+                                    phase_st, models, efforts))
         else:  # heal
             # Read judge INDEX.json to find failing call_types; if no index
             # exists yet, run phase_judge first so heal has verdicts to
@@ -8938,7 +9093,8 @@ def main() -> None:
                     "success_threshold": args.heal_success_threshold,
                 }
                 asyncio.run(phase_heal(call_type, failing_records, heal_out_dir,
-                                       caps, phase_st, models, config=config))
+                                       caps, phase_st, models, efforts,
+                                       config=config))
         return
 
     # Signal handlers (DESIGN §6 / DESIGN §14): SIGTERM and SIGHUP raise
@@ -8954,7 +9110,7 @@ def main() -> None:
     exit_message: str | None = None
     try:
         asyncio.run(orchestrate(args, caps, st.run_dir, st,
-                                sot_pref, verbosity, models))
+                                sot_pref, verbosity, models, efforts))
     except WorkerError as e:
         abnormal = True
         full_purge = False

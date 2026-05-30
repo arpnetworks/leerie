@@ -186,6 +186,16 @@ export PILA_MODEL=sonnet               # or: opus, haiku
 ./pila "task" --model opus
 ./pila "task" --model-implementer opus --model-classifier haiku
 
+# Pin reasoning depth via `claude -p --effort`. Without overrides,
+# judgment workers (classifier, planner, reconciler, provision,
+# integrator) default to `high`; acting workers (implementer,
+# conformer) inherit Claude's default. Per-worker overrides exist via
+# --effort-<worker> / PILA_EFFORT_<WORKER>. See
+# docs/IMPLEMENTATION.md §2 "Effort selection".
+export PILA_EFFORT=high                # low, medium, high, xhigh, max
+./pila "task" --effort max
+./pila "task" --effort-planner max
+
 # Dial how persistent each planner/implementer is at building confidence
 # before exiting blocked (default 8 rounds; see DESIGN.md §8). CLI flag,
 # env var, or `confidence_rounds = N` in pila.toml.

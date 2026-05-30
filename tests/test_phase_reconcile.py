@@ -66,7 +66,7 @@ def test_short_circuit_no_unresolved_returns_plans_unchanged(pila, tmp_path):
     models: dict[str, str] = {}
 
     result = asyncio.run(pila.phase_reconcile(plans, "test task", st,
-                                                  caps, models))
+                                                  caps, models, {}))
     # Same list, unchanged.
     assert result is plans
     assert plans[1]["subtasks"][0]["requires"] == [req_a]
@@ -106,7 +106,7 @@ def test_phase_reconcile_dies_on_planner_vs_planner_id_collision(pila, tmp_path)
     models: dict[str, str] = {}
 
     with pytest.raises(SystemExit) as exc:
-        asyncio.run(pila.phase_reconcile(plans, "task", st, caps, models))
+        asyncio.run(pila.phase_reconcile(plans, "task", st, caps, models, {}))
     assert exc.value.code != 0
 
 
@@ -132,7 +132,7 @@ def test_phase_reconcile_collision_check_runs_before_short_circuit(pila, tmp_pat
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
     with pytest.raises(SystemExit):
-        asyncio.run(pila.phase_reconcile(plans, "task", st, {**caps}, {}))
+        asyncio.run(pila.phase_reconcile(plans, "task", st, {**caps}, {}, {}))
 
 
 def test_phase_reconcile_collision_error_names_id_and_domains(pila, tmp_path, capsys):
@@ -154,7 +154,7 @@ def test_phase_reconcile_collision_error_names_id_and_domains(pila, tmp_path, ca
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
     with pytest.raises(SystemExit):
-        asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}))
+        asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}, {}))
     err = capsys.readouterr().err
     # The colliding id and all three domains are named.
     assert "feat-001" in err
@@ -172,7 +172,7 @@ def test_short_circuit_empty_plans(pila, tmp_path):
     st = _minimal_state(pila, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    result = asyncio.run(pila.phase_reconcile(plans, "x", st, caps, {}))
+    result = asyncio.run(pila.phase_reconcile(plans, "x", st, caps, {}, {}))
     assert result is plans
     assert result == []
 
@@ -185,7 +185,7 @@ def test_short_circuit_plan_with_no_requires(pila, tmp_path):
     st = _minimal_state(pila, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    result = asyncio.run(pila.phase_reconcile(plans, "x", st, caps, {}))
+    result = asyncio.run(pila.phase_reconcile(plans, "x", st, caps, {}, {}))
     assert result is plans
     assert st.data.get("worker_count", 0) == 0
 
@@ -323,7 +323,7 @@ def test_phase_reconcile_external_only_short_circuits(pila, tmp_path):
     st = _minimal_state(pila, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    result = asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}))
+    result = asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}, {}))
     assert result is plans
     # No worker spawned.
     assert st.data.get("worker_count", 0) == 0
@@ -350,7 +350,7 @@ def test_phase_reconcile_promotes_collision_before_unresolved_check(pila, tmp_pa
     st = _minimal_state(pila, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    result = asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}))
+    result = asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}, {}))
     assert result is plans
     # Promoted: the entry's extent is now in_plan, with reason preserved.
     entry = plans[1]["subtasks"][0]["requires"][0]
@@ -374,5 +374,5 @@ def test_phase_reconcile_persists_empty_preconditions_when_none(pila, tmp_path):
     st = _minimal_state(pila, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}))
+    asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}, {}))
     assert st.data.get("external_preconditions") == []

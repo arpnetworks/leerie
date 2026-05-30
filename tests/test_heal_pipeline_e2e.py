@@ -44,6 +44,7 @@ _CAPS = {
 _MODELS = {
     "judge": "opus",
 }
+_EFFORTS: dict[str, str | None] = {}
 
 # Judge envelopes: one passes, two fail.
 _JUDGE_PASS_ENVELOPE = {
@@ -283,7 +284,7 @@ class TestHealPipelineE2E:
                             _make_judge_invoke())
 
         result = asyncio.run(
-            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS)
+            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
         )
 
         assert result["judged"] == 3, (
@@ -305,7 +306,7 @@ class TestHealPipelineE2E:
                             _make_judge_invoke())
 
         asyncio.run(
-            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS)
+            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
         )
 
         index = json.loads((judge_dir / "INDEX.json").read_text())
@@ -326,7 +327,7 @@ class TestHealPipelineE2E:
                             _make_judge_invoke())
 
         asyncio.run(
-            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS)
+            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
         )
 
         for rec in records:
@@ -369,7 +370,7 @@ class TestHealPipelineE2E:
 
         verdict = asyncio.run(
             pila.phase_heal(
-                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS,
+                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )
         )
@@ -408,7 +409,7 @@ class TestHealPipelineE2E:
 
         asyncio.run(
             pila.phase_heal(
-                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS,
+                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )
         )
@@ -445,7 +446,7 @@ class TestHealPipelineE2E:
 
         asyncio.run(
             pila.phase_heal(
-                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS,
+                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )
         )
@@ -487,7 +488,7 @@ class TestHealPipelineE2E:
 
         asyncio.run(
             pila.phase_heal(
-                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS,
+                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )
         )
@@ -518,7 +519,7 @@ class TestHealPipelineE2E:
         monkeypatch.setattr(pila, "_invoke",
                             _make_judge_invoke())
         asyncio.run(
-            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS)
+            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
         )
         monkeypatch.undo()
 
@@ -544,7 +545,7 @@ class TestHealPipelineE2E:
 
         asyncio.run(
             pila.phase_heal(
-                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS,
+                _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )
         )

@@ -1090,6 +1090,75 @@ Models are not persisted in `.pila/state.json`. On `--resume`, models are
 re-resolved from the current environment, so changing `PILA_MODEL` between
 the original run and the resume is intentional and takes effect.
 
+### Effort selection
+
+The `claude -p` CLI exposes `--effort {low,medium,high,xhigh,max}` to dial
+reasoning depth. Pila pins effort per worker so judgment workers think to a
+consistent depth across runs — the previous behavior (no `--effort` flag,
+worker inherits whatever the user's Claude settings happen to default to)
+was a hidden source of cross-run variance in subtask count and other
+judgment-shaped outputs.
+
+The `claude -p` CLI exposes **no `--temperature` and no `--seed`**, so
+sampling stochasticity cannot be pinned. Effort is the strongest dial
+available; it does not eliminate run-to-run variance but does remove the
+"this run thought harder than that one" axis.
+
+**Per-worker defaults: `high` for judgment workers, unset for acting workers.**
+Judgment workers (classifier, planner, reconciler, provision, integrator)
+default to `high`. The acting workers (implementer, conformer) and post-run
+skill workers (judge, heal) default to *unset* — when no effort is resolved,
+no `--effort` flag is passed and the worker inherits Claude's default. This
+keeps acting workers' reasoning bounded by their own evidence gates
+(DESIGN §8) rather than by a global dial.
+
+| Worker       | Default | Why |
+|--------------|---------|-----|
+| classifier   | high    | category choice is judgment over the whole task |
+| planner      | high    | decomposition granularity is the load-bearing judgment step (DESIGN §8 planner gate) |
+| reconciler   | high    | cross-domain tag equivalence is judgment |
+| provision    | high    | recipe synthesis over arbitrary repo shapes is judgment |
+| integrator   | high    | behavioral conflict resolution; a wrong merge corrupts state |
+| implementer  | unset   | bounded by §8 evidence gate; pinning would override the gate's adaptive depth |
+| conformer    | unset   | advisory phase; same reasoning as implementer |
+| judge        | unset   | post-run scoring; no need to pin |
+| heal         | unset   | post-run patch generation; no need to pin |
+
+`EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
+`EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the five judgment
+workers above.
+
+Resolution order for each worker type `W` (highest priority first), mirroring
+model selection:
+
+1. **`--effort-<W>`** CLI flag (e.g. `--effort-planner max`)
+2. **`--effort`** CLI flag (sets the global default for this run)
+3. **`PILA_EFFORT_<W>`** env var (e.g. `PILA_EFFORT_PLANNER=max`)
+4. **`PILA_EFFORT`** env var (sets the global default)
+5. **`effort_<w>`** key in `pila.toml`
+6. **`effort`** key in `pila.toml`
+7. **Per-worker default** from `EFFORT_DEFAULT_PER_WORKER`
+8. **Global default `EFFORT_DEFAULT`** (`None` — flag omitted)
+
+| Worker       | env var                       | CLI flag                | TOML key            |
+|--------------|-------------------------------|-------------------------|---------------------|
+| (global)     | `PILA_EFFORT`             | `--effort`              | `effort`            |
+| classifier   | `PILA_EFFORT_CLASSIFIER`  | `--effort-classifier`   | `effort_classifier` |
+| planner      | `PILA_EFFORT_PLANNER`     | `--effort-planner`      | `effort_planner`    |
+| reconciler   | `PILA_EFFORT_RECONCILER`  | `--effort-reconciler`   | `effort_reconciler` |
+| provision    | `PILA_EFFORT_PROVISION`   | `--effort-provision`    | `effort_provision`  |
+| implementer  | `PILA_EFFORT_IMPLEMENTER` | `--effort-implementer`  | `effort_implementer`|
+| integrator   | `PILA_EFFORT_INTEGRATOR`  | `--effort-integrator`   | `effort_integrator` |
+| conformer    | `PILA_EFFORT_CONFORMER`   | `--effort-conformer`    | `effort_conformer`  |
+
+An invalid value in env or file is rejected at startup via `die()`. CLI
+values are validated by argparse `choices=`. A worker that resolves to `None`
+(no override and no per-worker default) produces the exact same CLI as
+before this feature landed — zero behavior change for unconfigured workers.
+
+Efforts are not persisted in `.pila/state.json`. Like models, on `--resume`
+they are re-resolved from the current environment.
+
 ### The `--answers` file
 
 A JSON object keyed by classifier-assigned question `id`. Optionally

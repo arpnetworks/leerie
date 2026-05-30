@@ -433,6 +433,7 @@ _CAPS = {
 }
 
 _MODELS = {"judge": "opus"}
+_EFFORTS: dict[str, str | None] = {}
 
 
 def _make_state(pila, run_dir: Path):
@@ -489,7 +490,7 @@ def test_phase_heal_stub_terminates_plateaued(pila, tmp_path, monkeypatch):
 
     verdict = asyncio.run(
         pila.phase_heal(
-            "classifier", records, heal_dir, _CAPS, st, _MODELS,
+            "classifier", records, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
             _no_op_request_patch, n=1, config=config,
         )
     )
@@ -520,7 +521,7 @@ def test_phase_heal_stub_writes_report(pila, tmp_path, monkeypatch):
 
     asyncio.run(
         pila.phase_heal(
-            "classifier", records, heal_dir, _CAPS, st, _MODELS,
+            "classifier", records, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
             _no_op_request_patch, n=1, config=config,
         )
     )

@@ -100,11 +100,15 @@ def env(pila, tmp_path):
 
     caps = dict(pila.DEFAULT_CAPS)
     models = {w: "sonnet" for w in pila.WORKER_TYPES}
+    # No --effort pinned for these tests — predates the effort selector
+    # and exercises the "inherit Claude default" branch.
+    efforts: dict[str, str | None] = {}
 
     return {
         "pila": pila, "repo": repo, "worktree": worktree,
         "sid": sid, "subtask": subtask, "run_dir": run_dir, "st": st,
-        "caps": caps, "models": models, "run_branch": run_branch,
+        "caps": caps, "models": models, "efforts": efforts,
+        "run_branch": run_branch,
     }
 
 
@@ -115,7 +119,7 @@ def _stub_run_conformer(pila_mod, results_queue, *, commits=None):
     commits = commits or {}
     state = {"i": 0}
 
-    async def _stub(sid, pila_dir, worktree, caps, st, models,
+    async def _stub(sid, pila_dir, worktree, caps, st, models, efforts,
                     *, rules_files, blt_commands, diff_base):
         i = state["i"]
         state["i"] += 1
@@ -155,7 +159,7 @@ def test_clean_result_exits_after_one_round(env, monkeypatch):
 
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert state["i"] == 1
     assert res is not None
@@ -173,7 +177,7 @@ def test_malformed_result_breaks_loop_with_warning(env):
 
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert state["i"] == 1  # loop did not retry on malformed output
     assert res == bad
@@ -188,7 +192,7 @@ def test_worker_crash_surfaces_as_warning(env):
 
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert state["i"] == 1
     assert res is None
@@ -215,7 +219,7 @@ def test_protected_path_commit_is_rolled_back(env):
 
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
 
     # The protected-path commit must be gone from HEAD after rollback.
     head_after = subprocess.run(
@@ -244,7 +248,7 @@ def test_rounds_cap_respected_with_residuals(env):
 
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert state["i"] == env["caps"]["conformance_rounds"]
     assert any("rule-residual" in w for w in warnings)
@@ -263,7 +267,7 @@ def test_phase_never_returns_failed_status(env):
     state = _stub_run_conformer(c, [None])
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
     # Returned shape: 2-tuple, second element is a list.
     assert isinstance(warnings, list)
     # res may be None on crash; that's the intended advisory signal.
@@ -292,7 +296,7 @@ def test_unprefixed_conformer_commits_surface_as_warnings(env):
 
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
 
     head_after = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=env["worktree"],
@@ -320,7 +324,7 @@ def test_prefixed_conformer_commits_do_not_warn(env):
 
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert not any("missing `conformer:` prefix" in w for w in warnings)
 
@@ -350,7 +354,7 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
     # raised by bump_workers and return None.
     result = asyncio.run(c.run_conformer(
         env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
-        env["st"], env["models"],
+        env["st"], env["models"], env["efforts"],
         rules_files=[], blt_commands={"build": "", "lint": "", "test": ""},
         diff_base="dummy"))
     assert result is None, "budget-exhausted conformer must return None"
@@ -360,7 +364,7 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
     env["st"].save()
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
     assert res is None
     assert any("crashed" in w for w in warnings), \
         "budget exhaustion should surface as a 'crashed' advisory warning"
@@ -379,7 +383,7 @@ def test_settle_subtask_never_escalates_on_conformer_crash(env, monkeypatch):
     # Stub run_implementer to return a clean `complete` result without
     # actually spawning a worker. The worktree already has the implementer's
     # commit from the env fixture, so the per-subtask gates will pass.
-    async def _stub_implementer(sid, pila_dir, caps, st, models,
+    async def _stub_implementer(sid, pila_dir, caps, st, models, efforts,
                                 continuation=False, note=""):
         return {
             "subtask_id": sid,
@@ -395,7 +399,7 @@ def test_settle_subtask_never_escalates_on_conformer_crash(env, monkeypatch):
     _stub_run_conformer(c, [None])
 
     res = asyncio.run(c.settle_subtask(
-        env["sid"], env["run_dir"], env["caps"], env["st"], env["models"]))
+        env["sid"], env["run_dir"], env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert res["status"] == "complete", \
         f"conformer crash escalated subtask to {res['status']!r}"
@@ -411,7 +415,7 @@ def test_settle_subtask_never_escalates_on_conformer_residuals(env, monkeypatch)
     until the cap is hit. The subtask still returns `complete`."""
     c = env["pila"]
 
-    async def _stub_implementer(sid, pila_dir, caps, st, models,
+    async def _stub_implementer(sid, pila_dir, caps, st, models, efforts,
                                 continuation=False, note=""):
         return {
             "subtask_id": sid,
@@ -431,7 +435,7 @@ def test_settle_subtask_never_escalates_on_conformer_residuals(env, monkeypatch)
     _stub_run_conformer(c, [failing] * 10)
 
     res = asyncio.run(c.settle_subtask(
-        env["sid"], env["run_dir"], env["caps"], env["st"], env["models"]))
+        env["sid"], env["run_dir"], env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert res["status"] == "complete"
     assert res.get("conformance_warnings"), \
@@ -450,7 +454,7 @@ def test_settle_subtask_survives_unexpected_exception_in_conformance(env, monkey
     c = env["pila"]
 
     # Stub run_implementer to short-circuit to a clean complete result.
-    async def _stub_implementer(sid, pila_dir, caps, st, models,
+    async def _stub_implementer(sid, pila_dir, caps, st, models, efforts,
                                 continuation=False, note=""):
         return {
             "subtask_id": sid,
@@ -469,7 +473,7 @@ def test_settle_subtask_survives_unexpected_exception_in_conformance(env, monkey
     monkeypatch.setattr(c, "_run_conformance_phase", _explode)
 
     res = asyncio.run(c.settle_subtask(
-        env["sid"], env["run_dir"], env["caps"], env["st"], env["models"]))
+        env["sid"], env["run_dir"], env["caps"], env["st"], env["models"], env["efforts"]))
 
     assert res["status"] == "complete", \
         f"unexpected exception in conformance escalated subtask to {res['status']!r}"
@@ -504,7 +508,7 @@ def test_protected_path_rollback_warns_about_discarded_uncommitted(env):
 
     res, warnings = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
-        env["caps"], env["st"], env["models"]))
+        env["caps"], env["st"], env["models"], env["efforts"]))
 
     # The protected-path rollback warning should be present (as before).
     assert any("protected-path" in w for w in warnings)

@@ -54,6 +54,10 @@ _MODELS = {
     "judge": "opus",
 }
 
+# No --effort flag passed for any worker; the test pre-dates the effort
+# selector and exercises the "inherit Claude default" branch.
+_EFFORTS: dict[str, str | None] = {}
+
 _CALL_TYPES = ["classifier", "planner", "provision", "implementer"]
 
 
@@ -126,7 +130,7 @@ def test_phase_judge_writes_three_verdict_files(pila, tmp_path, monkeypatch):
     _patch_invoke(pila, monkeypatch)
 
     result = asyncio.run(
-        pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS)
+        pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert result["judged"] == 3, f"Expected 3, got {result['judged']}"
@@ -144,7 +148,7 @@ def test_phase_judge_index_lists_all_call_ids(pila, tmp_path, monkeypatch):
     _write_ndjson(run_dir / "calls.ndjson", records)
     _patch_invoke(pila, monkeypatch)
 
-    asyncio.run(pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS))
+    asyncio.run(pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS))
 
     index_path = judge_dir / "INDEX.json"
     assert index_path.exists(), "INDEX.json not written"
@@ -167,7 +171,7 @@ def test_phase_judge_verdicts_validate_against_judge_schema(
     _write_ndjson(run_dir / "calls.ndjson", records)
     _patch_invoke(pila, monkeypatch)
 
-    asyncio.run(pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS))
+    asyncio.run(pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS))
 
     required_fields = {"passed", "dimensions", "rationale", "suggested_fixes"}
     dim_fields = {"schema_ok", "factual_ok", "hallucination_ok"}
@@ -197,7 +201,7 @@ def test_phase_judge_index_contains_passed_field(pila, tmp_path, monkeypatch):
     _write_ndjson(run_dir / "calls.ndjson", records)
     _patch_invoke(pila, monkeypatch)
 
-    asyncio.run(pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS))
+    asyncio.run(pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS))
 
     index = json.loads((judge_dir / "INDEX.json").read_text())
     for entry in index:
@@ -238,7 +242,7 @@ def test_phase_judge_honours_max_parallel(pila, tmp_path, monkeypatch):
 
     monkeypatch.setattr(pila, "_invoke", fake_invoke)
 
-    asyncio.run(pila.phase_judge(run_dir, judge_dir, caps, st, _MODELS))
+    asyncio.run(pila.phase_judge(run_dir, judge_dir, caps, st, _MODELS, _EFFORTS))
 
     assert peak_concurrent[0] <= caps["max_parallel"], (
         f"Peak concurrent ({peak_concurrent[0]}) exceeded max_parallel "
@@ -266,7 +270,7 @@ def test_phase_judge_filters_by_call_types(pila, tmp_path, monkeypatch):
 
     result = asyncio.run(
         pila.phase_judge(
-            run_dir, judge_dir, _CAPS, st, _MODELS,
+            run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS,
             judge_call_types=["classifier"],
         )
     )
@@ -291,7 +295,7 @@ def test_phase_judge_missing_ndjson(pila, tmp_path, monkeypatch):
     _patch_invoke(pila, monkeypatch)
 
     result = asyncio.run(
-        pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS)
+        pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert result["judged"] == 0
@@ -309,7 +313,7 @@ def test_phase_judge_empty_ndjson(pila, tmp_path, monkeypatch):
     _patch_invoke(pila, monkeypatch)
 
     result = asyncio.run(
-        pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS)
+        pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert result["judged"] == 0

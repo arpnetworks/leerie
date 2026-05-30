@@ -63,6 +63,7 @@ _CAPS = {
 _MODELS = {
     "judge": "opus",
 }
+_EFFORTS: dict[str, str | None] = {}
 
 _CALL_TYPES = ["classifier", "planner", "provision"]
 
@@ -188,7 +189,7 @@ def test_heal_baseline_writes_state_json(pila, tmp_path, monkeypatch):
     _patch_replay_and_judge(pila, monkeypatch)
 
     hs = asyncio.run(
-        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS)
+        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     state_path = heal_dir / "classifier" / "state.json"
@@ -209,7 +210,7 @@ def test_heal_baseline_baseline_covers_both_samples(pila, tmp_path, monkeypatch)
     _patch_replay_and_judge(pila, monkeypatch)
 
     hs = asyncio.run(
-        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS)
+        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert len(hs.baseline) == 2, f"Expected 2 baseline entries, got {len(hs.baseline)}"
@@ -232,7 +233,7 @@ def test_heal_baseline_writes_6_verdict_files(pila, tmp_path, monkeypatch):
     _patch_replay_and_judge(pila, monkeypatch)
 
     asyncio.run(
-        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS)
+        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     verdicts_dir = heal_dir / "classifier" / "baseline" / "verdicts"
@@ -250,7 +251,7 @@ def test_heal_baseline_sets_best_so_far(pila, tmp_path, monkeypatch):
     _patch_replay_and_judge(pila, monkeypatch)
 
     hs = asyncio.run(
-        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS)
+        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert "pass_rate" in hs.best_so_far, "best_so_far missing pass_rate"
@@ -266,7 +267,7 @@ def test_heal_baseline_history_is_empty(pila, tmp_path, monkeypatch):
     _patch_replay_and_judge(pila, monkeypatch)
 
     hs = asyncio.run(
-        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS)
+        pila.heal_baseline("classifier", records, 3, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert hs.history == [], f"Expected empty history, got {hs.history}"
@@ -336,7 +337,7 @@ def _setup_for_replay(pila, tmp_path, monkeypatch, n_replays: int = 2):
     _patch_replay_and_judge(pila, monkeypatch)
 
     asyncio.run(
-        pila.heal_baseline("classifier", records, 2, heal_dir, _CAPS, st, _MODELS)
+        pila.heal_baseline("classifier", records, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
     pila.heal_apply_patch(
         "classifier", 1, "REPLACEMENT_TEXT", "ANCHOR_POINT_HERE",
@@ -352,7 +353,7 @@ def test_heal_replay_patched_updates_history(pila, tmp_path, monkeypatch):
     )
 
     hs = asyncio.run(
-        pila.heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS)
+        pila.heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert len(hs.history) == 1, f"Expected 1 history entry, got {len(hs.history)}"
@@ -368,7 +369,7 @@ def test_heal_replay_patched_state_persisted(pila, tmp_path, monkeypatch):
     )
 
     asyncio.run(
-        pila.heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS)
+        pila.heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     state_path = heal_dir / "classifier" / "state.json"
@@ -392,7 +393,7 @@ def test_heal_replay_patched_best_so_far_updated(pila, tmp_path, monkeypatch):
     hs_pre.save()
 
     hs = asyncio.run(
-        pila.heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS)
+        pila.heal_replay_patched("classifier", 1, 2, heal_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     # Judge always returns passed=True, so pass_rate=1.0 > 0.0 → best updated.
