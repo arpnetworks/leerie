@@ -253,9 +253,11 @@ Prerequisites for the fly runtime:
 1. **`flyctl` installed and authenticated** — `fly auth status` must succeed.
    Install from https://fly.io/docs/flyctl/install/ (or `brew install flyctl`
    on macOS).
-2. **A published pila image** — build and push with `scripts/publish-image.sh`
+2. **A published pila image** — build and push with `scripts/remote/build-push.sh`
    (see `docs/IMPLEMENTATION.md` §0.5 *Registry publish path*). The fly runtime
-   pulls this image for each worker Machine it starts.
+   pulls this image for each worker Machine it starts. The launcher's
+   `ensure_image()` step also auto-publishes on the first remote run if the
+   tag is missing — `--no-auto-publish` opts out.
 
 The local `nerdctl` setup above is **not required** when using `--runtime fly`;
 pila's launcher skips the local container preflight and delegates the entire

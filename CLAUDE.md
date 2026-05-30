@@ -28,9 +28,13 @@ from Debian 12). The launcher itself is a portable bash script; it
 no longer needs `uv` or a host Python. See `docs/IMPLEMENTATION.md`
 §0 (install surface) and §0.5 (container shape).
 
-Pila is small (~1600 LOC of Python) and stays small. All control
-flow lives in one file: `orchestrator/pila.py`. The launcher and
-Dockerfile are the only other moving parts.
+All control flow lives in one file: `orchestrator/pila.py`. The
+launcher (a portable bash script) and the `Dockerfile` are the only
+other moving parts on the orchestrator side. The orchestrator is
+deliberately kept as a single module rather than split across
+packages — the design goal is that you can read the whole control
+flow top-to-bottom in one sitting. Stdlib-only on the Python side;
+`pytest` is the sole dev dependency.
 
 ## The three-layer rule (load-bearing — read first)
 

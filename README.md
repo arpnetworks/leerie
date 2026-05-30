@@ -251,7 +251,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--run-id ID` | — | Select a specific run by id (e.g., for `--resume` or `--phase` when multiple runs are in flight). |
 | `--list` | off | Enumerate in-flight and completed runs in this repository (run id, started, status, branch). |
 | `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `PILA_NO_PUSH` / `pila.toml`. |
-| `--remote` | off | Route execution to a remote backend (Fly.io) instead of the local `nerdctl run`. Consumed by the launcher before `REWRITTEN_ARGS`; the orchestrator never sees it. Also `PILA_REMOTE` env var or `remote = true` in `pila.toml`. |
+| `--remote` | off | **Legacy alias for `--runtime fly`.** Maps to `RUNTIME=fly` in the launcher and is consumed before `REWRITTEN_ARGS`, so the orchestrator never sees it. Also `PILA_REMOTE` env var or `remote = true` in `pila.toml`. Prefer `--runtime fly` in new invocations. |
 | `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
 | `--clarify` | off | Opt into surfacing intent questions to the user. Default: questions are dropped after the classifier's codebase→research filter, and the implementer makes a documented best-effort decision. Also `PILA_CLARIFY` env var or `clarify = true` in `pila.toml`. |
@@ -364,6 +364,39 @@ For a worked end-to-end example — from invocation through clarification,
 wave execution, run-branch review, and merge — see
 [`docs/USAGE.md`](docs/USAGE.md).
 
+## Documentation
+
+Every Pila document is reachable from this README. Architecture and code
+surface:
+
+- [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, constraints, phase
+  flow, the evidence-gated loop, deterministic enforcement
+- [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) — code-surface
+  reference (functions, caps, schemas, model / effort selection)
+- [`docs/USAGE.md`](docs/USAGE.md) — worked end-to-end example
+- [`docs/INSTALL.md`](docs/INSTALL.md) — per-OS container runtime setup
+  (Colima on macOS, containerd + nerdctl on Linux), Fly.io prerequisites
+- [`remote-task-system.md`](remote-task-system.md) — platform-agnostic
+  design of the remote (Fly.io) task-execution system: two-channel
+  seeding, machine lifecycle, PTY attach, pause-on-failure
+
+Policy and process:
+
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — development setup, task-completion
+  checklist, PR conventions (and pointer to [`CLAUDE.md`](CLAUDE.md), the
+  repo-local guidance for Claude Code)
+- [`SECURITY.md`](SECURITY.md) — threat model and vulnerability reporting
+- [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor Covenant
+- [`CHANGELOG.md`](CHANGELOG.md) — release notes
+
+Post-run analysis skills (invoked via Claude Code, not the orchestrator
+itself):
+
+- [`skills/judge-llm-batch/SKILL.md`](skills/judge-llm-batch/SKILL.md) —
+  score captured `claude -p` calls against a 3-dimensional accuracy rubric
+- [`skills/llm-self-heal/SKILL.md`](skills/llm-self-heal/SKILL.md) —
+  autonomous prompt-patch loop for failing call types
+
 ## Development
 
 Tests:
@@ -384,27 +417,49 @@ live `claude` binary would be needed; out of scope for the current suite).
 | Path | What it is |
 |------|------------|
 | `orchestrator/pila.py` | The orchestrator — all phases, waves, caps, retries |
+| `pila` | Executable bash launcher — runtime preflight + `nerdctl run` (or Fly Machine provisioning when `--runtime fly`) |
+| `Dockerfile` | Container image recipe — Debian 12 + Node + pnpm + `claude` CLI + baked orchestrator source. Built locally on first run, tagged `pila:<VERSION>` |
+| `fly.toml` | Fly.io Machine configuration — app name, region, vm sizing (4 cpu / 8 GB), `min_machines_running=0` (no warm pool) |
 | `prompts/classifier.md` | System prompt: classify task + surface intent questions |
 | `prompts/planner.md` | System prompt: decompose one category into a subtask plan |
 | `prompts/reconciler.md` | System prompt: reconcile cross-domain capability-tag drift between planner outputs |
+| `prompts/provision.md` | System prompt: LLM-fallback install recipe synthesis when the deterministic lockfile table misses (DESIGN §6½) |
 | `prompts/implementer.md` | System prompt: execute one subtask end to end |
+| `prompts/conformer.md` | System prompt: post-work doc/test/lint conformance pass (advisory; DESIGN §9) |
 | `prompts/integrator.md` | System prompt: resolve merge conflicts behaviorally |
+| `prompts/judge.md` | System prompt: 3-dimensional accuracy rubric for the post-run judge skill |
+| `prompts/patch_generator.md` | System prompt: minimal prompt-patch proposal for the post-run self-heal loop |
+| `prompts/_clarification_filter.md` | Shared include (codebase→research→ask filter) inlined by `classifier.md` and `implementer.md` via `load_prompt`'s `{{include: …}}` expansion |
+| `scripts/install.sh` | One-command `curl \| bash` installer (preflight → runtime preflight → clone → symlink → verify) |
+| `scripts/runtime-install.sh` | Per-OS auto-install of the container runtime (Colima on macOS; containerd + nerdctl on Debian / Fedora / Arch). Sourced by `install.sh` and the launcher |
+| `scripts/container-entry.sh` | Container PID 1 entrypoint — `cd /work && exec python3 /work/.pila-image/orchestrator/pila.py "$@"` |
 | `scripts/setup-run.sh` | Create per-run branch + worktree (`pila/runs/<run-id>`) |
 | `scripts/new-worktree.sh` | Create per-subtask branch + worktree off the run branch |
 | `scripts/integrate.sh` | Merge a subtask branch into the run branch |
-| `scripts/finalize.sh` | Verify the run branch is non-empty and ready to push (the working branch is not modified locally — the push + PR step lives in Python's `push_and_open_pr`, called from `phase_finalize` unless `--no-push`) |
+| `scripts/finalize.sh` | Verify the run branch is non-empty and ready to push. The working branch is never modified locally. The push + `gh pr create` step lives in the **host launcher** (bash + `jq`) and runs after `nerdctl run` exits cleanly, using the host's own auth state — see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Host-side finalize*. Skipped when `--no-push` is set. |
 | `scripts/cleanup.sh` | Remove worktrees for one run (default `--run-id`) or all runs (`--all-runs`). State dir always preserved as audit. `--branches` also deletes the matching `pila/runs/<id>` run branch *and* `pila/subtasks/<id>/*` subtask branches. `--subtask-branches` deletes only the subtask branches and keeps `pila/runs/<id>` (the post-finalize default — the run branch is the PR head). `--bootstrap` removes orphaned `_bootstrap-*` dirs (runs that died before classify completed). |
-| `scripts/remote/build-push.sh` | Build and push a self-contained pila image to Fly.io's registry (source baked in at `/work/.pila-image/`). See `docs/IMPLEMENTATION.md` §0.5 *Registry publish path*. |
-| `scripts/remote/provision.sh` | Fly Machine lifecycle helper (sourced by the launcher's `REMOTE=true` branch). Provides `provision_machine()` (create → wait-started → register destroy trap) and `destroy_machine()`. See `docs/IMPLEMENTATION.md` §7 *Machine lifecycle*. |
-| `scripts/remote/seed-auth.sh` | Worker auth + config seeding (sourced by the launcher after `provision_machine()` returns). Provides `seed_auth()`, which delivers `~/.claude.json` + `~/.claude/` + git identity to the remote machine via `flyctl machine exec` tar-pipe and git config calls. See `docs/IMPLEMENTATION.md` §7 *Worker auth + config seeding*. |
-| `scripts/remote/seed-repo.sh` | Two-channel repo seeding helper (sourced by the launcher after `provision_machine()` succeeds). Provides `seed_repo()`: full-history partial clone via `git clone --filter=blob:none`, then rsync of the local dirty set via `flyctl machine exec tar`. See `docs/IMPLEMENTATION.md` §7 *Repo seeding*. |
-| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by the launcher after remote orchestration succeeds). Provides `fetch_branch()`: discovers the completed run-id on the machine, streams the `pila/runs/<run-id>` git bundle to the host via `git fetch`, and tars `.pila/runs/<run-id>/` back so the existing host-side finalize block (push + `gh pr create`) runs unchanged. See `docs/IMPLEMENTATION.md` §7 *Run branch stream-back*. |
-| `pila` | Executable entry-point wrapper |
-| `commands/pila.md` | Thin plugin skill — reachable as `/pila` from Claude Code |
-| `docs/DESIGN.md` | Full design document and rationale |
-| `docs/IMPLEMENTATION.md` | Current code-surface spec (functions, caps, schemas) |
-| `docs/USAGE.md` | End-to-end walkthrough of one Pila run |
+| `scripts/remote/build-push.sh` | Build and push a self-contained pila image to Fly.io's registry (source baked in at `/work/.pila-image/`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §0.5 *Registry publish path*. |
+| `scripts/remote/provision.sh` | Fly Machine lifecycle helper (sourced by the launcher's `RUNTIME=fly` branch). Provides `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, and `decide_teardown()` (classifies `$PILA_REMOTE_EXIT_RC` and routes to stop for pause-on-failure or destroy on success / cancellation / rate-limit). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Machine lifecycle*. |
+| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, and `re-seed.sh`. Provides `update_run_json()` (atomic merge into the run sidecar) and `wait_for_started()` (poll Fly Machine status until ready). |
+| `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs. Reads `fly_machine_id` from the sidecar, runs `flyctl machine start`, waits for `started`, and clears `paused_at`/`pause_reason`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7. |
+| `scripts/remote/seed-auth.sh` | Worker auth + config seeding (sourced by the launcher after `provision_machine()` returns). Provides `seed_auth()`, which delivers `~/.claude.json` + `~/.claude/` + git identity to the remote machine via `flyctl machine exec` tar-pipe and git config calls. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Worker auth + config seeding*. |
+| `scripts/remote/seed-repo.sh` | Two-channel repo seeding helper (sourced by the launcher after `provision_machine()` succeeds). Provides `seed_repo()`: full-history partial clone via `git clone --filter=blob:none`, then rsync of the local dirty set via `flyctl machine exec tar`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Repo seeding*. |
+| `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Wakes a paused machine, runs a safety check, and re-runs `seed_repo_dirty`. Invoked by `pila --re-seed <run-id>` and the auto-re-seed step on `--resume --runtime fly`. |
+| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by the launcher after remote orchestration succeeds). Provides `fetch_branch()`: discovers the completed run-id on the machine, streams the `pila/runs/<run-id>` git bundle to the host via `git fetch`, and tars `.pila/runs/<run-id>/` back so the existing host-side finalize block (push + `gh pr create`) runs unchanged. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Run branch stream-back*. |
+| `scripts/remote/attach.sh` | PTY-over-SSH attach for `pila --attach`. Resolves the Fly Machine ID for a run and execs `flyctl ssh console` (no sshd in the image; hallpass is platform-injected). `--tail` mode replaces the shell with `tail -F` of the orchestrator log. |
+| `commands/pila.md` | Thin plugin skill — reachable as `/pila` from Claude Code; relays the `--clarify` Q-and-A flow |
+| `skills/judge-llm-batch/SKILL.md` | Post-run skill — scores captured `claude -p` calls against a 3-dimensional accuracy rubric (schema, factual grounding, hallucination-freeness) |
+| `skills/llm-self-heal/SKILL.md` | Post-run skill — autonomous self-heal loop that proposes prompt patches against failing call types, replays under judge scoring, and reports the best-found patch |
+| `CLAUDE.md` | Repo-local guidance for Claude Code working in this codebase (the three-layer rule, mandatory requirements, code style) |
 | `CONTRIBUTING.md` | Development setup, task-completion checklist, PR conventions |
+| `SECURITY.md` | Threat model, supported versions, vulnerability reporting policy |
+| `CODE_OF_CONDUCT.md` | Contributor Covenant Code of Conduct |
+| `CHANGELOG.md` | Release notes (Keep a Changelog format, SemVer) |
+| `docs/DESIGN.md` | Full design document and rationale (theory) |
+| `docs/IMPLEMENTATION.md` | Current code-surface spec — functions, caps, schemas (mechanism) |
+| `docs/INSTALL.md` | Per-OS container runtime setup and the Fly.io runtime prerequisites |
+| `docs/USAGE.md` | End-to-end walkthrough of one Pila run |
+| `remote-task-system.md` | Platform-agnostic design of the remote (Fly.io) task-execution system: seeding, lifecycle, PTY attach, pause-on-failure |
 
 ## Safety
 

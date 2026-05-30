@@ -212,7 +212,7 @@ provision_machine() {
   if [ -z "${FLY_IMAGE_TAG:-}" ]; then
     echo "pila: FLY_IMAGE_TAG is not set — cannot start a Fly Machine" >&2
     echo "  Build and push the pila image first:" >&2
-    echo "    ./scripts/publish-image.sh --app $FLY_APP --push" >&2
+    echo "    ./scripts/remote/build-push.sh --app $FLY_APP --push" >&2
     return 1
   fi
 

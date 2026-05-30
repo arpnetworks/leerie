@@ -261,7 +261,10 @@ schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
   containers. Default: `local` (nerdctl on the local container
   runtime). `fly` routes each worker through Fly.io Machines instead
   — requires `flyctl` logged in (`fly auth status`) and a published
-  pila image (see `scripts/publish-image.sh`). Also `PILA_RUNTIME`
+  pila image (built and pushed by `scripts/remote/build-push.sh`; the
+  launcher's `ensure_image()` step also auto-publishes on the first
+  remote run when the registry tag is missing — opt out with
+  `--no-auto-publish`). Also `PILA_RUNTIME`
   env var or `runtime = fly` in `pila.toml` (committed per-repo
   default; outranked by env and CLI). Precedence: `--runtime` →
   `PILA_RUNTIME` → `pila.toml` → default `local`.
@@ -269,4 +272,4 @@ schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
   for worker processes.
 
 The full inventory of CLI flags and environment variables is in the
-[README "Install and run" section](../README.md#install-and-run).
+[README "Configuration" section](../README.md#configuration).

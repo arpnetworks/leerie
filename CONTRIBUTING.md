@@ -1,8 +1,8 @@
 # Contributing to Pila
 
 Thanks for considering a contribution. Pila is small on purpose — a
-single-file Python orchestrator (~1600 LOC), stdlib-only on the Python
-side, with one dev dependency (`pytest`). The orchestrator runs inside a
+single-file Python orchestrator, stdlib-only on the Python side, with
+one dev dependency (`pytest`). The orchestrator runs inside a
 container (containerd via Colima on macOS, native on Linux); see
 [`docs/INSTALL.md`](docs/INSTALL.md) for the per-OS runtime setup. A good
 contribution preserves that shape: a focused fix or a clearly-bounded

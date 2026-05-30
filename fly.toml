@@ -4,7 +4,7 @@
 # started via `flyctl machine run` or the Machines API, torn down or stopped
 # when the run completes. There is no HTTP service, no warm pool.
 #
-# Image published by: scripts/publish-image.sh --app pila --push
+# Image published by: scripts/remote/build-push.sh --app pila --push
 # Deploy command:     flyctl deploy --app pila --image registry.fly.io/pila:<version>
 # Per-task launch:    flyctl machine run registry.fly.io/pila:<version> \
 #                       --app pila --region iad \
@@ -14,7 +14,7 @@
 app            = "pila"
 primary_region = "iad"
 
-# Image built and pushed by scripts/publish-image.sh.
+# Image built and pushed by scripts/remote/build-push.sh.
 # The version tag is updated to match .claude-plugin/plugin.json on each release.
 [build]
   image = "registry.fly.io/pila:0.2.1"
