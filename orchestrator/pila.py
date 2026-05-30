@@ -3712,19 +3712,41 @@ def _extract_tool_result_text(block: dict) -> str:
 
 
 def _tag_each_line(prefix: str, content: str) -> str:
-    """Prefix every non-empty line of `content` with `prefix`. Used
-    for tool_result summaries whose content can be multi-line (a
-    Read of a source file, a Grep result, a multi-line schema
-    error). Without this, the tag appears only on line 1 and
-    subsequent lines are bare text — in a parallel run with
-    max_parallel=4, untagged lines from one worker would be
-    indistinguishable from another worker's output.
+    """Prefix the first non-empty line of `content` with `prefix`;
+    subsequent lines get a width-matched continuation prefix that
+    preserves the `[<sid>` worker-attribution segment but drops the
+    event-kind token.
 
-    For single-line content this is a no-op (returns the same
-    string as `f'{prefix} {content}'`). For empty content it
-    returns the empty string so the caller's truthiness check
-    naturally drops it."""
-    return "\n".join(f"{prefix} {ln}" for ln in content.splitlines() if ln)
+    Used for tool_result summaries whose content can be multi-line
+    (a Read of a source file, a Grep result, a stack trace, a
+    compound command's stdout). Lines 2+ must stay attributable to
+    this worker — in a parallel run with max_parallel=4, untagged
+    continuation lines would be indistinguishable from another
+    worker's output. The kind token (`tool-fail`, `tool-ok`)
+    repeated on every line, however, is per-tool-call information
+    that obscures the actual content when repeated.
+
+    For single-line content the result is `f'{prefix} {content}'`.
+    For empty content it returns the empty string so the caller's
+    truthiness check naturally drops it. If `prefix` doesn't match
+    the expected `<indent>[<sid> <kind>]` shape (defensive — every
+    current caller does), the helper falls back to repeating
+    `prefix` on every line."""
+    lines = [ln for ln in content.splitlines() if ln]
+    if not lines:
+        return ""
+    open_b = prefix.find("[")
+    close_b = prefix.rfind("]")
+    cont = prefix
+    if open_b >= 0 and close_b > open_b:
+        inside = prefix[open_b + 1 : close_b]
+        sid, _, kind = inside.partition(" ")
+        if sid and kind:
+            keep = prefix[: open_b + 1] + sid
+            pad = " " * (close_b - len(keep))
+            cont = keep + pad + "]"
+    return "\n".join([f"{prefix} {lines[0]}",
+                      *(f"{cont} {ln}" for ln in lines[1:])])
 
 
 def _summarize_tool_use(sid: str, block: dict, verbosity: str) -> str:
@@ -3850,9 +3872,12 @@ def _summarize_stream_event(sid: str, event: dict, verbosity: str) -> str | None
                 # tool error names exactly the missing fields / the
                 # rejection reason — the diagnostic information a user
                 # needs to act. Mid-cut error messages drop the useful
-                # detail. Multi-line errors (rare but possible) are
-                # tagged per-line so lines 2+ stay attributable to
-                # this worker; see _tag_each_line.
+                # detail. Multi-line errors (rare but possible) get the
+                # `tool-fail` tag on line 1 and a width-matched
+                # continuation prefix (keeping the sid) on lines 2+
+                # so attribution survives parallel runs without
+                # repeating the kind token on every line — see
+                # _tag_each_line.
                 return _tag_each_line(f"  [{sid} tool-fail]", content_txt)
             # Successful tool results are file-only at stream; debug
             # gets the FULL content. The user opting into debug is
@@ -3860,8 +3885,11 @@ def _summarize_stream_event(sid: str, event: dict, verbosity: str) -> str | None
             # defeats the level. A worker reading a large file will
             # flood the orchestrator log at debug — that's the
             # accepted trade-off. Multi-line content (a Read of a
-            # source file, a Grep of code) is tagged per-line so
-            # every line is attributable to this worker.
+            # source file, a Grep of code) gets the `tool-ok` tag
+            # on line 1 and a width-matched continuation prefix
+            # (keeping the sid) on lines 2+ so attribution survives
+            # parallel runs without repeating the kind token on
+            # every line.
             if verbosity == "debug":
                 return _tag_each_line(f"  [{sid} tool-ok]", content_txt)
         return None

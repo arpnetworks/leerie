@@ -394,12 +394,14 @@ def test_tool_success_visible_at_debug(pila):
     assert "tool-ok" in out
 
 
-def test_tool_failure_multiline_each_line_tagged(pila):
+def test_tool_failure_multiline_first_line_kind_tag_rest_continuation(pila):
     """A multi-line tool-fail content (rare but possible — e.g. a
-    schema validator with a multi-line error format) must tag every
-    line with `[<sid> tool-fail]`. Otherwise lines 2+ would appear
-    as bare text in the orchestrator log, indistinguishable from
-    other workers' output in a parallel run."""
+    schema validator with a multi-line error format, or a compound
+    Bash command whose last stage errored). Line 1 carries
+    `[<sid> tool-fail]`; lines 2+ carry a width-matched continuation
+    prefix that keeps the sid (parallel-worker attribution) but
+    drops the kind token (the per-tool-call info is redundant on
+    every line and obscures the actual content)."""
     multi_err = ("line one of the error\n"
                  "line two with more detail\n"
                  "line three with a trailing fact")
@@ -409,19 +411,26 @@ def test_tool_failure_multiline_each_line_tagged(pila):
     ]}}
     out = pila._summarize_stream_event("x", event, "stream")
     assert out is not None
-    # Every line carries the tag.
-    assert "[x tool-fail] line one of the error" in out
-    assert "[x tool-fail] line two with more detail" in out
-    assert "[x tool-fail] line three with a trailing fact" in out
+    lines = out.splitlines()
+    assert lines[0] == "  [x tool-fail] line one of the error"
+    # Lines 2-3 share a continuation prefix that has the sid but
+    # not the kind, and is the same width as the original.
+    cont = lines[1][: len("  [x tool-fail]")]
+    assert len(cont) == len("  [x tool-fail]")
+    assert "x" in cont
+    assert "tool-fail" not in cont
+    for ln in lines[1:]:
+        assert ln.startswith(cont)
+    assert lines[1].endswith(" line two with more detail")
+    assert lines[2].endswith(" line three with a trailing fact")
 
 
-def test_tool_success_multiline_each_line_tagged_at_debug(pila):
-    """A Read of a multi-line file at debug verbosity tags every
-    non-empty line with `[<sid> tool-ok]`. Earlier behavior
-    returned the content with a single leading tag, leaving lines
-    2+ as bare text. Per the same per-line-attribution principle
-    as multi-line assistant text and the per-line timestamp fix
-    in Pass-15."""
+def test_tool_success_multiline_first_line_kind_tag_rest_continuation_at_debug(pila):
+    """A Read of a multi-line file at debug verbosity: line 1 gets
+    `[<sid> tool-ok]`; lines 2+ get a width-matched continuation
+    that keeps the sid. Blank interior lines are filtered (the
+    helper drops empty lines so the result doesn't end with a
+    bare-prefix-and-nothing entry)."""
     file_content = "def foo():\n    return 1\n\ndef bar():\n    return 2"
     event = {"type": "user", "message": {"content": [
         {"type": "tool_result", "is_error": False,
@@ -429,14 +438,20 @@ def test_tool_success_multiline_each_line_tagged_at_debug(pila):
     ]}}
     out = pila._summarize_stream_event("x", event, "debug")
     assert out is not None
-    # Every non-empty line is tagged.
-    assert "[x tool-ok] def foo():" in out
-    assert "[x tool-ok]     return 1" in out
-    assert "[x tool-ok] def bar():" in out
-    assert "[x tool-ok]     return 2" in out
-    # The blank line between functions must NOT produce a bare
-    # `[x tool-ok] ` entry.
-    assert "[x tool-ok] \n" not in out and not out.endswith("[x tool-ok] ")
+    lines = out.splitlines()
+    assert lines[0] == "  [x tool-ok] def foo():"
+    cont = lines[1][: len("  [x tool-ok]")]
+    assert len(cont) == len("  [x tool-ok]")
+    assert "x" in cont
+    assert "tool-ok" not in cont
+    # Every non-first line shares the same continuation prefix.
+    for ln in lines[1:]:
+        assert ln.startswith(cont)
+    # Blank interior lines are filtered out — exactly 4 non-blank.
+    assert len(lines) == 4
+    assert lines[1].endswith("    return 1")
+    assert lines[2].endswith(" def bar():")
+    assert lines[3].endswith("    return 2")
 
 
 def test_tool_success_not_truncated_at_debug(pila):
