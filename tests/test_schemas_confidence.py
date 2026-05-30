@@ -1,5 +1,5 @@
-"""Structural tests for the confidence/status fields added to the planner
-and implementer schemas (DESIGN §8).
+"""Structural tests for the confidence/status fields added to the planner,
+implementer, and conformer schemas (DESIGN §8).
 
 The point of pinning these structural contracts is mechanical enforcement
 of DESIGN §12 / §8: a worker that skipped self-gating fails its own JSON
@@ -71,6 +71,27 @@ def test_implementer_confidence_axes_are_numbers(pila):
     assert props["solution"]["type"] == "number"
 
 
+def test_conformer_schema_top_level_required(pila):
+    """Conformer must emit confidence (the §8 self-gate). Same
+    structural enforcement as planner/implementer — the orchestrator
+    does not read it, but the schema rejects payloads that skip it."""
+    conf = pila.SCHEMAS["conformer"]
+    required = set(conf["required"])
+    assert "confidence" in required
+
+
+def test_conformer_schema_confidence_required_fields(pila):
+    """The conformer's confidence object must require the same
+    discipline fields as planner/implementer (DESIGN §8 — same
+    disciplines, different axes)."""
+    conf = pila.SCHEMAS["conformer"]["properties"]["confidence"]
+    assert conf["type"] == "object"
+    required = set(conf["required"])
+    expected = {"conformance", "basis", "falsifiers_tested",
+                "contradictions_reconciled", "gap_to_close"}
+    assert expected.issubset(required)
+
+
 def test_gap_to_close_keys_match_score_axes(pila):
     """The gap_to_close sub-object's keys mirror the score axes so a
     below-threshold score has a clear field to fill. Catches future
@@ -81,3 +102,5 @@ def test_gap_to_close_keys_match_score_axes(pila):
         "task_understanding", "decomposition_quality"}
     impl_gap = pila.SCHEMAS["implementer"]["properties"]["confidence"]["properties"]["gap_to_close"]
     assert set(impl_gap["properties"].keys()) == {"root_cause", "solution"}
+    conformer_gap = pila.SCHEMAS["conformer"]["properties"]["confidence"]["properties"]["gap_to_close"]
+    assert set(conformer_gap["properties"].keys()) == {"conformance"}

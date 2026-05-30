@@ -48,9 +48,7 @@ validates it before executing anything, so deviation is rejected.
       "timeout_s": <integer seconds>
     },
     ...
-  ],
-  "confidence": "<short statement>",
-  "notes": "<optional reasoning>"
+  ]
 }
 ```
 
@@ -108,9 +106,7 @@ A Maven repo whose README says "build with `./mvnw clean install`":
      "command": ["mvn", "-B", "dependency:go-offline"],
      "working_dir": ".",
      "timeout_s": 1800}
-  ],
-  "confidence": "Maven repo with pom.xml; offline-resolve is the standard pre-build install step",
-  "notes": "README references ./mvnw which wraps the same Maven CLI."
+  ]
 }
 ```
 
@@ -123,9 +119,7 @@ A bare `pyproject.toml` Django-style repo with no lockfile:
      "command": ["pip", "install", "-e", "."],
      "working_dir": ".",
      "timeout_s": 600}
-  ],
-  "confidence": "README's 'How to install Django' section documents pip install -e .",
-  "notes": "Editable install of the project itself; no lockfile means no sync step."
+  ]
 }
 ```
 
@@ -135,8 +129,6 @@ A pure-docs repo:
 {
   "recipe": [
     {"kind": "none", "command": [], "working_dir": ".", "timeout_s": 0}
-  ],
-  "confidence": "No code surface; only markdown",
-  "notes": ""
+  ]
 }
 ```

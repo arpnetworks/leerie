@@ -1240,10 +1240,8 @@ on the classification.
 
 Between Phase 3 and Phase 4, `write_plan()` persists the merged plan
 (`.pila/plan.json`) and per-subtask spec files
-(`.pila/subtasks/<id>.json`), and `detect_test_runner()` scans for a
-deterministic test harness (pytest, npm, go, cargo, make) — stored in
-`state['test_runner']` for the conformance phase's advisory test run
-(consumed via `_infer_build_lint_test()`).
+(`.pila/subtasks/<id>.json`). The conformance phase derives its
+advisory test command separately via `_infer_build_lint_test()`.
 
 `plan.json` carries `{task, waves, subtasks, preconditions}`. The
 `preconditions` array is the deduped list of `extent: external` `requires`
@@ -2409,8 +2407,6 @@ written somewhere in `orchestrator/pila.py`. The coupling test in
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
-| `criteria_locks` | dict[str, str] | **deprecated** — sha256 hashes of locked criteria files. The criteria-lock discipline (DESIGN §9) was retired when the criteria file became informational; this field is no longer written by the orchestrator but is read-tolerated on resume of old runs. |
-| `criteria_revisions` | list[dict] | **deprecated** — append-only audit log of the retired worker-initiated revision channel. No longer written; read-tolerated on resume of old runs. |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |
 | `worker_count` | int | running total of `claude -p` invocations against `max_total_workers` |
 | `current_phase` | str | the orchestrator's active phase string (e.g. `"phase 2: planning"`, `"phase 4-5: implementing"`); written at each phase entry and read by `_memory_sampler` so each `memory.ndjson` sample can be correlated with the phase that produced it. Empty string before phase 1 fires |
@@ -2424,8 +2420,6 @@ written somewhere in `orchestrator/pila.py`. The coupling test in
 | `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `PILA_DANGEROUSLY_SKIP_PERMISSIONS` / `pila.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `verbosity` | str | resolved verbosity level (`quiet` / `normal` / `stream` / `debug`); re-resolved fresh on every run, including `--resume`, so the user can dial up or down without editing state |
 | `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler, provision) via `--add-dir`. Resolved from `--inspect-dir` / `PILA_INSPECT_DIRS` / `inspect_dirs` in `pila.toml`; re-resolved fresh on every run, including `--resume`, so the user can add or remove paths without editing state. Empty list when nothing is configured |
-| `test_runner` | list[str] | detected short-circuit test command |
-| `integrator_failure` | dict | unresolvable conflict from `integrate_wave` (non-fatal signal log) |
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
 | `scope_warnings` | dict[str, dict] | oversized-diff warnings from `check_diff_scope` (non-fatal signal log) |
 | `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log) — keys are subtask ids, values are `{result, warnings}` where `result` is the last conformer payload (or null on crash) and `warnings` is the list of advisory strings produced across all conformance rounds. Populated only on subtasks whose implementer reached `status: "complete"`. See DESIGN §9 *Post-work conformance* |
@@ -2501,11 +2495,7 @@ type. Required fields, current shape:
   with the worker's own prior statements, named with the kept version's
   evidence), `gap_to_close` (object with optional `task_understanding` and
   `decomposition_quality` strings — populated when either score is below
-  9.0). Optional: `source_of_truth` (enum `codebase` / `research` / `both`).
-  The `source_of_truth` enum is *defensive*: the orchestrator does not
-  currently consume the planner's echoed value (it reads
-  `answers["source_of_truth"]` instead); the enum future-proofs against a
-  future consumer reading a garbled value. Each subtask is `{id, title,
+  9.0). Each subtask is `{id, title,
   success_criteria_seed (all required), intent, scope_note,
   files_likely_touched, depends_on, requires, provides, size,
   investigation_notes}`. **`requires` is an array of objects, not bare
@@ -2560,17 +2550,19 @@ type. Required fields, current shape:
   (string), summary (string)}` — `ran: false` when the tool is not
   applicable to the repo; `passed` is irrelevant when `ran: false`),
   `summary` (string — one-line description of what the conformance pass
-  did). Optional: `confidence` (worker-internal self-gate, not consumed by
-  the orchestrator: `{conformance: number 1–10, basis: string,
-  falsifiers_tested: array, contradictions_reconciled: array, gap_to_close:
-  object}`). The schema enforces the structural part of DESIGN §9
-  *Post-work conformance*: a conformer that skipped its own honesty
-  discipline (e.g. wrote `passed: true` without a `command`) fails the
-  schema before the orchestrator reads it. The cross-field invariants —
-  residuals require a non-empty `rules_files_read`, every
-  `rule_violations_fixed` item cites a non-empty `rule`, every
-  `docs_updates` / `tests_updates` `path` exists in the worktree — are
-  enforced by `validate_conformance_result()`.
+  did), `confidence` (worker-internal self-gate, not consumed by the
+  orchestrator: required keys `conformance` (number 1–10), `basis`
+  (string), `falsifiers_tested` (array of strings), `contradictions_reconciled`
+  (array of strings), `gap_to_close` (object — populated when conformance
+  is below 9.0); see DESIGN §8 for the disciplines these fields make
+  mechanically required). The schema enforces the structural part of
+  DESIGN §9 *Post-work conformance*: a conformer that skipped its own
+  honesty discipline (e.g. wrote `passed: true` without a `command`, or
+  omitted the self-gate block) fails the schema before the orchestrator
+  reads it. The cross-field invariants — residuals require a non-empty
+  `rules_files_read`, every `rule_violations_fixed` item cites a non-empty
+  `rule`, every `docs_updates` / `tests_updates` `path` exists in the
+  worktree — are enforced by `validate_conformance_result()`.
 - **judge** — required: `passed` (bool — aggregate verdict, true only when all
   three dimensions are true), `dimensions` (object with required boolean fields
   `schema_ok`, `factual_ok`, `hallucination_ok`), `rationale` (str — 1–3

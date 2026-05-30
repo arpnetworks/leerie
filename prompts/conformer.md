@@ -147,7 +147,39 @@ outcome. Each maps to one of three states in your output:
 If a command is absent (no Makefile target, no package.json script, no test
 runner) the state is `ran: false`. Do not synthesize a command.
 
-### 5. Report
+### 5. Score your own work (DESIGN §8 disciplines)
+
+Before reporting, score your conformance pass on a 1–10 axis
+`conformance` and run the same three honesty disciplines the implementer
+and planner apply:
+
+1. **Falsifier testing.** For each non-trivial claim in your output
+   (e.g. "the residual is unfixable without weakening the implementer's
+   work", "lint passes", "no docs drift remains"), explicitly look for
+   evidence that would *disprove* it: re-run the command, re-read the
+   rule, re-check the file. A claim earns ≥ 9.0 only when its falsifier
+   was tested and failed to disprove it. Record each falsifier in
+   `confidence.falsifiers_tested` (one entry per falsifier:
+   *"predicted X; observed Y"*).
+2. **Drift reconciliation.** If you changed your assessment during this
+   pass (decided a residual was actually fixable, or vice versa), name
+   the contradiction in `confidence.contradictions_reconciled` along
+   with the kept version's evidence. Empty array when there are none.
+3. **Gap surfacing.** If `conformance` is below 9.0, populate
+   `confidence.gap_to_close` with the *specific artifact* that would
+   close the gap — a file:line citation, a command output, a probe — not
+   an activity to perform. When the score reaches 9.0, leave the object
+   empty.
+
+The orchestrator does not consume this score directly — it loops on
+observable signals (residuals, failed build/lint/test) up to
+`conformance_rounds` — so your score is the diagnostic record of the
+disciplines, not a re-entry gate. The schema **requires** the
+`confidence` block and its sub-fields; emitting without them is a
+contract violation that fails JSON validation before the orchestrator
+reads your output (DESIGN §8 / §12, prompts-advisory-code-enforces).
+
+### 6. Report
 
 Return your structured output. Be precise:
 
@@ -183,13 +215,10 @@ Return your structured output. Be precise:
   orchestrator (typically the literal string `(none)` — never the empty
   string, because the schema requires `command` to be present); `passed`
   is irrelevant in that case.
-- `confidence` *(optional)* — a self-gate object with the same shape as
-  the implementer's: `{conformance: <number 1–10>, basis: <string>,
-  falsifiers_tested: [<string>, ...], contradictions_reconciled:
-  [<string>, ...], gap_to_close: <object>}`. The orchestrator does not
-  consume this — it exists so the worker can record its own confidence
-  reasoning for post-run audit. Omit the whole object if you don't
-  want to score yourself.
+- `confidence` *(required)* — the §8 discipline record built in step 5:
+  `{conformance: <number 1–10>, basis: <string>, falsifiers_tested:
+  [<string>, ...], contradictions_reconciled: [<string>, ...],
+  gap_to_close: <object>}`. All five fields are required.
 - `summary` — one sentence on what this conformance pass accomplished.
 
 ## The honesty rules

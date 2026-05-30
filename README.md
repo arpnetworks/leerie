@@ -562,13 +562,12 @@ mechanism is load-bearing, not optional.
 
 **What if my project has no test runner?**
 That's fine — running tests is advisory only (DESIGN §9 *Post-work
-conformance*). When `detect_test_runner()` finds nothing, the
-conformance phase reports the test axis as not-applicable and surfaces
-no warning. The subtask's terminal status is determined by the
+conformance*). When `_infer_build_lint_test()` finds no test command,
+the conformance phase reports the test axis as not-applicable and
+surfaces no warning. The subtask's terminal status is determined by the
 implementer's confidence gate (DESIGN §8), not by whether tests ran.
-See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §4 for
-`detect_test_runner()` and §5 for the conformance phase's advisory
-contract.
+See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §5 for the
+conformance phase's advisory contract.
 
 **Can I see what each worker did?**
 Yes. Every worker commits to its own `pila/subtasks/<run-id>/<subtask-id>`

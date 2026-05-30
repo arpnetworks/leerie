@@ -152,15 +152,13 @@ DEFAULT_CAPS = {
 STATE_FIELDS = (
     "task", "started_at", "finished_at",
     "waves", "completed_waves", "subtask_status",
-    "criteria_locks", "criteria_revisions",
     "blocked",
     "worker_count", "telemetry",
     "categories", "classifier_questions", "answers",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
     "verbosity", "inspect_dirs",
-    "test_runner",
-    "integrator_failure", "integrator_warnings", "scope_warnings",
+    "integrator_warnings", "scope_warnings",
     "conformance",
     "provision",
     # external_preconditions: planner-declared `extent: external` requires
@@ -527,14 +525,6 @@ SCHEMAS: dict[str, dict] = {
         "required": ["domain", "subtasks", "status", "confidence"],
         "properties": {
             "domain": {"type": "string"},
-            # Defensive: the planner echoes back what it was given; downstream
-            # code reads from answers["source_of_truth"] (validated in
-            # gather_answers), not from this field. Kept as future-proofing in
-            # case a consumer of the planner's output appears later.
-            "source_of_truth": {
-                "type": "string",
-                "enum": ["codebase", "research", "both"],
-            },
             # DESIGN §8 planner gate: a planner whose evidence gate cannot
             # clear within confidence_rounds emits status="blocked" with an
             # empty subtasks list and the gap analysis in
@@ -807,7 +797,7 @@ SCHEMAS: dict[str, dict] = {
             "subtask_id", "rules_files_read",
             "rule_violations_fixed", "rule_violations_residual",
             "docs_updates", "tests_updates",
-            "build", "lint", "tests", "summary",
+            "build", "lint", "tests", "summary", "confidence",
         ],
         "properties": {
             "subtask_id": {"type": "string"},
@@ -862,8 +852,19 @@ SCHEMAS: dict[str, dict] = {
             "lint": _CONFORMER_BLT_PROP,
             "tests": _CONFORMER_BLT_PROP,
             "summary": {"type": "string"},
+            # Worker-internal: the conformer prompt asks the worker to run
+            # the §8 disciplines (falsifier testing, drift reconciliation,
+            # gap surfacing) and record the result here. The orchestrator
+            # does not consume the score — it loops on observable signals
+            # (residuals, failed build/lint/test) up to `conformance_rounds`.
+            # Required at the schema level so a worker that skipped the
+            # disciplines fails its own JSON schema before the orchestrator
+            # reads the payload (the structural enforcement called out in
+            # DESIGN §8 / §12).
             "confidence": {
                 "type": "object",
+                "required": ["conformance", "basis", "falsifiers_tested",
+                             "contradictions_reconciled", "gap_to_close"],
                 "properties": {
                     "conformance": {"type": "number"},
                     "basis": {"type": "string"},
@@ -871,7 +872,12 @@ SCHEMAS: dict[str, dict] = {
                         "type": "array", "items": {"type": "string"}},
                     "contradictions_reconciled": {
                         "type": "array", "items": {"type": "string"}},
-                    "gap_to_close": {"type": "object"},
+                    "gap_to_close": {
+                        "type": "object",
+                        "properties": {
+                            "conformance": {"type": "string"},
+                        },
+                    },
                 },
             },
         },
@@ -934,8 +940,6 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
-            "confidence": {"type": "string"},
-            "notes": {"type": "string"},
         },
     },
 }
@@ -3166,46 +3170,6 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
     st.save()
 
 
-def detect_test_runner() -> list[str] | None:
-    """Scan cwd for a known deterministic test harness.
-    Returns the command as a list, or None if nothing is recognisable."""
-    cwd = Path.cwd()
-
-    # Python: pytest
-    pt = cwd / "pyproject.toml"
-    if (cwd / "pytest.ini").exists() or (cwd / "setup.cfg").exists():
-        return ["python", "-m", "pytest", "--tb=short", "-q"]
-    if pt.exists() and "pytest" in pt.read_text():
-        return ["python", "-m", "pytest", "--tb=short", "-q"]
-
-    # JavaScript / TypeScript: npm test
-    pkg = cwd / "package.json"
-    if pkg.exists():
-        try:
-            scripts = json.loads(pkg.read_text()).get("scripts", {})
-            if "test" in scripts:
-                return ["npm", "test"]
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    # Go
-    if (cwd / "go.mod").exists():
-        return ["go", "test", "./..."]
-
-    # Rust
-    if (cwd / "Cargo.toml").exists():
-        return ["cargo", "test", "--quiet"]
-
-    # Make: test target
-    mk = cwd / "Makefile"
-    if mk.exists():
-        content = mk.read_text()
-        if "\ntest:" in content or content.startswith("test:"):
-            return ["make", "test"]
-
-    return None
-
-
 # --- per-repo dependency provisioning ----------------------------------------
 # See DESIGN.md §6½ "Per-repo dependency provisioning" and IMPLEMENTATION.md
 # §6½ for the layered design (.pila-setup.sh → mise install → table → LLM
@@ -3942,8 +3906,7 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
 
 # --- result cross-field validation -------------------------------------------
 
-def validate_result(result: dict,
-                    pila_dir: Path | None = None) -> str | None:
+def validate_result(result: dict) -> str | None:
     """Cross-field invariant checks that JSON Schema cannot express.
     Returns an error string if the result is self-contradictory, None if ok.
 
@@ -3955,10 +3918,7 @@ def validate_result(result: dict,
     and surface as conformance warnings, but do not affect terminal
     status. The other branches (handoff, blocked, failed, clarification)
     still enforce the mechanical-precondition fields their next-step
-    consumers require.
-
-    `pila_dir` is accepted for backwards compatibility with callers
-    that still pass it; it is no longer consulted."""
+    consumers require."""
     status = result.get("status")
     if status == "incomplete-handoff":
         cp = result.get("checkpoint_path")
@@ -8134,7 +8094,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
         # cross-field invariant check — catches a worker that lied about
         # status. A self-contradictory result means the worker is malfunctioning
         # or dishonest: non-retryable by `_retryable_failure`.
-        problem = validate_result(res, pila_dir)
+        problem = validate_result(res)
         if problem:
             log(f"  result invariant violated for {sid}: {problem}")
             done = await fail(problem)
@@ -8348,13 +8308,9 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             merge_err = await check_merge_committed(staging)
             if merge_err:
                 await run_proc(["git", "merge", "--abort"], cwd=str(staging))
-                st.data["integrator_failure"] = {
-                    "subtask": sid,
-                    "reason": f"integrator claimed 'resolved' but {merge_err}"}
-                st.save()
                 die(f"integrator for {sid} returned 'resolved' but {merge_err}. "
                     f"The merge was aborted; {compute_run_branch(st.run_id)} "
-                    "is clean. State saved — resolve and re-run with --resume.")
+                    "is clean. Resolve and re-run with --resume.")
             commit_err = await check_integrator_commit(staging)
             if commit_err:
                 # non-fatal: log and record, but don't undo the integration
@@ -8373,10 +8329,6 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             log(f"  integrator could not resolve {sid}: "
                 f"{ires.get('status')} — {diagnosis}")
             await run_proc(["git", "merge", "--abort"], cwd=str(staging))
-            st.data["integrator_failure"] = {
-                "subtask": sid, "status": ires.get("status"),
-                "diagnosis": diagnosis}
-            st.save()
             die(f"integrator could not integrate {sid} "
                 f"({ires.get('status')}): {diagnosis}\n"
                 f"The in-progress merge was aborted; "
@@ -8665,10 +8617,6 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
         st.save()
         subtasks, waves = schedule(plans)
         validate_plan(subtasks)
-        runner = detect_test_runner()
-        if runner:
-            log(f"detected test runner: {' '.join(runner)}")
-        st.data["test_runner"] = runner
         write_plan(pila_dir, task, st, subtasks, waves)
 
     await phase_execute(pila_dir, st, caps, models, efforts)

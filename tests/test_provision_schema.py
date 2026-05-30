@@ -67,19 +67,6 @@ def test_provision_command_is_argv_list(pila):
     assert cmd_schema["minItems"] == 1
 
 
-def test_provision_optional_top_level_fields(pila):
-    """confidence and notes are documented optional top-level fields
-    the LLM may emit for the audit log. Their absence must not reject
-    a payload; pin them as declared properties so removing them is a
-    deliberate decision, not an accident."""
-    props = pila.SCHEMAS["provision"]["properties"]
-    assert "confidence" in props
-    assert "notes" in props
-    # Not in required.
-    assert "confidence" not in set(pila.SCHEMAS["provision"]["required"])
-    assert "notes" not in set(pila.SCHEMAS["provision"]["required"])
-
-
 def test_provision_argv0_allowlist_intersects_documented_managers(pila):
     """The argv[0] allowlist enforced by validate_provision_recipe is
     the §12 carve-out's mechanical containment. Pin it against the

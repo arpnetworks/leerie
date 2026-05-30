@@ -160,7 +160,6 @@ Return **only** this JSON object as your final message — no prose, no fences:
 ```json
 {
   "domain": "bug-fixing",
-  "source_of_truth": "codebase",
   "status": "ready",
   "confidence": {
     "task_understanding": 9.4,

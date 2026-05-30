@@ -206,8 +206,8 @@ evidence-gated loop logic that produces this signal.
 
 **Integration fails.** The integrator can't merge a subtask branch into
 the run branch — usually a conflict it cannot resolve behaviorally.
-Pila records the failure in `state['integrator_failure']` (inside
-`.pila/runs/<run-id>/state.json`) and exits. Pull up the conflicting
+Pila prints the diagnosis to stderr, aborts the in-progress merge so
+the run branch stays clean, and exits non-zero. Pull up the conflicting
 branches yourself, resolve, and resume.
 
 **The run is interrupted.** Ctrl-C, system reboot, budget-cap hit. Run

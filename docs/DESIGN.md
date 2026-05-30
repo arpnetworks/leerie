@@ -1149,9 +1149,7 @@ signal (§8), the bar is the model's *anchored confidence in the
 solution*, not the contents of a text file — there is no longer a
 fixed bar to lower. The lock and the proposal channel were removed in
 the same change that consolidated build/lint/test under the conformance
-phase. (State-file readers may still encounter `criteria_locks` and
-`criteria_revisions` keys in old resumed runs; they are read-tolerant
-deprecations, no longer written.)
+phase.
 
 The criteria file remains useful as input to the conformance phase and
 as PR-time documentation, but it does not produce `failed` or `blocked`

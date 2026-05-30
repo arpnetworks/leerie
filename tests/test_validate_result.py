@@ -49,18 +49,6 @@ def test_complete_with_failing_criteria_returns_none(pila):
     }) is None
 
 
-def test_complete_missing_criteria_file_returns_none(pila, tmp_path):
-    """`pila_dir` is accepted for backwards compatibility but no
-    longer consulted — a missing criteria file does not reject
-    `complete`."""
-    (tmp_path / "criteria").mkdir()
-    assert pila.validate_result({
-        "status": "complete",
-        "subtask_id": "feat-001",
-        "criteria_results": [{"criterion": "x", "met": True}],
-    }, pila_dir=tmp_path) is None
-
-
 # --- incomplete-handoff status ---------------------------------------------
 
 def test_incomplete_handoff_without_checkpoint_path_returns_error(pila):
