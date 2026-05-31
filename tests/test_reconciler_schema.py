@@ -1,4 +1,4 @@
-"""Schema tests for `SCHEMAS["reconciler"]` — the four-array output the
+"""Schema tests for `SCHEMAS["reconciler"]` — the seven-array output the
 reconciler worker emits (DESIGN §5, §14).
 
 The schema is consumed by `claude_p()` via `--json-schema` to gate the
@@ -17,7 +17,7 @@ import pytest
 
 
 def _full_valid_output() -> dict:
-    """A reconciler output with all four arrays populated. Useful as a
+    """A reconciler output with all seven arrays populated. Useful as a
     baseline; individual tests mutate copies of this."""
     return {
         "renames": [
@@ -41,6 +41,22 @@ def _full_valid_output() -> dict:
                 "_added_by_reconciler": True,
             },
         ],
+        "dropped_requires": [
+            {"sid": "test-002", "tag": "framework-decision-made",
+             "reason": "The framework choice is recorded by test-002 "
+                       "itself in package.json; no other subtask produces "
+                       "it as a code artifact."},
+        ],
+        "dependency_edges": [
+            {"from": "test-003", "to": "test-004",
+             "reason": "test-003 must produce the schema before test-004 "
+                       "can consume it."},
+        ],
+        "merged_subtasks": [
+            {"into": "test-006", "from": "test-007",
+             "reason": "Both subtasks edit the same bootstrap file and "
+                       "wait on the same authoring decision."},
+        ],
         "unresolvable": [
             {"sid": "test-005",
              "tag": "magic-thing-that-doesnt-exist",
@@ -59,15 +75,47 @@ def test_reconciler_schema_exists(pila):
     assert schema["type"] == "object"
 
 
-def test_reconciler_requires_all_four_arrays(pila):
-    """The four arrays must be present in every output — even if empty.
+def test_reconciler_requires_all_seven_arrays(pila):
+    """All seven arrays must be present in every output — even if empty.
     Each array is independently optional in content (any can be empty)
     but the field itself must be there so callers don't crash on a
-    missing key."""
+    missing key. The seven cover three resolution actions (renames,
+    added_provides, added_subtasks), three cycle-breaking actions
+    (dropped_requires, dependency_edges, merged_subtasks), and one
+    escape hatch (unresolvable)."""
     schema = pila.SCHEMAS["reconciler"]
     required = set(schema["required"])
-    assert required == {"renames", "added_provides",
-                        "added_subtasks", "unresolvable"}
+    assert required == {"renames", "added_provides", "added_subtasks",
+                        "dropped_requires", "dependency_edges",
+                        "merged_subtasks", "unresolvable"}
+
+
+def test_reconciler_dropped_requires_shape(pila):
+    """dropped_requires removes an over-specified extent:in_plan requires
+    entry. Carries (sid, tag, reason) — reason is required so the user
+    sees why the requirement was dropped."""
+    item = pila.SCHEMAS["reconciler"]["properties"]["dropped_requires"]["items"]
+    assert set(item["required"]) == {"sid", "tag", "reason"}
+
+
+def test_reconciler_dependency_edges_shape(pila):
+    """dependency_edges asserts an explicit depends_on ordering between
+    two existing subtasks. Both ids are required (apply step validates
+    existence and die()s on missing); reason explains the asserted
+    ordering."""
+    item = pila.SCHEMAS["reconciler"]["properties"]["dependency_edges"]["items"]
+    assert set(item["required"]) == {"from", "to", "reason"}
+
+
+def test_reconciler_merged_subtasks_shape(pila):
+    """merged_subtasks collapses two subtasks into one. into/from/reason
+    are required; title/intent/success_criteria_seed are optional
+    overrides for restating the merged unit's contract."""
+    item = pila.SCHEMAS["reconciler"]["properties"]["merged_subtasks"]["items"]
+    assert set(item["required"]) == {"into", "from", "reason"}
+    props = item["properties"]
+    for optional in ("title", "intent", "success_criteria_seed"):
+        assert optional in props
 
 
 def test_reconciler_rename_shape(pila):
@@ -128,10 +176,11 @@ def test_reconciler_arrays_can_all_be_empty(pila):
     do (which in practice means phase_reconcile would have
     short-circuited before calling the worker, but the schema must
     still accept it)."""
-    empty = {"renames": [], "added_provides": [],
-             "added_subtasks": [], "unresolvable": []}
+    empty = {"renames": [], "added_provides": [], "added_subtasks": [],
+             "dropped_requires": [], "dependency_edges": [],
+             "merged_subtasks": [], "unresolvable": []}
     # Reach into the schema to confirm `required` covers exactly the
-    # four arrays — any of which being absent is a violation.
+    # seven arrays — any of which being absent is a violation.
     required = set(pila.SCHEMAS["reconciler"]["required"])
     for field in empty:
         assert field in required

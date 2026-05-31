@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -34,6 +35,7 @@ import sys
 import time
 import uuid
 from collections import deque
+from collections.abc import Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -620,18 +622,27 @@ SCHEMAS: dict[str, dict] = {
         },
     },
     "reconciler": {
-        # Output of the reconciler worker (DESIGN §5 / §14). Spawned by
+        # Output of the reconciler worker (DESIGN §5). Spawned by
         # phase_reconcile after phase_plan when the merged planner output
         # has `requires` capability tags with no matching `provides`. The
-        # worker reasons over the full task + merged subtasks + the list
-        # of unresolved tags, and emits one of four actions per tag.
-        # Each of the four output arrays is optional (any can be empty).
-        # The orchestrator applies renames/added_provides/added_subtasks
-        # mechanically; any `unresolvable` entry dies the run with the
-        # worker's stated reason.
+        # worker reasons over the full task + merged subtasks (with their
+        # provides, requires, depends_on, files_likely_touched) and the
+        # list of unresolved tags, then emits seven arrays:
+        #   - 3 resolution actions: renames, added_provides, added_subtasks
+        #     (close unresolved-requires gaps; the common case).
+        #   - 3 cycle-breaking actions: dropped_requires, dependency_edges,
+        #     merged_subtasks (used only in retry mode, when the gate
+        #     detected the first attempt's mutations closed a cycle).
+        #   - 1 escape hatch: unresolvable (genuine gap with no plausible
+        #     resolution; dies the run with the worker's stated reason).
+        # Each array is independently optional (any can be empty). The
+        # orchestrator applies the six action arrays mechanically and
+        # runs Tarjan's SCC + a must-include validator over the post-
+        # mutation graph; `unresolvable` aborts before any mutation.
         "type": "object",
         "required": ["renames", "added_provides", "added_subtasks",
-                     "unresolvable"],
+                     "dropped_requires", "dependency_edges",
+                     "merged_subtasks", "unresolvable"],
         "properties": {
             "renames": {
                 # Rewrite a `requires` tag on one subtask to match an
@@ -689,9 +700,77 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
+            "dropped_requires": {
+                # Cycle-breaking op #1: remove an over-specified
+                # `extent: in_plan` requires entry. Used when the requirement
+                # was an authoring-time decision the same subtask records,
+                # not a code artifact another subtask produces. Silent no-op
+                # on missing sid/entry (mirrors `renames`).
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["sid", "tag", "reason"],
+                    "properties": {
+                        "sid": {"type": "string"},
+                        "tag": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "dependency_edges": {
+                # Cycle-breaking op #2: assert an explicit `depends_on`
+                # ordering between two existing subtasks. Used when both
+                # sides legitimately need each other and one ordering is
+                # the right answer. Both ids must exist — apply step
+                # `die()`s on a missing id (fail-loud, mirrors the
+                # added_subtasks collision check).
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["from", "to", "reason"],
+                    "properties": {
+                        "from": {"type": "string"},
+                        "to": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "merged_subtasks": {
+                # Cycle-breaking op #3: collapse two subtasks into one when
+                # the cycle reflects a genuine authoring overlap (signal:
+                # shared `files_likely_touched` between SCC members). The
+                # surviving subtask (`into`) inherits the union of both
+                # halves' provides/requires/depends_on/files_likely_touched,
+                # with self-references dropped (a requires whose tag is now
+                # in provides is removed; `from` is removed from depends_on
+                # entries). Downstream subtasks' depends_on references to
+                # `from` are rewritten to `into`. Tag-based requires need
+                # no rewriting (they match by tag, and `into` carries the
+                # union of provides). Telemetry: surviving subtask gets
+                # `_merged_from: ["<absorbed-id>", ...]`. Optional override
+                # fields let the reconciler restate the merged unit's
+                # contract; absent overrides default to concatenation
+                # (success_criteria_seed) or `into`'s values.
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["into", "from", "reason"],
+                    "properties": {
+                        "into": {"type": "string"},
+                        "from": {"type": "string"},
+                        "reason": {"type": "string"},
+                        "title": {"type": "string"},
+                        "intent": {"type": "string"},
+                        "success_criteria_seed": {"type": "string"},
+                    },
+                },
+            },
             "unresolvable": {
                 # Gap with no plausible resolution. The orchestrator dies
-                # with the worker's `reason` shown verbatim.
+                # with the worker's `reason` shown verbatim. NOT a valid
+                # response to a cycle — cycle resolution must use one of
+                # the cycle-breaking ops above; the retry prompt enforces
+                # this.
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -7218,16 +7297,41 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
     """Mutate `plans` per the reconciler's output. On success, returns
     the same `plans` list (with in-place edits on existing subtasks
     plus an appended `_reconciler` pseudo-plan for any added_subtasks).
-    On an id-collision in `added_subtasks` (either with an existing
-    subtask or within added_subtasks itself), calls `die()` — the
-    pseudo-plan is never appended and `plans` is left unmutated.
+    On an id-collision in `added_subtasks` or a missing-id reference in
+    `dependency_edges` / `merged_subtasks`, calls `die()` — the
+    pseudo-plan is never appended and `plans` is left in an undefined
+    state (callers must deep-copy before applying if they need clean
+    reversion on failure; the cycle-resolution retry loop does this).
 
-    Renames rewrite a single `requires` entry on the named subtask.
-    Added_provides append a tag to the named subtask's `provides`.
-    Added_subtasks become a new domain="_reconciler" plan appended to
-    the list — schedule() flattens by id, so domain only affects the
-    per-domain log line. Each added subtask carries
-    `_added_by_reconciler: true` for downstream traceability.
+    Six action arrays consumed here, in order:
+
+    1. `renames` rewrite a single `requires` entry on the named subtask.
+    2. `added_provides` append a tag to the named subtask's `provides`.
+    3. `added_subtasks` become a new domain="_reconciler" plan appended
+       to the list — schedule() flattens by id, so domain only affects
+       the per-domain log line. Each added subtask carries
+       `_added_by_reconciler: true` for downstream traceability.
+    4. `dropped_requires` remove an `extent: in_plan` requires entry
+       (cycle-breaking op: used when the requirement was over-specified
+       — an authoring decision the same subtask records, not a code
+       artifact another subtask produces). Silent no-op on missing
+       sid/entry (mirrors `renames`).
+    5. `dependency_edges` append a planner-declared `depends_on` edge
+       between two existing subtasks (cycle-breaking op: used when both
+       sides legitimately need each other and one ordering is right).
+       Both ids must exist — `die()` on a missing id. Also dies on
+       `from == to` (self-loop — a subtask cannot depend on itself).
+    6. `merged_subtasks` collapse two existing subtasks into one
+       (cycle-breaking op: used when the cycle reflects genuine
+       authoring overlap — signal: shared `files_likely_touched` between
+       SCC members). The surviving subtask (`into`) inherits the union
+       of both halves' provides/requires/depends_on/files_likely_touched
+       with self-references dropped, and stamps
+       `_merged_from: [<absorbed-id>, ...]`. Downstream subtasks'
+       `depends_on` references to `from` are rewritten to `into`.
+       Tag-based `requires` need no rewriting (`into` carries the union
+       of provides). Both ids must exist and differ — `die()` on
+       violation.
 
     The `unresolvable` array is not consumed here — phase_reconcile()
     inspects it directly before calling this helper."""
@@ -7308,6 +7412,167 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
             "status": "ready",
             "subtasks": added,
         })
+        # Re-index so the cycle-breaking ops below can find added_subtasks
+        # by id (e.g. a dependency_edges entry could legitimately reference
+        # an added_subtask).
+        for s in added:
+            by_id[s["id"]] = s
+
+    # --- Cycle-breaking ops (apply after the resolution ops above) ---
+
+    for dr in output.get("dropped_requires", []):
+        s = by_id.get(dr["sid"])
+        if s is None:
+            continue  # silent no-op, mirrors `renames`
+        reqs = s.get("requires") or []
+        s["requires"] = [
+            entry for entry in reqs
+            if not (isinstance(entry, dict)
+                    and entry.get("extent") == "in_plan"
+                    and entry.get("tag") == dr["tag"])
+        ]
+
+    for de in output.get("dependency_edges", []):
+        frm, to = de["from"], de["to"]
+        if frm == to:
+            die(
+                "reconciler proposed dependency_edges with from == to "
+                f"({frm!r}); a subtask cannot depend on itself. Refine "
+                "the task or re-run."
+            )
+        if frm not in by_id or to not in by_id:
+            missing = [x for x in (frm, to) if x not in by_id]
+            die(
+                "reconciler proposed dependency_edges referencing "
+                f"non-existent subtask id(s): {', '.join(sorted(missing))}. "
+                "Both endpoints must be existing subtasks. Refine the task "
+                "or re-run."
+            )
+        target = by_id[to]
+        deps = target.setdefault("depends_on", [])
+        if frm not in deps:
+            deps.append(frm)
+
+    for ms in output.get("merged_subtasks", []):
+        into_id, from_id = ms["into"], ms["from"]
+        if into_id == from_id:
+            die(
+                "reconciler proposed merged_subtasks with into == from "
+                f"({into_id!r}); merge endpoints must differ."
+            )
+        if into_id not in by_id or from_id not in by_id:
+            missing = [x for x in (into_id, from_id) if x not in by_id]
+            die(
+                "reconciler proposed merged_subtasks referencing "
+                f"non-existent subtask id(s): {', '.join(sorted(missing))}. "
+                "Both into and from must be existing subtasks. Refine the "
+                "task or re-run."
+            )
+        into_s = by_id[into_id]
+        from_s = by_id[from_id]
+
+        # provides: union (dedup, order-preserving).
+        merged_provides = list(into_s.get("provides", []) or [])
+        for tag in (from_s.get("provides") or []):
+            if tag not in merged_provides:
+                merged_provides.append(tag)
+        into_s["provides"] = merged_provides
+
+        # requires: union, then drop self-references (an entry whose tag
+        # is now in the merged provides is satisfied by the merged unit
+        # itself — would be a self-loop in the graph).
+        seen_req: set[tuple[str, str]] = set()
+        merged_requires = []
+        for entry in (list(into_s.get("requires", []) or [])
+                      + list(from_s.get("requires", []) or [])):
+            if not isinstance(entry, dict):
+                continue
+            tag = entry.get("tag", "")
+            extent = entry.get("extent", "")
+            key = (tag, extent)
+            if key in seen_req:
+                continue
+            seen_req.add(key)
+            # Self-reference cleanup: only drop in_plan entries whose
+            # tag is now produced by the merged unit. external entries
+            # are out-of-graph and stay regardless.
+            if extent == "in_plan" and tag in merged_provides:
+                continue
+            merged_requires.append(entry)
+        into_s["requires"] = merged_requires
+
+        # depends_on: union, minus `from` itself (would be a self-loop),
+        # dedup, order-preserving.
+        merged_deps: list[str] = []
+        for dep in (list(into_s.get("depends_on", []) or [])
+                    + list(from_s.get("depends_on", []) or [])):
+            if dep == from_id or dep == into_id:
+                continue
+            if dep not in merged_deps:
+                merged_deps.append(dep)
+        into_s["depends_on"] = merged_deps
+
+        # files_likely_touched: union, order-preserving dedup.
+        merged_files: list[str] = []
+        for f in (list(into_s.get("files_likely_touched", []) or [])
+                  + list(from_s.get("files_likely_touched", []) or [])):
+            if f not in merged_files:
+                merged_files.append(f)
+        into_s["files_likely_touched"] = merged_files
+
+        # success_criteria_seed: optional override; default to
+        # concatenation so both halves' criteria survive into the
+        # implementer's spec.
+        override_scs = ms.get("success_criteria_seed")
+        if override_scs:
+            into_s["success_criteria_seed"] = override_scs
+        else:
+            into_scs = into_s.get("success_criteria_seed", "") or ""
+            from_scs = from_s.get("success_criteria_seed", "") or ""
+            if into_scs and from_scs:
+                into_s["success_criteria_seed"] = (
+                    f"{into_scs} AND {from_scs}")
+            elif from_scs:
+                into_s["success_criteria_seed"] = from_scs
+            # else: keep into's (possibly empty) SCS
+
+        # title / intent: optional overrides; default to keep into's.
+        if ms.get("title"):
+            into_s["title"] = ms["title"]
+        if ms.get("intent"):
+            into_s["intent"] = ms["intent"]
+
+        # _merged_from telemetry — append so a chain of merges is
+        # traceable (merge A into B, then B into C → C carries [A, B]).
+        merged_from = into_s.setdefault("_merged_from", [])
+        if from_id not in merged_from:
+            merged_from.append(from_id)
+        # If `from` itself absorbed others earlier, carry their ids too.
+        for prior in (from_s.get("_merged_from") or []):
+            if prior not in merged_from:
+                merged_from.append(prior)
+
+        # Remove `from` from its plan. Dicts are shared by reference
+        # with `by_id`, so we filter every plan's subtasks list.
+        for plan in plans:
+            plan["subtasks"] = [
+                s for s in plan.get("subtasks", []) if s.get("id") != from_id
+            ]
+        del by_id[from_id]
+
+        # Rewrite downstream depends_on references to `from` → `into`.
+        # Tag-based requires need no rewriting: they match by tag, and
+        # `into` now carries the union of provides. Dedup after the
+        # rewrite in case a subtask already depended on `into`.
+        for sid, s in by_id.items():
+            deps = s.get("depends_on") or []
+            if from_id in deps:
+                new_deps: list[str] = []
+                for dep in deps:
+                    dep = into_id if dep == from_id else dep
+                    if dep not in new_deps and dep != sid:
+                        new_deps.append(dep)
+                s["depends_on"] = new_deps
 
     return plans
 
@@ -7413,6 +7678,15 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 "id": s.get("id", ""),
                 "title": s.get("title", ""),
                 "intent": s.get("intent", ""),
+                # `depends_on` and `files_likely_touched` are surfaced so the
+                # reconciler can reason about ordering and file-overlap
+                # signals when its first attempt closes a cycle and the
+                # retry prompt asks it to revise. Without them, the model
+                # has no structural input for picking between
+                # dropped_requires / dependency_edges / merged_subtasks.
+                "depends_on": list(s.get("depends_on", []) or []),
+                "files_likely_touched": list(
+                    s.get("files_likely_touched", []) or []),
                 "provides": list(s.get("provides", []) or []),
                 "requires": in_plan_tags,
             })
@@ -7427,27 +7701,43 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     user_prompt = (
         "RECONCILER INPUT:\n" + json.dumps(payload, indent=2) +
         "\n\nResolve every unresolved_requires entry per your "
-        "instructions and emit the four-array JSON output."
+        "instructions and emit the seven-array JSON output."
     )
 
-    st.bump_workers(caps)
-    output = await claude_p(
-        user_prompt=user_prompt, system_prompt=sys_prompt,
-        schema_key="reconciler", cwd=os.getcwd(),
-        allowed_tools=INSPECT_TOOLS, max_turns=30,
-        autonomous=False, caps=caps, st=st,
-        model=models["reconciler"], effort=efforts["reconciler"],
-        sid="reconciler",
-        add_dirs=st.data.get("inspect_dirs") or None,
-    )
+    # Snapshot the pre-mutation plans + pre-mutation providers map. The
+    # snapshot is used both for clean reversion between retry attempts
+    # and for the recommendation heuristic's "speculative rename"
+    # detection (case 3): a rename's `from` tag is speculative if it
+    # had no pre-reconcile producer.
+    pre_plans_snapshot = copy.deepcopy(plans)
+    pre_subtasks_snapshot: dict[str, dict] = {}
+    for plan in pre_plans_snapshot:
+        for s in plan.get("subtasks", []):
+            pre_subtasks_snapshot[s["id"]] = s
+    pre_providers: dict[str, list[str]] = {}
+    for sid, s in pre_subtasks_snapshot.items():
+        for cap in s.get("provides", []) or []:
+            pre_providers.setdefault(cap, []).append(sid)
 
-    # Fail closed on unresolvable BEFORE mutating anything — the user
-    # gets the worker's diagnosis without phantom mutations on disk.
-    unresolvable = output.get("unresolvable", []) or []
-    if unresolvable:
-        # Reconciler output is {sid, tag, reason} — no domain field —
-        # so the orchestrator joins the producing planner-domain back
-        # in from the pre-reconcile unresolved list for rendering.
+    async def _spawn_reconciler(up: str) -> dict:
+        st.bump_workers(caps)
+        return await claude_p(
+            user_prompt=up, system_prompt=sys_prompt,
+            schema_key="reconciler", cwd=os.getcwd(),
+            allowed_tools=INSPECT_TOOLS, max_turns=30,
+            autonomous=False, caps=caps, st=st,
+            model=models["reconciler"], effort=efforts["reconciler"],
+            sid="reconciler",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    def _check_unresolvable(out: dict) -> None:
+        """Fail closed on unresolvable BEFORE mutating anything — the
+        user gets the worker's diagnosis without phantom mutations on
+        disk. Used in both attempts."""
+        unresolvable = out.get("unresolvable", []) or []
+        if not unresolvable:
+            return
         sid_domain = {u["sid"]: u["domain"] for u in unresolved}
         bullets = "\n".join(
             f"  • {sid_domain.get(u['sid'], '<unknown>')}/{u['sid']} "
@@ -7470,7 +7760,95 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             "feature checklist."
         )
 
+    # === Attempt 1: spawn, apply, check acyclic ===
+    output = await _spawn_reconciler(user_prompt)
+    _check_unresolvable(output)
     _apply_reconciler_output(plans, output)
+
+    # Build the post-mutation subtasks dict for the cycle gate.
+    post_subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            post_subtasks[s["id"]] = s
+    preds, _provs, edge_sources = _build_predecessor_graph(post_subtasks)
+    succ: dict[str, set[str]] = {sid: set() for sid in post_subtasks}
+    for tgt, src_set in preds.items():
+        for src in src_set:
+            succ[src].add(tgt)
+    sccs = _tarjan_sccs(set(post_subtasks), succ)
+
+    if sccs:
+        # Cycle detected on attempt 1 — log the diagnostic, compute
+        # recommendations, revert mutations, and retry once with the
+        # structured retry prompt.
+        diag = _format_cycle_diagnostic(
+            sccs, succ, edge_sources, output, post_subtasks)
+        log(f"phase 2½: acyclicity gate fired on attempt 1 — "
+            f"{len(sccs)} cycle(s) detected:\n{diag}")
+        recommendations = [
+            _recommend_cycle_resolution(
+                scc, succ, edge_sources, post_subtasks, output, pre_providers)
+            for scc in sccs
+        ]
+        retry_prompt = _build_cycle_retry_prompt(
+            sccs, succ, edge_sources, output, post_subtasks,
+            recommendations, user_prompt)
+
+        # Revert: deep-copy the pre-mutation snapshot back into `plans`.
+        # The list is mutated in place so callers' references stay valid.
+        plans.clear()
+        plans.extend(copy.deepcopy(pre_plans_snapshot))
+
+        # === Attempt 2: spawn with retry prompt, validate must-include,
+        # apply, check acyclic. If still cyclic → die. ===
+        log("phase 2½: respawning reconciler with cycle-resolution "
+            "retry prompt")
+        output2 = await _spawn_reconciler(retry_prompt)
+        _check_unresolvable(output2)
+
+        # Must-include validation: did the revised output address every
+        # named cycle? Uses the cycles named in the retry prompt (from
+        # the attempt-1 graph). If any cycle was ignored, die cleanly.
+        unaddressed = _validate_must_include(output2, sccs)
+        if unaddressed:
+            bullets = "\n".join(f"  • {u}" for u in unaddressed)
+            die(
+                f"reconciler's revised output ignored "
+                f"{len(unaddressed)} named cycle(s):\n{bullets}\n"
+                "Pila requires every named cycle to be addressed by at "
+                "least one of dropped_requires / dependency_edges / "
+                "merged_subtasks. The retry prompt listed the legal "
+                "operations per cycle; the model defied the structural "
+                "constraint. Refine the task or re-run."
+            )
+
+        _apply_reconciler_output(plans, output2)
+
+        # Re-run the gate on attempt 2's output.
+        post2_subtasks: dict[str, dict] = {}
+        for plan in plans:
+            for s in plan.get("subtasks", []):
+                post2_subtasks[s["id"]] = s
+        preds2, _p2, edge_sources2 = _build_predecessor_graph(post2_subtasks)
+        succ2: dict[str, set[str]] = {sid: set() for sid in post2_subtasks}
+        for tgt, src_set in preds2.items():
+            for src in src_set:
+                succ2[src].add(tgt)
+        sccs2 = _tarjan_sccs(set(post2_subtasks), succ2)
+        if sccs2:
+            diag2 = _format_cycle_diagnostic(
+                sccs2, succ2, edge_sources2, output2, post2_subtasks)
+            die(
+                "phase 2½ acyclicity gate fired on attempt 2 — the "
+                "reconciler's revised output still produces "
+                f"{len(sccs2)} cycle(s):\n{diag2}\n"
+                "Both retry attempts exhausted. Refine the task "
+                "description or split it into smaller runs that produce "
+                "fewer cross-domain capability-tag mismatches; runs with "
+                "<15 renames historically never cycle."
+            )
+        # Attempt 2 succeeded — adopt its output for downstream logging.
+        output = output2
 
     # Re-run the DESIGN §5 `requires.extent` mechanical passes against the
     # post-reconciler plan tree so any `extent: external` entries on
@@ -7531,6 +7909,653 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     return plans
 
 
+def _tarjan_sccs(
+    nodes: set[str],
+    succ: dict[str, set[str]],
+) -> list[list[str]]:
+    """Tarjan's strongly-connected-components algorithm.
+
+    Returns a list of SCCs (each a list of node ids), filtered to
+    *non-trivial* components — size ≥ 2 or a self-loop. Trivial
+    singletons (a node with no edge to itself) are not returned because
+    they are by definition acyclic.
+
+    Iterative implementation (no recursion) so very deep graphs cannot
+    blow the stack. Deterministic: nodes are visited in sorted order and
+    each component is returned in discovery order, so the same input
+    always produces byte-identical output.
+    """
+    index_of: dict[str, int] = {}
+    lowlink: dict[str, int] = {}
+    on_stack: set[str] = set()
+    stack: list[str] = []
+    sccs: list[list[str]] = []
+    counter = 0
+
+    # Sorted-roots ensures determinism across runs.
+    for root in sorted(nodes):
+        if root in index_of:
+            continue
+        work: list[tuple[str, Iterator[str]]] = []
+        index_of[root] = counter
+        lowlink[root] = counter
+        counter += 1
+        stack.append(root)
+        on_stack.add(root)
+        work.append((root, iter(sorted(succ.get(root, set())))))
+
+        while work:
+            v, it = work[-1]
+            advanced = False
+            for w in it:
+                if w not in index_of:
+                    index_of[w] = counter
+                    lowlink[w] = counter
+                    counter += 1
+                    stack.append(w)
+                    on_stack.add(w)
+                    work.append(
+                        (w, iter(sorted(succ.get(w, set())))))
+                    advanced = True
+                    break
+                elif w in on_stack:
+                    lowlink[v] = min(lowlink[v], index_of[w])
+            if advanced:
+                continue
+            if lowlink[v] == index_of[v]:
+                comp: list[str] = []
+                while True:
+                    w = stack.pop()
+                    on_stack.discard(w)
+                    comp.append(w)
+                    if w == v:
+                        break
+                # Filter to non-trivial: size ≥ 2 OR self-loop on size 1.
+                if len(comp) > 1 or v in succ.get(v, set()):
+                    sccs.append(sorted(comp))
+            work.pop()
+            if work:
+                parent = work[-1][0]
+                lowlink[parent] = min(lowlink[parent], lowlink[v])
+    return sccs
+
+
+def _attribute_cycle_edges(
+    scc: list[str],
+    succ: dict[str, set[str]],
+    edge_sources: dict[tuple[str, str], str],
+    output: dict,
+    subtasks: dict[str, dict],
+) -> list[dict]:
+    """For each edge inside an SCC, attribute it back to the reconciler
+    mutation (if any) that closed it. Returns a list of edge dicts:
+    `{from, to, source, mutation}` where `source` is the raw
+    edge_sources label (`"depends_on"` or `"requires:<tag>"`) and
+    `mutation` is a short string describing the reconciler mutation that
+    produced the edge: `"rename: <sid>'s '<from>' -> '<to>'"`,
+    `"added_subtask: <id>"`, `"dependency_edge: <from> -> <to>"`, or
+    `"planner-declared"` when no reconciler mutation closed the edge
+    (the planner already had this depends_on, so the rename/edge that
+    formed the cycle is on the OTHER side of the SCC).
+    """
+    scc_set = set(scc)
+    # Index reconciler renames by (sid, new-tag) for fast lookup.
+    # After a rename `feat-001: foo -> bar`, the edge created is
+    # feat-001 -> <provider-of-bar>, where the new requires entry has
+    # tag=bar.
+    rename_by_target: dict[tuple[str, str], dict] = {}
+    for r in output.get("renames", []):
+        rename_by_target[(r["sid"], r["to"])] = r
+    added_ids = {s["id"] for s in output.get("added_subtasks", [])}
+    dep_edge_set = {
+        (de["from"], de["to"]) for de in output.get("dependency_edges", [])
+    }
+
+    edges_out: list[dict] = []
+    for src in scc:
+        for dst in sorted(succ.get(src, set())):
+            if dst not in scc_set:
+                continue
+            label = edge_sources.get((src, dst), "?")
+            mutation = "planner-declared"
+            # If this edge's source subtask is a reconciler-added one,
+            # the whole subtask is the "mutation."
+            if src in added_ids:
+                mutation = f"added_subtask: {src}"
+            elif dst in added_ids:
+                # The added subtask's provides matched a requires on src.
+                mutation = f"added_subtask: {dst}"
+            elif (src, dst) in dep_edge_set:
+                mutation = f"dependency_edge: {src} -> {dst}"
+            elif label.startswith("requires:"):
+                # The edge `src -> dst` means src provides what dst
+                # requires. So the renamed requires entry is on the
+                # CONSUMER (dst), not the producer (src). Look up the
+                # rename by (dst, tag).
+                tag = label.split(":", 1)[1]
+                r = rename_by_target.get((dst, tag))
+                if r is not None:
+                    mutation = (
+                        f"rename: {dst}'s '{r['from']}' -> '{r['to']}' "
+                        f"(provided by {src})"
+                    )
+            edges_out.append({
+                "from": src, "to": dst,
+                "source": label, "mutation": mutation,
+            })
+    return edges_out
+
+
+def _format_cycle_diagnostic(
+    sccs: list[list[str]],
+    succ: dict[str, set[str]],
+    edge_sources: dict[tuple[str, str], str],
+    output: dict,
+    subtasks: dict[str, dict],
+) -> str:
+    """Render an SCC list + edge attributions into the multi-line
+    diagnostic string used by both the gate's `die()` and the retry
+    prompt's cycle section. Deterministic — same input, same output.
+    """
+    lines: list[str] = []
+    for i, scc in enumerate(sccs, 1):
+        edges = _attribute_cycle_edges(
+            scc, succ, edge_sources, output, subtasks)
+        lines.append(f"CYCLE {i}: {' <-> '.join(scc)} "
+                     f"({len(scc)}-node SCC)")
+        lines.append("  Edges in the cycle:")
+        for e in edges:
+            lines.append(
+                f"    {e['from']} -> {e['to']}   "
+                f"[{e['source']}; {e['mutation']}]")
+        # Structural signals for merge/edge/drop choice in the retry prompt.
+        shared_files = _shared_files_in_scc(scc, subtasks)
+        planner_depends = [
+            (e['from'], e['to']) for e in edges
+            if e['mutation'] == 'planner-declared'
+            and e['source'] == 'depends_on'
+        ]
+        if shared_files:
+            lines.append(f"  Shared files_likely_touched: "
+                         f"{shared_files}   ← merge signal")
+        else:
+            lines.append("  Shared files_likely_touched: none")
+        if planner_depends:
+            descs = [f"{f} -> {t}" for f, t in planner_depends]
+            lines.append(f"  Planner-declared depends_on in SCC: "
+                         f"{', '.join(descs)}")
+        else:
+            lines.append("  Planner-declared depends_on in SCC: none")
+    return "\n".join(lines)
+
+
+def _shared_files_in_scc(
+    scc: list[str], subtasks: dict[str, dict],
+) -> list[str]:
+    """Files that appear in `files_likely_touched` of ≥ 2 SCC members.
+    Empirically (commit 836a9d8, n=3 historical runs) shared-files had
+    zero false positives as a "these subtasks really overlap" signal;
+    here it's the merge-vs-edge tiebreaker the recommendation heuristic
+    consumes."""
+    if len(scc) < 2:
+        return []
+    file_owners: dict[str, list[str]] = {}
+    for sid in scc:
+        s = subtasks.get(sid) or {}
+        for f in (s.get("files_likely_touched") or []):
+            file_owners.setdefault(f, []).append(sid)
+    return sorted(f for f, owners in file_owners.items() if len(owners) >= 2)
+
+
+def _recommend_cycle_resolution(
+    scc: list[str],
+    succ: dict[str, set[str]],
+    edge_sources: dict[tuple[str, str], str],
+    subtasks: dict[str, dict],
+    output: dict,
+    pre_providers: dict[str, list[str]],
+) -> dict:
+    """Deterministic recommendation for breaking one SCC.
+
+    Returns a dict shaped like one entry of the reconciler's cycle-
+    breaking arrays, with an extra `op` key naming the action (always
+    either `"dropped_requires"` or `"merged_subtasks"` — the heuristic
+    never recommends `dependency_edges`; that op is reachable only when
+    the model overrides the recommendation) and a `rationale`
+    explaining why this op was picked.
+
+    Heuristic (in order, first match wins):
+
+    1. **Exactly one edge in the SCC is a planner-declared depends_on** →
+       `dropped_requires` on the rename that closes the reverse direction.
+       Planner ordering wins; the reconciler's rename is the drift.
+       [Verifies on summarizer run 1: feat-009 -> feat-008 is planner-
+        declared; recommend drop of feat-008's prisma-data-access-ready
+        requires.]
+
+    2. **Else SCC members share files_likely_touched (and SCC has size 2 —
+       merge is pairwise)** →
+       `merged_subtasks(into=smaller_by_scs, from=larger)`. The subtasks
+       are authoring the same file; one commit will do both pieces of
+       work; the shorter-criterion subtask becomes the canonical home
+       (tie-break: lexicographic sid).
+       [Verifies on summarizer run 2: feat-001 and config-005 share
+        package.json; feat-001 has shorter SCS; recommend merge into
+        feat-001.]
+
+    3. **Else** → `dropped_requires` on the rename whose `from` tag had
+       no planner-declared producer in the pre-reconcile graph. The
+       rename was speculative — the tag was never going to resolve to
+       a real producer; dropping the requirement is structurally
+       honest.
+
+    4. **Tie-breaker of last resort** → drop the lexicographically later
+       rename in the SCC.
+
+    `pre_providers` is the providers map from BEFORE renames were
+    applied (used by case 3 to identify speculative renames). The
+    caller computes it from the pre-mutation deep copy of the plans.
+    """
+    edges = _attribute_cycle_edges(
+        scc, succ, edge_sources, output, subtasks)
+
+    # --- Case 1: planner-declared depends_on edge present ---
+    planner_edges = [
+        e for e in edges if e["mutation"] == "planner-declared"
+        and e["source"] == "depends_on"
+    ]
+    if len(planner_edges) == 1:
+        planner_e = planner_edges[0]
+        # The rename to drop is the one that closes the reverse
+        # direction (from planner-e.to back to planner-e.from). In the
+        # graph: edge `src -> dst` means src provides what dst requires
+        # — so the renamed requires entry lives on the CONSUMER (dst).
+        for e in edges:
+            if e["from"] == planner_e["to"] and e["to"] == planner_e["from"]:
+                if e["mutation"].startswith("rename:"):
+                    src_label = e["source"]
+                    if src_label.startswith("requires:"):
+                        tag = src_label.split(":", 1)[1]
+                        return {
+                            "op": "dropped_requires",
+                            "sid": e["to"],
+                            "tag": tag,
+                            "reason": (
+                                f"{planner_e['from']} -> {planner_e['to']} "
+                                "is planner-declared via depends_on; the "
+                                f"reverse rename on {e['to']} is the "
+                                "drift that closed the cycle. Drop the "
+                                "rename's requirement so the planner-"
+                                "declared ordering wins."
+                            ),
+                            "rationale": "case-1: planner-edge keeper",
+                        }
+
+    # --- Case 2: shared files_likely_touched ---
+    shared = _shared_files_in_scc(scc, subtasks)
+    if shared and len(scc) == 2:
+        a, b = scc[0], scc[1]
+        a_scs = (subtasks[a].get("success_criteria_seed") or "")
+        b_scs = (subtasks[b].get("success_criteria_seed") or "")
+        # Shorter SCS becomes the canonical home (`into`); tie-break by
+        # lexicographic sid for determinism.
+        if len(a_scs) < len(b_scs):
+            into, from_ = a, b
+        elif len(b_scs) < len(a_scs):
+            into, from_ = b, a
+        else:
+            into, from_ = sorted([a, b])
+        return {
+            "op": "merged_subtasks",
+            "into": into,
+            "from": from_,
+            "reason": (
+                f"Both subtasks edit the same file(s) ({', '.join(shared)}) "
+                "and the cycle reflects a genuine authoring overlap, not "
+                "a code-artifact dependency. Collapse them into one unit "
+                f"with {into} as the canonical home (shorter "
+                "success_criteria_seed)."
+            ),
+            "rationale": "case-2: shared-files merge",
+        }
+
+    # --- Case 3: speculative rename (no pre-reconcile producer) ---
+    # Edge `src -> dst` carries the rename on the CONSUMER (dst). The
+    # rename rewrote some `from`-tag on dst into `tag`; the speculative
+    # test asks whether the ORIGINAL `from`-tag had any producer in
+    # pre_providers.
+    for e in edges:
+        if not e["mutation"].startswith("rename:"):
+            continue
+        src_label = e["source"]
+        if not src_label.startswith("requires:"):
+            continue
+        tag = src_label.split(":", 1)[1]
+        for r in output.get("renames", []):
+            if r["sid"] == e["to"] and r["to"] == tag:
+                original = r["from"]
+                if not pre_providers.get(original):
+                    return {
+                        "op": "dropped_requires",
+                        "sid": e["to"],
+                        "tag": tag,
+                        "reason": (
+                            f"Rename of {e['to']}'s '{original}' was "
+                            "speculative — no planner-declared producer "
+                            "existed for the original tag in the pre-"
+                            "reconcile graph. The renamed requirement is "
+                            "structurally honest to drop rather than "
+                            "preserve via merge/edge."
+                        ),
+                        "rationale": "case-3: speculative-rename drop",
+                    }
+
+    # --- Case 4: lexicographic last-resort tiebreaker ---
+    # Drop the lexicographically later rename in the SCC (consumer side).
+    # Always returns something; this is the final guarantee that the
+    # recommendation function is total.
+    rename_edges = [
+        e for e in edges
+        if e["mutation"].startswith("rename:")
+        and e["source"].startswith("requires:")
+    ]
+    if rename_edges:
+        rename_edges.sort(
+            key=lambda e: (e["to"], e["source"]), reverse=True)
+        e = rename_edges[0]
+        tag = e["source"].split(":", 1)[1]
+        return {
+            "op": "dropped_requires",
+            "sid": e["to"],
+            "tag": tag,
+            "reason": (
+                "No structural signal preferred a specific resolution; "
+                "dropping the lexicographically later rename as a "
+                "deterministic tiebreaker. Override with a different "
+                "operation if you have a structural reason to."
+            ),
+            "rationale": "case-4: lexicographic tiebreaker",
+        }
+
+    # --- Degenerate: no rename edges in the SCC (all depends_on / added) ---
+    # This shape shouldn't occur in practice (the gate fires when the
+    # reconciler's mutations closed a cycle), but if it does, drop a
+    # placeholder for the apply step to ignore. The model still gets the
+    # SCC and is free to propose any of the cycle-breaking ops.
+    return {
+        "op": "dropped_requires",
+        "sid": scc[0],
+        "tag": "",
+        "reason": (
+            "No reconciler-introduced rename was found in this SCC; the "
+            "cycle may have been formed purely by planner-declared edges "
+            "(very rare). Propose any cycle-breaking op."
+        ),
+        "rationale": "case-degenerate",
+    }
+
+
+def _format_recommendation(rec: dict) -> str:
+    """Render a recommendation dict (from `_recommend_cycle_resolution`)
+    as a single-line operation literal the retry prompt presents as
+    "the answer." The `reason` is inlined verbatim (repr-escaped) so a
+    literal-minded model can copy the entire line directly into its
+    output without having to interpolate a placeholder. Deterministic.
+
+    The recommendation heuristic only ever emits `dropped_requires`
+    (cases 1/3/4) or `merged_subtasks` (case 2). It never emits
+    `dependency_edges` — that op is reachable only when the model
+    overrides the recommendation, in which case `_format_must_include`
+    (not this function) renders the option string."""
+    op = rec.get("op", "")
+    reason = repr(rec.get("reason", ""))
+    if op == "dropped_requires":
+        return (f"dropped_requires(sid={rec['sid']!r}, "
+                f"tag={rec['tag']!r}, reason={reason})")
+    if op == "merged_subtasks":
+        return (f"merged_subtasks(into={rec['into']!r}, "
+                f"from={rec['from']!r}, reason={reason})")
+    return f"<unknown op: {op}>"
+
+
+def _format_must_include(scc: list[str], edges: list[dict]) -> list[str]:
+    """For one SCC, list the bounded set of legal cycle-breaking
+    operations the retry's apply step will accept. The retry prompt
+    surfaces this set so the model knows the legal answer space. The
+    apply step's must-include validation rejects outputs that pick
+    none of them.
+    """
+    options: list[str] = []
+    # Each rename in the SCC can be dropped. Edge `src -> dst` carries
+    # the rename on the consumer (dst), so the drop targets dst's sid.
+    for e in edges:
+        if (e["mutation"].startswith("rename:")
+                and e["source"].startswith("requires:")):
+            tag = e["source"].split(":", 1)[1]
+            options.append(
+                f"dropped_requires(sid={e['to']!r}, tag={tag!r}, ...)")
+    # For 2-node SCCs, dependency_edges in either direction and
+    # merged_subtasks in either direction are also legal answers.
+    if len(scc) == 2:
+        a, b = scc[0], scc[1]
+        options.append(
+            f"dependency_edges(from={a!r}, to={b!r}, ...)")
+        options.append(
+            f"dependency_edges(from={b!r}, to={a!r}, ...)")
+        options.append(
+            f"merged_subtasks(into={a!r}, from={b!r}, ...)")
+        options.append(
+            f"merged_subtasks(into={b!r}, from={a!r}, ...)")
+    return options
+
+
+def _build_cycle_retry_prompt(
+    sccs: list[list[str]],
+    succ: dict[str, set[str]],
+    edge_sources: dict[tuple[str, str], str],
+    output: dict,
+    subtasks: dict[str, dict],
+    recommendations: list[dict],
+    original_user_prompt: str,
+) -> str:
+    """Build the retry prompt sent to the reconciler when the
+    acyclicity gate fires on attempt 1.
+
+    Structure:
+      - One section per SCC with: edges + structural signals +
+        recommendation + bounded "must-include" set.
+      - Instructions on the legal answer space (no `unresolvable` for
+        cycles).
+      - The original user prompt re-appended verbatim so the worker
+        has the full input + the resolution context.
+    """
+    parts: list[str] = []
+    parts.append(
+        "Your previous reconciler output created "
+        f"{len(sccs)} dependency cycle(s) in the merged plan. Pila has "
+        "analyzed each cycle and computed a recommended resolution using "
+        "structural signals. You must either emit the recommendation "
+        "verbatim or propose an alternative from the bounded set below. "
+        "`unresolvable` is NOT a valid response to a cycle — cycles must "
+        "be broken with one of dropped_requires / dependency_edges / "
+        "merged_subtasks.\n"
+    )
+    for i, (scc, rec) in enumerate(zip(sccs, recommendations), 1):
+        edges = _attribute_cycle_edges(
+            scc, succ, edge_sources, output, subtasks)
+        shared = _shared_files_in_scc(scc, subtasks)
+        planner_edges = [
+            (e['from'], e['to']) for e in edges
+            if e['mutation'] == 'planner-declared'
+            and e['source'] == 'depends_on'
+        ]
+        parts.append(
+            f"\nCYCLE {i}: {' <-> '.join(scc)} ({len(scc)}-node SCC)")
+        parts.append("  Edges:")
+        for e in edges:
+            parts.append(
+                f"    {e['from']} -> {e['to']}   "
+                f"[{e['source']}; {e['mutation']}]")
+        parts.append("  Structural signals:")
+        if shared:
+            parts.append(
+                f"    - Shared files_likely_touched: {shared}   "
+                "← merge signal")
+        else:
+            parts.append("    - Shared files_likely_touched: none")
+        if planner_edges:
+            descs = [f"{f} -> {t}" for f, t in planner_edges]
+            parts.append(
+                f"    - Planner-declared depends_on in SCC: "
+                f"{', '.join(descs)}")
+        else:
+            parts.append(
+                "    - Planner-declared depends_on in SCC: none")
+        # SCS lengths help the model understand the merge tiebreak.
+        if len(scc) == 2:
+            scs_lens = [
+                f"{sid}={len(subtasks.get(sid, {}).get('success_criteria_seed') or '')}"
+                for sid in scc
+            ]
+            parts.append(
+                f"    - success_criteria_seed lengths (chars): "
+                f"{', '.join(scs_lens)}")
+        parts.append(
+            f"\n  RECOMMENDED: {_format_recommendation(rec)}")
+        parts.append(f"    Why: {rec.get('reason', '')}")
+        parts.append("\n  Your output for this cycle MUST include at "
+                     "least one of:")
+        for opt in _format_must_include(scc, edges):
+            marker = ("    ← recommended"
+                      if _matches_recommendation(opt, rec) else "")
+            parts.append(f"    - {opt}{marker}")
+    parts.append(
+        "\nEmit the same seven-array output as before, with the "
+        "additions necessary to break every cycle. Pila will re-run "
+        "cycle detection on your revised output and reject any response "
+        "that still has cycles — including new cycles your revisions "
+        "introduce.\n\n--- ORIGINAL INPUT ---\n"
+    )
+    parts.append(original_user_prompt)
+    return "\n".join(parts)
+
+
+def _matches_recommendation(option_str: str, rec: dict) -> bool:
+    """Whether a must-include option string matches the recommendation
+    (so the retry prompt can mark it with ← recommended).
+
+    The recommendation is always either `dropped_requires` or
+    `merged_subtasks` (see `_format_recommendation` docstring); no
+    `dependency_edges` branch is reachable here."""
+    op = rec.get("op", "")
+    if op == "dropped_requires":
+        return option_str.startswith(
+            f"dropped_requires(sid={rec['sid']!r}, tag={rec['tag']!r}")
+    if op == "merged_subtasks":
+        return option_str.startswith(
+            f"merged_subtasks(into={rec['into']!r}, from={rec['from']!r}")
+    return False
+
+
+def _validate_must_include(
+    output: dict,
+    sccs: list[list[str]],
+) -> list[str]:
+    """For each SCC, check that the reconciler's revised output includes
+    at least one operation from its must-include set. Returns the list
+    of SCCs (each rendered with ' <-> ' between sids) that were NOT
+    addressed — empty list means every cycle was addressed.
+
+    Called from the retry loop after attempt 2 emits, before the
+    apply-step runs. A non-empty result means the model defied the
+    structural constraint and the run aborts cleanly.
+    """
+    drops = {(e["sid"], e["tag"]) for e in output.get("dropped_requires", [])}
+    edges = {(e["from"], e["to"]) for e in output.get("dependency_edges", [])}
+    merges = {frozenset([m["into"], m["from"]])
+              for m in output.get("merged_subtasks", [])}
+    unaddressed: list[str] = []
+    for scc in sccs:
+        scc_set = set(scc)
+        addressed = False
+        # dropped_requires against an SCC member (any tag).
+        for sid, tag in drops:
+            if sid in scc_set:
+                addressed = True
+                break
+        if addressed:
+            continue
+        # dependency_edges with both endpoints in the SCC.
+        for f, t in edges:
+            if f in scc_set and t in scc_set:
+                addressed = True
+                break
+        if addressed:
+            continue
+        # merged_subtasks where both ids are in the SCC.
+        for pair in merges:
+            if pair <= scc_set:
+                addressed = True
+                break
+        if not addressed:
+            unaddressed.append(" <-> ".join(scc))
+    return unaddressed
+
+
+def _build_predecessor_graph(
+    subtasks: dict[str, dict],
+) -> tuple[dict[str, set[str]], dict[str, list[str]],
+           dict[tuple[str, str], str]]:
+    """Build the predecessor graph from a merged subtasks dict.
+
+    Returns `(preds, providers, edge_sources)`:
+    - `preds[sid]` is the set of subtask ids that must complete before `sid`.
+    - `providers[tag]` is the list of subtask ids that declare `tag` in
+      their `provides`.
+    - `edge_sources[(pred, succ)]` is a diagnostic label describing what
+      created the edge: `"depends_on"` for a planner-declared
+      `depends_on`, or `"requires:<tag>"` for a cross-domain capability-
+      tag match. Used by the phase 2½ cycle gate's edge-attribution
+      message and by future scheduler diagnostics.
+
+    Shared between the phase 2½ acyclicity gate (`phase_reconcile`) and
+    the phase 3 scheduler (`schedule`) so the two cannot drift in what
+    counts as an edge. Pure function — no logging, no side effects, no
+    `die()`. Callers handle empties and cycles themselves.
+
+    `requires` entries are objects `{tag, extent, reason?}` (DESIGN §5
+    `requires.extent`); only `extent: in_plan` entries become graph
+    edges — `external` entries are out-of-graph by planner declaration
+    and surface as preconditions in `plan.json` instead.
+    """
+    providers: dict[str, list[str]] = {}
+    for sid, s in subtasks.items():
+        for cap in s.get("provides", []):
+            providers.setdefault(cap, []).append(sid)
+
+    preds: dict[str, set[str]] = {sid: set() for sid in subtasks}
+    edge_sources: dict[tuple[str, str], str] = {}
+    for sid, s in subtasks.items():
+        for dep in s.get("depends_on", []):
+            if dep in subtasks:
+                preds[sid].add(dep)
+                # `depends_on` wins over a `requires`-tag attribution for
+                # the same edge — the planner explicitly declared it, so
+                # diagnostics should name that as the source.
+                edge_sources[(dep, sid)] = "depends_on"
+        for entry in s.get("requires", []):
+            if not isinstance(entry, dict) or entry.get("extent") != "in_plan":
+                continue
+            cap = entry.get("tag", "")
+            for provider in providers.get(cap, []):
+                if provider != sid:
+                    preds[sid].add(provider)
+                    # Don't overwrite a `depends_on` attribution.
+                    edge_sources.setdefault(
+                        (provider, sid), f"requires:{cap}")
+    return preds, providers, edge_sources
+
+
 def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
     """Phase 3 (pure Python): merge plans, resolve intra- and cross-domain
     dependencies, topologically sort into waves. Deterministic."""
@@ -7562,31 +8587,14 @@ def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
             "domains; see the per-category log lines above for each "
             "blocked planner's gap_to_close.")
 
-    # provides -> [subtask ids] for cross-domain edge resolution
-    providers: dict[str, list[str]] = {}
-    for sid, s in subtasks.items():
-        for cap in s.get("provides", []):
-            providers.setdefault(cap, []).append(sid)
+    preds, _providers, _edge_sources = _build_predecessor_graph(subtasks)
 
-    # build edges: predecessors of each subtask. `requires` entries are
-    # objects `{tag, extent, reason?}` (DESIGN §5 `requires.extent`);
-    # only `extent: in_plan` entries become graph edges — `external`
-    # entries are out-of-graph by planner declaration and are surfaced
-    # as preconditions in plan.json instead.
-    preds: dict[str, set[str]] = {sid: set() for sid in subtasks}
-    for sid, s in subtasks.items():
-        for dep in s.get("depends_on", []):
-            if dep in subtasks:
-                preds[sid].add(dep)
-        for entry in s.get("requires", []):
-            if not isinstance(entry, dict) or entry.get("extent") != "in_plan":
-                continue
-            cap = entry.get("tag", "")
-            for provider in providers.get(cap, []):
-                if provider != sid:
-                    preds[sid].add(provider)
-
-    # Kahn's algorithm -> waves
+    # Kahn's algorithm -> waves. Cycles are normally caught upstream by
+    # phase 2½'s acyclicity gate (with edge attribution + retry); if one
+    # slips through to here, the same `_build_predecessor_graph` produced
+    # the edges, so the gate's earlier Tarjan would have caught it. The
+    # `remaining`-dump fallback below stays as a belt-and-suspenders
+    # diagnostic for that improbable case.
     waves: list[list[str]] = []
     done: set[str] = set()
     remaining = set(subtasks)

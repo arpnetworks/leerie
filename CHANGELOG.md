@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **Reconciler now resolves dependency cycles instead of letting them
+  crash the scheduler.** Previously, when the reconciler's renames
+  closed a cross-domain dependency cycle (each rename locally correct,
+  jointly cycle-creating), the failure surfaced two phases later as
+  `pila: error: dependency cycle among subtasks: <29 of 41 sorted
+  ids>` from `schedule()`'s Kahn pass — Tarjan never ran, edges were
+  never attributed, the user got noise. Two captured failures on a
+  real run (`~/src/enric/summarizer/.pila/runs/`) made this concrete:
+  run 2's cycle was a 2-node SCC `config-005 ↔ feat-001` (both edges
+  reconciler renames); run 1's was `feat-008 ↔ feat-009` (one
+  planner-declared `depends_on` + one reconciler rename). The
+  reconciler's action vocabulary expanded by three cycle-breaking
+  ops (`dropped_requires`, `dependency_edges`, `merged_subtasks`),
+  bringing the schema to seven arrays total (three resolution + three
+  cycle-breaking + one `unresolvable` escape hatch). Phase 2½ now runs
+  Tarjan's SCC over the post-mutation graph, and on cycle detection
+  reverts the mutations (deep-copy snapshot), computes a deterministic
+  recommendation per SCC from structural signals (planner-declared
+  `depends_on` direction; `files_likely_touched` overlap), and
+  respawns the reconciler once with a structured retry prompt naming
+  the SCC, offending mutations, recommendation, and bounded
+  must-include set of legal cycle-breaking ops. The model never has
+  to detect cycles itself — pila does that in Python and hands back
+  structured feedback — which sidesteps the captured reconciler
+  showing zero spontaneous cycle-awareness across 10k chars of
+  reasoning. If attempt 2 still cycles, the run aborts with the SCC
+  + offending mutations enumerated (informative, not the prior
+  29-of-41-sids dump). New helpers: `_tarjan_sccs`,
+  `_attribute_cycle_edges`, `_shared_files_in_scc`,
+  `_format_cycle_diagnostic`, `_recommend_cycle_resolution`,
+  `_format_recommendation`, `_format_must_include`,
+  `_build_cycle_retry_prompt`, `_matches_recommendation`,
+  `_validate_must_include`. Shared `_build_predecessor_graph`
+  extracted from `schedule()` so the gate and scheduler cannot
+  drift in what counts as an edge. Reconciler payload now includes
+  `depends_on` and `files_likely_touched` per subtask (the model
+  needs them to reason about ordering and merge candidates).
+  37 test cases (33 functions, one parametrized across 5
+  successful-run shapes) in `tests/test_reconciler_cycle_gate.py` cover
+  both captured runs verbatim, 3- and 4-node synthetic cycles,
+  connector cycles, all three apply-step ops with edge cases
+  (extent-preservation, chain merges, override fields, self-loop
+  fail-loud), recommendation correctness on all four heuristic
+  cases (planner-edge keeper, shared-files merge, speculative-
+  rename drop, lexicographic tiebreaker), direct unit tests for
+  the two render functions (`_format_recommendation`,
+  `_matches_recommendation`), must-include validation including
+  a negative case (op on a non-SCC sid does not credit the
+  cycle), post-retry cycle detection, mutation reversion
+  cleanness, and 5 regression fixtures from successful
+  historical runs (false-positive guard — the gate is silent on
+  every known-acyclic plan in the cross-repo canvass: centella
+  feat-rebrand, barnacle telemetry, navegando bugfix, pila
+  feat-please-read, finalmemoriam bugfix).
+
 ### Changed
 
 - **`max_parallel` default lowered from 4 to 2.** Subprocess fan-out

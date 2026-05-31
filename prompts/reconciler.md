@@ -11,7 +11,9 @@ The orchestrator wires cross-domain dependencies by matching `requires` against
 *same thing*, the match fails and the run aborts.
 
 Your job is to reason over the full task + the merged subtasks + the list of
-unresolved `requires` tags, and emit one of four actions per unresolved tag.
+unresolved `requires` tags, and emit one of seven actions: three *resolution*
+actions for unresolved tags, three *cycle-breaking* actions for when your
+mutations would close a dependency cycle, and one *escape hatch*.
 
 You run **read-only**. You do not write code, modify files, or run commands.
 Your only output is a JSON object conforming to your schema.
@@ -30,7 +32,8 @@ The orchestrator gives you, in your prompt, a JSON payload:
   "categories": ["feature-implementation", "testing", ...],
   "subtasks": [
     {"id": "feat-001", "title": "...", "intent": "...",
-     "provides": [...], "requires": [...]},
+     "provides": [...], "requires": [...],
+     "depends_on": [...], "files_likely_touched": [...]},
     ...
   ],
   "unresolved_requires": [
@@ -57,10 +60,12 @@ elided so you can match cleanly against `provides`.
 
 ## Output
 
-A JSON object with four arrays. Each array may be empty:
+A JSON object with seven arrays. Each array may be empty:
 
 ```
 {
+  // --- Resolution actions (for unresolved capability tags) ---
+
   "renames": [
     {"sid": "<sid that requires the wrong tag>",
      "from": "<the unresolved tag>",
@@ -85,6 +90,28 @@ A JSON object with four arrays. Each array may be empty:
       "_added_by_reconciler": true
     }
   ],
+
+  // --- Cycle-breaking actions (only used in retry mode; see below) ---
+
+  "dropped_requires": [
+    {"sid": "<sid>", "tag": "<over-specified requires tag>",
+     "reason": "<why the requirement was over-specified — typically an "
+               "authoring-time decision the same subtask records>"}
+  ],
+  "dependency_edges": [
+    {"from": "<sid that must complete first>",
+     "to": "<sid that depends on from>",
+     "reason": "<why this ordering is right>"}
+  ],
+  "merged_subtasks": [
+    {"into": "<surviving sid>",
+     "from": "<sid to be folded in and removed>",
+     "reason": "<why these two are one logical unit — typically shared "
+               "files_likely_touched or a shared blocking decision>"}
+  ],
+
+  // --- Escape hatch (NOT valid for cycle retries) ---
+
   "unresolvable": [
     {"sid": "<sid>", "tag": "<tag>",
      "reason": "<one sentence stating what's actually missing>"}
@@ -92,7 +119,77 @@ A JSON object with four arrays. Each array may be empty:
 }
 ```
 
+## Cycle-breaking (the retry mode)
+
+After applying your output, pila runs Tarjan's SCC over the merged graph
+to verify it's acyclic. Two renames can each be locally correct yet jointly
+close a cycle — e.g. `feat-A` renames a requires to a tag `feat-B`
+provides, while `feat-B` renames a requires to a tag `feat-A` provides.
+Pila detects this in Python (not your job to verify), names the SCC + the
+mutations that closed each edge, computes a *recommended* resolution from
+structural signals (planner-declared `depends_on` direction;
+`files_likely_touched` overlap), and **respawns you once** with that
+data and a bounded set of acceptable operations per cycle.
+
+In retry mode, the input prompt will name each cycle, the offending
+mutations, the recommendation, and the must-include set. You must either:
+
+- Emit the recommendation verbatim (it's computed deterministically from
+  signals pila can see in code; it's correct in the common cases), OR
+- Pick a different operation from the bounded set with a structural
+  reason in the `reason` field.
+
+You may **not** use `unresolvable` for a cycle — cycles must be broken
+with one of `dropped_requires` / `dependency_edges` / `merged_subtasks`.
+Pila's apply step rejects revised outputs that ignore a named cycle.
+
+Operation guide for the cycle-breaking ops:
+
+- **`dropped_requires`** when one side's requires entry was over-specified.
+  Example: `config-005` requires `app-server-framework-present` to know
+  which framework to pin in `package.json`. But the framework choice is an
+  authoring-time decision config-005 *records*, not a code artifact
+  feat-001 *produces*. The cleanest resolution is to drop the requires —
+  config-005 picks a reasonable default (e.g. `express`, matching the
+  reference repos), and feat-001 consumes whatever config-005 pinned.
+
+- **`dependency_edges`** when both sides legitimately need each other,
+  one ordering is the right answer, and there's no planner-declared
+  `depends_on` already encoding it. Note: for cycles where one direction
+  is *already* a planner-declared `depends_on` (e.g. run 1's `feat-009 →
+  feat-008` planner edge + a reconciler-renamed `requires` closing the
+  reverse direction), pila's recommendation is `dropped_requires` alone —
+  the planner-declared edge is already in the graph, so adding it again
+  via `dependency_edges` is redundant. Use `dependency_edges` only when
+  you have a structural reason to assert an ordering pila's heuristic
+  didn't compute (e.g., neither direction is planner-declared, files
+  aren't shared, and the model has domain knowledge that one ordering is
+  correct). In that case, pair it with `dropped_requires` to remove the
+  rename closing the opposite direction.
+
+- **`merged_subtasks`** when the cycle reflects genuine authoring overlap.
+  Signal: SCC members share `files_likely_touched`. Example: run 2's
+  cycle had `feat-001` and `config-005` both editing `package.json`, both
+  waiting on the framework choice. The reference repos shipped this kind
+  of bootstrap as one atomic commit; emit a merge with the shorter-SCS
+  subtask as `into`. Surviving subtask inherits the union of
+  `provides`/`requires`/`depends_on`/`files_likely_touched` with self-
+  references dropped.
+
+The mechanical floor (gate + must-include validation + post-retry re-check)
+is the guarantee. The recommendation primes you toward the structurally
+correct answer; you don't need to mentally execute SCC detection or
+verify acyclicity unaided. If your revised output still cycles, pila
+aborts with the full SCC report.
+
 ## Decision rules
+
+These rules govern your **first attempt**, where the task is resolving
+`unresolved_requires`. If your output later turns out to close a
+dependency cycle, pila will respawn you with a structured retry prompt
+naming the cycle and the bounded cycle-breaking ops you must pick from
+(see *Cycle-breaking (the retry mode)* above) — you don't need to think
+about cycles here.
 
 For each `(sid, tag)` in `unresolved_requires`, pick the *first* applicable
 action from this priority order:
@@ -175,6 +272,9 @@ Output:
   ],
   "added_provides": [],
   "added_subtasks": [],
+  "dropped_requires": [],
+  "dependency_edges": [],
+  "merged_subtasks": [],
   "unresolvable": []
 }
 ```

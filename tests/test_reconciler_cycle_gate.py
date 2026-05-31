@@ -1,0 +1,1135 @@
+"""Synthetic-cycle test corpus for the phase 2½ acyclicity gate, the
+recommendation heuristic, the retry-prompt builder, the must-include
+validation, and the three new cycle-breaking apply-step ops
+(`dropped_requires` / `dependency_edges` / `merged_subtasks`).
+
+The corpus is grounded in the two captured failures from
+`~/src/enric/summarizer/.pila/runs/` (run 1: `feat-008 ↔ feat-009`
+mixed-edge SCC; run 2: `config-005 ↔ feat-001` two-rename SCC) plus
+synthetic triangles, 4-cycles, and connector cycles to exercise the
+gate's diagnostic shape under topologies we haven't observed yet.
+
+All tests are deterministic and require no `claude` binary — they
+exercise the apply step, gate, heuristic, and prompt-builder purely
+against synthetic fixtures.
+"""
+from __future__ import annotations
+
+import copy
+
+import pytest
+
+
+# ===========================================================================
+# Helpers
+# ===========================================================================
+
+def _req(tag: str, extent: str = "in_plan") -> dict:
+    return {"tag": tag, "extent": extent}
+
+
+def _subtask(sid: str, *, provides=(), requires=(), depends_on=(),
+             files=(), scs: str = "") -> dict:
+    return {
+        "id": sid,
+        "title": f"Subtask {sid}",
+        "intent": f"intent for {sid}",
+        "provides": list(provides),
+        "requires": [_req(r) if isinstance(r, str) else r for r in requires],
+        "depends_on": list(depends_on),
+        "files_likely_touched": list(files),
+        "success_criteria_seed": scs or f"{sid} succeeds",
+        "size": "small",
+    }
+
+
+def _plan(domain: str, *subtasks) -> dict:
+    return {"domain": domain, "status": "ready", "subtasks": list(subtasks)}
+
+
+def _build_graph(pila, subtasks_dict):
+    """Build (preds, providers, edge_sources, succ) the way the gate
+    does, so tests can call Tarjan directly."""
+    preds, providers, edge_sources = pila._build_predecessor_graph(
+        subtasks_dict)
+    succ = {sid: set() for sid in subtasks_dict}
+    for tgt, src_set in preds.items():
+        for src in src_set:
+            succ[src].add(tgt)
+    return preds, providers, edge_sources, succ
+
+
+# Fixture plans matching the two captured cycles. Reconstructed from the
+# `structured_output` events in the captured reconciler.log files.
+
+def _run2_post_reconcile_plans() -> list[dict]:
+    """Run 2's `feat-001 ↔ config-005` 2-node SCC. Both edges are
+    reconciler renames; pre-reconcile graph is acyclic. Returned in
+    POST-reconcile shape (renames already applied) so the gate fires."""
+    # feat-001 requires "app-runtime-deps" (renamed from
+    # "node-server-runtime-libs-present"); provided by config-005.
+    feat_001 = _subtask(
+        "feat-001",
+        provides=["backend-http-server"],
+        requires=["app-runtime-deps"],
+        files=["package.json", "server/index.ts"],
+        scs="server starts and /health returns 200",
+    )
+    # config-005 requires "backend-http-server" (renamed from
+    # "app-server-framework-present"); provided by feat-001.
+    config_005 = _subtask(
+        "config-005",
+        provides=["app-runtime-deps", "app-build-scripts"],
+        requires=["backend-http-server"],
+        files=["package.json"],
+        scs=("package.json exposes build, start (production server), a "
+             "worker/start-worker path; pnpm install resolves; "
+             "the runtime deps are pinned"),
+    )
+    return [_plan("feature-implementation", feat_001),
+            _plan("configuration-build", config_005)]
+
+
+def _run2_reconciler_output() -> dict:
+    """The two renames the captured reconciler emitted for run 2."""
+    return {
+        "renames": [
+            {"sid": "feat-001",
+             "from": "node-server-runtime-libs-present",
+             "to": "app-runtime-deps"},
+            {"sid": "config-005",
+             "from": "app-server-framework-present",
+             "to": "backend-http-server"},
+        ],
+        "added_provides": [],
+        "added_subtasks": [],
+        "dropped_requires": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
+        "unresolvable": [],
+    }
+
+
+def _run1_post_reconcile_plans() -> list[dict]:
+    """Run 1's `feat-008 ↔ feat-009` 2-node SCC. One edge is planner-
+    declared (`feat-009 depends_on feat-008`); the other is a
+    reconciler rename. Returned in POST-reconcile shape."""
+    feat_008 = _subtask(
+        "feat-008",
+        provides=["audio-pipeline-driver"],
+        # Renamed from some original tag → "prisma-data-access-ready"
+        # (provided by feat-009).
+        requires=["prisma-data-access-ready"],
+        files=["src/lib/audio.ts"],
+        scs="audio pipeline drives chunks end to end",
+    )
+    feat_009 = _subtask(
+        "feat-009",
+        provides=["prisma-data-access-ready"],
+        requires=[],
+        # Planner-declared depends_on closing the reverse direction.
+        depends_on=["feat-008"],
+        files=["src/lib/prisma.ts"],
+        scs="prisma client connects and runs a smoke query",
+    )
+    return [_plan("feature-implementation", feat_008, feat_009)]
+
+
+def _run1_reconciler_output() -> dict:
+    return {
+        "renames": [
+            {"sid": "feat-008",
+             "from": "data-access-ready",
+             "to": "prisma-data-access-ready"},
+        ],
+        "added_provides": [],
+        "added_subtasks": [],
+        "dropped_requires": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
+        "unresolvable": [],
+    }
+
+
+# ===========================================================================
+# Test 1: Run-2 case — both edges from renames, gate fires
+# ===========================================================================
+
+def test_gate_fires_on_run2_two_rename_cycle(pila):
+    """Tarjan returns the 2-node SCC; diagnostic names both subtasks
+    and attributes each edge to its rename."""
+    plans = _run2_post_reconcile_plans()
+    output = _run2_reconciler_output()
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert sccs == [["config-005", "feat-001"]], (
+        "expected one 2-node SCC sorted lex: ['config-005', 'feat-001']")
+
+    diag = pila._format_cycle_diagnostic(
+        sccs, succ, edge_sources, output, by_id)
+    assert "config-005" in diag and "feat-001" in diag
+    # Both edges are attributed to renames (not planner-declared).
+    assert "rename:" in diag
+    # Shared files signal surfaces.
+    assert "package.json" in diag
+
+
+# ===========================================================================
+# Test 2: Run-1 case — mixed depends_on + rename, gate fires
+# ===========================================================================
+
+def test_gate_fires_on_run1_mixed_edge_cycle(pila):
+    """Run 1: feat-009 -> feat-008 via planner depends_on; feat-008 ->
+    feat-009 via renamed requires. Diagnostic names each edge's source
+    separately (depends_on vs. rename)."""
+    plans = _run1_post_reconcile_plans()
+    output = _run1_reconciler_output()
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert sccs == [["feat-008", "feat-009"]]
+
+    diag = pila._format_cycle_diagnostic(
+        sccs, succ, edge_sources, output, by_id)
+    # Both source labels appear.
+    assert "depends_on" in diag
+    assert "requires:" in diag
+    assert "planner-declared" in diag
+    assert "rename:" in diag
+
+
+# ===========================================================================
+# Test 3: 3-node triangle via mixed edges
+# ===========================================================================
+
+def test_gate_fires_on_3node_triangle(pila):
+    """A->B->C->A cycle via requires-tag matches."""
+    a = _subtask("feat-a", provides=["a"], requires=["c"])
+    b = _subtask("feat-b", provides=["b"], requires=["a"])
+    c = _subtask("feat-c", provides=["c"], requires=["b"])
+    by_id = {s["id"]: s for s in (a, b, c)}
+
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert len(sccs) == 1
+    assert sorted(sccs[0]) == ["feat-a", "feat-b", "feat-c"]
+
+
+# ===========================================================================
+# Test 4: 4-node cycle A->B->C->D->A via mixed depends_on / requires
+# ===========================================================================
+
+def test_gate_fires_on_4node_cycle_mixed_edges(pila):
+    a = _subtask("a", provides=["a-cap"], depends_on=["d"])
+    b = _subtask("b", provides=["b-cap"], requires=["a-cap"])
+    c = _subtask("c", provides=["c-cap"], depends_on=["b"])
+    d = _subtask("d", provides=["d-cap"], requires=["c-cap"])
+    by_id = {s["id"]: s for s in (a, b, c, d)}
+
+    _preds, _provs, _es, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert len(sccs) == 1
+    assert sorted(sccs[0]) == ["a", "b", "c", "d"]
+
+
+# ===========================================================================
+# Test 5: Cycle involving a reconciler-added connector
+# ===========================================================================
+
+def test_gate_fires_on_connector_cycle(pila):
+    """A reconciler-added connector closes a loop; edge attribution
+    names the connector by id."""
+    feat_001 = _subtask("feat-001",
+                        provides=["x"], requires=["connector-cap"])
+    # Connector required something feat-001 provides → cycle.
+    connector = _subtask("recon-001",
+                         provides=["connector-cap"], requires=["x"])
+    connector["_added_by_reconciler"] = True
+    by_id = {s["id"]: s for s in (feat_001, connector)}
+
+    output = {
+        "renames": [], "added_provides": [],
+        "added_subtasks": [connector], "dropped_requires": [],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert sccs == [["feat-001", "recon-001"]]
+
+    diag = pila._format_cycle_diagnostic(
+        sccs, succ, edge_sources, output, by_id)
+    assert "added_subtask: recon-001" in diag
+
+
+# ===========================================================================
+# Test 6: dropped_requires resolves the run-2 cycle
+# ===========================================================================
+
+def test_dropped_requires_resolves_run2(pila):
+    """Apply step removes the named requires entry; the graph becomes
+    acyclic; Kahn's produces valid waves."""
+    plans = _run2_post_reconcile_plans()
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [{
+            "sid": "config-005",
+            "tag": "backend-http-server",
+            "reason": "framework choice is an authoring decision config-005 "
+                      "records, not a code artifact",
+        }],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+
+    # The dropped requires entry is gone.
+    config_005 = next(s for plan in plans for s in plan["subtasks"]
+                      if s["id"] == "config-005")
+    assert all(r.get("tag") != "backend-http-server"
+               for r in config_005["requires"])
+
+    # Graph is acyclic now.
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+    _preds, _provs, _es, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert sccs == []
+
+
+# ===========================================================================
+# Test 7: dependency_edges resolves an asymmetric case
+# ===========================================================================
+
+def test_dependency_edges_appends_dedup_and_breaks_cycle(pila):
+    """Apply step appends to depends_on (dedup) so the explicit
+    ordering is recorded; the existing graph stays consistent."""
+    # Two subtasks with no current cycle.
+    a = _subtask("a", provides=["a-cap"], requires=[])
+    b = _subtask("b", provides=["b-cap"], requires=[])
+    plans = [_plan("feat", a, b)]
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [],
+        "dependency_edges": [
+            {"from": "a", "to": "b", "reason": "..."},
+            {"from": "a", "to": "b", "reason": "..."},  # dup → dedup
+        ],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+    b_after = next(s for plan in plans for s in plan["subtasks"]
+                   if s["id"] == "b")
+    assert b_after["depends_on"] == ["a"], (
+        "duplicate dependency_edges must be deduped on append")
+
+
+def test_dependency_edges_die_on_missing_id(pila):
+    a = _subtask("a", provides=["a-cap"])
+    plans = [_plan("feat", a)]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [],
+        "dependency_edges": [
+            {"from": "a", "to": "ghost", "reason": "missing"},
+        ],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    with pytest.raises(SystemExit):
+        pila._apply_reconciler_output(plans, output)
+
+
+# ===========================================================================
+# Test 8: merged_subtasks resolves the run-2 cycle
+# ===========================================================================
+
+def test_merged_subtasks_resolves_run2(pila):
+    """Apply step folds config-005 into feat-001, unioning fields,
+    dropping self-references, stamping _merged_from, rewriting
+    downstream depends_on. Graph becomes acyclic."""
+    plans = _run2_post_reconcile_plans()
+    # Add a third subtask that depends on `config-005`, to test that
+    # downstream depends_on references are rewritten.
+    extra = _subtask("feat-002", provides=["y"], depends_on=["config-005"])
+    plans[0]["subtasks"].append(extra)
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [{
+            "into": "feat-001", "from": "config-005",
+            "reason": "Both edit package.json; reference repos ship "
+                      "bootstrap as one unit.",
+        }],
+        "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+
+    # `from` (config-005) is removed.
+    all_ids = {s["id"] for plan in plans for s in plan["subtasks"]}
+    assert "config-005" not in all_ids
+    assert "feat-001" in all_ids
+
+    feat_001 = next(s for plan in plans for s in plan["subtasks"]
+                    if s["id"] == "feat-001")
+    # Provides union (dedup, order-preserving).
+    assert set(feat_001["provides"]) == {
+        "backend-http-server", "app-runtime-deps", "app-build-scripts",
+    }
+    # Requires self-references dropped: feat-001 originally required
+    # "app-runtime-deps" (which the merged unit now provides) → dropped.
+    # config-005 originally required "backend-http-server" (also self-
+    # provided now) → dropped.
+    req_tags = {r["tag"] for r in feat_001["requires"]}
+    assert "app-runtime-deps" not in req_tags
+    assert "backend-http-server" not in req_tags
+    # Files union.
+    assert set(feat_001["files_likely_touched"]) == {
+        "package.json", "server/index.ts"}
+    # _merged_from telemetry.
+    assert feat_001["_merged_from"] == ["config-005"]
+    # success_criteria_seed concatenation.
+    assert "AND" in feat_001["success_criteria_seed"]
+
+    # Downstream depends_on rewriting: feat-002 previously depended on
+    # config-005; now depends on feat-001.
+    feat_002 = next(s for plan in plans for s in plan["subtasks"]
+                    if s["id"] == "feat-002")
+    assert feat_002["depends_on"] == ["feat-001"]
+
+    # Graph is acyclic.
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+    _preds, _provs, _es, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert sccs == []
+
+
+# ===========================================================================
+# Test 9: merged_subtasks fail-loud on missing id
+# ===========================================================================
+
+def test_merged_subtasks_die_on_missing_id(pila):
+    a = _subtask("a", provides=["a"])
+    plans = [_plan("feat", a)]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [{
+            "into": "a", "from": "ghost", "reason": "...",
+        }],
+        "unresolvable": [],
+    }
+    with pytest.raises(SystemExit):
+        pila._apply_reconciler_output(plans, output)
+
+
+def test_merged_subtasks_die_on_self_merge(pila):
+    a = _subtask("a", provides=["a"])
+    plans = [_plan("feat", a)]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [{
+            "into": "a", "from": "a", "reason": "self",
+        }],
+        "unresolvable": [],
+    }
+    with pytest.raises(SystemExit):
+        pila._apply_reconciler_output(plans, output)
+
+
+# ===========================================================================
+# Test 10: Acyclic plan: gate silent
+# ===========================================================================
+
+def test_gate_silent_on_acyclic_plan(pila):
+    a = _subtask("a", provides=["a"])
+    b = _subtask("b", provides=["b"], requires=["a"])
+    c = _subtask("c", provides=["c"], requires=["b"], depends_on=["a"])
+    by_id = {s["id"]: s for s in (a, b, c)}
+    _preds, _provs, _es, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert sccs == []
+
+
+# ===========================================================================
+# Test 11: Regression fixtures from real successful runs (zero false positives)
+# ===========================================================================
+
+# Tiny synthetic stand-ins for the five successful-run plans surveyed in
+# the cross-repo canvass. We don't ship the full captured plans here
+# (they're large and live in user .pila/runs/ directories) — these
+# scaffolds mirror the structural shape (n subtasks, m capability
+# matches, no cycles) so the gate's silent-on-acyclic property is
+# pinned in the test corpus.
+
+@pytest.mark.parametrize("name,subtasks", [
+    ("centella-feat-rebrand-3domains", [
+        ("feat-001", ["a"], [], []),
+        ("feat-002", ["b"], ["a"], []),
+        ("refactor-001", ["c"], ["b"], []),
+        ("docs-001", [], ["c"], []),
+    ]),
+    ("barnacle-12-renames", [
+        ("feat-001", ["f1"], [], []),
+        ("feat-002", ["f2"], ["f1"], []),
+        ("feat-003", ["f3"], ["f1"], []),
+        ("config-001", ["c1"], ["f2"], []),
+        ("config-002", ["c2"], ["f3"], []),
+        ("docs-001", [], ["c1", "c2"], []),
+    ]),
+    ("navegando-bugfix-no-recon", [
+        ("bugfix-001", ["b1"], [], []),
+        ("bugfix-002", ["b2"], ["b1"], []),
+        ("feat-001", ["f1"], ["b2"], []),
+    ]),
+    ("pila-feat-please-read-2domains", [
+        ("feat-001", ["f1"], [], []),
+        ("feat-002", ["f2"], ["f1"], []),
+        ("config-001", [], ["f2"], []),
+    ]),
+    ("finalmemoriam-bugfix-1rename", [
+        ("bugfix-001", ["b1"], [], []),
+        ("test-001", [], ["b1"], []),
+    ]),
+])
+def test_gate_silent_on_successful_run_shapes(pila, name, subtasks):
+    """The gate must NOT fire on any of the five successful-run shapes
+    surveyed in the cross-repo canvass. False-positive regression
+    guard. (Synthetic stand-ins; the real captured plans pass the same
+    check when reconstructed from .pila/runs/.)"""
+    by_id = {sid: _subtask(sid, provides=p, requires=r, depends_on=d)
+             for (sid, p, r, d) in subtasks}
+    _preds, _provs, _es, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert sccs == [], f"{name}: gate fired on a known-acyclic shape"
+
+
+# ===========================================================================
+# Test 12: Retry-prompt builder produces expected structure
+# ===========================================================================
+
+def test_retry_prompt_builder_contains_required_sections(pila):
+    """The retry prompt names the SCC, the edges, the structural
+    signals, the recommendation, and the must-include set."""
+    plans = _run2_post_reconcile_plans()
+    output = _run2_reconciler_output()
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+
+    # Pre-providers map: at this point, both subtasks still have their
+    # ORIGINAL requires; pre-providers is just provides → [sid]. (In
+    # production, this comes from the pre-mutation snapshot in
+    # phase_reconcile.)
+    pre_providers = {
+        "backend-http-server": ["feat-001"],
+        "app-runtime-deps": ["config-005"],
+        "app-build-scripts": ["config-005"],
+    }
+    recs = [pila._recommend_cycle_resolution(
+        scc, succ, edge_sources, by_id, output, pre_providers)
+        for scc in sccs]
+    prompt = pila._build_cycle_retry_prompt(
+        sccs, succ, edge_sources, output, by_id, recs,
+        "ORIGINAL USER PROMPT")
+
+    # Required sections.
+    assert "1 dependency cycle" in prompt
+    assert "CYCLE 1:" in prompt
+    assert "config-005" in prompt and "feat-001" in prompt
+    assert "RECOMMENDED:" in prompt
+    assert "MUST include" in prompt
+    assert "unresolvable" in prompt and "NOT a valid" in prompt
+    assert "ORIGINAL USER PROMPT" in prompt
+    # Structural signals.
+    assert "Shared files_likely_touched: ['package.json']" in prompt
+    # Recommendation line must inline the actual reason text — not a
+    # `reason=...` literal-ellipsis placeholder the model would have to
+    # interpolate. Fix 3A: the model should be able to copy the
+    # RECOMMENDED line verbatim into its output.
+    assert "reason=..." not in prompt, (
+        "RECOMMENDED line should inline the actual reason text "
+        "(repr-escaped), not a placeholder ellipsis")
+    # And a snippet of the actual reason (run-2's case-2 merge rationale)
+    # appears somewhere in the prompt — both in the RECOMMENDED line and
+    # in the Why: commentary line.
+    assert "Both subtasks edit the same file" in prompt
+
+
+# ===========================================================================
+# Test 13: Mutation reversion is clean (deep-copy round trip)
+# ===========================================================================
+
+def test_mutation_reversion_via_deep_copy_is_clean(pila):
+    """Deep-copy snapshot before apply; revert by restoring from the
+    snapshot. Post-revert state must equal the original."""
+    plans = _run2_post_reconcile_plans()
+    snapshot = copy.deepcopy(plans)
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [{
+            "into": "feat-001", "from": "config-005", "reason": "...",
+        }],
+        "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+    # Confirm we actually mutated something.
+    all_ids = {s["id"] for plan in plans for s in plan["subtasks"]}
+    assert "config-005" not in all_ids
+
+    # Revert by deep-copying the snapshot back into plans.
+    plans.clear()
+    plans.extend(copy.deepcopy(snapshot))
+    # Post-revert equals original.
+    assert plans == snapshot
+
+
+# ===========================================================================
+# Test 14: Recommendation heuristic on both captured cycles
+# ===========================================================================
+
+def test_recommendation_correct_on_run2_cycle(pila):
+    """Run 2's cycle has shared package.json; heuristic case 2 fires.
+    feat-001 has the shorter SCS, so it becomes `into`."""
+    plans = _run2_post_reconcile_plans()
+    output = _run2_reconciler_output()
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    rec = pila._recommend_cycle_resolution(
+        sccs[0], succ, edge_sources, by_id, output,
+        pre_providers={
+            "backend-http-server": ["feat-001"],
+            "app-runtime-deps": ["config-005"],
+        })
+    assert rec["op"] == "merged_subtasks"
+    assert rec["into"] == "feat-001"
+    assert rec["from"] == "config-005"
+    assert rec["rationale"] == "case-2: shared-files merge"
+
+
+def test_recommendation_correct_on_run1_cycle(pila):
+    """Run 1's cycle has planner-declared feat-009 -> feat-008; case 1
+    fires; drop the rename closing the reverse direction."""
+    plans = _run1_post_reconcile_plans()
+    output = _run1_reconciler_output()
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    rec = pila._recommend_cycle_resolution(
+        sccs[0], succ, edge_sources, by_id, output,
+        pre_providers={"prisma-data-access-ready": ["feat-009"]})
+    assert rec["op"] == "dropped_requires"
+    assert rec["sid"] == "feat-008"
+    assert rec["tag"] == "prisma-data-access-ready"
+    assert rec["rationale"] == "case-1: planner-edge keeper"
+
+
+# ===========================================================================
+# Test 15: Must-include validation fail-loud
+# ===========================================================================
+
+def test_must_include_validation_flags_unaddressed_cycle(pila):
+    """If the revised output doesn't include any op addressing a named
+    cycle, _validate_must_include returns it as unaddressed."""
+    plans = _run2_post_reconcile_plans()
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+
+    # An "empty" revised output (no cycle-breaking ops at all).
+    empty_output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    unaddressed = pila._validate_must_include(empty_output, sccs)
+    assert unaddressed == ["config-005 <-> feat-001"]
+
+
+def test_must_include_validation_passes_when_drop_addresses_cycle(pila):
+    plans = _run2_post_reconcile_plans()
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [
+            {"sid": "config-005", "tag": "backend-http-server",
+             "reason": "..."},
+        ],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    unaddressed = pila._validate_must_include(output, sccs)
+    assert unaddressed == []
+
+
+def test_must_include_validation_passes_when_merge_addresses_cycle(pila):
+    plans = _run2_post_reconcile_plans()
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [
+            {"into": "feat-001", "from": "config-005", "reason": "..."},
+        ],
+        "unresolvable": [],
+    }
+    unaddressed = pila._validate_must_include(output, sccs)
+    assert unaddressed == []
+
+
+# ===========================================================================
+# Test 16: Post-retry cycle detection (revised output introduces new cycle)
+# ===========================================================================
+
+def test_post_retry_detects_newly_introduced_cycle(pila):
+    """If the revised output resolves the named cycle but introduces a
+    new one elsewhere, the post-retry Tarjan fires with the new SCC."""
+    # Start with run 2's cycle. Imagine the model "resolves" it by
+    # dropping config-005's requires (good) but then adds a
+    # dependency_edges that creates a NEW cycle with an unrelated
+    # subtask.
+    plans = _run2_post_reconcile_plans()
+    # Add an unrelated subtask that the new edge will cycle with.
+    extra = _subtask("feat-x",
+                     provides=["x-cap"], requires=["app-runtime-deps"])
+    plans[0]["subtasks"].append(extra)
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [
+            {"sid": "config-005", "tag": "backend-http-server",
+             "reason": "..."},
+        ],
+        "dependency_edges": [
+            # Creates a new cycle: config-005 provides app-runtime-deps,
+            # feat-x requires app-runtime-deps → edge config-005 → feat-x.
+            # Now we add feat-x → config-005, closing a NEW 2-node SCC.
+            {"from": "feat-x", "to": "config-005", "reason": "..."},
+        ],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+    _preds, _provs, _es, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    # Original cycle is gone, but a new one exists.
+    assert sccs == [["config-005", "feat-x"]]
+
+
+# ===========================================================================
+# Test 17: No-recommendation case falls back to speculative-rename drop
+# ===========================================================================
+
+def test_recommendation_case3_speculative_rename(pila):
+    """SCC with no shared files and no planner depends_on. Case 3 fires:
+    drop the rename whose original tag had no pre-reconcile producer."""
+    # Create a 2-rename cycle where the renames don't share files.
+    a = _subtask("a",
+                 provides=["a-real"],
+                 requires=["b-real"],  # post-rename
+                 files=["a.ts"])
+    b = _subtask("b",
+                 provides=["b-real"],
+                 requires=["a-real"],  # post-rename
+                 files=["b.ts"])
+    by_id = {s["id"]: s for s in (a, b)}
+    output = {
+        "renames": [
+            # Rename `a-needs-something` → `b-real`. Original
+            # `a-needs-something` had NO producer in pre_providers → speculative.
+            {"sid": "a", "from": "a-needs-something", "to": "b-real"},
+            # Rename `b-needs-something` → `a-real`. Original ALSO had
+            # no producer.
+            {"sid": "b", "from": "b-needs-something", "to": "a-real"},
+        ],
+        "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    rec = pila._recommend_cycle_resolution(
+        sccs[0], succ, edge_sources, by_id, output,
+        pre_providers={"a-real": ["a"], "b-real": ["b"]})
+    assert rec["op"] == "dropped_requires"
+    assert rec["rationale"] == "case-3: speculative-rename drop"
+
+
+# ===========================================================================
+# Test 18: Tarjan deterministic ordering
+# ===========================================================================
+
+def test_tarjan_returns_sorted_sccs(pila):
+    """Both the inner SCC node list AND the order of SCCs returned must
+    be deterministic so diagnostic messages don't churn between runs."""
+    a = _subtask("z", provides=["z"], requires=["a"])
+    b = _subtask("a", provides=["a"], requires=["z"])
+    by_id = {s["id"]: s for s in (a, b)}
+    _preds, _provs, _es, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    # Inner list sorted lex.
+    assert sccs == [["a", "z"]]
+
+
+# ===========================================================================
+# Test 19: dropped_requires preserves extent: external entries with the
+# same tag
+# ===========================================================================
+
+def test_dropped_requires_preserves_external_extent(pila):
+    """The apply step's `dropped_requires` op must only remove
+    `extent: in_plan` entries. If a subtask carries both an in_plan and
+    an external entry for the same tag string (rare but possible — the
+    external one names an out-of-graph prerequisite that happens to
+    share a name with the in_plan tag), only the in_plan entry should
+    be removed. The external entry surfaces as a deploy-note
+    precondition and must survive."""
+    s = _subtask("feat-a", provides=[])
+    s["requires"] = [
+        {"tag": "shared-name", "extent": "in_plan"},
+        {"tag": "shared-name", "extent": "external",
+         "reason": "provisioned by the infra repo's CDK stack"},
+    ]
+    plans = [_plan("feat", s)]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [{
+            "sid": "feat-a", "tag": "shared-name",
+            "reason": "in_plan entry was over-specified",
+        }],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+    feat_a = next(s for plan in plans for s in plan["subtasks"]
+                  if s["id"] == "feat-a")
+    extents = sorted(r["extent"] for r in feat_a["requires"])
+    assert extents == ["external"], (
+        f"only the in_plan entry should be removed; got extents={extents}")
+    # The external entry's reason field is preserved.
+    ext = feat_a["requires"][0]
+    assert ext["reason"].startswith("provisioned by")
+
+
+# ===========================================================================
+# Test 20: merged_subtasks chain carries _merged_from forward
+# ===========================================================================
+
+def test_merged_subtasks_chain_carries_merged_from(pila):
+    """Three subtasks A, B, C. Merge A into B, then B into C. C must
+    carry both ids in `_merged_from` so a downstream consumer can
+    trace the full ancestry of the merged unit."""
+    a = _subtask("a", provides=["a-cap"], files=["x.ts"])
+    b = _subtask("b", provides=["b-cap"], files=["x.ts"])
+    c = _subtask("c", provides=["c-cap"], files=["x.ts"])
+    plans = [_plan("feat", a, b, c)]
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [
+            {"into": "b", "from": "a", "reason": "..."},
+            {"into": "c", "from": "b", "reason": "..."},
+        ],
+        "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+    surviving = [s for plan in plans for s in plan["subtasks"]]
+    assert len(surviving) == 1
+    assert surviving[0]["id"] == "c"
+    # First merge: b gets _merged_from = ["a"]. Second merge: c gets
+    # _merged_from starting with ["b"], then carries over b's prior
+    # ["a"]. Order: [b, a] because b is appended first, then a from
+    # b's prior _merged_from.
+    assert surviving[0]["_merged_from"] == ["b", "a"]
+
+
+# ===========================================================================
+# Test 21: merged_subtasks override fields take precedence
+# ===========================================================================
+
+def test_merged_subtasks_override_fields(pila):
+    """When the merge op includes optional `title`, `intent`, and
+    `success_criteria_seed`, the surviving subtask must carry the
+    overrides verbatim (not the concatenation default for SCS, not the
+    `into` value for title/intent)."""
+    a = _subtask("a", provides=["a-cap"], scs="A's original criterion")
+    b = _subtask("b", provides=["b-cap"], scs="B's original criterion")
+    a["title"] = "A's original title"
+    a["intent"] = "A's original intent"
+    plans = [_plan("feat", a, b)]
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [{
+            "into": "a", "from": "b", "reason": "...",
+            "title": "merged unit title",
+            "intent": "merged unit intent",
+            "success_criteria_seed": "merged unit criterion",
+        }],
+        "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+    a_after = next(s for plan in plans for s in plan["subtasks"]
+                   if s["id"] == "a")
+    assert a_after["title"] == "merged unit title"
+    assert a_after["intent"] == "merged unit intent"
+    assert a_after["success_criteria_seed"] == "merged unit criterion"
+    # No " AND " concatenation when the override is provided.
+    assert "AND" not in a_after["success_criteria_seed"]
+
+
+# ===========================================================================
+# Test 22: merged_subtasks requires-cleanup preserves external entries
+# ===========================================================================
+
+def test_merged_subtasks_requires_cleanup_preserves_external(pila):
+    """When the merged unit provides tag X and an absorbed side had a
+    requires entry for X, the cleanup must only drop the entry if its
+    `extent: in_plan`. An `extent: external` entry for the same tag
+    survives — it names an out-of-graph prerequisite, not a code-
+    artifact dependency the merge satisfies."""
+    a = _subtask("a", provides=["x"])
+    b = _subtask("b", provides=[])
+    b["requires"] = [
+        {"tag": "x", "extent": "external",
+         "reason": "provisioned by another repo's deploy"},
+    ]
+    plans = [_plan("feat", a, b)]
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [{
+            "into": "a", "from": "b", "reason": "..."}],
+        "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+    a_after = next(s for plan in plans for s in plan["subtasks"]
+                   if s["id"] == "a")
+    # The merged unit provides "x" but the external requires entry for
+    # "x" must survive (it's out-of-graph).
+    assert "x" in a_after["provides"]
+    ext_entries = [r for r in a_after["requires"]
+                   if r.get("extent") == "external" and r.get("tag") == "x"]
+    assert len(ext_entries) == 1, (
+        "external requires entry for the same tag as a merged provide "
+        "must survive self-reference cleanup")
+
+
+# ===========================================================================
+# Test 23: dependency_edges fail-loud on self-loop
+# ===========================================================================
+
+def test_dependency_edges_die_on_self_loop(pila):
+    """`dependency_edges: [{from: 'a', to: 'a', ...}]` is a malformed
+    op (a subtask cannot depend on itself). Apply step must die at
+    apply time — symmetric with `merged_subtasks`'s into==from check —
+    rather than allow the self-loop to surface downstream as a 1-node
+    SCC."""
+    a = _subtask("a", provides=["a-cap"])
+    plans = [_plan("feat", a)]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [],
+        "dependency_edges": [
+            {"from": "a", "to": "a", "reason": "self-loop"},
+        ],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    with pytest.raises(SystemExit):
+        pila._apply_reconciler_output(plans, output)
+
+
+# ===========================================================================
+# Test 24: recommendation case-4 (lexicographic tiebreaker) — the
+# always-returns-something guarantee
+# ===========================================================================
+
+def test_recommendation_case4_lexicographic_tiebreaker(pila):
+    """When none of cases 1-3 apply — no planner-declared depends_on in
+    the SCC, no shared files_likely_touched, and every rename's `from`
+    tag had a producer in pre_providers (so case 3's speculative-rename
+    test doesn't fire) — case 4 fires as the deterministic last resort.
+    It drops the rename keyed by the lexicographically later (consumer-
+    sid, source-label) pair.
+
+    The function's contract is "always returns a recommendation," so
+    a regression that breaks case 4 would silently produce no
+    recommendation for an SCC the model then has to resolve unaided.
+    Pin the contract here."""
+    # Two subtasks with disjoint files and no shared depends_on. Both
+    # provides+requires entries are post-rename — the renames simply
+    # collapse two synonym tags whose originals BOTH had pre-producers
+    # (so case 3 abstains).
+    a = _subtask("subtask-a",
+                 provides=["a-canonical"],
+                 requires=["b-canonical"],
+                 files=["a.ts"])
+    b = _subtask("subtask-b",
+                 provides=["b-canonical"],
+                 requires=["a-canonical"],
+                 files=["b.ts"])
+    by_id = {s["id"]: s for s in (a, b)}
+    output = {
+        "renames": [
+            # subtask-a's original requires tag was `b-synonym`, and
+            # `b-synonym` HAD a producer in the pre-reconcile graph
+            # (some sibling subtask, not modeled here — pre_providers
+            # just needs to claim it). So this rename is NOT
+            # speculative — case 3 abstains.
+            {"sid": "subtask-a", "from": "b-synonym", "to": "b-canonical"},
+            {"sid": "subtask-b", "from": "a-synonym", "to": "a-canonical"},
+        ],
+        "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert sccs == [["subtask-a", "subtask-b"]]
+
+    # Both rename `from` tags claim pre-producers, so case 3 abstains
+    # and case 4 fires.
+    pre_providers = {
+        "b-synonym": ["some-other-subtask"],
+        "a-synonym": ["yet-another-subtask"],
+        "a-canonical": ["subtask-a"],
+        "b-canonical": ["subtask-b"],
+    }
+    rec = pila._recommend_cycle_resolution(
+        sccs[0], succ, edge_sources, by_id, output, pre_providers)
+    assert rec["op"] == "dropped_requires"
+    assert rec["rationale"] == "case-4: lexicographic tiebreaker"
+    # The tiebreaker sorts rename-bearing edges by (e["to"], e["source"])
+    # DESC and picks the first. The two edges in the SCC are:
+    #   subtask-a -> subtask-b  [requires:a-canonical; rename on subtask-b]
+    #   subtask-b -> subtask-a  [requires:b-canonical; rename on subtask-a]
+    # The consumer side (e["to"]) gets the drop. DESC order: subtask-b
+    # comes before subtask-a, so the dropped requires entry lives on
+    # subtask-b and targets tag `a-canonical`.
+    assert rec["sid"] == "subtask-b"
+    assert rec["tag"] == "a-canonical"
+
+
+# ===========================================================================
+# Test 25: _format_recommendation dropped_requires branch direct unit
+# ===========================================================================
+
+def test_format_recommendation_dropped_requires(pila):
+    """Direct unit test pins the rendered shape for a dropped_requires
+    recommendation. The integration tests only render the merged_subtasks
+    branch (via the run-2 fixture in
+    test_retry_prompt_builder_contains_required_sections); without
+    this direct test, a refactor that broke the dropped_requires
+    branch's f-string would not be caught."""
+    rec = {
+        "op": "dropped_requires",
+        "sid": "feat-001",
+        "tag": "app-runtime-deps",
+        "reason": "Single-quoted 'reason' with a newline\nand a backslash\\",
+        "rationale": "case-3: speculative-rename drop",
+    }
+    rendered = pila._format_recommendation(rec)
+    # repr() escapes the embedded quotes and newline so the line stays
+    # a valid Python-call literal.
+    assert rendered.startswith(
+        "dropped_requires(sid='feat-001', tag='app-runtime-deps', reason=")
+    assert rendered.endswith(")")
+    # reason text is in there, with quote/newline escapes intact.
+    assert "Single-quoted" in rendered
+    assert "\\n" in rendered or "\\\\n" in rendered, (
+        "newline in reason should appear escaped in the rendered string")
+    # No literal ellipsis placeholder.
+    assert "reason=..." not in rendered
+
+
+# ===========================================================================
+# Test 26: _format_recommendation merged_subtasks branch direct unit
+# ===========================================================================
+
+def test_format_recommendation_merged_subtasks(pila):
+    """Direct unit test for the merged_subtasks render branch."""
+    rec = {
+        "op": "merged_subtasks",
+        "into": "feat-001",
+        "from": "config-005",
+        "reason": "Both edit package.json",
+        "rationale": "case-2: shared-files merge",
+    }
+    rendered = pila._format_recommendation(rec)
+    assert rendered.startswith(
+        "merged_subtasks(into='feat-001', from='config-005', reason=")
+    assert rendered.endswith(")")
+    assert "Both edit package.json" in rendered
+
+
+# ===========================================================================
+# Test 27: _matches_recommendation marks the recommended option
+# ===========================================================================
+
+def test_matches_recommendation_marks_correct_option(pila):
+    """For each of the two reachable recommendation ops, an option
+    string that starts with the recommendation's prefix returns True;
+    a non-matching option returns False. Without this test, a bug that
+    caused the function to always return False (no `← recommended`
+    marker in the retry prompt) would not be caught."""
+    # dropped_requires
+    rec_drop = {"op": "dropped_requires", "sid": "a", "tag": "x",
+                "reason": "r", "rationale": "case-1: planner-edge keeper"}
+    matching = "dropped_requires(sid='a', tag='x', ...)"
+    not_matching = "dropped_requires(sid='b', tag='x', ...)"
+    assert pila._matches_recommendation(matching, rec_drop) is True
+    assert pila._matches_recommendation(not_matching, rec_drop) is False
+    # merged_subtasks
+    rec_merge = {"op": "merged_subtasks", "into": "a", "from": "b",
+                 "reason": "r", "rationale": "case-2: shared-files merge"}
+    matching = "merged_subtasks(into='a', from='b', ...)"
+    not_matching = "merged_subtasks(into='b', from='a', ...)"
+    assert pila._matches_recommendation(matching, rec_merge) is True
+    assert pila._matches_recommendation(not_matching, rec_merge) is False
+
+
+# ===========================================================================
+# Test 28: _validate_must_include rejects ops targeting non-SCC sids
+# ===========================================================================
+
+def test_must_include_rejects_op_on_non_scc_sid(pila):
+    """The validator credits an op against a cycle only when the op
+    targets an SCC member. An op on an unrelated subtask should NOT
+    satisfy any cycle's must-include set — without this negative test,
+    a regression that caused the validator to always return [] would
+    not be caught by the existing positive tests."""
+    # SCC of A and B; unrelated subtask C.
+    a = _subtask("a", provides=["a-cap"], requires=["b-cap"])
+    b = _subtask("b", provides=["b-cap"], requires=["a-cap"])
+    c = _subtask("c", provides=["c-cap"])
+    by_id = {s["id"]: s for s in (a, b, c)}
+    _preds, _provs, _es, succ = _build_graph(pila, by_id)
+    sccs = pila._tarjan_sccs(set(by_id), succ)
+    assert sccs == [["a", "b"]], "fixture: SCC is exactly {a, b}"
+
+    # Op targets C, not A or B → must NOT credit the cycle.
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [
+            {"sid": "c", "tag": "c-cap", "reason": "unrelated drop"},
+        ],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    unaddressed = pila._validate_must_include(output, sccs)
+    assert unaddressed == ["a <-> b"], (
+        "a dropped_requires on a non-SCC sid must NOT satisfy the cycle's "
+        "must-include set; validator should report the cycle as unaddressed")

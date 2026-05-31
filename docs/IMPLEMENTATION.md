@@ -1358,8 +1358,8 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 1½ Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ "Worker-driven install"). Runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.pila-setup.sh` hook if present → `synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — workers run install commands themselves in their own worktrees (not the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.pila-setup.sh` run through `run_streaming` so their output is visible live. Skipped on `--resume` (whole fresh-run else-branch is); the env var is re-exported from persisted state on resume. |
 | 0 Clarify | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`). Intent questions from the classifier are dropped by default; pass `--clarify` to surface them. With `--clarify` + interactive: collect; with `--clarify` + non-interactive: write `pending-questions.json`, exit code 10 (DESIGN §11) |
 | 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `pila.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()` |
-| 2½ Reconcile | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. **Before matching, two mechanical passes run: (a) `_promote_external_collisions(plans)` rewrites any `extent: external` entry whose tag is in some plan's `provides` to `extent: in_plan` (the in-plan producer wins); (b) `_collect_external_preconditions(plans)` extracts every remaining `extent: external` entry into a deduped list `{tag, reasons[], originating_subtasks[]}` that bypasses the reconciler and is persisted by `write_plan`. Both passes are re-run after `_apply_reconciler_output` so any `extent: external` entries on reconciler-added connector subtasks also flow through the same machinery (collision-promoted if a provider now exists; otherwise added to the persisted preconditions list). The second collection idempotently replaces `st.data["external_preconditions"]` — the helper returns the full deduped set so a re-run is a refresh, not an append.** Only `extent: in_plan` entries with no matching `provides` enter the unresolved set. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits renames / added_provides / added_subtasks / unresolvable. Orchestrator applies the first three mechanically; if `unresolvable` is non-empty, `die()` with the reconciler's diagnosis (DESIGN §5). |
-| 3 Schedule | `warn_cross_planner_file_overlap`, `filter_offtree_subtasks`, `schedule`, `validate_plan` | warn on cross-planner file overlap; **soft-drop subtasks whose `files_likely_touched` resolves outside the run's repo root (most commonly into an inspect-dir mount) — recorded in `state.data["dropped_subtasks"]`**; merge plans, build the global DAG, Kahn topological sort into waves; cycle → `die()` |
+| 2½ Reconcile | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. **Before matching, two mechanical passes run: (a) `_promote_external_collisions(plans)` rewrites any `extent: external` entry whose tag is in some plan's `provides` to `extent: in_plan` (the in-plan producer wins); (b) `_collect_external_preconditions(plans)` extracts every remaining `extent: external` entry into a deduped list `{tag, reasons[], originating_subtasks[]}` that bypasses the reconciler and is persisted by `write_plan`. Both passes are re-run after `_apply_reconciler_output` so any `extent: external` entries on reconciler-added connector subtasks also flow through the same machinery (collision-promoted if a provider now exists; otherwise added to the persisted preconditions list). The second collection idempotently replaces `st.data["external_preconditions"]` — the helper returns the full deduped set so a re-run is a refresh, not an append.** Only `extent: in_plan` entries with no matching `provides` enter the unresolved set. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits seven arrays — three *resolution* (renames / added_provides / added_subtasks), three *cycle-breaking* (dropped_requires / dependency_edges / merged_subtasks), and one *escape hatch* (unresolvable). Orchestrator applies the six action arrays mechanically; if `unresolvable` is non-empty, `die()` with the reconciler's diagnosis (DESIGN §5). After applying, runs an **acyclicity gate** (Tarjan's SCC over the post-mutation graph); on cycle, deep-copies the pre-mutation plans, computes a recommended cycle-resolution per SCC from structural signals, respawns the reconciler once with a structured retry prompt + bounded "must-include" set of acceptable operations, and re-runs the gate. If still cyclic, `die()` with the SCC + offending mutations enumerated. See "Phase 2½ checks" and "Cycle-resolution retry loop" below. |
+| 3 Schedule | `warn_cross_planner_file_overlap`, `filter_offtree_subtasks`, `schedule`, `validate_plan` | warn on cross-planner file overlap; **soft-drop subtasks whose `files_likely_touched` resolves outside the run's repo root (most commonly into an inspect-dir mount) — recorded in `state.data["dropped_subtasks"]`**; merge plans, build the global DAG via `_build_predecessor_graph` (shared with the phase 2½ acyclicity gate), Kahn topological sort into waves. Cycles are expected to be caught upstream by the phase 2½ gate; if one slips through, `die()` with the full SCC report. |
 | 4 Setup | `phase_execute` head → `setup-run.sh` | create the run branch `pila/runs/<run-id>` and its worktree (per-run, isolated from any other run) |
 | 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave` | per wave: implementers awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then run a deterministic conflict-marker scan on the integrated worktree. `settle_subtask` runs the **post-work conformance phase** (DESIGN §9 *Post-work conformance*) on the success path before returning — `discover_rules_files` → `run_conformer` loop (≤ `conformance_rounds`) → re-run the per-subtask mechanical-precondition gates (`check_branch_has_commits`, dirty-worktree, `check_diff_scope`) against the conformer's commits → attach `conformance_warnings` to the result. The phase is advisory: residuals, build/lint/test failures, gate violations on conformer commits, and `WorkerError` all surface as warnings, never as `failed`/`blocked`. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` aborts the run *before* `integrate_wave` is called — the blocker is recorded in `state.json` and the run resumes with `--resume`. There is no LLM wave-level re-validation; the §8 confidence gate is the load-bearing per-subtask signal, and `scan_conflict_markers` is the deterministic post-integration safety net |
 | 6 Finalize | `phase_finalize` → `finalize.sh`, `cleanup.sh`; launcher then pushes on host | verify the run branch is non-empty; record `finished_at` in `run.json`; delete the per-subtask branches `pila/subtasks/<run-id>/*` (the run branch is **kept** as the PR head; state dir is kept as audit). **The push + PR step has moved to the host launcher** (DESIGN §6 *Finalization*) — `phase_finalize` writes the sentinel and exits; the launcher polls `run.json`, then runs `git push pila/runs/<run-id>` + `gh pr create` on the host using the host's own auth (no in-container forwarding of gh tokens, SSH keys, or agent sockets). The working branch is **not** modified locally — the PR is the proposed integration. |
@@ -1426,7 +1426,44 @@ The bootstrap directory `.pila/runs/_bootstrap-<6hex>/` is used until classify c
 |-------|---------|
 | reconciler's `unresolvable` array non-empty → `die()` with the worker's diagnosis | genuine gaps where no planner produced a needed capability *in the build graph* and no plausible connector subtask can be inferred. Restricted to `extent: in_plan` entries — `extent: external` entries are filtered out before the unresolved set is computed and surface as `preconditions` in `plan.json` rather than as failures. Each unresolved `(sid, tag)` pair is annotated with the consuming subtask's producing planner-domain (from `_compute_unresolved_requires`) so the abort message can render `domain/sid` — naming the planner-domain whose plan held the dangling dependency, which is the primary remediation lever for the user. |
 | reconciler output validated against `SCHEMAS["reconciler"]` | malformed reconciler response (caught by `claude_p`'s schema gate; structurally invalid output is retried once, then escalated) |
+| **acyclicity gate** (Tarjan SCC over the post-mutation graph; runs *before* the unresolved-requires re-check) | a rename / added_subtask / dependency_edge that closes a dependency cycle. Each individual reconciler mutation can be locally correct yet jointly cycle-creating — e.g. two renames whose targets each provide what the other side requires. Tarjan localizes the SCC; edge attribution names which mutation closed each edge. On detection, pila tries one cycle-resolution retry (see "Cycle-resolution retry loop" below); if the retry still cycles, `die()` with the SCC + offending mutations enumerated. |
+| **must-include constraint** (apply-step enforcement on retry output) | a retried reconciler output that omits any operation from the bounded set pila required for each named cycle. The retry prompt lists the legal operations per cycle (`dropped_requires` on either rename, `dependency_edges` in either direction, `merged_subtasks` in either direction); if the revised output doesn't include at least one for each cycle, `die()` with the missing-cycle diagnostic — surfaces "model defied a structural constraint" cleanly, never a silent cycle. |
 | after applying reconciler output, the unresolved-requires set is recomputed; non-empty → `die()` | the reconciler's renames/added_subtasks/added_provides didn't actually close every gap (e.g., a new subtask itself has unresolved `requires`) — fail-loud rather than progress to `validate_plan` with a still-broken graph |
+
+**Cycle-resolution retry loop.** When the acyclicity gate fires on the first
+reconciler attempt, `phase_reconcile` deep-copies the pre-mutation plans,
+reverts the failed mutations, computes a *recommended* operation per SCC
+from structural signals (in `_recommend_cycle_resolution`), builds a
+retry prompt (in `_build_cycle_retry_prompt`) that names the SCC, the
+mutations that closed each edge, the structural signals, the
+recommendation, and the bounded "must-include" set of acceptable
+operations, then respawns the reconciler worker once with that prompt.
+Maximum two attempts total — mirrors the schema-fail retry shape at
+`pila.py: claude_p()`. Cost: one extra reconciler spawn (~$1–2, ~1 min)
+on cycling runs only; non-cycling runs pay nothing extra.
+
+The recommendation heuristic is deterministic:
+
+1. **Exactly one edge in the SCC is a planner-declared `depends_on`** →
+   recommend `dropped_requires` on the rename that closes the reverse
+   direction. (Planner ordering wins; the reconciler's rename is the drift.)
+2. **Else SCC members share `files_likely_touched`** → recommend
+   `merged_subtasks(into, from)` where `into` is the smaller subtask by
+   `success_criteria_seed` length (tie-break: lexicographic sid). The
+   subtasks are authoring the same file; one commit will do both pieces of
+   work; the shorter-criterion subtask becomes the canonical home.
+3. **Else** → recommend `dropped_requires` on the rename whose `from` tag
+   had no planner-declared producer in the pre-reconcile graph. (The
+   rename was speculative — the tag was never going to resolve to a real
+   producer; dropping the requirement is structurally honest.)
+4. **Tie-breaker of last resort** → drop the lexicographically later rename.
+
+The retry prompt presents the recommendation as the answer (not as one of
+several options) and explicitly forbids `unresolvable` for cycle
+resolution — the model must commit to one of the bounded operations or
+echo the recommendation. The mechanical floor (gate + must-include) is
+the guarantee; the recommendation primes the model toward the
+structurally-correct answer.
 
 ### Plan validation — `validate_plan` (after scheduling, before persisting the plan)
 | Check | Catches |
@@ -1443,11 +1480,13 @@ The bootstrap directory `.pila/runs/_bootstrap-<6hex>/` is used until classify c
 warning, never fails**, when two planners' subtasks both list the same
 path in `files_likely_touched`. Empirically (May 2026, n=3 historical
 runs) failed runs had ≥9 cross-planner overlaps each while the
-successful run had zero; the warning surfaces that risk at plan time
-instead of waiting for the integrator to crash mid-wave. The reconciler
-currently bridges capability-tag vocabulary drift but not file-claim
-conflicts — a future-work item is to extend its action vocabulary to
-resolve overlaps automatically.
+successful run had zero; the warning surfaces that risk at plan time.
+The reconciler now consumes the same shared-files signal as one input to
+the recommendation heuristic (above) when a cycle requires resolution
+— SCC members that share `files_likely_touched` get a `merged_subtasks`
+recommendation. The warning itself remains as runtime visibility for the
+user; it complements the recommendation heuristic rather than replacing
+it.
 
 `filter_offtree_subtasks()` runs at the same layer (after
 `warn_cross_planner_file_overlap`, before `schedule()`) and **soft-drops

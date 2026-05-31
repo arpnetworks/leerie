@@ -193,15 +193,39 @@ It is reconciled by the orchestrator with three mechanisms:
   finish, the orchestrator computes the set of `requires` tags that no
   `provides` claims, and if that set is non-empty, spawns a single
   *reconciler* worker. The reconciler reads the full task plus every
-  subtask and emits one of four actions per unresolved tag: a *rename* (two
-  tags mean the same thing — rewrite one to match the other), an
-  *added provides* (an existing subtask actually produces the capability
-  but didn't declare it — add the tag), an *added subtask* (a genuine gap —
-  propose a new subtask to fill it), or *unresolvable* (no plausible
-  resolution — abort the run with the reconciler's diagnosis). All judgment
-  about tag equivalence lives in the reconciler worker; the orchestrator
-  computes the unresolved set mechanically and applies the worker's output
-  mechanically.
+  subtask (with their `provides`, `requires`, `depends_on`, and
+  `files_likely_touched`) and emits actions across seven arrays. Three
+  *resolution* actions — `renames` (two tags mean the same thing — rewrite
+  one to match the other), `added_provides` (an existing subtask actually
+  produces the capability but didn't declare it), `added_subtasks` (a
+  genuine gap — propose a new subtask to fill it). Three *cycle-breaking*
+  actions for when the resolution actions would close a dependency cycle —
+  `dropped_requires` (the requirement was over-specified by its planner —
+  e.g. an authoring-time decision the same subtask records, not a code
+  artifact another subtask produces), `dependency_edges` (assert an
+  explicit `depends_on` ordering when both sides legitimately need each
+  other and one ordering is the right answer), `merged_subtasks` (collapse
+  two subtasks into one when the cycle reflects a genuine authoring
+  overlap — both edit the same file, both wait on the same decision). And
+  one *escape hatch* — `unresolvable` for unmet requirements with no
+  plausible resolution (aborts the run with the reconciler's diagnosis).
+  All judgment about tag equivalence and cycle resolution lives in the
+  reconciler worker; the orchestrator computes the unresolved set
+  mechanically, runs Tarjan's SCC on the post-mutation graph, and applies
+  the worker's output mechanically.
+
+  Acyclicity is a first-class output property — the reconciler's job is to
+  produce an acyclic merged plan, not just to resolve unresolved capability
+  tags. If the worker's first attempt closes a cycle (each rename can be
+  individually correct yet jointly cycle-creating), the orchestrator
+  detects it with Tarjan's SCC, computes a recommended resolution from
+  structural signals (planner-declared `depends_on` orientation;
+  `files_likely_touched` overlap), and respawns the worker once with the
+  cycle data, the recommendation, and a bounded set of acceptable
+  operations. The model never has to detect cycles itself; pila does that
+  in Python and hands the model concrete structural feedback. If the
+  second attempt still cycles, the run aborts with the SCC and the
+  offending mutations named — never a silent bad ordering.
 
 ### `requires.extent` — in-graph vs. external prerequisites
 
@@ -220,8 +244,10 @@ entry along one axis:
 
 - `extent: in_plan` — satisfied by another subtask in this plan; the
   orchestrator wires a graph edge by matching against `provides`. The
-  reconciler resolves these (rename / added_provides / added_subtasks) and
-  aborts on a true unresolvable.
+  reconciler resolves these via the action vocabulary described in the
+  *Cross-domain dependencies* subsection above (resolution actions for
+  unmatched tags; cycle-breaking actions when its mutations close a
+  dependency cycle; `unresolvable` as the abort escape hatch).
 - `extent: external` — a real prerequisite the planner is declaring lives
   outside the build graph. The `reason` field names the owner (other repo,
   ops runbook, manual step) and why no in-repo subtask could plausibly
@@ -251,7 +277,10 @@ attribute, nor connect. An external prerequisite never reaches that path.
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
 independent and run in parallel; waves run in sequence. A dependency cycle is
-unsatisfiable and aborts the run rather than being silently broken.
+unsatisfiable; the reconciler's retry loop tries to break it (preferring
+`dropped_requires` / `dependency_edges` / `merged_subtasks` over the cycle-
+closing renames), and if that fails the run aborts with the SCC + the
+mutations that closed it named — never silently broken.
 
 Cross-domain dependencies are reconciled by the orchestrator from capability
 tags (with the reconciler bridging vocabulary drift) and enforced as wave
@@ -1476,6 +1505,14 @@ recurs everywhere in the design:
   computes path resolution itself and soft-drops any subtask whose paths
   resolve under a read-only mount instead. The planner prompt documents
   the constraint, but the soft-drop is the actual guarantee.
+- The orchestrator does not trust the reconciler to verify its own mutations
+  are acyclic; it runs Tarjan's SCC on the post-mutation graph itself,
+  recommends a resolution from structural signals, and respawns the
+  reconciler once with the cycle data if the first attempt cycled (§5).
+  Asking a model to mentally execute SCC detection on a 40+ node graph with
+  20+ pending mutations is at the edge of model capability; doing the
+  detection in Python and handing the model structured feedback plays to
+  model strengths.
 
 The complementary half of the principle is just as important: **what cannot be
 checked mechanically is left to the worker, and not second-guessed by code.**

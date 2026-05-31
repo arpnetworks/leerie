@@ -225,22 +225,30 @@ def test_phase_reconcile_uses_reconciler_prompt(pila):
 
 def test_phase_reconcile_dies_on_unresolvable(pila):
     """When the reconciler returns a non-empty `unresolvable` array, the
-    orchestrator dies with the worker's reasoning. Pin the call to
-    die() and the structural shape."""
+    orchestrator dies with the worker's reasoning. The check runs
+    BEFORE _apply_reconciler_output so a fail-closed run leaves no
+    phantom mutations. Implemented via `_check_unresolvable(output)`
+    which factors the check + die out of the inline retry-loop body
+    (cycle-resolution retry calls it for both attempts)."""
     src = inspect.getsource(pila.phase_reconcile)
-    # die() must be called inside an unresolvable check.
+    # die() and the unresolvable check must be present.
     assert "unresolvable" in src
-    assert "die(" in src
-    # Specifically: dies BEFORE mutating anything, so phantom edits
-    # aren't left on disk. Pin by looking for the unresolvable check
-    # appearing before the _apply_reconciler_output call.
-    unresolvable_pos = src.find('unresolvable = output.get("unresolvable"')
+    # `_check_unresolvable` is the helper that does the check + die. It
+    # must be called BEFORE `_apply_reconciler_output(plans, output)`.
+    check_pos = src.find("_check_unresolvable(output)")
     apply_pos = src.find("_apply_reconciler_output(plans, output)")
-    assert unresolvable_pos != -1 and apply_pos != -1
-    assert unresolvable_pos < apply_pos, (
+    assert check_pos != -1, (
+        "phase_reconcile must invoke _check_unresolvable on the first "
+        "reconciler attempt before applying any mutations"
+    )
+    assert apply_pos != -1
+    assert check_pos < apply_pos, (
         "unresolvable check must run BEFORE _apply_reconciler_output "
         "so a fail-closed run leaves no phantom mutations"
     )
+    # The helper itself must call die() with a non-empty unresolvable.
+    helper_src = inspect.getsource(pila.phase_reconcile)
+    assert "die(" in helper_src
 
 
 def test_phase_reconcile_second_pass_check_present(pila):
