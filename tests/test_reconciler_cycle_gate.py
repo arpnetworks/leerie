@@ -1133,3 +1133,204 @@ def test_must_include_rejects_op_on_non_scc_sid(pila):
     assert unaddressed == ["a <-> b"], (
         "a dropped_requires on a non-SCC sid must NOT satisfy the cycle's "
         "must-include set; validator should report the cycle as unaddressed")
+
+
+# ===========================================================================
+# Tests 29-37: unresolved-requires retry loop (mirror of cycle-gate corpus)
+# Grounded against captured run 075210 where deps-008 required
+# 'cdk-stacks-authored' and the reconciler invented 'infra-stacks-authored'
+# without renaming the original consumer's tag.
+# ===========================================================================
+
+def test_tag_jaccard_known_pairs(pila):
+    """Pin the similarity function on the captured-failure pair + edge
+    cases. The 0.500 result on the 075210 pair is load-bearing for the
+    case-1 heuristic firing."""
+    # Captured run 075210: shared {stacks, authored} of {cdk, stacks,
+    # authored, infra} → 2/4 = 0.5.
+    assert pila._tag_jaccard(
+        "cdk-stacks-authored", "infra-stacks-authored") == 0.5
+    # Identical tags → 1.0.
+    assert pila._tag_jaccard("foo-bar", "foo-bar") == 1.0
+    # Disjoint → 0.0.
+    assert pila._tag_jaccard("foo-bar", "baz-qux") == 0.0
+    # Both empty → 0.0 (not div-by-zero).
+    assert pila._tag_jaccard("", "") == 0.0
+    # One empty → 0.0.
+    assert pila._tag_jaccard("foo", "") == 0.0
+    # Single-token tags with overlap.
+    assert pila._tag_jaccard("foo", "foo-bar") == 0.5
+
+
+def test_recommend_unresolved_resolution_075210_case(pila):
+    """The captured failure: deps-008 requires 'cdk-stacks-authored';
+    config-011 (added by reconciler) provides 'infra-stacks-authored'.
+    Heuristic case-1 must fire and recommend the missing rename. This
+    is the load-bearing test for the retry path's value."""
+    providers = {
+        "infra-stacks-authored": ["config-011"],
+        "infra-cdk-deps-present": ["deps-008"],  # self — should be skipped
+        "prisma-deps-present": ["deps-001"],
+        "node-engine-bumped": ["deps-007"],
+    }
+    rec = pila._recommend_unresolved_resolution(
+        "deps-008", "cdk-stacks-authored", providers)
+    assert rec is not None
+    assert rec["op"] == "rename"
+    assert rec["sid"] == "deps-008"
+    assert rec["from"] == "cdk-stacks-authored"
+    assert rec["to"] == "infra-stacks-authored"
+    assert rec["rationale"] == "case-1: unique-strong-similarity"
+
+
+def test_recommend_unresolved_resolution_self_loop_guard(pila):
+    """Self-loop guard: if the top-similar candidate is provided by the
+    consumer's OWN sid, skip it. Caught the historical deps-011
+    'supabase-client-imports-removed' case where Jaccard would rank
+    deps-011's own 'supabase-client-dep-removed' as top match, creating
+    a self-edge in the dependency graph."""
+    providers = {
+        "supabase-client-dep-removed": ["deps-011"],  # SELF — must skip
+        "node-engine-bumped": ["deps-007"],
+    }
+    rec = pila._recommend_unresolved_resolution(
+        "deps-011", "supabase-client-imports-removed", providers)
+    # Self-match skipped; nothing else has j >= 0.5; abstain.
+    assert rec is None
+
+
+def test_recommend_unresolved_resolution_no_match(pila):
+    """No candidate has j >= 0.5 → return None, model decides unaided.
+    Historical scan showed ~88% of post-mutation unresolved entries hit
+    this branch — the heuristic abstains gracefully."""
+    providers = {
+        "totally-unrelated-thing": ["sub-a"],
+        "another-unrelated": ["sub-b"],
+    }
+    rec = pila._recommend_unresolved_resolution(
+        "consumer", "something-completely-different", providers)
+    assert rec is None
+
+
+def test_recommend_unresolved_resolution_multi_strong_abstains(pila):
+    """Multiple candidates with j >= 0.5 and none >= 0.7 → abstain
+    (model picks unaided). Avoids confidently picking between two
+    near-equal candidates."""
+    # Two candidates both at Jaccard 0.6.
+    providers = {
+        "infra-aws-stacks-authored": ["sub-x"],   # j with target = 0.6
+        "cdk-aws-stacks-deployed": ["sub-y"],     # j with target = 0.6
+        "unrelated": ["sub-z"],
+    }
+    rec = pila._recommend_unresolved_resolution(
+        "consumer", "cdk-aws-stacks-authored", providers)
+    # Neither hits the j>=0.7 very-high threshold; case-1 needs unique
+    # top match so it also doesn't fire. Abstain.
+    assert rec is None
+
+
+def test_validate_unresolved_must_include_accepts_rename(pila):
+    """A rename on the unresolved (sid, tag) addresses the entry."""
+    unresolved = [{"domain": "deps", "sid": "deps-008",
+                   "tag": "cdk-stacks-authored"}]
+    output = {
+        "renames": [{"sid": "deps-008", "from": "cdk-stacks-authored",
+                     "to": "infra-stacks-authored"}],
+        "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    assert pila._validate_unresolved_must_include(output, unresolved) == []
+
+
+def test_validate_unresolved_must_include_accepts_added_provides(pila):
+    """An added_provides covering the unresolved tag (on any sid)
+    addresses the entry."""
+    unresolved = [{"domain": "deps", "sid": "deps-008",
+                   "tag": "cdk-stacks-authored"}]
+    output = {
+        "renames": [], "added_provides": [{"sid": "config-001",
+                                            "tag": "cdk-stacks-authored"}],
+        "added_subtasks": [], "dropped_requires": [],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    assert pila._validate_unresolved_must_include(output, unresolved) == []
+
+
+def test_validate_unresolved_must_include_accepts_added_subtask_with_provides(pila):
+    """An added_subtask whose `provides` includes the unresolved tag
+    addresses the entry."""
+    unresolved = [{"domain": "deps", "sid": "deps-008",
+                   "tag": "cdk-stacks-authored"}]
+    output = {
+        "renames": [], "added_provides": [],
+        "added_subtasks": [{"id": "config-011",
+                             "provides": ["cdk-stacks-authored"]}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    assert pila._validate_unresolved_must_include(output, unresolved) == []
+
+
+def test_validate_unresolved_must_include_accepts_unresolvable(pila):
+    """An `unresolvable` on the same (sid, tag) addresses the entry —
+    surfaces a clean die() instead of failing must-include validation."""
+    unresolved = [{"domain": "deps", "sid": "deps-008",
+                   "tag": "cdk-stacks-authored"}]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [],
+        "unresolvable": [{"sid": "deps-008", "tag": "cdk-stacks-authored",
+                          "reason": "no real producer in this plan"}],
+    }
+    assert pila._validate_unresolved_must_include(output, unresolved) == []
+
+
+def test_validate_unresolved_must_include_rejects_unrelated_op(pila):
+    """A rename on a DIFFERENT sid+tag does NOT address an unresolved
+    entry. Without this negative test, a regression that caused the
+    validator to always return [] would not be caught."""
+    unresolved = [{"domain": "deps", "sid": "deps-008",
+                   "tag": "cdk-stacks-authored"}]
+    output = {
+        "renames": [{"sid": "config-005", "from": "some-other-tag",
+                     "to": "infra-stacks-authored"}],
+        "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    unaddressed = pila._validate_unresolved_must_include(output, unresolved)
+    assert unaddressed == ["deps/deps-008 requires 'cdk-stacks-authored'"]
+
+
+def test_build_unresolved_retry_prompt_contains_required_sections(pila):
+    """The retry prompt must surface the unresolved tags, top-3
+    similarity ranking, the recommendation (if computed), the
+    must-include set, and the original user prompt at the end."""
+    unresolved = [{"domain": "dependency-migration", "sid": "deps-008",
+                   "tag": "cdk-stacks-authored"}]
+    providers = {
+        "infra-stacks-authored": ["config-011"],
+        "prisma-deps-present": ["deps-001"],
+    }
+    rec = pila._recommend_unresolved_resolution(
+        "deps-008", "cdk-stacks-authored", providers)
+    recs = {("deps-008", "cdk-stacks-authored"): rec}
+    prompt = pila._build_unresolved_retry_prompt(
+        unresolved, providers, recs, "ORIGINAL USER PROMPT")
+
+    # Required sections.
+    assert "1 cross-domain" in prompt
+    assert "UNRESOLVED 1:" in prompt
+    assert "dependency-migration/deps-008" in prompt
+    assert "cdk-stacks-authored" in prompt
+    assert "infra-stacks-authored" in prompt
+    assert "HINT" in prompt  # recommendation surfaces as HINT, not "RECOMMENDED:"
+    assert "false friend" in prompt  # softened framing
+    assert "MUST include" in prompt
+    assert "unresolvable" in prompt
+    assert "ORIGINAL USER PROMPT" in prompt
+    # Recommendation rendered as a rename literal.
+    assert "rename(sid='deps-008'" in prompt
+    assert "to='infra-stacks-authored'" in prompt

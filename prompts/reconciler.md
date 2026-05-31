@@ -182,6 +182,22 @@ correct answer; you don't need to mentally execute SCC detection or
 verify acyclicity unaided. If your revised output still cycles, pila
 aborts with the full SCC report.
 
+The **same retry pattern fires on a second failure class**: an
+unresolved `requires` tag that survives your first attempt's renames,
+added_provides, and added_subtasks. The common cause is inventing a
+new tag in your added_subtasks/added_provides without renaming the
+original consumer's tag to match (two synonyms for the same concept
+that never get unified). On detection, pila respawns you with a retry
+prompt that surfaces string-similarity hints — top candidate
+`provides` tags ranked by Jaccard over hyphen-tokens. The
+recommendation is framed as a *hint* (a prior), not the answer:
+textual similarity can produce false friends (a narrow synonym for a
+broader concept). Use the hint if it's semantically correct;
+otherwise pick from the bounded set (`renames` /
+`added_provides` / `added_subtasks` / `unresolvable`) — `unresolvable`
+IS valid here (unlike for cycles), since the right answer to "no real
+producer exists" is to surface that cleanly.
+
 ## Decision rules
 
 These rules govern your **first attempt**, where the task is resolving

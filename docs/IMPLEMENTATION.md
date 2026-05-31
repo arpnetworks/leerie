@@ -1428,7 +1428,9 @@ The bootstrap directory `.pila/runs/_bootstrap-<6hex>/` is used until classify c
 | reconciler output validated against `SCHEMAS["reconciler"]` | malformed reconciler response (caught by `claude_p`'s schema gate; structurally invalid output is retried once, then escalated) |
 | **acyclicity gate** (Tarjan SCC over the post-mutation graph; runs *before* the unresolved-requires re-check) | a rename / added_subtask / dependency_edge that closes a dependency cycle. Each individual reconciler mutation can be locally correct yet jointly cycle-creating — e.g. two renames whose targets each provide what the other side requires. Tarjan localizes the SCC; edge attribution names which mutation closed each edge. On detection, pila tries one cycle-resolution retry (see "Cycle-resolution retry loop" below); if the retry still cycles, `die()` with the SCC + offending mutations enumerated. |
 | **must-include constraint** (apply-step enforcement on retry output) | a retried reconciler output that omits any operation from the bounded set pila required for each named cycle. The retry prompt lists the legal operations per cycle (`dropped_requires` on either rename, `dependency_edges` in either direction, `merged_subtasks` in either direction); if the revised output doesn't include at least one for each cycle, `die()` with the missing-cycle diagnostic — surfaces "model defied a structural constraint" cleanly, never a silent cycle. |
-| after applying reconciler output, the unresolved-requires set is recomputed; non-empty → `die()` | the reconciler's renames/added_subtasks/added_provides didn't actually close every gap (e.g., a new subtask itself has unresolved `requires`) — fail-loud rather than progress to `validate_plan` with a still-broken graph |
+| **unresolved-requires retry loop** (recompute unresolved set after applying reconciler output) | the reconciler's renames/added_subtasks/added_provides didn't actually close every gap. Common cause: model invented a new tag in `added_subtasks` and forgot to rename the original consumer's tag to match (captured run `075210`: `deps-008` required `cdk-stacks-authored`; reconciler created `config-011` providing `infra-stacks-authored` and never renamed deps-008's tag). On first detection, pila tries one retry with a structured prompt that surfaces string-similarity hints from the post-mutation `provides` namespace. If the retry still leaves unresolved tags, `die()` with the structured report. |
+| **unresolved-retry must-include constraint** (apply-step enforcement on retry output) | a retried output that omits any operation addressing the named unresolved entries. Legal addressing: `rename` on the (sid, tag), `added_provides` covering the tag, `added_subtask` whose provides includes the tag, or `unresolvable` on the (sid, tag). |
+| post-unresolved-retry cycle gate re-run | the retry's revised output reintroduces a cycle (e.g., a rename closes a loop). Same Tarjan check as the primary acyclicity gate; on cycle, `die()` with the SCC report. |
 
 **Cycle-resolution retry loop.** When the acyclicity gate fires on the first
 reconciler attempt, `phase_reconcile` deep-copies the pre-mutation plans,
@@ -1464,6 +1466,42 @@ resolution — the model must commit to one of the bounded operations or
 echo the recommendation. The mechanical floor (gate + must-include) is
 the guarantee; the recommendation primes the model toward the
 structurally-correct answer.
+
+**Unresolved-requires retry loop.** Symmetric architecture to the
+cycle-resolution loop, fired by a different gate. When the post-mutation
+`_compute_unresolved_requires` set is non-empty (after the cycle gate
+has already cleared), `phase_reconcile` deep-copies the pre-mutation
+plans, computes a string-similarity recommendation per unresolved entry
+(in `_recommend_unresolved_resolution`), builds a retry prompt (in
+`_build_unresolved_retry_prompt`) that surfaces the unresolved
+`(sid, tag)` pairs, the top-3 candidate `provides` ranked by Jaccard,
+the recommendation (if computed), and the bounded must-include set,
+then respawns the reconciler once. Maximum two attempts total; cost
+mirrors the cycle retry.
+
+The recommendation heuristic is deterministic but framed as a *hint*
+(not the answer) because the underlying signal is textual string
+similarity — which can produce false friends (a textually-close-but-
+semantically-distinct synonym). Two guards filter candidates before
+scoring: a **self-loop guard** skips candidates whose provider includes
+the consumer's own sid (would create a self-edge), and an
+**extent-aware** guard ensures only `extent: in_plan` entries are
+considered. Cases (first match after guards wins):
+
+1. **Unique top match with Jaccard ≥ 0.5** → recommend
+   `rename(sid, from=tag, to=top.tag)`. (Verified on captured run
+   075210: fires correctly with `j=0.5` for `cdk-stacks-authored` →
+   `infra-stacks-authored`.)
+2. **Top match with Jaccard ≥ 0.7 (even if not unique)** → same.
+3. **Else** → no recommendation; model picks unaided (the common case
+   per historical scan; ~88% of post-mutation unresolved entries lack
+   a strong-similarity candidate).
+
+`unresolvable` IS valid for this retry (unlike the cycle retry's
+strict forbid) — if no real producer exists for the tag, surfacing
+that cleanly is the right answer. The mechanical floor (must-include
+validator + post-retry unresolved + cycle re-check) catches every
+malformed revision; the recommendation is best-effort.
 
 ### Plan validation — `validate_plan` (after scheduling, before persisting the plan)
 | Check | Catches |

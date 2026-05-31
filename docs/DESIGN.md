@@ -227,6 +227,18 @@ It is reconciled by the orchestrator with three mechanisms:
   second attempt still cycles, the run aborts with the SCC and the
   offending mutations named — never a silent bad ordering.
 
+  The same retry-with-structural-feedback pattern applies to the second
+  failure mode the post-mutation gates catch: **unresolved `requires`
+  tags that survive the reconciler's first attempt**. The common cause
+  is the model inventing a new tag in `added_subtasks`/`added_provides`
+  without renaming the original consumer's tag to match (two synonyms
+  for the same concept that never get unified). The orchestrator
+  computes string-similarity hints over the post-mutation `provides`
+  namespace, surfaces them in the retry prompt as a *prior* (not the
+  answer — textual similarity can produce false friends), and respawns
+  the worker once. If the retry leaves the same tag unresolved, the
+  run aborts with the structured report.
+
 ### `requires.extent` — in-graph vs. external prerequisites
 
 Not every prerequisite a planner identifies is satisfiable by another code

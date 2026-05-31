@@ -7883,24 +7883,134 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     st.save()
 
     # Second-pass check: an `added_subtask` may itself have an unresolved
-    # `requires`. If so, the reconciler's output didn't actually close
-    # every gap — fail loud rather than progress to schedule() with a
-    # still-broken graph.
+    # `requires`, OR the reconciler may have invented a new tag in its
+    # added_subtasks/added_provides without renaming the original
+    # consumer's tag to match (the captured run 075210 failure shape:
+    # `cdk-stacks-authored` left unresolved because the model created a
+    # connector providing `infra-stacks-authored` and forgot the rename
+    # on deps-008).
+    #
+    # On first detection: spawn the reconciler once more with a structured
+    # retry prompt that surfaces the unresolved tags + string-similarity
+    # hints from the post-mutation provides namespace. Mirror of the
+    # cycle-resolution retry loop above. Same 2-attempt budget; the
+    # second attempt's failure dies cleanly with the full report.
     still_unresolved = _compute_unresolved_requires(plans)
     if still_unresolved:
-        bullets = "\n".join(
-            f"  • {u['domain']}/{u['sid']} requires '{u['tag']}'"
-            for u in still_unresolved
-        )
-        die(
-            "reconciler output left "
-            f"{len(still_unresolved)} cross-domain dependency/dependencies "
-            f"still unresolved after applying its renames / "
-            f"added_provides / added_subtasks:\n{bullets}\n"
-            "This usually means an added_subtask itself requires a "
-            "capability that no other subtask provides. Refine the task "
-            "description and re-run."
-        )
+        log(f"phase 2½: unresolved-requires gate fired on attempt 1 — "
+            f"{len(still_unresolved)} tag(s) without producers")
+
+        # Build the post-mutation providers map for the recommendation
+        # heuristic + retry-prompt builder.
+        post_subtasks_for_unresolved: dict[str, dict] = {}
+        for plan in plans:
+            for s in plan.get("subtasks", []):
+                post_subtasks_for_unresolved[s["id"]] = s
+        post_providers: dict[str, list[str]] = {}
+        for sid, s in post_subtasks_for_unresolved.items():
+            for cap in (s.get("provides") or []):
+                post_providers.setdefault(cap, []).append(sid)
+
+        # Compute recommendations per unresolved entry (may be None for
+        # entries with no strong-similarity candidate).
+        recommendations: dict[tuple[str, str], dict | None] = {}
+        for u in still_unresolved:
+            recommendations[(u["sid"], u["tag"])] = (
+                _recommend_unresolved_resolution(
+                    u["sid"], u["tag"], post_providers))
+        n_recommended = sum(1 for r in recommendations.values()
+                            if r is not None)
+        log(f"  computed {n_recommended} string-similarity hint(s) "
+            f"({len(still_unresolved) - n_recommended} unresolved "
+            "entry/entries left to model judgment)")
+
+        retry_prompt = _build_unresolved_retry_prompt(
+            still_unresolved, post_providers, recommendations, user_prompt)
+
+        # Revert: deep-copy snapshot back into `plans` (same pattern
+        # as the cycle retry). `pre_plans_snapshot` is still in scope
+        # from the cycle-gate block above.
+        plans.clear()
+        plans.extend(copy.deepcopy(pre_plans_snapshot))
+
+        log("phase 2½: respawning reconciler with unresolved-tags "
+            "retry prompt")
+        output3 = await _spawn_reconciler(retry_prompt)
+        _check_unresolvable(output3)
+
+        # Must-include validation: did the revised output address every
+        # named unresolved entry? Same fail-loud discipline as the
+        # cycle-gate's must-include check.
+        unaddressed = _validate_unresolved_must_include(
+            output3, still_unresolved)
+        if unaddressed:
+            bullets = "\n".join(f"  • {u}" for u in unaddressed)
+            die(
+                f"reconciler's revised output ignored "
+                f"{len(unaddressed)} named unresolved-requires entry/"
+                f"entries:\n{bullets}\n"
+                "Pila requires every named unresolved entry to be "
+                "addressed by at least one of renames / added_provides "
+                "/ added_subtasks / unresolvable. The retry prompt "
+                "listed the legal operations per entry; the model "
+                "defied the structural constraint. Refine the task or "
+                "re-run."
+            )
+
+        _apply_reconciler_output(plans, output3)
+
+        # Re-run the external-extent passes against attempt-2's plans
+        # (mirror of the post-cycle-retry re-run; attempt-2's
+        # added_subtasks may carry external requires entries that need
+        # the promotion-and-collection passes).
+        _promote_external_collisions(plans)
+        preconditions_after = _collect_external_preconditions(plans)
+        st.data["external_preconditions"] = preconditions_after
+        st.save()
+
+        # Re-run the cycle gate on attempt-2's output — the revised
+        # output could plausibly introduce a new cycle (e.g., a rename
+        # that closes a loop with an existing edge).
+        post3_subtasks: dict[str, dict] = {}
+        for plan in plans:
+            for s in plan.get("subtasks", []):
+                post3_subtasks[s["id"]] = s
+        preds3, _p3, edge_sources3 = _build_predecessor_graph(post3_subtasks)
+        succ3: dict[str, set[str]] = {sid: set() for sid in post3_subtasks}
+        for tgt, src_set in preds3.items():
+            for src in src_set:
+                succ3[src].add(tgt)
+        sccs3 = _tarjan_sccs(set(post3_subtasks), succ3)
+        if sccs3:
+            diag3 = _format_cycle_diagnostic(
+                sccs3, succ3, edge_sources3, output3, post3_subtasks)
+            die(
+                "phase 2½ acyclicity gate fired on the unresolved-"
+                "retry attempt — the reconciler's revised output "
+                f"introduced {len(sccs3)} cycle(s):\n{diag3}\n"
+                "The unresolved-tags retry produced a graph the cycle "
+                "gate rejects. Refine the task or re-run."
+            )
+
+        # Re-check unresolved on the final state.
+        final_unresolved = _compute_unresolved_requires(plans)
+        if final_unresolved:
+            bullets = "\n".join(
+                f"  • {u['domain']}/{u['sid']} requires '{u['tag']}'"
+                for u in final_unresolved
+            )
+            die(
+                "reconciler output left "
+                f"{len(final_unresolved)} cross-domain dependency/"
+                f"dependencies still unresolved after the unresolved-"
+                f"tags retry:\n{bullets}\n"
+                "Both retry attempts exhausted. This usually means "
+                "the reconciler can't find a real producer for the "
+                "tag and didn't emit `unresolvable`. Refine the task "
+                "description and re-run."
+            )
+        # Attempt-2 succeeded — adopt its output for downstream logging.
+        output = output3
 
     log(f"phase 2½: reconciled "
         f"({len(output.get('renames', []))} rename(s), "
@@ -8499,6 +8609,253 @@ def _validate_must_include(
                 break
         if not addressed:
             unaddressed.append(" <-> ".join(scc))
+    return unaddressed
+
+
+def _tag_jaccard(a: str, b: str) -> float:
+    """Token-set Jaccard similarity over hyphen-split tokens.
+
+    Pila's capability-tag namespace tends toward hyphenated phrases
+    where true synonyms share root tokens (e.g. `cdk-stacks-authored`
+    ≈ `infra-stacks-authored` share `stacks`+`authored` → 2/4 = 0.5).
+    The unresolved-tags retry heuristic uses this to rank candidate
+    `provides` against an unresolved `requires` tag.
+
+    Limitation: cannot detect synonyms that share no tokens (e.g.
+    `aws-services-selected` vs `infra-stacks-authored`). In those
+    cases the heuristic abstains and the model picks unaided.
+    """
+    ta = set(a.split('-')) if a else set()
+    tb = set(b.split('-')) if b else set()
+    if not ta and not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _recommend_unresolved_resolution(
+    consumer_sid: str,
+    unresolved_tag: str,
+    providers: dict[str, list[str]],
+) -> dict | None:
+    """Deterministic recommendation for resolving one unresolved
+    `(consumer_sid, unresolved_tag)` requires entry. Mirror of
+    `_recommend_cycle_resolution` for the unresolved-tags retry.
+
+    Returns a dict shaped like a rename op (with `op` + `rationale`),
+    or `None` if no candidate is confident enough to recommend
+    (model picks unaided).
+
+    Self-loop guard: skips candidates whose `providers[candidate]`
+    includes `consumer_sid` — a rename TO a tag the consumer itself
+    provides would create a self-edge in the dependency graph.
+    Caught the historical `deps-011 'supabase-client-imports-removed'`
+    case in run feat-let-s-add-telemetry-051809.
+
+    Heuristic (after the self-loop guard filters candidates):
+      1. Unique top match with Jaccard ≥ 0.5 → recommend rename.
+      2. Top match with Jaccard ≥ 0.7 (even if not unique) → recommend
+         rename (very high similarity is high confidence).
+      3. Else → return None.
+
+    The recommendation framing in the retry prompt treats this output
+    as a *hint* (string-similarity prior), NOT as the answer the model
+    must emit verbatim. Historical scan showed pila renames usually
+    span vocabularies with low textual overlap; the heuristic is
+    calibrated for synonym-asymmetric cases (like captured run
+    075210), not general renames.
+    """
+    # Score candidates, applying the self-loop guard.
+    scored: list[tuple[float, str]] = []
+    for candidate_tag, candidate_providers in providers.items():
+        if consumer_sid in candidate_providers:
+            # Self-loop trap: skip.
+            continue
+        j = _tag_jaccard(unresolved_tag, candidate_tag)
+        scored.append((j, candidate_tag))
+    scored.sort(reverse=True)
+
+    if not scored:
+        return None
+
+    # Case 1: unique top match with j >= 0.5.
+    strong = [s for s in scored if s[0] >= 0.5]
+    if len(strong) == 1:
+        return {
+            "op": "rename",
+            "sid": consumer_sid,
+            "from": unresolved_tag,
+            "to": strong[0][1],
+            "reason": (
+                f"Top string-similarity match (Jaccard {strong[0][0]:.3f}, "
+                "shared hyphen-tokens) — unique above the 0.5 threshold."
+            ),
+            "rationale": "case-1: unique-strong-similarity",
+        }
+
+    # Case 2: very high similarity (j >= 0.7) even if not unique.
+    very_strong = [s for s in scored if s[0] >= 0.7]
+    if very_strong:
+        return {
+            "op": "rename",
+            "sid": consumer_sid,
+            "from": unresolved_tag,
+            "to": very_strong[0][1],
+            "reason": (
+                f"Very high string-similarity match (Jaccard "
+                f"{very_strong[0][0]:.3f}, shared hyphen-tokens)."
+            ),
+            "rationale": "case-2: very-high-similarity",
+        }
+
+    # No confident match — model picks unaided.
+    return None
+
+
+def _build_unresolved_retry_prompt(
+    unresolved: list[dict],
+    providers: dict[str, list[str]],
+    recommendations: dict[tuple[str, str], dict | None],
+    original_user_prompt: str,
+) -> str:
+    """Build the retry prompt sent to the reconciler when the
+    unresolved-requires gate fires on attempt 1.
+
+    Per unresolved entry, render:
+      - The (consumer_sid, unresolved_tag) pair.
+      - The top-3 string-similar `provides` tags (always shown).
+      - The recommendation (if computed) framed as a HINT — string
+        similarity can produce false friends (e.g. narrow synonym for
+        a broader concept), so the model is told to emit verbatim only
+        if semantically correct.
+      - The bounded must-include set.
+
+    `recommendations` maps (sid, tag) → recommendation-dict-or-None.
+    """
+    parts: list[str] = []
+    parts.append(
+        "Your previous reconciler output left "
+        f"{len(unresolved)} cross-domain `requires` tag(s) still "
+        "unresolved after applying your renames / added_provides / "
+        "added_subtasks. Pila has computed string-similarity hints "
+        "from the post-mutation `provides` namespace. Use the hints "
+        "if they're semantically correct; if a hint is only "
+        "textually close (a 'false friend' — e.g. a narrow synonym "
+        "for a broader concept), pick a different option from the "
+        "bounded set below. `unresolvable` IS valid here if no real "
+        "producer exists.\n"
+    )
+
+    for i, u in enumerate(unresolved, 1):
+        sid = u["sid"]
+        tag = u["tag"]
+        rec = recommendations.get((sid, tag))
+        parts.append(
+            f"\nUNRESOLVED {i}: {u.get('domain', '<unknown>')}/{sid} "
+            f"requires '{tag}'")
+
+        # Top-3 similarity ranking (always shown — context for the model).
+        scored = sorted(
+            ((_tag_jaccard(tag, p), p)
+             for p in providers if sid not in providers[p]),
+            reverse=True,
+        )
+        if scored:
+            parts.append("  Top string-similar provides (consumer's own "
+                         "provides excluded — self-loop guard):")
+            for j, p in scored[:3]:
+                parts.append(
+                    f"    j={j:.3f}  '{p}'  (provided by {providers[p]})")
+        else:
+            parts.append("  No provides in the plan to rank against.")
+
+        # Recommendation, if computed.
+        if rec is not None:
+            parts.append(
+                f"\n  HINT (string-similarity prior — verify "
+                f"semantically before emitting):")
+            parts.append(
+                f"    rename(sid='{rec['sid']}', "
+                f"from='{rec['from']}', to='{rec['to']}', "
+                f"reason='{rec['reason']}')")
+        else:
+            parts.append(
+                "\n  No high-confidence hint computed — pick from the "
+                "bounded set below using your judgment.")
+
+        # Must-include set.
+        parts.append(
+            "\n  Your output for this unresolved entry MUST include "
+            "at least one of:")
+        if scored:
+            top = scored[0][1]
+            parts.append(
+                f"    - renames: rewrite this entry to a real producer "
+                f"(e.g. rename({sid}, '{tag}' → '{top}'))")
+        parts.append(
+            f"    - added_provides: declare an existing subtask "
+            f"actually produces '{tag}' (add it to that subtask's "
+            f"provides)")
+        parts.append(
+            f"    - added_subtasks: add a new connector subtask whose "
+            f"provides includes '{tag}'")
+        parts.append(
+            f"    - unresolvable: name this as a genuine gap with a "
+            "one-sentence reason (aborts the run cleanly).")
+
+    parts.append(
+        "\nEmit the same seven-array output as before. Pila will "
+        "re-check unresolved-requires AND re-run the cycle gate on "
+        "your revised output; an attempt that still has unresolved "
+        "tags will abort the run with the structured report.\n\n"
+        "--- ORIGINAL INPUT ---\n")
+    parts.append(original_user_prompt)
+    return "\n".join(parts)
+
+
+def _validate_unresolved_must_include(
+    output: dict,
+    unresolved: list[dict],
+) -> list[str]:
+    """For each unresolved (sid, tag), check the reconciler's revised
+    output addresses it via one of: rename on that sid+tag, added_provides
+    covering that tag (any sid), added_subtask whose provides includes
+    that tag, OR unresolvable on that sid+tag.
+
+    Returns the list of unaddressed entries (rendered as "domain/sid
+    requires 'tag'") — empty list means every unresolved entry was
+    addressed. Mirror of `_validate_must_include` for the cycle gate.
+
+    Called from the unresolved-retry loop after attempt 2 emits, before
+    the apply-step runs. A non-empty result means the model defied the
+    structural constraint and the run aborts cleanly.
+    """
+    # Index the revised output's operations for fast lookup.
+    rename_sid_tags = {
+        (r["sid"], r["from"]) for r in output.get("renames", [])
+    }
+    added_provides_tags = {
+        ap["tag"] for ap in output.get("added_provides", [])
+    }
+    added_subtask_provides: set[str] = set()
+    for s in output.get("added_subtasks", []):
+        for tag in (s.get("provides") or []):
+            added_subtask_provides.add(tag)
+    unresolvable_sid_tags = {
+        (u["sid"], u["tag"]) for u in output.get("unresolvable", [])
+    }
+
+    unaddressed: list[str] = []
+    for u in unresolved:
+        sid, tag = u["sid"], u["tag"]
+        addressed = (
+            (sid, tag) in rename_sid_tags
+            or tag in added_provides_tags
+            or tag in added_subtask_provides
+            or (sid, tag) in unresolvable_sid_tags
+        )
+        if not addressed:
+            unaddressed.append(
+                f"{u.get('domain', '<unknown>')}/{sid} requires '{tag}'")
     return unaddressed
 
 

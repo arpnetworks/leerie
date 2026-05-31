@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Reconciler now retries on unresolved-requires after the first
+  attempt, symmetric with the cycle-resolution retry.** A captured
+  summarizer run (`deps-we-need-to-migrate-this-repo-075210`) died
+  at phase 2½ with `deps-008 requires 'cdk-stacks-authored'` left
+  unresolved — the reconciler had invented a connector providing
+  `infra-stacks-authored` (a synonym) and forgot to rename deps-008's
+  tag to match. The cycle-resolution work didn't help (the failure
+  isn't a cycle). Phase 2½ now wraps the post-mutation
+  `_compute_unresolved_requires` check in a retry loop: on first
+  detection, deep-copy the pre-mutation plans, compute a
+  string-similarity recommendation per unresolved entry (Jaccard over
+  hyphen-tokens, with a self-loop guard skipping candidates provided
+  by the consumer's own sid), build a retry prompt surfacing the
+  top-3 candidate provides + the recommendation as a *hint* (string
+  similarity can produce false friends — narrow synonyms for broader
+  concepts), respawn the reconciler once. The retry's must-include
+  validator accepts `rename`/`added_provides`/`added_subtasks`/
+  `unresolvable` per unresolved entry; a post-retry cycle gate
+  re-runs to catch reintroduced cycles. Verified in plan-mode against
+  the captured failure: the Jaccard heuristic produces the correct
+  recommendation (`rename(deps-008, 'cdk-stacks-authored' →
+  'infra-stacks-authored')`) with no model judgment required.
+  Historical scan across 3 runs surfaced two real defects that the
+  design now addresses: a self-loop trap (the heuristic would
+  recommend renames TO tags the consumer itself provides), and
+  textual-vs-semantic mismatch (j≥0.5 candidates that are narrower
+  synonyms than the model's correct choice). Both mitigated: guard
+  for the first, softened "hint" framing for the second. 11 new
+  tests cover the Jaccard function, recommendation heuristic
+  (075210 case, self-loop guard, no-match, multi-strong-abstain),
+  must-include validator (4 acceptance shapes + 1 rejection), retry
+  prompt builder.
+
 - **Reconciler now resolves dependency cycles instead of letting them
   crash the scheduler.** Previously, when the reconciler's renames
   closed a cross-domain dependency cycle (each rename locally correct,
