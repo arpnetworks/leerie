@@ -109,8 +109,9 @@ def test_validate_result_rejects_missing_clarification_question(pila, tmp_path):
     res["clarification_question"] = None
     err = pila.validate_result(res)
     assert err is not None
-    assert "clarification_question" in err
-    assert "DESIGN §11" in err
+    assert err[0] == "broken"
+    assert "clarification_question" in err[1]
+    assert "DESIGN §11" in err[1]
 
 
 def test_validate_result_rejects_empty_question_field(pila, tmp_path):
@@ -119,7 +120,8 @@ def test_validate_result_rejects_empty_question_field(pila, tmp_path):
     res["clarification_question"]["question"] = ""
     err = pila.validate_result(res)
     assert err is not None
-    assert "question" in err
+    assert err[0] == "broken"
+    assert "question" in err[1]
 
 
 def test_validate_result_rejects_empty_why_underivable(pila, tmp_path):
@@ -131,7 +133,8 @@ def test_validate_result_rejects_empty_why_underivable(pila, tmp_path):
     res["clarification_question"]["why_underivable"] = "   "
     err = pila.validate_result(res)
     assert err is not None
-    assert "why_underivable" in err
+    assert err[0] == "broken"
+    assert "why_underivable" in err[1]
 
 
 def test_validate_result_rejects_missing_checkpoint_path(pila, tmp_path):
@@ -140,15 +143,23 @@ def test_validate_result_rejects_missing_checkpoint_path(pila, tmp_path):
     res["checkpoint_path"] = None
     err = pila.validate_result(res)
     assert err is not None
-    assert "checkpoint_path" in err
-    assert "work-in-progress must survive" in err
+    assert err[0] == "broken"
+    assert "checkpoint_path" in err[1]
+    assert "work-in-progress must survive" in err[1]
 
 
 def test_validate_result_rejects_nonexistent_checkpoint_file(pila, tmp_path):
+    """`needs-clarification` with a missing checkpoint is `"broken"`,
+    not `"empty_handoff"` — a worker that asks a question with no
+    work-in-progress to return to is lying about its own status. Only
+    the `incomplete-handoff` variant of the same shape is retryable
+    (see test_incomplete_handoff_with_nonexistent_checkpoint_returns_error
+    in test_validate_result.py)."""
     res = _good_clarification_result(str(tmp_path / "ghost.md"))
     err = pila.validate_result(res)
     assert err is not None
-    assert "does not exist" in err
+    assert err[0] == "broken"
+    assert "does not exist" in err[1]
 
 
 def test_validate_result_rejects_empty_question_id(pila, tmp_path):
@@ -159,7 +170,8 @@ def test_validate_result_rejects_empty_question_id(pila, tmp_path):
     res["clarification_question"]["id"] = ""
     err = pila.validate_result(res)
     assert err is not None
-    assert "id" in err
+    assert err[0] == "broken"
+    assert "id" in err[1]
 
 
 # ----- existing invariants still hold (regression guard) ---------------------
@@ -171,7 +183,8 @@ def test_incomplete_handoff_still_requires_checkpoint(pila):
         "checkpoint_path": None,
     })
     assert err is not None
-    assert "incomplete-handoff" in err
+    assert err[0] == "broken"
+    assert "incomplete-handoff" in err[1]
 
 
 def test_blocked_still_requires_blocker(pila):
@@ -179,4 +192,5 @@ def test_blocked_still_requires_blocker(pila):
         "subtask_id": "x", "status": "blocked", "blocker": "",
     })
     assert err is not None
-    assert "blocker" in err
+    assert err[0] == "broken"
+    assert "blocker" in err[1]

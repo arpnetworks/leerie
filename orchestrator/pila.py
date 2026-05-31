@@ -4089,9 +4089,12 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
 
 # --- result cross-field validation -------------------------------------------
 
-def validate_result(result: dict) -> str | None:
+def validate_result(result: dict) -> tuple[str, str] | None:
     """Cross-field invariant checks that JSON Schema cannot express.
-    Returns an error string if the result is self-contradictory, None if ok.
+    Returns `(failure_kind, message)` if the result is self-contradictory,
+    None if ok. `failure_kind` is the structured discriminator
+    `_retryable_failure` dispatches on; `message` is the human-readable
+    diagnostic surfaced to the user.
 
     Per DESIGN §8, the §8 confidence gate is the only load-bearing
     discipline; the criteria file is informational (DESIGN §9). A
@@ -4106,20 +4109,25 @@ def validate_result(result: dict) -> str | None:
     if status == "incomplete-handoff":
         cp = result.get("checkpoint_path")
         if not cp:
-            return "status='incomplete-handoff' but checkpoint_path is null"
+            return ("broken",
+                    "status='incomplete-handoff' but checkpoint_path is null")
         if not Path(cp).exists():
-            return f"checkpoint_path '{cp}' does not exist on disk"
+            # "empty_handoff" — the Claude Code session-limit / rate-limit no-op
+            # case and the --max-turns-with-no-checkpoint case both land here.
+            # Both are corrective-note retryable: a fresh worker can plausibly
+            # do better. See _RETRYABLE_FAILURE_KINDS.
+            return ("empty_handoff",
+                    f"checkpoint_path '{cp}' does not exist on disk")
     elif status == "blocked":
         if not (result.get("blocker") or "").strip():
-            return "status='blocked' but blocker field is empty"
+            return ("broken", "status='blocked' but blocker field is empty")
     elif status == "failed":
         # A `failed` result without a summary is a worker contract violation:
-        # the prompt requires a diagnosis, and `_retryable_failure` needs real
-        # text to classify against. Without it the run drops a canned string
-        # ("worker reported failure") into the retry classifier — terminal,
-        # but with no actionable record of what went wrong.
+        # the prompt requires a diagnosis. Without it, the user sees a canned
+        # placeholder rather than a real explanation of what went wrong.
         if not (result.get("summary") or "").strip():
-            return "status='failed' but summary is empty — no diagnosis provided"
+            return ("broken",
+                    "status='failed' but summary is empty — no diagnosis provided")
     elif status == "needs-clarification":
         # DESIGN §11 mid-execution clarification: the question and the
         # work-in-progress checkpoint MUST both be present. The question
@@ -4131,19 +4139,23 @@ def validate_result(result: dict) -> str | None:
         # research."
         cq = result.get("clarification_question")
         if not cq:
-            return ("status='needs-clarification' but clarification_question "
+            return ("broken",
+                    "status='needs-clarification' but clarification_question "
                     "is null — see DESIGN §11")
         for field in ("id", "question", "why_underivable"):
             if not (cq.get(field) or "").strip():
-                return (f"status='needs-clarification' but "
+                return ("broken",
+                        f"status='needs-clarification' but "
                         f"clarification_question.{field} is empty — "
                         "see DESIGN §11")
         cp = result.get("checkpoint_path")
         if not cp:
-            return ("status='needs-clarification' but checkpoint_path is "
+            return ("broken",
+                    "status='needs-clarification' but checkpoint_path is "
                     "null — the work-in-progress must survive the question")
         if not Path(cp).exists():
-            return (f"status='needs-clarification' but checkpoint_path "
+            return ("broken",
+                    f"status='needs-clarification' but checkpoint_path "
                     f"'{cp}' does not exist on disk")
     return None
 
@@ -4243,12 +4255,14 @@ async def check_integrator_commit(staging: Path) -> str | None:
 # --- branch-has-commits verification -----------------------------------------
 
 async def check_branch_has_commits(sid: str, worktree: str,
-                                   parent_branch: str) -> str | None:
-    """Return error if the implementer's subtask branch has no commits
-    ahead of the run branch (`parent_branch` — typically
-    `pila/runs/<run-id>`). An empty diff means the worker produced
-    schema-valid JSON claiming success while doing nothing — a silent
-    no-op that wastes an integration attempt."""
+                                   parent_branch: str
+                                   ) -> tuple[str, str] | None:
+    """Return `(failure_kind, message)` if the implementer's subtask
+    branch has no commits ahead of the run branch (`parent_branch` —
+    typically `pila/runs/<run-id>`), else None. An empty diff means the
+    worker produced schema-valid JSON claiming success while doing
+    nothing — a silent no-op that wastes an integration attempt. The
+    `"no_commits"` kind is retryable per `_RETRYABLE_FAILURE_KINDS`."""
     if not Path(worktree).exists():
         return None  # worktree gone — can't determine, don't block
     try:
@@ -4261,7 +4275,8 @@ async def check_branch_has_commits(sid: str, worktree: str,
     if r.returncode != 0:
         return None
     if not r.stdout.strip():
-        return (f"subtask branch for {sid} has no commits ahead of the run "
+        return ("no_commits",
+                f"subtask branch for {sid} has no commits ahead of the run "
                 f"branch ({parent_branch}) — implementer claimed complete "
                 "without making any changes")
     return None
@@ -9456,7 +9471,10 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
     except WorkerError as e:
         # worker could not return schema-valid output even after a retry
         # (e.g. it hit --max-turns mid-task) -> treat as a handoff so a fresh
-        # implementer can continue from whatever checkpoint exists.
+        # implementer can continue from whatever checkpoint exists. If no
+        # checkpoint was written, validate_result tags it
+        # `failure_kind="empty_handoff"` (retryable); see the TimeoutExpired
+        # arm below for the full retry-classification rationale.
         return {"subtask_id": sid, "status": "incomplete-handoff",
                 "checkpoint_path": str(pila_dir / "checkpoints" / f"{sid}.md"),
                 "summary": f"worker produced no schema-valid result: {e}"}
@@ -9469,10 +9487,10 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
         # 50KB traceback (with the entire claude -p command line) to
         # the user's terminal. Same treatment as the WorkerError
         # arm — a fresh implementer can continue from any partial
-        # checkpoint. If no checkpoint was written, the line-2314
-        # arm of _retryable_failure catches the empty-handoff and
-        # allows one retry; the failed_retries cap then bounds the
-        # chain.
+        # checkpoint. If no checkpoint was written, validate_result
+        # tags the missing-checkpoint case as `failure_kind="empty_handoff"`
+        # which `_retryable_failure` accepts as retryable; the
+        # failed_retries cap then bounds the chain.
         #
         # Why retry rather than terminal: pila's typical usage is
         # unattended (overnight runs), so a transient hang has real
@@ -9489,53 +9507,48 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
                             "can continue from any partial checkpoint")}
 
 
-def _retryable_failure(reason: str) -> bool:
-    """The retry policy, in one place.
+# Per DESIGN §12 "prompts are advisory, code enforces" (and its inverse:
+# deterministic code must not make judgment calls on prose), the retry
+# classifier dispatches on a structured `failure_kind` tagged at the
+# producer rather than substring-matching a free-form `reason` string.
+# Adding a new retryable failure mode: extend this set AND have the
+# producer return the new kind. The coupling test in
+# tests/test_retryable_failure.py asserts every producer's retryable-path
+# return uses a kind in this set.
+_RETRYABLE_FAILURE_KINDS = frozenset({
+    "no_commits",      # check_branch_has_commits — implementer claimed
+                       # complete with nothing committed
+    "dirty_worktree",  # inline status-porcelain check in settle_subtask —
+                       # uncommitted changes would be lost on integration
+    "empty_handoff",   # validate_result — `incomplete-handoff` envelope
+                       # with a checkpoint_path that does not exist on
+                       # disk. Two known triggers: (a) the Claude Code
+                       # session-limit / rate-limit no-op case (primarily
+                       # caught by detect_session_limit() upstream; this
+                       # is the safety net for a message-format change),
+                       # and (b) a worker that hit --max-turns with no
+                       # checkpoint written, synthesized into the same
+                       # envelope by run_implementer's WorkerError /
+                       # TimeoutExpired catches. Both are corrective-note
+                       # cases — a fresh worker can plausibly do better.
+})
 
-    A failure is retried only if a corrective note to a fresh worker can
-    plausibly fix it — e.g. "you forgot to commit" or "your worktree was
-    dirty." A failure that means the worker is broken or dishonest is NOT
-    retried: re-running it burns a worker invocation against the budget for no
-    expected gain, and (for a bad-handoff case) a cold restart discards the
-    partial work the checkpoint pointed at.
 
-    Retryable (corrective note can fix it):
-      - branch had no commits ahead of the run branch
-      - worktree left dirty (uncommitted changes)
-      - `incomplete-handoff` worker produced no checkpoint on disk
-        (the `validate_result` line-2314-style message). Two known
-        triggers: (a) the Claude Code session-limit / rate-limit case
-        where the worker did nothing because the subscription was
-        capped — primarily caught by `detect_session_limit()` upstream
-        but this is the safety net for a message-format change; (b) a
-        worker that hit `--max-turns` with no checkpoint written, which
-        `run_implementer` synthesizes into the same envelope shape (see
-        the WorkerError catch at the end of `run_implementer`). Both
-        are corrective-note cases — a fresh worker can plausibly do
-        better — not lies about status.
+def _retryable_failure(kind: str) -> bool:
+    """The retry policy, in one place. Dispatches on a structured
+    `failure_kind` produced by the failure source — never on prose.
 
-    Terminal (worker is broken/dishonest — terminate immediately, no retry):
-      - cross-field invariant violation (worker lied about its own status)
-      - diff touched a protected path (.pila/, .git/, or any top-level
-        .claude/ file; the .claude/{agents,commands,skills}/ subtrees are
-        exempt per is_protected_path())
-      - any worker-level error surfaced as a failure
-    """
-    retryable_markers = ("no commits ahead of the run",
-                         "uncommitted change")
-    if any(m in reason for m in retryable_markers):
-        return True
-    # Prefix-match — not pair-match on "checkpoint_path" + "does not
-    # exist on disk" — because validate_result's needs-clarification
-    # check emits a *different* message that also contains both
-    # substrings (`status='needs-clarification' but checkpoint_path
-    # '...' does not exist on disk`) but represents a genuinely-broken
-    # worker that must stay non-retryable. Only the
-    # incomplete-handoff variant (`checkpoint_path '...' does not exist
-    # on disk`) is the session-limit-no-op signature.
-    if reason.startswith("checkpoint_path '"):
-        return True
-    return False
+    Retryable kinds (`_RETRYABLE_FAILURE_KINDS`): a corrective note to a
+    fresh worker can plausibly fix the failure.
+
+    Everything else is terminal: the worker is broken or dishonest, and
+    re-running it burns a worker invocation against the budget for no
+    expected gain. The canonical terminal kind emitted by `validate_result`
+    and `settle_subtask` is `"broken"` (cross-field invariant violation,
+    diff touched a protected path, worker-level error). Any unknown kind
+    is also terminal — adding a new retryable mode requires extending
+    `_RETRYABLE_FAILURE_KINDS`."""
+    return kind in _RETRYABLE_FAILURE_KINDS
 
 
 # --- post-work conformance phase (DESIGN §9 *Post-work conformance*) -------
@@ -9934,9 +9947,12 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
     subtask_path = pila_dir / "subtasks" / f"{sid}.json"
     subtask = json.loads(subtask_path.read_text()) if subtask_path.exists() else {}
 
-    async def fail(reason: str) -> dict | None:
-        """Record a failed attempt. Returns a terminal result dict if the
-        subtask is done (non-retryable, or retry cap exhausted), or None if the
+    async def fail(kind: str, reason: str) -> dict | None:
+        """Record a failed attempt. `kind` is the structured discriminator
+        `_retryable_failure` dispatches on (see `_RETRYABLE_FAILURE_KINDS`);
+        `reason` is the human-readable diagnostic stored on the result and
+        echoed to the log. Returns a terminal result dict if the subtask
+        is done (non-retryable, or retry cap exhausted), or None if the
         caller should loop for one more corrective attempt.
 
         On a retryable failure that will loop, `_reset_subtask_worktree`
@@ -9949,8 +9965,8 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
         res = {"subtask_id": sid, "status": "failed", "summary": reason}
         st.data.setdefault("subtask_status", {})[sid] = "failed"
         st.save()
-        if not _retryable_failure(reason):
-            log(f"  {sid}: non-retryable failure — terminating: {reason}")
+        if not _retryable_failure(kind):
+            log(f"  {sid}: non-retryable failure ({kind}) — terminating: {reason}")
             return res
         retries += 1
         if retries > caps["failed_retries"]:
@@ -9967,11 +9983,15 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
 
         # cross-field invariant check — catches a worker that lied about
         # status. A self-contradictory result means the worker is malfunctioning
-        # or dishonest: non-retryable by `_retryable_failure`.
+        # or dishonest: non-retryable by `_retryable_failure` (kind="broken"),
+        # except for the empty-handoff case which validate_result tags
+        # "empty_handoff" — retryable because a fresh worker can plausibly
+        # do better.
         problem = validate_result(res)
         if problem:
-            log(f"  result invariant violated for {sid}: {problem}")
-            done = await fail(problem)
+            kind, message = problem
+            log(f"  result invariant violated for {sid}: {message}")
+            done = await fail(kind, message)
             if done is not None:
                 return done
             continue
@@ -9986,8 +10006,9 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             commit_err = await check_branch_has_commits(
                 sid, worktree, compute_run_branch(st.run_id))
             if commit_err:
-                log(f"  branch check failed for {sid}: {commit_err}")
-                done = await fail(commit_err)
+                kind, message = commit_err
+                log(f"  branch check failed for {sid}: {message}")
+                done = await fail(kind, message)
                 if done is not None:
                     return done
                 continue
@@ -9997,8 +10018,10 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             dirty = [l for l in wt_status.stdout.splitlines()
                      if l and not l.startswith("??")]
             if dirty:
-                done = await fail(f"{sid}: worktree has {len(dirty)} uncommitted "
-                                  f"change(s) — changes will be lost on integration")
+                done = await fail(
+                    "dirty_worktree",
+                    f"{sid}: worktree has {len(dirty)} uncommitted "
+                    f"change(s) — changes will be lost on integration")
                 if done is not None:
                     return done
                 continue
@@ -10006,7 +10029,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             # broken, not merely careless. Non-retryable by `_retryable_failure`.
             scope_err = await check_diff_scope(sid, worktree, subtask, st)
             if scope_err:
-                done = await fail(scope_err)
+                done = await fail("broken", scope_err)
                 if done is not None:
                     return done
                 continue
@@ -10113,9 +10136,14 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             continue
 
         if status == "failed":
-            # a worker that reported failure itself — treat its summary as the
-            # reason and run it through the same retry policy
-            done = await fail(res.get("summary") or "worker reported failure")
+            # A worker that reported failure itself — terminal by default.
+            # The worker (not an orchestrator-side check) decided to fail,
+            # so there is no producer-tagged structured kind. "broken" is
+            # the right default: a worker that ran to completion and then
+            # self-reported `failed` is broken-worker territory unless we
+            # have evidence otherwise. Matches IMPLEMENTATION.md §1592.
+            done = await fail(
+                "broken", res.get("summary") or "worker reported failure")
             if done is not None:
                 return done
             continue

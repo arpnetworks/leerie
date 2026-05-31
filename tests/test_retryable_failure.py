@@ -1,10 +1,9 @@
 """Tests for _retryable_failure() — the retry policy classifier.
 
-Includes the coupling test promised in IMPLEMENTATION.md §10: the
-retryable markers in `_retryable_failure` must match the error strings
-actually emitted by `check_branch_has_commits` and the inline
-dirty-worktree check in `settle_subtask`. If either side drifts without
-the other being updated, the coupling test fails.
+Per DESIGN §12, the classifier dispatches on a structured
+`failure_kind` enum tagged at the producer rather than substring-
+matching prose. The coupling test below asserts that every producer's
+retryable-path return uses a kind in `_RETRYABLE_FAILURE_KINDS`.
 """
 from __future__ import annotations
 
@@ -20,150 +19,156 @@ PILA_PY = (Path(__file__).resolve().parent.parent
 
 # --- behavior of _retryable_failure ---------------------------------------
 
-@pytest.mark.parametrize("reason", [
-    "subtask branch for feat-001 has no commits ahead of the run branch (pila/runs/feat-foo-abc123) — implementer claimed complete without making any changes",
-    "worktree has 3 uncommitted change(s) — implementer left it dirty",
-    "single uncommitted change found",
+@pytest.mark.parametrize("kind", [
+    "no_commits",
+    "dirty_worktree",
+    "empty_handoff",
 ])
-def test_retryable_strings_return_true(pila, reason):
-    assert pila._retryable_failure(reason) is True
+def test_retryable_kinds_return_true(pila, kind):
+    assert pila._retryable_failure(kind) is True
 
 
-@pytest.mark.parametrize("reason", [
-    "diff touches protected path(s): ['.pila/state.json']",
-    "validate_result cross-field invariant violated",
-    "worker reported is_error",
-    "schema validation failed twice",
+@pytest.mark.parametrize("kind", [
+    "broken",
     "",
+    "unknown_kind",
+    # legacy substrings from the old prose-classifying implementation
+    # — must NOT accidentally pass through the new enum check:
+    "no commits ahead of the run",
+    "checkpoint_path 'foo' does not exist on disk",
 ])
-def test_terminal_strings_return_false(pila, reason):
-    assert pila._retryable_failure(reason) is False
+def test_terminal_kinds_return_false(pila, kind):
+    assert pila._retryable_failure(kind) is False
 
 
-# --- the checkpoint-missing branch ----------------------------------------
-
-def test_incomplete_handoff_missing_checkpoint_is_retryable(pila):
-    """The validate_result line-2314 message for an `incomplete-handoff`
-    worker that produced no checkpoint must be retryable. This is the
-    Claude Code session-limit / rate-limit safety net: when the
-    subscription cap is hit, claude -p returns the session-limit text
-    and the worker's envelope claims `incomplete-handoff` while pointing
-    at a checkpoint that was never written. The new prefix-match arm in
-    `_retryable_failure` catches it so the next attempt (on a fresh
-    process after the reset window, or even on the same process if
-    detect_session_limit upstream missed) is allowed to retry."""
-    reason = ("checkpoint_path '/Users/x/.pila/runs/r/checkpoints/feat-001.md' "
-              "does not exist on disk")
-    assert pila._retryable_failure(reason) is True
-
-
-def test_needs_clarification_missing_checkpoint_stays_terminal(pila):
-    """The validate_result line-2350 message (needs-clarification with a
-    missing checkpoint) shares both substrings 'checkpoint_path' and
-    'does not exist on disk' with the retryable line-2314 message, but
-    represents a genuinely-broken worker (the prompt requires both a
-    question AND a checkpoint; a worker that asks a question with no
-    work-in-progress to come back to is lying about its own status).
-    Must stay terminal — the prefix-match in `_retryable_failure`
-    disambiguates the two by anchoring on the start of the line-2314
-    wording (`checkpoint_path '...`)."""
-    reason = ("status='needs-clarification' but checkpoint_path "
-              "'/Users/x/.pila/runs/r/checkpoints/feat-001.md' "
-              "does not exist on disk")
-    assert pila._retryable_failure(reason) is False
-
-
-def test_needs_clarification_null_checkpoint_stays_terminal(pila):
-    """The validate_result line-2347 sibling case — checkpoint_path is
-    null entirely — was always terminal and stays terminal."""
-    reason = ("status='needs-clarification' but checkpoint_path is null "
-              "— the work-in-progress must survive the question")
-    assert pila._retryable_failure(reason) is False
-
-
-def test_checkpoint_missing_marker_matches_validate_result_string(pila):
-    """Coupling test for the new retryable branch — same spirit as
-    test_retryable_markers_match_check_strings above.
-
-    The new `reason.startswith("checkpoint_path '")` arm in
-    `_retryable_failure` must match the exact string `validate_result`
-    emits for the incomplete-handoff case. If `validate_result`'s
-    wording changes, this test fails and forces the retry classifier
-    to be updated in the same change."""
-    validate_src = inspect.getsource(pila.validate_result)
-    # Look for the exact f-string format that produces the line-2314
-    # message. The literal characters `checkpoint_path '` (with the
-    # trailing single quote) are what `_retryable_failure` keys on.
-    assert "checkpoint_path '{cp}' does not exist on disk" in validate_src, (
-        "validate_result no longer emits the incomplete-handoff "
-        "'checkpoint_path' format that _retryable_failure depends on. "
-        "Update both in the same change."
+def test_retryable_kinds_constant_matches_documented_set(pila):
+    """The retryable enum must be exactly the three documented kinds.
+    Adding a kind requires updating IMPLEMENTATION.md §1867 in the same
+    change."""
+    assert pila._RETRYABLE_FAILURE_KINDS == frozenset(
+        {"no_commits", "dirty_worktree", "empty_handoff"}
     )
 
 
-# --- the coupling test ----------------------------------------------------
+# --- coupling test: producer returns must match consumer's accepted set ---
 
-def test_retryable_markers_match_check_strings(pila):
-    """The substring markers in _retryable_failure must appear verbatim
-    in the source of the functions that emit the corresponding error
-    strings. If a check function's wording changes, this test fails and
-    forces the retry classifier to be updated in the same change."""
+# Every retryable-path producer return literal. Drift here without a
+# matching change to `_RETRYABLE_FAILURE_KINDS` is caught by the test
+# below. Keep this list aligned with IMPLEMENTATION.md §1867's
+# producer table.
+_PRODUCER_RETRYABLE_KINDS = {
+    # check_branch_has_commits → "no_commits"
+    "no_commits",
+    # the inline dirty-worktree check in settle_subtask → "dirty_worktree"
+    "dirty_worktree",
+    # validate_result's incomplete-handoff missing-checkpoint arm → "empty_handoff"
+    "empty_handoff",
+}
+
+
+def test_producer_kinds_all_classified_retryable(pila):
+    """Every kind a producer can tag on a retryable path must be in
+    `_RETRYABLE_FAILURE_KINDS`. If a producer tags a new kind and
+    forgets to add it to the enum, this test catches the drift."""
+    missing = _PRODUCER_RETRYABLE_KINDS - pila._RETRYABLE_FAILURE_KINDS
+    assert not missing, (
+        f"producers emit {missing!r} on retryable paths but "
+        f"_RETRYABLE_FAILURE_KINDS does not accept them — the retry "
+        f"classifier would silently downgrade these to terminal. "
+        f"Add to _RETRYABLE_FAILURE_KINDS or fix the producer."
+    )
+
+
+def test_check_branch_has_commits_tags_no_commits(pila):
+    """`check_branch_has_commits` must return `("no_commits", ...)` on
+    its retryable arm. If the kind is renamed or the producer is
+    rewritten to return a different shape, this test fails."""
+    src = inspect.getsource(pila.check_branch_has_commits)
+    assert '"no_commits"' in src, (
+        "check_branch_has_commits no longer tags `no_commits` — the "
+        "retry classifier would not treat its failure as retryable."
+    )
+
+
+def test_validate_result_tags_empty_handoff_for_missing_checkpoint(pila):
+    """`validate_result`'s incomplete-handoff + missing-checkpoint arm
+    must tag `("empty_handoff", ...)` — this is the Claude Code
+    session-limit / rate-limit safety net path."""
+    src = inspect.getsource(pila.validate_result)
+    assert '"empty_handoff"' in src, (
+        "validate_result no longer tags `empty_handoff` for the "
+        "incomplete-handoff missing-checkpoint case — the session-"
+        "limit no-op recovery path would be silently downgraded "
+        "to terminal."
+    )
+
+
+def test_settle_subtask_tags_dirty_worktree(pila):
+    """The inline dirty-worktree check in `settle_subtask` is the only
+    producer of the `dirty_worktree` kind. Find it in the pila.py
+    source text and confirm the literal appears."""
     source = PILA_PY.read_text()
-
-    # Extract the markers from _retryable_failure's source so the test
-    # finds whichever markers the function currently declares.
-    retryable_src = inspect.getsource(pila._retryable_failure)
-    markers_match = re.search(
-        r"retryable_markers\s*=\s*\(([^)]+)\)", retryable_src, re.DOTALL
-    )
-    assert markers_match, "could not locate retryable_markers tuple in source"
-    markers = re.findall(r'"([^"]+)"', markers_match.group(1))
-    assert markers, "no markers extracted from retryable_markers tuple"
-
-    # Locate check_branch_has_commits' source and confirm its error
-    # string contains one of the markers.
-    cbc_src = inspect.getsource(pila.check_branch_has_commits)
-    assert any(m in cbc_src for m in markers), (
-        f"check_branch_has_commits emits no string matching any of "
-        f"{markers!r} — the retry classifier would not treat its failure "
-        f"as retryable."
-    )
-
-    # The dirty-worktree check is inline in settle_subtask, not its own
-    # function. Find it in the pila.py source text and confirm one
-    # of the markers appears.
     settle_match = re.search(
         r"^(?:async )?def settle_subtask\b.*?"
         r"(?=^(?:async )?(?:def |class ))",
         source, re.DOTALL | re.MULTILINE,
     )
     assert settle_match, "could not locate settle_subtask in source"
-    settle_src = settle_match.group(0)
-    assert any(m in settle_src for m in markers), (
-        f"settle_subtask emits no string matching any of {markers!r} "
-        f"in its dirty-worktree check — the retry classifier would not "
-        f"treat that failure as retryable."
+    assert '"dirty_worktree"' in settle_match.group(0), (
+        "settle_subtask's dirty-worktree check no longer tags "
+        "`dirty_worktree` — that retryable case would be silently "
+        "downgraded to terminal."
     )
 
 
-def test_coupling_specifics(pila):
-    """Sanity check: the two known coupled pairs are still in force.
-    Looser than test_retryable_markers_match_check_strings but reads
-    more clearly when this test alone fails."""
-    cbc_src = inspect.getsource(pila.check_branch_has_commits)
-    assert "no commits ahead of the run" in cbc_src, (
-        "check_branch_has_commits no longer emits the "
-        "'no commits ahead of the run' marker"
-    )
+def test_settle_subtask_fail_calls_use_two_arg_signature():
+    """Every `await fail(...)` invocation inside `settle_subtask` must
+    pass exactly two positional args: (kind, reason). The legacy
+    single-arg shape `fail(reason)` would raise `TypeError` at runtime
+    because `fail` was changed to take a structured `failure_kind`
+    discriminator. The original refactor missed pila.py:10293's
+    worker-self-reported-failed arm because no test exercised that
+    branch (the path is rare in production — see IMPLEMENTATION.md
+    §1592). This test parses settle_subtask's AST and asserts the
+    signature is consistent across ALL call sites.
+
+    Concretely guards: the worker-self-reported `status: "failed"`
+    arm in settle_subtask must pass a structured kind alongside the
+    worker's freeform summary."""
+    import ast
 
     source = PILA_PY.read_text()
-    settle_match = re.search(
-        r"^(?:async )?def settle_subtask\b.*?"
-        r"(?=^(?:async )?(?:def |class ))",
-        source, re.DOTALL | re.MULTILINE,
+    tree = ast.parse(source)
+
+    # Locate settle_subtask in the module's top-level functions.
+    settle = None
+    for node in tree.body:
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "settle_subtask":
+            settle = node
+            break
+    assert settle is not None, "could not locate settle_subtask in pila.py AST"
+
+    # Find every Call node inside settle_subtask whose callee is the
+    # bare name `fail` — the local closure. Exclude the def itself.
+    fail_calls = []
+    for node in ast.walk(settle):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+                and node.func.id == "fail":
+            fail_calls.append(node)
+
+    assert fail_calls, (
+        "no `fail(...)` calls found inside settle_subtask — the test's "
+        "AST walk is broken or the function was renamed."
     )
-    assert settle_match
-    assert "uncommitted change" in settle_match.group(0), (
-        "settle_subtask's dirty-worktree check no longer emits the "
-        "'uncommitted change' marker"
+
+    bad = [
+        (call.lineno, len(call.args), [ast.unparse(a) for a in call.args])
+        for call in fail_calls
+        if len(call.args) != 2
+    ]
+    assert not bad, (
+        f"fail() calls inside settle_subtask must pass exactly 2 "
+        f"positional args (kind, reason); found wrong arity at: {bad!r}. "
+        f"Every fail() invocation must pair a structured "
+        f"`failure_kind` with a human-readable `reason`."
     )

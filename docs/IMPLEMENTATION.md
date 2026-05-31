@@ -1583,12 +1583,13 @@ sees both messages and re-frames the task.
 ### Per-subtask checks — in `settle_subtask`, every worker result
 | Check | Catches | On failure |
 |-------|---------|-----------|
-| `validate_result()` cross-field invariants | `handoff` with no checkpoint file; `blocked` with no blocker; `failed` with no summary; `needs-clarification` with no `clarification_question` or no `checkpoint_path` | **Terminal** |
+| `validate_result()` — `incomplete-handoff` with missing checkpoint file | session-limit no-op; `--max-turns` with no checkpoint written | **Retryable** (`failure_kind="empty_handoff"`) |
+| `validate_result()` — other cross-field invariants | `handoff` with null `checkpoint_path`; `blocked` with no blocker; `failed` with no summary; `needs-clarification` with no `clarification_question` / invalid `checkpoint_path` | **Terminal** (`failure_kind="broken"`) |
 | `check_branch_has_commits()` | `complete` claim, nothing committed | **Retryable** |
 | dirty worktree check | uncommitted changes that vanish on integration | **Retryable** |
 | `check_diff_scope()` | `.pila/` or `.git/` in the diff; any `.claude/` path *except* `.claude/agents/`, `.claude/commands/`, `.claude/skills/` (the documented Claude Code user-deliverable subtrees — implementers may write a subagent/command/skill file there as a legitimate deliverable, but never `settings.json` or any top-level `.claude/` file) | **Terminal** (protected path); scope-volume warning is non-fatal (triggered when `files_likely_touched` is non-empty *and* touched > max(3× expected, 5), or when touched > 15 regardless of the planner's estimate) |
 | `validate_checkpoint()` — on `incomplete-handoff` | required section missing; required section empty/whitespace; required section contains only a placeholder token (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing `.`/`!`/`?`/`…` ignored and repeated `?` collapsed); a path listed under `## Files touched` no longer exists in the worktree and is not flagged `[deleted]` | returns `blocked` |
-| `_retryable_failure(summary)` — on `status='failed'` returned by the worker itself | worker self-report of failure | routed through the retry policy using the worker's `summary` as the reason; because `summary` is freeform text it almost never matches a retryable marker, so in practice a self-reported `failed` is **terminal** on first occurrence |
+| `_retryable_failure(kind)` — on `status='failed'` returned by the worker itself | worker self-report of failure | routed through the retry policy with `failure_kind="broken"` (worker self-report has no producer to tag a more specific kind, and a self-reported failure is broken-worker territory by default); **terminal** on first occurrence |
 
 `validate_result()` accepts a `complete` status regardless of what
 `criteria_results` carries — empty, missing, or with `met:false`
@@ -1863,27 +1864,36 @@ there first when handoffs become routine.
 Maps to `DESIGN.md`: §13. The code-enforced / prompt-governed split there is
 *the* point — do not present the second table as a code guarantee.
 
-### The two-tier retry policy — `_retryable_failure(reason)`
-One classifier function decides retryable vs. terminal. It substring-matches
-the failure reason; the markers must stay in sync with the strings the check
-functions actually emit. The coupling test in
-`tests/test_retryable_failure.py` enforces this — if you change a marker
-in `_retryable_failure` without updating the matching check string (or
-vice versa), the test fails. When adding a new retryable failure mode,
-edit `_retryable_failure` and the check function in the same change.
+### The two-tier retry policy — `_retryable_failure(kind)`
+One classifier function decides retryable vs. terminal. It dispatches on a
+structured `failure_kind` enum tagged at the producer; the prose `reason`
+stays for user-visible diagnostics but no longer drives control flow. The
+retryable set is the module-level constant `_RETRYABLE_FAILURE_KINDS`.
 
-| Failure | Tier | Marker / source |
+Per DESIGN §12, classification by substring match on a prose `reason`
+would be deterministic code making a judgment call on natural-language
+text — a model should classify prose; a substring match cannot. Tagging
+at the producer eliminates the prose round-trip.
+
+The coupling test in `tests/test_retryable_failure.py` enforces that
+every retryable-path return from a producer (`validate_result`,
+`check_branch_has_commits`, the inline dirty-worktree check) carries a
+`failure_kind` in `_RETRYABLE_FAILURE_KINDS`. When adding a new
+retryable failure mode, extend the enum and update the producer in the
+same change.
+
+| Failure | Tier | `failure_kind` / source |
 |---------|------|-----------------|
-| branch has no commits ahead of the run branch | Retryable | `"no commits ahead of the run"` from `check_branch_has_commits` |
-| worktree left dirty | Retryable | `"uncommitted change"` from the dirty-worktree check |
-| `incomplete-handoff` worker produced no checkpoint on disk | Retryable | `reason.startswith("checkpoint_path '")` — the line-2314 prefix of `validate_result`'s incomplete-handoff check. Triggers in two known cases: (1) Claude Code session-limit / rate-limit no-op workers leave no checkpoint (primarily caught by `detect_session_limit()` upstream; this is the safety net for a message-format change), and (2) a worker that hit `--max-turns` with no checkpoint written, which `run_implementer`'s WorkerError handler synthesizes into the same envelope. Both are corrective-note cases. Prefix-match — *not* pair-match on `"checkpoint_path"` + `"does not exist on disk"` — because `validate_result`'s needs-clarification check (line 2350) emits a message containing both substrings but represents a genuinely-broken worker that must stay non-retryable. |
-| cross-field invariant violation (other) | Terminal | `validate_result` |
-| diff touched a protected path | Terminal | `check_diff_scope` |
-| worker-level error (timeout, schema-invalid twice) | Terminal | `WorkerError` path |
+| branch has no commits ahead of the run branch | Retryable | `"no_commits"` from `check_branch_has_commits` |
+| worktree left dirty | Retryable | `"dirty_worktree"` from the inline dirty-worktree check in `settle_subtask` |
+| `incomplete-handoff` worker produced no checkpoint on disk | Retryable | `"empty_handoff"` from `validate_result`'s incomplete-handoff branch when the checkpoint file is missing. Triggers in two known cases: (1) Claude Code session-limit / rate-limit no-op workers leave no checkpoint (primarily caught by `detect_session_limit()` upstream; this is the safety net for a message-format change), and (2) a worker that hit `--max-turns` with no checkpoint written, which `run_implementer`'s WorkerError handler synthesizes into the same envelope. Both are corrective-note cases. |
+| cross-field invariant violation (other) | Terminal | `"broken"` from `validate_result` |
+| diff touched a protected path | Terminal | `"broken"` from `check_diff_scope` |
+| worker-level error (timeout, schema-invalid twice) | Terminal | `"broken"` from `WorkerError` path |
 
 `settle_subtask` routes every failure through `_retryable_failure` via the
-`fail()` helper. Retryable consumes the retry cap; terminal ends the subtask on
-first occurrence.
+`fail(kind, reason)` helper. Retryable consumes the retry cap; terminal ends
+the subtask on first occurrence.
 
 On a retryable failure that will loop, `fail()` calls
 `_reset_subtask_worktree(sid, pila_dir, run_id)` to remove the leftover
@@ -2946,7 +2956,7 @@ enforcement functions:
 | `test_resolve_models.py` | `resolve_models()` — per-worker precedence (CLI > env > TOML), defaults, validation, empty/whitespace handling |
 | `test__read_toml_key.py` | `_read_toml_key()` — the shared `pila.toml` line parser used by both resolvers |
 | `test_gather_answers_validation.py` | the source-of-truth validation gate in `gather_answers()` |
-| `test_retryable_failure.py` | `_retryable_failure()`, **including a coupling test** that the retryable markers actually appear in the strings emitted by `check_branch_has_commits` and the inline dirty-worktree check |
+| `test_retryable_failure.py` | `_retryable_failure()`, **including a coupling test** that every producer's retryable-path return tags a `failure_kind` in `_RETRYABLE_FAILURE_KINDS` (`validate_result`, `check_branch_has_commits`, the inline dirty-worktree check in `settle_subtask`) |
 | `test_state_fields.py` | `STATE_FIELDS` tuple parity, in both directions: against the §8 field table, and against every `st.data[...] = …` / `setdefault(...)` write in `pila.py`. This is the mechanism §8's "this table is canonical" claim relies on |
 | `test_validate_plan.py` | `validate_plan()` (every rule in §5) |
 | `test_validate_result.py` | `validate_result()` (every status-branch invariant) |
