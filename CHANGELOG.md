@@ -25,7 +25,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`prompts/planner.md:205-208`) explicitly permits empty `subtasks`
   with `status: "ready"` — "an empty plan is a legitimate outcome of
   a cleared evidence gate" — but the orchestrator had no code branch
-  to express that answer. `schedule()` (pila.py:9472) ran an
+  to express that answer. `schedule()` (pila.py:9548) ran an
   unconditional `die("planners produced no subtasks")` on any empty
   scheduling input, treating "task already done" identically to
   "everyone failed." This is **not** a regression from the recent
@@ -40,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *every* plan satisfies `status == "ready"` and `subtasks == []`;
   it returns `None` on any mixed outcome (one or more domains have
   subtasks → normal run proceeds) and on any blocked-only outcome
-  (the existing all-blocked die at pila.py:9533 still fires so the
+  (the existing all-blocked die at pila.py:9543 still fires so the
   user knows a gate failed). `_finish_no_work_run(st, no_work_map)`
   is the terminal handler: it logs the no-work summary with each
   planner's basis quoted, records `no_work_required=True` +
@@ -55,7 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `schedule()` — after the reconciler so a planner that emits empty
   subtasks but the reconciler later adds connector subtasks is not
   misclassified as no-work, and before scheduling so the bare die
-  at pila.py:9472 is unreachable on the happy path (it remains as a
+  at pila.py:9548 is unreachable on the happy path (it remains as a
   defensive backstop for direct `schedule()` callers, e.g. tests).
   When `detect_no_work` fires, `_run_phases` returns early — phases
   4–6 are skipped entirely; no run branch is materialized, no
