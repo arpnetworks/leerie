@@ -221,7 +221,7 @@ STATE_FIELDS = (
 CATEGORIES = [
     "feature-implementation", "bug-fixing", "refactoring",
     "performance-optimization", "testing", "dependency-migration",
-    "configuration-build", "documentation",
+    "configuration-build", "infrastructure", "documentation",
 ]
 
 # Short abbreviations used in the run_id branch-name prefix (DESIGN §6
@@ -235,6 +235,7 @@ CATEGORY_ABBREV = {
     "testing": "test",
     "dependency-migration": "deps",
     "configuration-build": "config",
+    "infrastructure": "infra",
     "documentation": "docs",
 }
 
@@ -643,17 +644,21 @@ SCHEMAS: dict[str, dict] = {
         # worker reasons over the full task + merged subtasks (with their
         # provides, requires, depends_on, files_likely_touched) and the
         # list of unresolved tags, then emits eight arrays:
-        #   - 4 resolution actions: renames, added_provides, added_subtasks,
-        #     conditional_drops (close unresolved-requires gaps; the common
-        #     case). conditional_drops is the fourth — added for planner-
-        #     emitted consumers whose own `intent` declares them
-        #     conditional on an unresolvable precondition (the capability
-        #     graph has no semantics for conditional subtasks, so the
-        #     reconciler converts the planner's prose conditionality into
-        #     a structured drop).
-        #   - 3 cycle-breaking actions: dropped_requires, dependency_edges,
-        #     merged_subtasks (used only in retry mode, when the gate
-        #     detected the first attempt's mutations closed a cycle).
+        #   - 5 resolution actions: renames, added_provides, added_subtasks,
+        #     conditional_drops, dropped_requires (close unresolved-requires
+        #     gaps; the common case). conditional_drops handles planner-
+        #     emitted consumers whose own `intent` declares them conditional
+        #     on an unresolvable precondition. dropped_requires handles
+        #     consumers whose `requires` entry is over-specified — an
+        #     aggregate, coarser synonym, or authoring-time decision the
+        #     same subtask itself records (the consumer stays; only the
+        #     bad edge goes).
+        #   - 2 cycle-breaking-only actions: dependency_edges, merged_subtasks
+        #     (used only in retry mode, when the gate detected the first
+        #     attempt's mutations closed a cycle). dropped_requires also
+        #     plays a cycle-breaking role in retry mode (over-specified
+        #     requires entries that close cycles), but its primary home
+        #     is now resolution.
         #   - 1 escape hatch: unresolvable (genuine gap with no plausible
         #     resolution; dies the run with the worker's stated reason).
         # Each array is independently optional (any can be empty). The
@@ -750,11 +755,19 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "dropped_requires": {
-                # Cycle-breaking op #1: remove an over-specified
-                # `extent: in_plan` requires entry. Used when the requirement
-                # was an authoring-time decision the same subtask records,
-                # not a code artifact another subtask produces. Silent no-op
-                # on missing sid/entry (mirrors `renames`).
+                # Resolution op #5 AND Cycle-breaking op #1: remove an
+                # over-specified `extent: in_plan` requires entry.
+                # Resolution mode: the requires entry is an aggregate,
+                # coarser synonym, or authoring-time decision the same
+                # subtask itself records (rather than a code artifact
+                # another subtask produces) — the consumer stays in the
+                # plan, only the bad edge goes.
+                # Cycle-breaking mode: an over-specified requires entry
+                # was what closed a dependency cycle; dropping it breaks
+                # the cycle without removing real subtask coupling.
+                # Apply mechanics are identical in either mode and live in
+                # `_apply_reconciler_output`. Silent no-op on missing
+                # sid/entry (mirrors `renames`).
                 "type": "array",
                 "items": {
                     "type": "object",
@@ -1719,7 +1732,7 @@ def compute_run_id(categories: list[str], task: str, started_at: str) -> str:
     task description, and the run start timestamp. See DESIGN §6.
 
     The first entry in `categories` decides the short prefix; it must
-    appear in CATEGORY_ABBREV (i.e., be one of the eight CATEGORIES). If
+    appear in CATEGORY_ABBREV (i.e., be one of the CATEGORIES). If
     the list is empty or has no recognized category, falls back to 'misc'
     — this is defensive only; phase_classify already dies before this
     function is reached when the classifier returns no recognized
@@ -7410,7 +7423,11 @@ def _find_oversized_added_subtasks(plans: list[dict]) -> list[dict]:
     return oversized
 
 
-def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
+def _apply_reconciler_output(
+    plans: list[dict],
+    output: dict,
+    attempt_1_renames: list[dict] | None = None,
+) -> list[dict]:
     """Mutate `plans` per the reconciler's output. On success, returns
     the same `plans` list (with in-place edits on existing subtasks
     plus an appended `_reconciler` pseudo-plan for any added_subtasks).
@@ -7421,6 +7438,17 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
     undefined state (callers must deep-copy before applying if they
     need clean reversion on failure; the cycle-resolution retry loop
     does this).
+
+    `attempt_1_renames` is the attempt-1 reconciler output's `renames`
+    list, used by the `dropped_requires` apply step (only) to accept
+    either form of an unresolved tag — the post-mutation tag that
+    attempt 1's rename produced, or the pre-revert tag the consumer's
+    `requires` actually holds after the retry's revert restored the
+    pre-mutation plans. Mirrors the dual-tag acceptance in
+    `_validate_unresolved_must_include` so the validator and the apply
+    step cannot disagree — the same symmetry repair commit cd244cf
+    applied to renames/added_provides/added_subtasks. `None` on
+    attempt 1 (no revert in scope, strict match is correct).
 
     Seven action arrays consumed here, in order:
 
@@ -7446,10 +7474,14 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
        in `phase_reconcile` after this function returns. Silent no-op
        on missing sid (mirrors `renames` / `dropped_requires`).
     5. `dropped_requires` remove an `extent: in_plan` requires entry
-       (cycle-breaking op: used when the requirement was over-specified
-       — an authoring decision the same subtask records, not a code
-       artifact another subtask produces). Silent no-op on missing
-       sid/entry (mirrors `renames`).
+       (resolution op AND cycle-breaking op: used when the requirement
+       was over-specified — an aggregate, coarser synonym, or
+       authoring-time decision the same subtask itself records, not a
+       code artifact another subtask produces. The consumer stays in
+       the plan; only the bad edge is removed). Apply mechanics are
+       identical in either mode — phase_reconcile's must-include
+       validator accepts it in unresolved-tag retry mode too. Silent
+       no-op on missing sid/entry (mirrors `renames`).
     6. `dependency_edges` append a planner-declared `depends_on` edge
        between two existing subtasks (cycle-breaking op: used when both
        sides legitimately need each other and one ordering is right).
@@ -7604,16 +7636,42 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
 
     # --- Cycle-breaking ops (apply after the resolution ops above) ---
 
+    # Build a (sid, post_tag) -> pre_tag map from attempt-1's renames
+    # so dropped_requires applied in a retry context can match either
+    # form of the unresolved tag. Empty dict in attempt 1
+    # (`attempt_1_renames is None`) → the comprehension over `.get()`
+    # never returns a pre_tag, so the strict-equality branch is the
+    # only one that fires — preserves attempt-1 behavior.
+    pre_revert_tag_by_sid_tag: dict[tuple[str, str], str] = {}
+    if attempt_1_renames:
+        for r in attempt_1_renames:
+            sid_r = r.get("sid")
+            from_tag = r.get("from")
+            to_tag = r.get("to")
+            if sid_r and from_tag and to_tag:
+                pre_revert_tag_by_sid_tag[(sid_r, to_tag)] = from_tag
+
     for dr in output.get("dropped_requires", []):
         s = by_id.get(dr["sid"])
         if s is None:
             continue  # silent no-op, mirrors `renames`
+        # Accept either the post-mutation tag (dr["tag"]) or the
+        # pre-revert tag (looked up via attempt_1_renames). After the
+        # retry's revert, the consumer's `requires` holds the
+        # pre-revert form; if the model emits dropped_requires keyed
+        # on the post-mutation form, fall back to the pre-revert tag.
+        # Mirror of the validator's dual-tag acceptance — keeps the
+        # apply step and the must-include validator from disagreeing.
+        candidate_tags = {dr["tag"]}
+        pre_tag = pre_revert_tag_by_sid_tag.get((dr["sid"], dr["tag"]))
+        if pre_tag is not None:
+            candidate_tags.add(pre_tag)
         reqs = s.get("requires") or []
         s["requires"] = [
             entry for entry in reqs
             if not (isinstance(entry, dict)
                     and entry.get("extent") == "in_plan"
-                    and entry.get("tag") == dr["tag"])
+                    and entry.get("tag") in candidate_tags)
         ]
 
     for de in output.get("dependency_edges", []):
@@ -8013,7 +8071,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             "retry prompt")
         output2 = await _spawn_reconciler(size_retry_prompt)
         _check_unresolvable(output2)
-        _apply_reconciler_output(plans, output2)
+        _apply_reconciler_output(
+            plans, output2, attempt_1_renames=output.get("renames"))
         _record_conditional_drops(output2)
 
         # Re-run the size gate on attempt 2's output.
@@ -8099,7 +8158,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 "constraint. Refine the task or re-run."
             )
 
-        _apply_reconciler_output(plans, output2)
+        _apply_reconciler_output(
+            plans, output2, attempt_1_renames=output.get("renames"))
         _record_conditional_drops(output2)
 
         # Re-run the gate on attempt 2's output.
@@ -8238,13 +8298,15 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 f"entries:\n{bullets}\n"
                 "Pila requires every named unresolved entry to be "
                 "addressed by at least one of renames / added_provides "
-                "/ added_subtasks / conditional_drops / unresolvable. "
+                "/ added_subtasks / conditional_drops / dropped_requires "
+                "/ unresolvable. "
                 "The retry prompt listed the legal operations per entry; "
                 "the model defied the structural constraint. Refine the "
                 "task or re-run."
             )
 
-        _apply_reconciler_output(plans, output3)
+        _apply_reconciler_output(
+            plans, output3, attempt_1_renames=output.get("renames"))
         _record_conditional_drops(output3)
 
         # Re-run the external-extent passes against attempt-2's plans
@@ -9184,7 +9246,11 @@ def _build_unresolved_retry_prompt(
         "textually close (a 'false friend' — e.g. a narrow synonym "
         "for a broader concept), pick a different option from the "
         "bounded set below. `unresolvable` IS valid here if no real "
-        "producer exists.\n"
+        "producer exists. `dropped_requires` IS also valid: when the "
+        "consumer's own `provides` already covers the work the requires "
+        "tag names (an over-specified self-reference rather than a real "
+        "cross-subtask dependency), drop the requires entry — the "
+        "consumer stays, only the bad edge goes.\n"
     )
 
     for i, u in enumerate(unresolved, 1):
@@ -9271,6 +9337,17 @@ def _build_unresolved_retry_prompt(
             "'conditionally add', 'otherwise this subtask is dropped'). "
             "Reserved for planner-authored consumers.")
         parts.append(
+            f"    - dropped_requires: drop just this `requires` entry "
+            f"from {sid!r} (the consumer stays in the plan) — ONLY if "
+            f"the consumer's own `provides` already covers the work "
+            f"'{pre_revert_tag}' names, at a different granularity. "
+            "I.e. the requires entry is an aggregate, a coarser synonym, "
+            "or an authoring-time decision the same subtask itself "
+            "records, rather than a code artifact another subtask "
+            "produces. Distinct from `conditional_drops` (which removes "
+            "the whole subtask) — use this when the consumer should "
+            "stay but the over-specified self-reference should go.")
+        parts.append(
             f"    - unresolvable: name this as a genuine gap with a "
             "one-sentence reason (aborts the run cleanly).")
 
@@ -9293,7 +9370,10 @@ def _validate_unresolved_must_include(
     output addresses it via one of: rename on that sid+tag, added_provides
     covering that tag (any sid), added_subtask whose provides includes
     that tag, conditional_drops on the consumer sid (drops the
-    planner-emitted conditional consumer wholesale — DESIGN §5), OR
+    planner-emitted conditional consumer wholesale — DESIGN §5),
+    dropped_requires on that sid+tag (consumer's requires is
+    over-specified — an aggregate or coarser synonym of the consumer's
+    own provides; the requires entry is the defect, not the plan), OR
     unresolvable on that sid+tag.
 
     Returns the list of unaddressed entries (rendered as "domain/sid
@@ -9357,6 +9437,15 @@ def _validate_unresolved_must_include(
     conditional_drop_sids = {
         cd["sid"] for cd in output.get("conditional_drops", [])
     }
+    # dropped_requires addresses an unresolved entry by removing the
+    # over-specified `requires` entry from the consumer's `requires`
+    # list. Matched on (sid, tag); the apply step at the existing
+    # `dropped_requires` site (see `_apply_reconciler_output`) keys the
+    # same way. The consumer stays in the plan — only the over-specified
+    # edge is removed.
+    dropped_requires_sid_tags = {
+        (dr["sid"], dr["tag"]) for dr in output.get("dropped_requires", [])
+    }
 
     unaddressed: list[str] = []
     for u in unresolved:
@@ -9384,11 +9473,22 @@ def _validate_unresolved_must_include(
             or (pre_revert_tag is not None
                 and pre_revert_tag in added_subtask_provides)
         )
+        # dropped_requires: same dual-tag acceptance as the other ops.
+        # If attempt 2 re-emits the rename, the apply step sees
+        # consumer.requires=[post-mutation-tag]; if attempt 2 omits
+        # the rename, the requires entry holds the pre-revert tag.
+        # Either form should count as addressing this unresolved entry.
+        dropped_requires_addressed = (
+            (sid, tag) in dropped_requires_sid_tags
+            or (pre_revert_tag is not None
+                and (sid, pre_revert_tag) in dropped_requires_sid_tags)
+        )
         addressed = (
             rename_addressed
             or added_provides_addressed
             or added_subtask_addressed
             or sid in conditional_drop_sids
+            or dropped_requires_addressed
             or (sid, tag) in unresolvable_sid_tags
         )
         if not addressed:

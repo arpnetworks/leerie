@@ -85,10 +85,11 @@ def test_reconciler_requires_all_eight_arrays(pila):
     """All eight arrays must be present in every output — even if empty.
     Each array is independently optional in content (any can be empty)
     but the field itself must be there so callers don't crash on a
-    missing key. The eight cover four resolution actions (renames,
-    added_provides, added_subtasks, conditional_drops), three
-    cycle-breaking actions (dropped_requires, dependency_edges,
-    merged_subtasks), and one escape hatch (unresolvable)."""
+    missing key. The eight cover five resolution actions (renames,
+    added_provides, added_subtasks, conditional_drops, dropped_requires
+    — the latter is dual-role and also serves as a cycle-breaker), two
+    cycle-breaking-only actions (dependency_edges, merged_subtasks),
+    and one escape hatch (unresolvable)."""
     schema = pila.SCHEMAS["reconciler"]
     required = set(schema["required"])
     assert required == {"renames", "added_provides", "added_subtasks",

@@ -1304,6 +1304,232 @@ def test_validate_unresolved_must_include_accepts_unresolvable(pila):
     assert pila._validate_unresolved_must_include(output, unresolved) == []
 
 
+def test_validate_unresolved_must_include_accepts_dropped_requires(pila):
+    """A dropped_requires on the unresolved (sid, tag) addresses the
+    entry — the consumer's requires entry was over-specified (aggregate
+    or coarser synonym of its own provides) and the cleanest resolution
+    is to remove the bad edge. The consumer itself stays in the plan.
+    Mirrors `_validate_unresolved_must_include` rule 5."""
+    unresolved = [{"domain": "configuration-build", "sid": "config-006",
+                   "tag": "aws-runtime-env-keys-finalized"}]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [],
+        "dropped_requires": [{"sid": "config-006",
+                              "tag": "aws-runtime-env-keys-finalized",
+                              "reason": "self-reference over-specified"}],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    assert pila._validate_unresolved_must_include(output, unresolved) == []
+
+
+def test_validate_unresolved_must_include_dropped_requires_pre_revert_tag(pila):
+    """When attempt 1 renamed the consumer's tag, attempt 2's
+    dropped_requires may target the PRE-revert tag (what the consumer's
+    requires entry actually holds after the unresolved-retry's revert).
+    The validator must accept the pre-revert form via dual-tag matching,
+    mirroring how renames/added_provides/added_subtasks already work."""
+    # Attempt 1 renamed (config-006, foo-finalized → foo-keys-finalized).
+    attempt_1_output = {
+        "renames": [{"sid": "config-006", "from": "foo-finalized",
+                     "to": "foo-keys-finalized"}],
+    }
+    # The unresolved set contains the POST-mutation tag.
+    unresolved = [{"domain": "configuration-build", "sid": "config-006",
+                   "tag": "foo-keys-finalized"}]
+    # Attempt 2 emits dropped_requires targeting the PRE-revert tag
+    # (which is what the consumer's requires actually holds after revert).
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [],
+        "dropped_requires": [{"sid": "config-006", "tag": "foo-finalized",
+                              "reason": "self-reference over-specified"}],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    assert pila._validate_unresolved_must_include(
+        output, unresolved, attempt_1_output) == []
+
+
+def test_validate_unresolved_must_include_dropped_requires_post_mutation_tag(pila):
+    """Symmetric to the pre-revert case: attempt 2 may also target the
+    POST-mutation tag (a literal-minded model reading the unresolved
+    header verbatim). The validator must accept that form too — without
+    it, pila would reject its own model's reasonable output."""
+    attempt_1_output = {
+        "renames": [{"sid": "config-006", "from": "foo-finalized",
+                     "to": "foo-keys-finalized"}],
+    }
+    unresolved = [{"domain": "configuration-build", "sid": "config-006",
+                   "tag": "foo-keys-finalized"}]
+    # Attempt 2 emits dropped_requires with the POST-mutation tag.
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [],
+        "dropped_requires": [{"sid": "config-006",
+                              "tag": "foo-keys-finalized",
+                              "reason": "self-reference over-specified"}],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    assert pila._validate_unresolved_must_include(
+        output, unresolved, attempt_1_output) == []
+
+
+def test_apply_reconciler_output_dropped_requires_strict_match_attempt_1(pila):
+    """Attempt-1 apply (no attempt_1_renames passed) does strict tag
+    equality — preserves prior behavior. Documents the contract: the
+    dual-tag fallback only fires in retry mode."""
+    plans = [{"domain": "config", "status": "ready", "subtasks": [
+        {"id": "config-006", "title": "env keyset",
+         "provides": ["env-keyset-contract"],
+         "requires": [{"tag": "aws-runtime-env-keys-finalized",
+                       "extent": "in_plan"}]},
+    ]}]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [],
+        "dropped_requires": [{"sid": "config-006",
+                              "tag": "aws-runtime-env-keys-finalized",
+                              "reason": "self-reference over-specified"}],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, output)
+    sub = plans[0]["subtasks"][0]
+    assert sub["requires"] == []
+
+
+def test_apply_reconciler_output_dropped_requires_dual_tag_in_retry(pila):
+    """In retry mode, the apply step accepts EITHER the post-mutation
+    tag or the pre-revert tag — symmetric to the validator's dual-tag
+    acceptance. The scenario: attempt 1 renamed the consumer's
+    requires tag; the retry reverts the plan; attempt 2 emits
+    dropped_requires targeting the post-mutation form (the unresolved
+    set's tag). Without the dual-tag fallback this would silently
+    no-op and the run would die with 'still unresolved'."""
+    # Simulate post-revert state: the consumer's requires holds the
+    # PRE-revert tag (what the original planner wrote).
+    plans = [{"domain": "config", "status": "ready", "subtasks": [
+        {"id": "config-006", "title": "env keyset",
+         "provides": ["env-keyset-contract"],
+         "requires": [{"tag": "foo-finalized", "extent": "in_plan"}]},
+    ]}]
+    # Attempt 1's renames (the source for the dual-tag map).
+    attempt_1_renames = [{"sid": "config-006", "from": "foo-finalized",
+                          "to": "foo-keys-finalized"}]
+    # Attempt 2 emits dropped_requires targeting the POST-mutation tag.
+    output2 = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [],
+        "dropped_requires": [{"sid": "config-006",
+                              "tag": "foo-keys-finalized",
+                              "reason": "self-reference over-specified"}],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(
+        plans, output2, attempt_1_renames=attempt_1_renames)
+    sub = plans[0]["subtasks"][0]
+    assert sub["requires"] == [], (
+        "apply step must remove the pre-revert-tagged entry even when "
+        "attempt 2 targets the post-mutation form (dual-tag symmetry)")
+
+
+def test_apply_reconciler_output_dropped_requires_pre_revert_in_retry(pila):
+    """Symmetric to the prior test: attempt 2 emits dropped_requires
+    targeting the PRE-revert tag (what the consumer's requires actually
+    holds). Strict equality works in this case; the dual-tag fallback
+    doesn't fire but the same code path covers it. Documents that the
+    happy path (model follows the prompt's must-include example, which
+    uses the pre-revert tag) still works."""
+    plans = [{"domain": "config", "status": "ready", "subtasks": [
+        {"id": "config-006", "title": "env keyset",
+         "provides": ["env-keyset-contract"],
+         "requires": [{"tag": "foo-finalized", "extent": "in_plan"}]},
+    ]}]
+    attempt_1_renames = [{"sid": "config-006", "from": "foo-finalized",
+                          "to": "foo-keys-finalized"}]
+    output2 = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [],
+        "dropped_requires": [{"sid": "config-006", "tag": "foo-finalized",
+                              "reason": "self-reference over-specified"}],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(
+        plans, output2, attempt_1_renames=attempt_1_renames)
+    sub = plans[0]["subtasks"][0]
+    assert sub["requires"] == []
+
+
+def test_apply_reconciler_output_dropped_requires_no_rename_for_target_sid(pila):
+    """Retry mode where `attempt_1_renames` is non-empty but does NOT
+    cover the dropped_requires target sid (attempt 1 renamed OTHER
+    subtasks; this consumer's tag was untouched). The dual-tag map
+    has no entry for (target_sid, tag) → `pre_revert_tag_by_sid_tag.get()`
+    returns None → `candidate_tags` stays singleton → strict equality
+    applies. This locks in the graceful-degrade contract: the dual-tag
+    fallback only fires when attempt 1 actually renamed the target sid,
+    never over-removes by accident.
+
+    Also asserts the negative: a dropped_requires whose tag matches
+    neither the consumer's actual requires entry nor any rename
+    translation leaves the entry alone (silent no-op, mirrors the
+    existing missing-sid behavior)."""
+    plans = [{"domain": "config", "status": "ready", "subtasks": [
+        {"id": "config-006", "title": "env keyset",
+         "provides": ["env-keyset-contract"],
+         "requires": [{"tag": "foo-keys-finalized", "extent": "in_plan"}]},
+        {"id": "config-009", "title": "github vars sync",
+         "provides": ["github-vars-sync-script"],
+         "requires": [{"tag": "infra-stack-output-names", "extent": "in_plan"}]},
+    ]}]
+    # Attempt 1 renamed a DIFFERENT sid (config-009), not the target
+    # of attempt 2's dropped_requires.
+    attempt_1_renames = [{"sid": "config-009",
+                          "from": "infra-stack-output-names-old",
+                          "to": "infra-stack-output-names"}]
+    # Positive case: strict-equality match on (config-006, foo-keys-finalized).
+    output2 = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [],
+        "dropped_requires": [{"sid": "config-006",
+                              "tag": "foo-keys-finalized",
+                              "reason": "self-reference over-specified"}],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(
+        plans, output2, attempt_1_renames=attempt_1_renames)
+    config_006 = plans[0]["subtasks"][0]
+    config_009 = plans[0]["subtasks"][1]
+    assert config_006["requires"] == [], (
+        "strict-equality match still works when attempt-1 didn't rename "
+        "the target sid (dual-tag map gracefully degrades)")
+    # Negative: config-009's requires entry is untouched.
+    assert config_009["requires"] == [
+        {"tag": "infra-stack-output-names", "extent": "in_plan"}]
+
+    # Same scenario with a mismatched tag — must be a silent no-op,
+    # never over-remove via a phantom pre-revert tag.
+    plans2 = [{"domain": "config", "status": "ready", "subtasks": [
+        {"id": "config-006", "title": "env keyset",
+         "provides": ["env-keyset-contract"],
+         "requires": [{"tag": "foo-keys-finalized", "extent": "in_plan"}]},
+    ]}]
+    output_bad = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [],
+        "dropped_requires": [{"sid": "config-006",
+                              "tag": "totally-unrelated-tag",
+                              "reason": "spurious"}],
+        "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(
+        plans2, output_bad, attempt_1_renames=attempt_1_renames)
+    assert plans2[0]["subtasks"][0]["requires"] == [
+        {"tag": "foo-keys-finalized", "extent": "in_plan"}], (
+        "a dropped_requires with a tag the consumer doesn't hold (and "
+        "no pre-revert translation) must be a silent no-op, never "
+        "remove an unrelated entry")
+
+
 def test_validate_unresolved_must_include_rejects_unrelated_op(pila):
     """A rename on a DIFFERENT sid+tag does NOT address an unresolved
     entry. Without this negative test, a regression that caused the

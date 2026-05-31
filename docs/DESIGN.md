@@ -75,7 +75,7 @@ context and a defined input/output contract.
 ```
 Orchestrator (deterministic — owns all control flow, caps, state)
 │
-├─ Phase 1   Classify the task into 1..8 categories          → 1 worker
+├─ Phase 1   Classify the task into 1..9 categories          → 1 worker
 │              ↓ derive the run identifier from category + task + start time
 ├─ Phase 0   Clarify — intent-only questions, only if needed
 ├─ Phase 2   Plan — one planner per matched category         → N workers (parallel)
@@ -126,7 +126,7 @@ the ground-truth audit trail; the inline view is the live feed.
 
 ---
 
-## 4. The eight task categories
+## 4. The nine task categories
 
 Every task is classified into one or more of:
 
@@ -136,8 +136,20 @@ Every task is classified into one or more of:
 4. **performance-optimization** — faster, lighter, or cheaper; same behavior
 5. **testing** — writing and maintaining automated tests
 6. **dependency-migration** — upgrading libraries, moving frameworks or API versions
-7. **configuration-build** — CI/CD, build scripts, infrastructure-as-code
-8. **documentation** — docstrings, comments, READMEs, changelogs
+7. **configuration-build** — CI/CD, build scripts, package and environment
+   configuration at the application side — dotenv files, build entry points,
+   Dockerfiles, GitHub Action workflows, operator scripts that consume cloud
+   outputs. Excludes authoring the cloud resources themselves.
+8. **infrastructure** — infrastructure-as-code that defines cloud resources
+   (CDK / Terraform / Pulumi / CloudFormation / Helm / Kustomize): network,
+   IAM, compute, data, messaging, observability backends, and the stack
+   outputs (resource ARNs / IDs / endpoint names) the configuration-build
+   work consumes. `configuration-build` and `infrastructure` form a
+   producer→consumer pair — infrastructure authors the resources;
+   configuration-build wires the app to them. The split keeps the
+   capability-tag boundary crisp: infra provides
+   `<stack>-stack-output-names`-style tags; config-build consumes them.
+9. **documentation** — docstrings, comments, READMEs, changelogs
 
 A task commonly spans several categories. One planner is assigned per matched
 category; the categories are domains of expertise, not mutually exclusive bins.
@@ -194,7 +206,7 @@ It is reconciled by the orchestrator with three mechanisms:
   `provides` claims, and if that set is non-empty, spawns a single
   *reconciler* worker. The reconciler reads the full task plus every
   subtask (with their `provides`, `requires`, `depends_on`, and
-  `files_likely_touched`) and emits actions across eight arrays. Four
+  `files_likely_touched`) and emits actions across eight arrays. Five
   *resolution* actions — `renames` (two tags mean the same thing — rewrite
   one to match the other), `added_provides` (an existing subtask actually
   produces the capability but didn't declare it), `added_subtasks` (a
@@ -203,17 +215,21 @@ It is reconciled by the orchestrator with three mechanisms:
   conditional on an unresolvable precondition — i.e. the planner authored
   it as "no-op if X" and X turned out to be false; the capability graph
   has no semantics for conditional subtasks, so the reconciler converts
-  the planner's prose conditionality into a structured drop). Three
-  *cycle-breaking* actions for when the resolution actions would close a
-  dependency cycle — `dropped_requires` (the requirement was over-specified
-  by its planner — e.g. an authoring-time decision the same subtask records,
-  not a code artifact another subtask produces), `dependency_edges` (assert
-  an explicit `depends_on` ordering when both sides legitimately need each
-  other and one ordering is the right answer), `merged_subtasks` (collapse
-  two subtasks into one when the cycle reflects a genuine authoring
-  overlap — both edit the same file, both wait on the same decision). And
-  one *escape hatch* — `unresolvable` for unmet requirements with no
-  plausible resolution (aborts the run with the reconciler's diagnosis).
+  the planner's prose conditionality into a structured drop),
+  `dropped_requires` (drop the consumer's `requires` entry when it was
+  over-specified by its planner — an aggregate, coarser synonym, or
+  authoring-time decision the same subtask itself records, rather than a
+  code artifact another subtask produces; the consumer stays in the plan,
+  only the bad edge goes — `dropped_requires` also plays a cycle-breaking
+  role, but its primary home is now resolution). Two *cycle-breaking-only*
+  actions for when the resolution actions would close a dependency cycle —
+  `dependency_edges` (assert an explicit `depends_on` ordering when both
+  sides legitimately need each other and one ordering is the right
+  answer), `merged_subtasks` (collapse two subtasks into one when the
+  cycle reflects a genuine authoring overlap — both edit the same file,
+  both wait on the same decision). And one *escape hatch* —
+  `unresolvable` for unmet requirements with no plausible resolution
+  (aborts the run with the reconciler's diagnosis).
   All judgment about tag equivalence, conditional-drop eligibility, and
   cycle resolution lives in the reconciler worker; the orchestrator computes
   the unresolved set mechanically, runs Tarjan's SCC on the post-mutation
@@ -289,11 +305,15 @@ exists in the plan, so the edge can be wired without judgment.
 
 `unresolvable` is now reserved for genuinely-broken in-plan tags — typos,
 hallucinations, or in-plan capabilities the reconciler can neither rename,
-attribute, nor connect. An external prerequisite never reaches that path,
-and a planner-declared *conditional* consumer (one whose own `intent`
-admits it should be dropped if its precondition is false) routes through
-`conditional_drops` instead — `unresolvable` is reserved for unconditional
-consumers whose required capability genuinely cannot be produced.
+attribute, nor connect. An external prerequisite never reaches that path;
+a planner-declared *conditional* consumer (one whose own `intent` admits
+it should be dropped if its precondition is false) routes through
+`conditional_drops`; and an *over-specified* `requires` entry (an
+aggregate or coarser synonym of what the consumer itself provides, rather
+than a real cross-subtask dependency) routes through `dropped_requires` —
+`unresolvable` is reserved for unconditional consumers whose required
+capability genuinely cannot be produced AND is not an over-specified
+self-reference.
 
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
@@ -1896,7 +1916,7 @@ is deliberate and is justified in the section named.
 
 | Original requirement | Where it lives in the design | Note |
 |----------------------|------------------------------|------|
-| Classify the task into 8 categories | §4; Phase 1 | — |
+| Classify the task into 9 categories | §4; Phase 1 | — |
 | A subagent per category | §3, §4; Phase 2 planners | Planners *return plans*; they do not spawn. Forced by Constraint 1 (§2). |
 | Decompose into the most granular subtasks | §5 | Target narrowed to *smallest independently verifiable unit* — "most granular possible" over-decomposes (§5). |
 | Determine parallel vs. sequential — waves | §5; Phase 3 | Done globally over a merged dependency graph, not per-domain. |
@@ -1930,5 +1950,5 @@ design:
   resolves vocabulary drift between domains' capability tags before the
   scheduler builds its DAG.
 - **Per-domain implementer specialization.** One generic implementer serves all
-  eight domains today. Eight domain-specialized implementers would allow richer
+  nine domains today. Nine domain-specialized implementers would allow richer
   per-domain guidance, at the cost of more to maintain.

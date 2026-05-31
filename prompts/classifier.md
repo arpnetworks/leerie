@@ -10,7 +10,7 @@ or `Bash(find ...)` first, then `Read` the specific file(s) of interest.
 
 ## Classify
 
-Assign the task to one or more of these eight categories:
+Assign the task to one or more of these nine categories:
 
 - `feature-implementation` — building new functionality that did not exist.
 - `bug-fixing` — correcting code that produces wrong behavior, including diagnosis.
@@ -18,11 +18,31 @@ Assign the task to one or more of these eight categories:
 - `performance-optimization` — faster, lighter, or cheaper while keeping behavior the same.
 - `testing` — writing and maintaining automated tests.
 - `dependency-migration` — upgrading libraries, moving frameworks/platforms/API versions.
-- `configuration-build` — CI/CD, build scripts, infrastructure-as-code, environment setup.
+- `configuration-build` — CI/CD, build scripts, package configuration, and
+  environment setup at the *application side*: dotenv templates and
+  `.env.*` files, build entry points, Dockerfiles, GitHub Action
+  workflows that orchestrate build/test/deploy, operator scripts that
+  consume cloud-resource outputs. Excludes authoring the cloud resources
+  themselves.
+- `infrastructure` — authoring or modifying infrastructure-as-code
+  artifacts that define cloud resources (CDK / Terraform / Pulumi /
+  CloudFormation / Helm / Kustomize), including network, IAM, compute
+  (ECS / EKS / Lambda), data (RDS / DynamoDB / S3), messaging (SQS /
+  SNS / Kafka / Redis / Valkey), observability backends, and the stack
+  outputs (resource ARNs / IDs / endpoint names) the
+  `configuration-build` work consumes. When the task says "do what the
+  inspect repos do" and an `--inspect-dir` references a repo with an
+  `infra/` tree, this category applies.
 - `documentation` — docstrings, comments, READMEs, changelogs.
 
 A task commonly spans several. Include every category that genuinely applies;
 do not pad.
+
+Split principle for `configuration-build` vs `infrastructure`:
+`configuration-build` owns *wiring* (the app reads cloud outputs via
+env vars, scripts, build args); `infrastructure` owns *producers* (the
+stacks that emit those outputs). If both are in scope, include both —
+they form a producer→consumer pair.
 
 {{include: _clarification_filter.md}}
 

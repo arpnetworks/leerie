@@ -101,6 +101,33 @@ The orchestrator gives you, in your prompt:
    ]
    ```
 
+   **`infrastructure` ↔ `configuration-build` arrow.** When both
+   categories are in scope, the dependency arrow goes
+   `infrastructure → configuration-build`, not the reverse.
+   `infrastructure` subtasks *author* cloud resources and emit
+   provides tags like `<stack>-stack-output-names`,
+   `<resource>-arn-published`, `cdk-app-synthesizable`.
+   `configuration-build` subtasks *consume* those outputs (env files,
+   GitHub Action vars, seed scripts) and emit provides tags like
+   `env-keyset-contract`, `github-vars-sync-script`,
+   `app-docker-image-buildable`. Do not invert this: a
+   `configuration-build` subtask should not provide a cloud-resource
+   authoring tag, and an `infrastructure` subtask should not require
+   an application-side wiring tag.
+
+   **Don't require a coarser version of your own provides.** Each
+   `requires` entry should name a *distinct* code artifact produced by
+   another subtask, not an aggregate or final form of what your own
+   subtask already produces. If your subtask provides
+   `env-keyset-contract` (the act of authoring the env keyset), do not
+   also require `aws-runtime-env-keys-finalized` (an aggregate over the
+   same act of finalizing it) — the finalization IS your subtask's
+   job, and the reconciler will surface the self-reference as
+   unresolvable. If the finalization legitimately depends on another
+   domain's output, require that upstream tag directly
+   (e.g. `<stack>-stack-output-names`), not a coarser aggregate that
+   collapses your own work into it.
+
 4. **Seed success criteria.** For each subtask, write a concrete, checkable
    `success_criteria_seed` — describe an automated test wherever possible.
 
