@@ -619,8 +619,8 @@ def test_recommendation_correct_on_run1_cycle(pila):
     """Run 1's cycle has planner-declared feat-009 -> feat-008; case 1
     fires; drop the rename closing the reverse direction.
 
-    Pass-14 fix: the recommendation targets the ORIGINAL pre-rename
-    tag (`data-access-ready`), not the post-rename tag
+    The recommendation targets the ORIGINAL pre-rename tag
+    (`data-access-ready`), not the post-rename tag
     (`prisma-data-access-ready`). The cycle-retry reverts to pre-
     mutation plans before applying attempt 2, so the consumer's
     requires entry holds the original tag at apply time — a drop
@@ -1031,9 +1031,9 @@ def test_recommendation_case4_lexicographic_tiebreaker(pila):
     #   subtask-b -> subtask-a  [requires:b-canonical; rename on subtask-a]
     # The consumer side (e["to"]) gets the drop. DESC order: subtask-b
     # comes before subtask-a, so the dropped requires entry lives on
-    # subtask-b. Pass-14 fix: the tag is the ORIGINAL pre-rename tag
-    # (subtask-b's rename was `a-synonym → a-canonical`, so the drop
-    # targets `a-synonym`) — matches the consumer's requires after the
+    # subtask-b. The tag is the ORIGINAL pre-rename tag (subtask-b's
+    # rename was `a-synonym → a-canonical`, so the drop targets
+    # `a-synonym`) — matches the consumer's requires after the
     # retry's revert.
     assert rec["sid"] == "subtask-b"
     assert rec["tag"] == "a-synonym", (
@@ -1335,7 +1335,7 @@ def test_build_unresolved_retry_prompt_contains_required_sections(pila):
         "deps-008", "cdk-stacks-authored", providers, {})
     recs = {("deps-008", "cdk-stacks-authored"): rec}
     prompt = pila._build_unresolved_retry_prompt(
-        unresolved, providers, recs, "ORIGINAL USER PROMPT")
+        unresolved, providers, recs, {}, "ORIGINAL USER PROMPT")
 
     # Required sections.
     assert "1 cross-domain" in prompt
@@ -1364,15 +1364,54 @@ def test_build_unresolved_retry_prompt_contains_required_sections(pila):
     assert "rename(sid='deps-008', from='cdk-stacks-authored', " in prompt
 
 
+def test_build_unresolved_retry_prompt_uses_pre_revert_tag_in_example(pila):
+    """When attempt 1 renamed the consumer's tag to the now-unresolved
+    target, the must-include `renames:` example must use the original
+    pre-revert tag as `from` — not the post-mutation tag. After the
+    retry's revert restores the pre-mutation plans, the consumer's
+    requires entry holds the pre-revert tag; a rename emitted with
+    `from=<post-mutation-tag>` would silently no-op.
+
+    Symmetric to the pre-revert tag handling in
+    `_recommend_unresolved_resolution` + `_validate_unresolved_must_include`;
+    this is the third site (the prompt builder's inline must-include
+    example)."""
+    # Attempt 1 emitted a rename: consumer's original `foo-original`
+    # → `bar`. Post-mutation, the consumer requires `bar`, but
+    # nothing in the plan provides `bar` → unresolved.
+    output = {
+        "renames": [{"sid": "consumer", "from": "foo-original",
+                     "to": "bar", "reason": "..."}],
+        "added_provides": [],
+        "added_subtasks": [],
+        "dropped_requires": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
+        "unresolvable": [],
+    }
+    unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
+    providers = {"barely-related-tag": ["producer"]}
+    recs = {("consumer", "bar"): None}  # exercises the no-recommendation path
+    prompt = pila._build_unresolved_retry_prompt(
+        unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
+
+    # The must-include example MUST use the pre-revert tag
+    # (`foo-original`) as `from`, not the post-mutation `bar`.
+    assert "from='foo-original'" in prompt, (
+        "must-include example must use the pre-revert tag as `from` so "
+        "a model copying it verbatim hits the consumer's actual entry "
+        "after the retry's revert")
+    assert "from='bar'" not in prompt, (
+        "must-include example must NOT use the post-mutation tag as "
+        "`from` — that's the silent-no-op trap")
+
+
 # ===========================================================================
-# Test 49: end-to-end integration test of the unresolved-retry loop
-#
-# The plan for the unresolved-retry feature called for this test (and a
-# stubbed-claude_p replay verification) when it shipped; pass 12 of the
-# audit caught that it wasn't actually implemented. Adding it now so a
-# regression in the retry-loop wiring (e.g., refactor breaks attempt-2's
-# prompt construction, or the revert step doesn't fully restore the
-# snapshot) would be caught by pytest, not only by live PR-review runs.
+# Test 49: end-to-end integration test of the unresolved-retry loop.
+# Drives phase_reconcile with a stubbed claude_p so a regression in the
+# retry-loop wiring (e.g., refactor breaks attempt-2's prompt construction,
+# or the revert step doesn't fully restore the snapshot) is caught by
+# pytest, not only by live PR-review runs.
 # ===========================================================================
 
 def _minimal_state_for_retry(pila, tmp_path):
@@ -1538,10 +1577,8 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
 
 # ===========================================================================
 # Test 50 — failure-path integration test for the unresolved-retry loop
-#
-# Plan line 718 called for `test_unresolved_retry_dies_after_attempt_2`
-# when the unresolved-retry feature shipped; pass 12 added the happy-path
-# companion but missed this failure-path. Pass 13 closes the gap.
+# (companion to the happy-path test above; both fake claude_p to drive
+# phase_reconcile through the retry path).
 # ===========================================================================
 
 def test_unresolved_retry_dies_after_attempt_2(
@@ -1637,9 +1674,8 @@ def test_unresolved_retry_dies_after_attempt_2(
 
 # ===========================================================================
 # Test 51 — happy-path integration test for the cycle-resolution retry loop
-#
-# Pass 12 added the analogue for the unresolved-retry and explicitly
-# deferred this symmetric test to pass 13. Pass 13 closes the gap.
+# (symmetric to the unresolved-retry happy-path test above; both fake
+# claude_p to drive phase_reconcile through the retry path).
 # ===========================================================================
 
 def test_cycle_retry_loop_integration_with_stubbed_reconciler(
@@ -1659,8 +1695,7 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
     5. The drop landed on the right subtask's requires.
 
     Mirror of test_unresolved_retry_loop_integration_with_stubbed_reconciler
-    for the cycle-retry path. The cycle-retry plan never explicitly named
-    this test, but pass 12 flagged the symmetric gap as a pass-13 candidate.
+    for the cycle-retry path.
     """
     # Pre-reconcile fixture: two subtasks whose unresolved requires
     # the model will rename onto each other's provides, closing a cycle.
@@ -1716,14 +1751,13 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
         "merged_subtasks": [], "unresolvable": [],
     }
     # Attempt 2: model emits the rename + drop pila's recommendation
-    # suggests. Pass-14 fix: pila's recommendation targets the ORIGINAL
-    # pre-rename tag — which matches the consumer's requires entry
-    # after the retry's revert restores the pre-mutation state. The
-    # apply step's drop loop matches on entry tag, so dropping the
-    # original tag executes correctly; dropping the post-rename tag
-    # would silently no-op (no matching entry post-revert) and the
-    # cycle would persist. Fixture mirrors what pila actually
-    # recommends post pass-14:
+    # suggests. Pila's recommendation targets the ORIGINAL pre-rename
+    # tag — which matches the consumer's requires entry after the
+    # retry's revert restores the pre-mutation state. The apply step's
+    # drop loop matches on entry tag, so dropping the original tag
+    # executes correctly; dropping the post-rename tag would silently
+    # no-op (no matching entry post-revert) and the cycle would
+    # persist. Fixture mirrors what pila actually recommends:
     # - keep the feat-001 rename (resolves feat-001's requires to
     #   config-005's `app-runtime-deps`).
     # - drop config-005's ORIGINAL `app-server-framework-present`
@@ -1810,13 +1844,10 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
 
 # ===========================================================================
 # Test 52 — failure-path integration test for the cycle-resolution retry loop
-#
-# Pass 13 explicitly deferred this as a "hypothetical pass 14 if requested."
-# Pass 14 closes the gap. Symmetric to pass-13's
-# test_unresolved_retry_dies_after_attempt_2 but for the cycle-retry path:
-# fake claude_p returns attempt-1's cycle-closing renames + an attempt-2
-# output that fails the must-include validator (drops on a non-SCC sid).
-# Asserts SystemExit + 2 calls + non-zero exit code.
+# (symmetric to test_unresolved_retry_dies_after_attempt_2 but for the
+# cycle-retry path). Fake claude_p returns attempt-1's cycle-closing renames
+# + an attempt-2 output that fails the must-include validator (drops on a
+# non-SCC sid). Asserts SystemExit + 2 calls + non-zero exit code.
 # ===========================================================================
 
 def test_cycle_retry_dies_after_attempt_2(
@@ -1922,14 +1953,13 @@ def test_cycle_retry_dies_after_attempt_2(
 # ===========================================================================
 # Test 53 — unresolved-retry recommendation uses pre-revert tag as `from`
 #
-# Pass-15 finding 15B: the unresolved-retry's `rename` recommendation
-# had the same post-mutation-tag trap pass-14 fixed for the cycle-retry.
-# If attempt-1 rewrote the consumer's tag (rename to a non-existent
-# provider), the unresolved entry surfaces with the POST-rename tag,
-# but after the retry's revert the consumer's requires entry holds the
-# ORIGINAL pre-rename tag. The recommendation must emit `from=original-
-# tag` so the model copying it verbatim produces a rename the apply
-# step actually executes.
+# The unresolved-retry's `rename` recommendation has the same post-mutation-
+# tag trap as the cycle-retry's `dropped_requires` recommendation. If
+# attempt-1 rewrote the consumer's tag (rename to a non-existent provider),
+# the unresolved entry surfaces with the POST-rename tag, but after the
+# retry's revert the consumer's requires entry holds the ORIGINAL pre-rename
+# tag. The recommendation must emit `from=original-tag` so the model copying
+# it verbatim produces a rename the apply step actually executes.
 # ===========================================================================
 
 def test_recommend_unresolved_resolution_with_attempt_1_rename(pila):
@@ -1974,9 +2004,9 @@ def test_recommend_unresolved_resolution_with_attempt_1_rename(pila):
 
 def test_recommend_unresolved_resolution_no_rename_in_attempt_1(pila):
     """If attempt-1's renames don't touch the consumer's tag (the
-    common case — pass-12's captured 075210 fixture), the recommendation
-    falls through to using the unresolved tag as-is for `from`. Pin
-    that the existing behavior is preserved."""
+    common case — captured 075210 fixture), the recommendation falls
+    through to using the unresolved tag as-is for `from`. Pin that
+    the existing behavior is preserved."""
     providers = {"bar-canonical": ["other-subtask"]}
     # Empty attempt-1 output (no renames touched the consumer).
     attempt_1_output = {
@@ -1997,7 +2027,7 @@ def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(pila):
     """The validator must accept a rename whose `from` is the
     consumer's pre-revert tag (looked up via attempt-1's output) — not
     just the post-mutation tag. This matches what pila's own
-    recommendation produces post pass-15.
+    recommendation produces.
 
     Without this, pila would reject its own recommendation as not
     addressing the unresolved entry."""
@@ -2029,3 +2059,148 @@ def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(pila):
         "validator must accept a rename whose `from` matches the "
         "consumer's pre-revert tag (looked up via attempt-1's renames); "
         f"got {unaddressed}")
+
+
+def test_validate_unresolved_must_include_accepts_added_provides_pre_revert_tag(pila):
+    """The validator must accept an added_provides covering the
+    consumer's PRE-revert tag, not just the post-mutation tag.
+
+    Without this, a model that addresses the unresolved entry via
+    added_provides(producer, tag=<pre-revert-tag>) — the only form
+    that actually resolves the entry after the retry's revert
+    restores consumer.requires=[pre-revert-tag] — would be rejected
+    by the validator."""
+    unresolved = [{"domain": "feat", "sid": "consumer",
+                   "tag": "bar"}]  # post-mutation tag
+    attempt_1_output = {
+        "renames": [
+            {"sid": "consumer", "from": "foo-original", "to": "bar"},
+        ],
+        "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    # Attempt-2 declares producer provides the PRE-revert tag.
+    attempt_2_output = {
+        "renames": [],
+        "added_provides": [{"sid": "producer", "tag": "foo-original"}],
+        "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    unaddressed = pila._validate_unresolved_must_include(
+        attempt_2_output, unresolved, attempt_1_output)
+    assert unaddressed == [], (
+        "validator must accept added_provides covering the pre-revert "
+        f"tag; got {unaddressed}")
+
+
+def test_validate_unresolved_must_include_accepts_added_subtask_pre_revert_tag(pila):
+    """The validator must accept an added_subtask whose `provides`
+    includes the consumer's PRE-revert tag."""
+    unresolved = [{"domain": "feat", "sid": "consumer",
+                   "tag": "bar"}]  # post-mutation tag
+    attempt_1_output = {
+        "renames": [
+            {"sid": "consumer", "from": "foo-original", "to": "bar"},
+        ],
+        "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    attempt_2_output = {
+        "renames": [], "added_provides": [],
+        "added_subtasks": [{"id": "connector-001",
+                             "provides": ["foo-original"]}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    unaddressed = pila._validate_unresolved_must_include(
+        attempt_2_output, unresolved, attempt_1_output)
+    assert unaddressed == [], (
+        "validator must accept added_subtasks whose provides covers "
+        f"the pre-revert tag; got {unaddressed}")
+
+
+def test_build_unresolved_retry_prompt_added_ops_examples_use_pre_revert_tag(pila):
+    """The must-include `added_provides:` and `added_subtasks:`
+    examples must reference the PRE-revert tag, not the post-mutation
+    tag. A model copying the example verbatim with the post-mutation
+    tag would silently no-op after the retry's revert restores
+    consumer.requires=[pre-revert-tag]."""
+    output = {
+        "renames": [{"sid": "consumer", "from": "foo-original",
+                     "to": "bar", "reason": "..."}],
+        "added_provides": [],
+        "added_subtasks": [],
+        "dropped_requires": [],
+        "dependency_edges": [],
+        "merged_subtasks": [],
+        "unresolvable": [],
+    }
+    unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
+    providers = {"barely-related-tag": ["producer"]}
+    recs = {("consumer", "bar"): None}
+    prompt = pila._build_unresolved_retry_prompt(
+        unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
+
+    # added_provides example uses pre-revert tag (foo-original), not
+    # post-mutation tag (bar).
+    assert "actually produces 'foo-original'" in prompt, (
+        "added_provides example must reference the pre-revert tag")
+    assert "actually produces 'bar'" not in prompt, (
+        "added_provides example must NOT reference the post-mutation tag")
+    # added_subtasks example uses pre-revert tag (foo-original).
+    assert "provides includes 'foo-original'" in prompt, (
+        "added_subtasks example must reference the pre-revert tag")
+    assert "provides includes 'bar'" not in prompt, (
+        "added_subtasks example must NOT reference the post-mutation tag")
+
+
+def test_build_unresolved_retry_prompt_includes_revert_note_when_tags_differ(pila):
+    """When attempt 1 renamed the consumer's tag, the per-entry NOTE
+    must explain the revert semantic so a literal-minded model doesn't
+    override the must-include examples with the post-mutation form."""
+    output = {
+        "renames": [{"sid": "consumer", "from": "foo-original",
+                     "to": "bar", "reason": "..."}],
+        "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
+    providers = {"barely-related-tag": ["producer"]}
+    recs = {("consumer", "bar"): None}
+    prompt = pila._build_unresolved_retry_prompt(
+        unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
+
+    assert "NOTE:" in prompt, "revert note must be present when tags differ"
+    assert "renamed 'foo-original' → 'bar'" in prompt, (
+        "note must name the attempt-1 rename so the model can correlate")
+    assert "ORIGINAL 'foo-original'" in prompt, (
+        "note must tell the model which tag to address")
+    assert "don't emit 'bar'" in prompt, (
+        "note must explicitly warn against the post-mutation form")
+
+
+def test_build_unresolved_retry_prompt_omits_revert_note_when_tags_match(pila):
+    """When no attempt-1 rename touched the consumer (pre_revert_tag
+    == tag), the revert note is irrelevant noise and must be omitted."""
+    output = {
+        "renames": [],  # no rename touched the consumer
+        "added_provides": [], "added_subtasks": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    unresolved = [{"domain": "deps", "sid": "deps-008",
+                   "tag": "cdk-stacks-authored"}]
+    providers = {"infra-stacks-authored": ["config-011"]}
+    rec = pila._recommend_unresolved_resolution(
+        "deps-008", "cdk-stacks-authored", providers, output)
+    recs = {("deps-008", "cdk-stacks-authored"): rec}
+    prompt = pila._build_unresolved_retry_prompt(
+        unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
+
+    assert "NOTE:" not in prompt, (
+        "revert note must be omitted when pre_revert_tag equals "
+        "the unresolved tag (no attempt-1 rename touched this consumer)")

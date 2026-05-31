@@ -676,13 +676,15 @@ SCHEMAS: dict[str, dict] = {
             },
             "added_subtasks": {
                 # Genuine gap — propose a new subtask to fill it. Shape
-                # mirrors planner-output subtasks (same required fields)
-                # plus the `_added_by_reconciler` traceability flag.
+                # mirrors planner-output subtasks (same required fields).
+                # Pila stamps `_added_by_reconciler: true` on every entry
+                # in `_apply_reconciler_output` — the model has no business
+                # setting it (any guarantee that matters lives in code,
+                # not in the model's response).
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["id", "title", "success_criteria_seed",
-                                 "_added_by_reconciler"],
+                    "required": ["id", "title", "success_criteria_seed"],
                     "properties": {
                         "id": {"type": "string"},
                         "title": {"type": "string"},
@@ -696,7 +698,6 @@ SCHEMAS: dict[str, dict] = {
                         "success_criteria_seed": {"type": "string"},
                         "size": {"type": "string"},
                         "investigation_notes": {"type": "string"},
-                        "_added_by_reconciler": {"type": "boolean"},
                     },
                 },
             },
@@ -3184,7 +3185,22 @@ def validate_plan(subtasks: dict) -> None:
                           f"{sorted(_ID_PREFIXES)} — cross-domain collisions "
                           "and audit-trail ambiguity otherwise")
         if s.get("size", "").lower() == "large":
-            errors.append(f"{sid}: size='large' — planner must split it further")
+            # Name the actual author. Reconciler-added subtasks carry
+            # `_added_by_reconciler: true` (stamped in
+            # `_apply_reconciler_output`). The phase 2½ size gate catches
+            # reconciler-authored `large` upstream with a structured
+            # retry; if one reaches this validator, the size-retry
+            # exhausted and the message should say so. For planner-
+            # authored `large`, the planner prompt already states the
+            # rule (`prompts/planner.md`: "Never emit `size: large`") so
+            # the message blames the planner directly.
+            if s.get("_added_by_reconciler"):
+                errors.append(
+                    f"{sid}: size='large' — reconciler must split it "
+                    "further (size-retry exhausted)")
+            else:
+                errors.append(
+                    f"{sid}: size='large' — planner must split it further")
         if not (s.get("success_criteria_seed") or "").strip():
             errors.append(f"{sid}: success_criteria_seed is empty — "
                           "implementer has no starting point for criteria")
@@ -7293,6 +7309,28 @@ def _compute_unresolved_requires(plans: list[dict]) -> list[dict]:
     return unresolved
 
 
+def _find_oversized_added_subtasks(plans: list[dict]) -> list[dict]:
+    """Pure-Python lookup: every reconciler-added subtask (carrying
+    `_added_by_reconciler: true`, stamped by `_apply_reconciler_output`)
+    whose `size` is `"large"`. Mirrors the planner-side prohibition the
+    planner prompt already states ("Never emit `size: large`") and the
+    final `validate_plan` backstop — but fires earlier so the size
+    gate in `phase_reconcile` can respawn the reconciler with structured
+    feedback before the post-merge validator gets a chance to die().
+
+    Returns subtask dicts as-is (not copies); the size gate only needs
+    them for prompt rendering, not mutation. Empty list means the size
+    gate short-circuits — no extra reconciler spawn."""
+    oversized: list[dict] = []
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            if not s.get("_added_by_reconciler"):
+                continue
+            if (s.get("size") or "").lower() == "large":
+                oversized.append(s)
+    return oversized
+
+
 def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
     """Mutate `plans` per the reconciler's output. On success, returns
     the same `plans` list (with in-place edits on existing subtasks
@@ -7309,8 +7347,9 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
     2. `added_provides` append a tag to the named subtask's `provides`.
     3. `added_subtasks` become a new domain="_reconciler" plan appended
        to the list — schedule() flattens by id, so domain only affects
-       the per-domain log line. Each added subtask carries
-       `_added_by_reconciler: true` for downstream traceability.
+       the per-domain log line. Each added subtask is stamped with
+       `_added_by_reconciler: true` for downstream traceability
+       (size gate + validate_plan error wording rely on it).
     4. `dropped_requires` remove an `extent: in_plan` requires entry
        (cycle-breaking op: used when the requirement was over-specified
        — an authoring decision the same subtask records, not a code
@@ -7407,6 +7446,14 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
                 "would silently drop one of the subtasks from the DAG. "
                 "Refine the task or re-run."
             )
+        # Stamp `_added_by_reconciler: true` on every added subtask.
+        # The size gate + validate_plan's "planner vs reconciler" error
+        # wording rely on this flag; stamping it here (rather than
+        # trusting the model to set it in its response) makes the
+        # provenance signal a mechanical guarantee that a defective
+        # model cannot bypass by emitting `false`.
+        for s in added:
+            s["_added_by_reconciler"] = True
         plans.append({
             "domain": "_reconciler",
             "status": "ready",
@@ -7760,10 +7807,61 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             "feature checklist."
         )
 
-    # === Attempt 1: spawn, apply, check acyclic ===
+    # === Attempt 1: spawn, apply, check size, check acyclic ===
     output = await _spawn_reconciler(user_prompt)
     _check_unresolvable(output)
     _apply_reconciler_output(plans, output)
+
+    # Size gate: any reconciler-added subtask with `size: large` is an
+    # authoring defect. Runs *before* the acyclicity gate because
+    # oversize bundling is upstream — a `large` subtask that bundles
+    # four capabilities is also more likely to produce a cycle than
+    # four small single-capability subtasks. Splitting first lets the
+    # cycle gate evaluate a cleaner graph. Mirror of the cycle-retry
+    # control flow below: revert, respawn with structured prompt, re-
+    # apply, re-check; die() on exhaustion.
+    oversized = _find_oversized_added_subtasks(plans)
+    if oversized:
+        offenders = ", ".join(s.get("id", "<unknown>") for s in oversized)
+        log(f"phase 2½: size gate fired on attempt 1 — "
+            f"{len(oversized)} oversized added_subtask(s): {offenders}")
+        size_retry_prompt = _build_size_retry_prompt(oversized, user_prompt)
+
+        # Revert: deep-copy the pre-mutation snapshot back into `plans`.
+        plans.clear()
+        plans.extend(copy.deepcopy(pre_plans_snapshot))
+
+        log("phase 2½: respawning reconciler with size-resolution "
+            "retry prompt")
+        output2 = await _spawn_reconciler(size_retry_prompt)
+        _check_unresolvable(output2)
+        _apply_reconciler_output(plans, output2)
+
+        # Re-run the size gate on attempt 2's output.
+        oversized2 = _find_oversized_added_subtasks(plans)
+        if oversized2:
+            bullets = "\n".join(
+                f"  • {s.get('id', '<unknown>')} "
+                f"(provides={list(s.get('provides', []) or [])})"
+                for s in oversized2
+            )
+            die(
+                "phase 2½ size gate fired on attempt 2 — the reconciler's "
+                f"revised output still emits {len(oversized2)} `added_subtask`(s) "
+                f"with `size: large`:\n{bullets}\n"
+                "Both retry attempts exhausted. The model bundled work that "
+                "exceeds one worker's context twice in a row. Refine the "
+                "task description so the foundation capabilities are named "
+                "as separate concerns, or split the task into smaller runs."
+            )
+        # Attempt 2 succeeded — adopt its output for downstream logging.
+        output = output2
+        # Refresh the snapshot so any later retry (cycle, unresolved)
+        # reverts to the post-size-retry state, not the original
+        # pre-mutation state. Without this refresh, a subsequent cycle
+        # retry's revert would undo the size split and the oversized
+        # subtask would return.
+        pre_plans_snapshot = copy.deepcopy(plans)
 
     # Build the post-mutation subtasks dict for the cycle gate.
     post_subtasks: dict[str, dict] = {}
@@ -7849,6 +7947,11 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             )
         # Attempt 2 succeeded — adopt its output for downstream logging.
         output = output2
+        # Refresh the snapshot so the unresolved retry (if it fires
+        # next) reverts to the post-cycle-retry state, not the
+        # original pre-mutation state. Without this refresh, the
+        # unresolved retry would undo the cycle break.
+        pre_plans_snapshot = copy.deepcopy(plans)
 
     # Re-run the DESIGN §5 `requires.extent` mechanical passes against the
     # post-reconciler plan tree so any `extent: external` entries on
@@ -7925,7 +8028,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             "entry/entries left to model judgment)")
 
         retry_prompt = _build_unresolved_retry_prompt(
-            still_unresolved, post_providers, recommendations, user_prompt)
+            still_unresolved, post_providers, recommendations, output,
+            user_prompt)
 
         # Revert: deep-copy snapshot back into `plans` (same pattern
         # as the cycle retry). `pre_plans_snapshot` is still in scope
@@ -7943,7 +8047,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         # cycle-gate's must-include check. Pass `output` (attempt-1's
         # output) so the validator can accept renames whose `from` is
         # the consumer's pre-revert tag — matches what pila's own
-        # recommendation produces (pass-15 fix).
+        # recommendation produces.
         unaddressed = _validate_unresolved_must_include(
             output3, still_unresolved, output)
         if unaddressed:
@@ -8605,6 +8709,77 @@ def _build_cycle_retry_prompt(
     return "\n".join(parts)
 
 
+def _build_size_retry_prompt(
+    oversized: list[dict],
+    original_user_prompt: str,
+) -> str:
+    """Build the retry prompt sent to the reconciler when the size gate
+    fires on attempt 1 (any `added_subtask` emitted with `size: large`).
+
+    Structure:
+      - One section per offending subtask with: title, intent, the
+        `provides` tags it bundled, its `requires`, its `depends_on`.
+      - The explicit decomposition rule (one subtask per `provides` tag,
+        or smaller groupings that share state).
+      - The original user prompt re-appended verbatim so the worker has
+        the full input + the resolution context.
+
+    No recommendation heuristic — unlike the cycle and unresolved-requires
+    retries, the answer here is mechanical: split into N subtasks. The
+    model just needs to know which subtasks are oversized and what the
+    rule is."""
+    parts: list[str] = []
+    parts.append(
+        f"Your previous reconciler output emitted {len(oversized)} "
+        "`added_subtask`(s) with `size: large`. Pila enforces "
+        "`size ∈ {small, medium}` on all reconciler-added subtasks — "
+        "the same constraint planners are bound to. A `large` subtask "
+        "bundles work that must be implementable in one worker context; "
+        "if it cannot, it must be split.\n"
+    )
+    for i, s in enumerate(oversized, 1):
+        sid = s.get("id", "<unknown>")
+        title = s.get("title", "")
+        intent = s.get("intent", "")
+        provides = list(s.get("provides", []) or [])
+        in_plan_reqs = [
+            e.get("tag", "") for e in (s.get("requires") or [])
+            if isinstance(e, dict) and e.get("extent") == "in_plan"
+            and e.get("tag")
+        ]
+        depends_on = list(s.get("depends_on", []) or [])
+        parts.append(f"\nOVERSIZED {i}: {sid}")
+        if title:
+            parts.append(f"  Title: {title}")
+        if intent:
+            parts.append(f"  Intent: {intent}")
+        parts.append(
+            f"  Provides ({len(provides)} tag(s)): "
+            f"{provides if provides else '(none — this is itself a smell)'}")
+        parts.append(
+            f"  Requires (in_plan): "
+            f"{in_plan_reqs if in_plan_reqs else '(none)'}")
+        parts.append(
+            f"  Depends_on: {depends_on if depends_on else '(none)'}")
+    parts.append(
+        "\nDecomposition rule: emit one subtask per `provides` tag, or "
+        "smaller groupings of tags that genuinely share state (e.g., a "
+        "DB client and its DAL belong together; an env-config module and "
+        "an object-storage helper do not). Partition the `provides` tags "
+        "across the new subtasks so every original tag is still produced "
+        "by exactly one subtask. Inherit `requires` and `depends_on` "
+        "onto the subtask(s) that need them; do not duplicate. Each new "
+        "subtask must have `size: small` or `size: medium`."
+        "\n\nEmit the same seven-array output as before, with the "
+        "oversized subtask(s) replaced by the split subtasks in "
+        "`added_subtasks`. Pila will re-run the size gate on your "
+        "revised output and reject any response that still emits "
+        "`size: large`.\n\n--- ORIGINAL INPUT ---\n"
+    )
+    parts.append(original_user_prompt)
+    return "\n".join(parts)
+
+
 def _matches_recommendation(option_str: str, rec: dict) -> bool:
     """Whether a must-include option string matches the recommendation
     (so the retry prompt can mark it with ← recommended).
@@ -8707,9 +8882,9 @@ def _recommend_unresolved_resolution(
     rewritten the consumer's tag to `unresolved_tag`; after the
     retry's revert, the consumer's entry holds `r["from"]` (the
     original pre-rename tag). Else `unresolved_tag` was never touched
-    by a rename and IS the consumer's pre-revert tag. Same trap
-    pass-14 fixed for cycle-retry's `dropped_requires` recommendations
-    (`_original_tag_for_rename_edge`); applies analogously here.
+    by a rename and IS the consumer's pre-revert tag. Analogous to
+    `_original_tag_for_rename_edge`'s role for the cycle-retry's
+    `dropped_requires` recommendations.
 
     Self-loop guard: skips candidates whose `providers[candidate]`
     includes `consumer_sid` — a rename TO a tag the consumer itself
@@ -8791,6 +8966,7 @@ def _build_unresolved_retry_prompt(
     unresolved: list[dict],
     providers: dict[str, list[str]],
     recommendations: dict[tuple[str, str], dict | None],
+    output: dict,
     original_user_prompt: str,
 ) -> str:
     """Build the retry prompt sent to the reconciler when the
@@ -8806,6 +8982,15 @@ def _build_unresolved_retry_prompt(
       - The bounded must-include set.
 
     `recommendations` maps (sid, tag) → recommendation-dict-or-None.
+    `output` is attempt 1's reconciler output — used to look up the
+    pre-revert tag for any unresolved entry that attempt 1 renamed.
+    All must-include examples (renames `from`, added_provides tag,
+    added_subtasks provides) use the pre-revert tag so a model copying
+    them verbatim hits the consumer's actual requires entry after the
+    retry's revert restores the pre-mutation plans. When `pre_revert_tag
+    != tag`, a NOTE is also rendered explaining the revert semantic so
+    a literal-minded model doesn't override the examples with the
+    post-mutation tag (which silently no-ops at apply time).
     """
     parts: list[str] = []
     parts.append(
@@ -8858,7 +9043,30 @@ def _build_unresolved_retry_prompt(
                 "\n  No high-confidence hint computed — pick from the "
                 "bounded set below using your judgment.")
 
-        # Must-include set.
+        # Must-include set. The rename example must use the
+        # pre-revert tag as `from`: attempt 2 applies against the
+        # reverted (pre-mutation) plans, so the consumer's requires
+        # entry holds the pre-revert tag, not the post-mutation one.
+        pre_revert_tag = tag
+        for r in output.get("renames", []):
+            if r.get("sid") == sid and r.get("to") == tag:
+                pre_revert_tag = r["from"]
+                break
+        # When attempt 1 renamed the consumer's tag, the unresolved
+        # header shows the POST-mutation tag but the must-include
+        # examples reference the PRE-revert tag. Explain the revert
+        # so a literal-minded model doesn't override the examples
+        # with the post-mutation form (which silently no-ops after
+        # apply).
+        if pre_revert_tag != tag:
+            parts.append(
+                f"\n  NOTE: Your attempt 1 renamed '{pre_revert_tag}' → "
+                f"'{tag}' on this consumer. Pila reverts your attempt-1 "
+                f"output before re-applying attempt 2 against the "
+                f"pre-mutation plans — so the consumer's requires entry "
+                f"holds the ORIGINAL '{pre_revert_tag}' at apply time. "
+                f"Address '{pre_revert_tag}' (the examples below use it "
+                f"correctly); don't emit '{tag}' as the tag/from field.")
         parts.append(
             "\n  Your output for this unresolved entry MUST include "
             "at least one of:")
@@ -8866,14 +9074,15 @@ def _build_unresolved_retry_prompt(
             top = scored[0][1]
             parts.append(
                 f"    - renames: rewrite this entry to a real producer "
-                f"(e.g. rename(sid={sid!r}, from={tag!r}, to={top!r}))")
+                f"(e.g. rename(sid={sid!r}, from={pre_revert_tag!r}, "
+                f"to={top!r}))")
         parts.append(
             f"    - added_provides: declare an existing subtask "
-            f"actually produces '{tag}' (add it to that subtask's "
-            f"provides)")
+            f"actually produces '{pre_revert_tag}' (add it to that "
+            f"subtask's provides)")
         parts.append(
             f"    - added_subtasks: add a new connector subtask whose "
-            f"provides includes '{tag}'")
+            f"provides includes '{pre_revert_tag}'")
         parts.append(
             f"    - unresolvable: name this as a genuine gap with a "
             "one-sentence reason (aborts the run cleanly).")
@@ -8902,15 +9111,17 @@ def _validate_unresolved_must_include(
     requires 'tag'") — empty list means every unresolved entry was
     addressed. Mirror of `_validate_must_include` for the cycle gate.
 
-    For rename ops, accept a match if the revised rename's `from`
-    equals EITHER the unresolved (post-mutation) tag OR the consumer's
-    pre-revert tag (looked up via `attempt_1_output`'s renames). This
-    matches what pila's own recommendation produces post pass-15: the
-    recommendation's `from` is the pre-revert tag (so the apply step's
-    rename loop finds the entry to rewrite after the retry's revert
-    restores the pre-mutation state). Without this dual-tag
-    acceptance, pila would reject its own recommendation as not
-    addressing the unresolved entry.
+    For rename / added_provides / added_subtasks ops, accept a match
+    if the op covers EITHER the unresolved (post-mutation) tag OR the
+    consumer's pre-revert tag (looked up via `attempt_1_output`'s
+    renames). This matches what pila's own recommendation + must-include
+    examples produce: the pre-revert tag is what the consumer's
+    requires entry holds at apply time after the retry's revert
+    restores the pre-mutation state. Without this dual-tag
+    acceptance pila would reject its own recommendations as not
+    addressing the unresolved entry; without ALSO accepting the
+    post-mutation form a model that legitimately re-emits the rename
+    + addresses the resulting post-mutation entry would be rejected.
 
     Called from the unresolved-retry loop after attempt 2 emits, before
     the apply-step runs. A non-empty result means the model defied the
@@ -8923,7 +9134,8 @@ def _validate_unresolved_must_include(
     """
     # Build a (consumer_sid → pre_revert_tag) lookup from attempt-1's
     # renames so we can accept the pre-revert tag alongside the
-    # unresolved (post-mutation) tag in rename validation.
+    # unresolved (post-mutation) tag in validation (all three branches:
+    # rename, added_provides, added_subtasks).
     pre_revert_tag_by_sid_tag: dict[tuple[str, str], str] = {}
     if attempt_1_output:
         for r in attempt_1_output.get("renames", []):
@@ -8958,10 +9170,26 @@ def _validate_unresolved_must_include(
             or (pre_revert_tag is not None
                 and (sid, pre_revert_tag) in rename_sid_tags)
         )
+        # added_provides/added_subtasks must accept BOTH the post-mutation
+        # tag (legal when attempt 2 re-emits the rename so apply produces
+        # consumer.requires=[post-mutation-tag]) AND the pre-revert tag
+        # (legal when attempt 2 omits the rename and the producer covers
+        # the consumer's pre-revert entry directly). Symmetric to the
+        # dual-tag acceptance for the rename branch above.
+        added_provides_addressed = (
+            tag in added_provides_tags
+            or (pre_revert_tag is not None
+                and pre_revert_tag in added_provides_tags)
+        )
+        added_subtask_addressed = (
+            tag in added_subtask_provides
+            or (pre_revert_tag is not None
+                and pre_revert_tag in added_subtask_provides)
+        )
         addressed = (
             rename_addressed
-            or tag in added_provides_tags
-            or tag in added_subtask_provides
+            or added_provides_addressed
+            or added_subtask_addressed
             or (sid, tag) in unresolvable_sid_tags
         )
         if not addressed:

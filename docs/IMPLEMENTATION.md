@@ -1426,11 +1426,45 @@ The bootstrap directory `.pila/runs/_bootstrap-<6hex>/` is used until classify c
 |-------|---------|
 | reconciler's `unresolvable` array non-empty → `die()` with the worker's diagnosis | genuine gaps where no planner produced a needed capability *in the build graph* and no plausible connector subtask can be inferred. Restricted to `extent: in_plan` entries — `extent: external` entries are filtered out before the unresolved set is computed and surface as `preconditions` in `plan.json` rather than as failures. Each unresolved `(sid, tag)` pair is annotated with the consuming subtask's producing planner-domain (from `_compute_unresolved_requires`) so the abort message can render `domain/sid` — naming the planner-domain whose plan held the dangling dependency, which is the primary remediation lever for the user. |
 | reconciler output validated against `SCHEMAS["reconciler"]` | malformed reconciler response (caught by `claude_p`'s schema gate; structurally invalid output is retried once, then escalated) |
+| **size gate** on `added_subtasks` (runs *before* the acyclicity gate) | a reconciler-added subtask emitted with `size: large`. The reconciler-authored subtasks carry `_added_by_reconciler: true` (set in `_apply_reconciler_output`); `_find_oversized_added_subtasks` collects every offender. On detection, pila tries one size-resolution retry (see "Size-resolution retry loop" below); if the retry still emits `size: large`, `die()` with the offending sids enumerated. The downstream `validate_plan` size check (line "no `size: large` subtasks" under "Plan validation") is the final backstop and only fires for planner-authored `large` after this retry exhausts; its error message names "planner" vs "reconciler" via the `_added_by_reconciler` flag so the user knows which prompt misbehaved. |
 | **acyclicity gate** (Tarjan SCC over the post-mutation graph; runs *before* the unresolved-requires re-check) | a rename / added_subtask / dependency_edge that closes a dependency cycle. Each individual reconciler mutation can be locally correct yet jointly cycle-creating — e.g. two renames whose targets each provide what the other side requires. Tarjan localizes the SCC; edge attribution names which mutation closed each edge. On detection, pila tries one cycle-resolution retry (see "Cycle-resolution retry loop" below); if the retry still cycles, `die()` with the SCC + offending mutations enumerated. |
 | **must-include constraint** (apply-step enforcement on retry output) | a retried reconciler output that omits any operation from the bounded set pila required for each named cycle. The retry prompt lists the legal operations per cycle (`dropped_requires` on either rename, `dependency_edges` in either direction, `merged_subtasks` in either direction); if the revised output doesn't include at least one for each cycle, `die()` with the missing-cycle diagnostic — surfaces "model defied a structural constraint" cleanly, never a silent cycle. |
 | **unresolved-requires retry loop** (recompute unresolved set after applying reconciler output) | the reconciler's renames/added_subtasks/added_provides didn't actually close every gap. Common cause: model invented a new tag in `added_subtasks` and forgot to rename the original consumer's tag to match (captured run `075210`: `deps-008` required `cdk-stacks-authored`; reconciler created `config-011` providing `infra-stacks-authored` and never renamed deps-008's tag). On first detection, pila tries one retry with a structured prompt that surfaces string-similarity hints from the post-mutation `provides` namespace. If the retry still leaves unresolved tags, `die()` with the structured report. |
 | **unresolved-retry must-include constraint** (apply-step enforcement on retry output) | a retried output that omits any operation addressing the named unresolved entries. Legal addressing: `rename` on the (sid, tag), `added_provides` covering the tag, `added_subtask` whose provides includes the tag, or `unresolvable` on the (sid, tag). |
 | post-unresolved-retry cycle gate re-run | the retry's revised output reintroduces a cycle (e.g., a rename closes a loop). Same Tarjan check as the primary acyclicity gate; on cycle, `die()` with the SCC report. |
+
+**Size-resolution retry loop.** When the size gate fires on the first
+reconciler attempt (any `added_subtask` with `size: large`), `phase_reconcile`
+deep-copies the pre-mutation plans, reverts the failed mutations, builds a
+retry prompt (in `_build_size_retry_prompt`) that names each offending sid,
+its `provides`/`requires`/`depends_on`, and the explicit decomposition rule
+("emit one subtask per `provides` tag, or smaller groupings that share state"),
+then respawns the reconciler worker once with that prompt. Maximum two
+attempts total — mirrors the cycle-retry shape. Cost: one extra reconciler
+spawn on oversize runs only; non-oversize runs pay nothing extra.
+
+No recommendation heuristic is computed (unlike the cycle loop): the
+mechanical guarantee is "split it into N subtasks each providing one
+`provides` tag," which is rendered directly into the retry prompt. The
+reconciler's prompt (`prompts/reconciler.md`) also documents the rule on
+first attempt; the retry is the enforcement.
+
+The size gate runs *before* the acyclicity gate because oversize
+authoring is an upstream defect: a `large` subtask bundling four
+capabilities is also more likely to produce a cycle than four small
+single-capability subtasks. Splitting first lets the cycle gate evaluate
+the cleaner graph.
+
+**Retry composition (snapshot refresh).** When multiple retries fire on
+the same run (e.g., size retry succeeds and then the cycle gate fires),
+each successful retry refreshes `pre_plans_snapshot` to the post-retry
+state. The next retry's revert therefore restores the most recent good
+state, not the original pre-mutation state. Without this refresh, a
+cycle retry firing after a successful size retry would undo the size
+split — the oversized subtask would return and reach `validate_plan`,
+producing a misleading "size-retry exhausted" error even though the
+size retry actually succeeded. The unresolved retry doesn't refresh
+because it's the last gate before `phase_reconcile` returns.
 
 **Cycle-resolution retry loop.** When the acyclicity gate fires on the first
 reconciler attempt, `phase_reconcile` deep-copies the pre-mutation plans,
@@ -1507,7 +1541,7 @@ malformed revision; the recommendation is best-effort.
 | Check | Catches |
 |-------|---------|
 | ids match domain prefix (`bugfix-`, `feat-`, `refactor-`, `perf-`, `test-`, `deps-`, `config-`, `docs-`) | cross-domain collisions, audit ambiguity. The planner's user prompt receives the prefix directly as `ID_PREFIX = CATEGORY_ABBREV[domain] + "-"`, so the prompt cannot drift from the validator's allowlist — both derive from the same `CATEGORY_ABBREV` map (in `pila.py`). |
-| no `size: large` subtasks | planner violated the sizing constraint |
+| no `size: large` subtasks | planner OR reconciler violated the sizing constraint. The error message names the actual author via the `_added_by_reconciler` flag — "planner must split it further" for planner-authored, "reconciler must split it further (size-retry exhausted)" for reconciler-added subtasks that survived the size-resolution retry loop. The reconciler path is exercised through the phase 2½ size gate first; this row is the post-merge backstop for the planner case and the exhaustion case. |
 | no empty `success_criteria_seed` | implementer has no criteria starting point |
 | every `depends_on` id exists | dangling edges silently dropped by the scheduler |
 | every `requires` entry is an object `{tag, extent, reason?}`; `extent ∈ {in_plan, external}`; `reason` non-empty when `extent: external` | malformed planner output (caught at JSON-schema validation in `claude_p`; this row is the post-merge defensive re-check) |

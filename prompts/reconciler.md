@@ -86,8 +86,7 @@ A JSON object with seven arrays. Each array may be empty:
         {"tag": "<some-other-cap>", "extent": "in_plan"}
       ],
       "depends_on": [],
-      "size": "small",
-      "_added_by_reconciler": true
+      "size": "small"
     }
   ],
 
@@ -237,7 +236,21 @@ action from this priority order:
 
    `success_criteria_seed` must be **concrete and checkable** — describe an
    automated test or observable behavior. The new subtask must produce the
-   unresolved tag in its `provides`. Set `_added_by_reconciler: true`.
+   unresolved tag in its `provides`. (Pila stamps the
+   `_added_by_reconciler: true` traceability flag on every added subtask
+   — you don't need to set it.)
+
+   **Never emit `size: large`** on an added subtask — `size ∈ {small, medium}`
+   only, same as the planner constraint. If the foundation you're filling
+   in feels large (e.g., a "server foundation" bundling typed env + db
+   client + object storage + auth session), emit **one subtask per
+   `provides` tag**, or smaller groupings of tags that genuinely share
+   state (a db client and its DAL belong together; an env-config module
+   and an object-storage helper do not). Partition the `provides` tags
+   across the new subtasks so every original tag is still produced by
+   exactly one subtask. If you emit `size: large`, pila will respawn
+   you once with a structured size-resolution prompt naming each
+   oversized subtask; a second `large` emission is a fatal error.
 
 4. **`unresolvable`.** If you cannot confidently propose any of the above,
    list it under `unresolvable` with a one-sentence `reason`. The

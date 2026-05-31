@@ -134,16 +134,19 @@ def test_reconciler_added_provides_shape(pila):
 
 def test_reconciler_added_subtasks_shape_matches_planner(pila):
     """Added subtasks must carry the same required fields as planner
-    subtasks (id, title, success_criteria_seed) plus the
-    `_added_by_reconciler` traceability flag. Mirrors the planner
-    subtask schema so the rest of the pipeline (validate_plan, scheduler,
-    settle_subtask) accepts them without special-casing."""
+    subtasks (id, title, success_criteria_seed). The
+    `_added_by_reconciler` traceability flag is stamped by
+    `_apply_reconciler_output` after the model emits, so it is
+    deliberately NOT a model-required field (a defective model
+    setting it false would otherwise bypass the size gate)."""
     item = pila.SCHEMAS["reconciler"]["properties"]["added_subtasks"]["items"]
     required = set(item["required"])
     assert "id" in required
     assert "title" in required
     assert "success_criteria_seed" in required
-    assert "_added_by_reconciler" in required
+    assert "_added_by_reconciler" not in required, (
+        "`_added_by_reconciler` must not be a model-required field — "
+        "pila stamps it mechanically in `_apply_reconciler_output`")
 
 
 def test_reconciler_added_subtask_carries_planner_fields(pila):
@@ -160,8 +163,12 @@ def test_reconciler_added_subtask_carries_planner_fields(pila):
             f"reconciler added_subtask schema must include planner field "
             f"'{field}' or downstream code will reject it"
         )
-    # Plus the reconciler-only flag.
-    assert "_added_by_reconciler" in props
+    # `_added_by_reconciler` is NOT in the schema's `properties` —
+    # pila stamps it after the model emits, so the model has no
+    # business setting it.
+    assert "_added_by_reconciler" not in props, (
+        "`_added_by_reconciler` must not be a model-settable property — "
+        "pila stamps it mechanically in `_apply_reconciler_output`")
 
 
 def test_reconciler_unresolvable_shape(pila):
