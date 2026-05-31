@@ -194,25 +194,30 @@ It is reconciled by the orchestrator with three mechanisms:
   `provides` claims, and if that set is non-empty, spawns a single
   *reconciler* worker. The reconciler reads the full task plus every
   subtask (with their `provides`, `requires`, `depends_on`, and
-  `files_likely_touched`) and emits actions across seven arrays. Three
+  `files_likely_touched`) and emits actions across eight arrays. Four
   *resolution* actions — `renames` (two tags mean the same thing — rewrite
   one to match the other), `added_provides` (an existing subtask actually
   produces the capability but didn't declare it), `added_subtasks` (a
-  genuine gap — propose a new subtask to fill it). Three *cycle-breaking*
-  actions for when the resolution actions would close a dependency cycle —
-  `dropped_requires` (the requirement was over-specified by its planner —
-  e.g. an authoring-time decision the same subtask records, not a code
-  artifact another subtask produces), `dependency_edges` (assert an
-  explicit `depends_on` ordering when both sides legitimately need each
+  genuine gap — propose a new subtask to fill it), `conditional_drops`
+  (drop a planner-emitted consumer subtask whose own `intent` declares it
+  conditional on an unresolvable precondition — i.e. the planner authored
+  it as "no-op if X" and X turned out to be false; the capability graph
+  has no semantics for conditional subtasks, so the reconciler converts
+  the planner's prose conditionality into a structured drop). Three
+  *cycle-breaking* actions for when the resolution actions would close a
+  dependency cycle — `dropped_requires` (the requirement was over-specified
+  by its planner — e.g. an authoring-time decision the same subtask records,
+  not a code artifact another subtask produces), `dependency_edges` (assert
+  an explicit `depends_on` ordering when both sides legitimately need each
   other and one ordering is the right answer), `merged_subtasks` (collapse
   two subtasks into one when the cycle reflects a genuine authoring
   overlap — both edit the same file, both wait on the same decision). And
   one *escape hatch* — `unresolvable` for unmet requirements with no
   plausible resolution (aborts the run with the reconciler's diagnosis).
-  All judgment about tag equivalence and cycle resolution lives in the
-  reconciler worker; the orchestrator computes the unresolved set
-  mechanically, runs Tarjan's SCC on the post-mutation graph, and applies
-  the worker's output mechanically.
+  All judgment about tag equivalence, conditional-drop eligibility, and
+  cycle resolution lives in the reconciler worker; the orchestrator computes
+  the unresolved set mechanically, runs Tarjan's SCC on the post-mutation
+  graph, and applies the worker's output mechanically.
 
   Acyclicity is a first-class output property — the reconciler's job is to
   produce an acyclic merged plan, not just to resolve unresolved capability
@@ -284,7 +289,11 @@ exists in the plan, so the edge can be wired without judgment.
 
 `unresolvable` is now reserved for genuinely-broken in-plan tags — typos,
 hallucinations, or in-plan capabilities the reconciler can neither rename,
-attribute, nor connect. An external prerequisite never reaches that path.
+attribute, nor connect. An external prerequisite never reaches that path,
+and a planner-declared *conditional* consumer (one whose own `intent`
+admits it should be dropped if its precondition is false) routes through
+`conditional_drops` instead — `unresolvable` is reserved for unconditional
+consumers whose required capability genuinely cannot be produced.
 
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually

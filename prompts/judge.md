@@ -26,7 +26,7 @@ worker's call_type requires:
 - All required fields for the call_type are present and have the right types:
   - **classifier**: `categories` (array of strings), optional `questions` array
   - **planner**: `domain`, `subtasks` (array), `status` (ready|blocked), `confidence` object
-  - **reconciler**: seven arrays — `renames`, `added_provides`, `added_subtasks` (resolution actions); `dropped_requires`, `dependency_edges`, `merged_subtasks` (cycle-breaking actions, used when the reconciler is respawned by pila's acyclicity gate); `unresolvable` (escape hatch). All seven are required-but-may-be-empty.
+  - **reconciler**: eight arrays — `renames`, `added_provides`, `added_subtasks`, `conditional_drops` (resolution actions; `conditional_drops` is the fourth — drops a planner-emitted consumer subtask whose own intent declares it conditional on an unresolvable in_plan precondition); `dropped_requires`, `dependency_edges`, `merged_subtasks` (cycle-breaking actions, used when the reconciler is respawned by pila's acyclicity gate); `unresolvable` (escape hatch). All eight are required-but-may-be-empty.
   - **implementer**: `subtask_id`, `status` (one of: complete|incomplete-handoff|blocked|failed|needs-clarification), `confidence` object
   - **integrator**: `incoming_subtask`, `status` (resolved|design-conflict|failed)
   - **conformer**: `subtask_id`, `rules_files_read` (array), `rule_violations_fixed`, `rule_violations_residual`, `docs_updates`, `tests_updates` (all arrays), `build`/`lint`/`tests` (each an object), `summary` (string)

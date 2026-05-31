@@ -9,6 +9,76 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Reconciler gains an eighth action: `conditional_drops` for
+  planner-declared conditional subtasks.** A captured summarizer run
+  (`deps-we-need-to-migrate-this-repo-787f7a`) died at phase 2½ with
+  `deps-004 requires 'email-provider-is-ses'` left unresolvable —
+  the planner had emitted `deps-004` as a *conditional* subtask
+  with `intent: "Add the SES client only if the email-delivery
+  migration replaces the current Resend provider with Amazon SES;
+  otherwise this subtask is a no-op the orchestrator can drop."` and
+  used `requires: [{tag: email-provider-is-ses, extent: in_plan}]`
+  as a runtime gate. No subtask in any planner-domain produced that
+  tag (this repo keeps Resend), so the reconciler correctly emitted
+  `unresolvable` — and `_check_unresolvable` (pila.py) fail-closed
+  the run. The reconciler's `unresolvable.reason` *quoted* the
+  planner's own "no-op the orchestrator should drop" language
+  verbatim: the model knew the right answer was "drop the consumer
+  subtask" but had no operation in its vocabulary to express that.
+  The capability graph has no semantics for conditional subtasks.
+
+  The reconciler's action vocabulary expands to eight arrays — four
+  *resolution* (renames / added_provides / added_subtasks /
+  conditional_drops), three *cycle-breaking* (dropped_requires /
+  dependency_edges / merged_subtasks), and one *escape hatch*
+  (unresolvable). `conditional_drops` is restricted to planner-
+  authored consumers (the apply step `die()`s if the target carries
+  `_added_by_reconciler: true` — a reconciler-added subtask has no
+  planner prose to convert into a structured drop). When the model
+  uses it, `_apply_reconciler_output` removes the named sid from its
+  plan, prunes downstream `depends_on` references, and the audit
+  trail (sid → `{reason, from_unresolved_tag}`) lands in
+  `st.data["conditional_drops"]` — distinct field from
+  `st.data["dropped_subtasks"]` (off-tree soft drops from phase 3)
+  so the two soft-drop causes stay separately auditable.
+
+  `unresolvable` is now reserved for *unconditional* consumers whose
+  required capability genuinely cannot be produced; planner-declared
+  conditional consumers route through `conditional_drops` instead.
+  The unresolved-retry must-include validator
+  (`_validate_unresolved_must_include`) accepts `conditional_drops`
+  on the consumer sid as a fifth legal addressing op alongside
+  rename/added_provides/added_subtask/unresolvable. Apply order
+  positions `conditional_drops` after `added_subtasks` (so the
+  `_added_by_reconciler` guard catches reconciler-targeted drops)
+  and before the cycle-breaking ops (so they see the post-drop
+  graph and their missing-id guards fire correctly on
+  `depends_on`/`merge` to a dropped sid).
+
+  The cycle gate is unchanged: `conditional_drops` is *not* a
+  cycle-breaking op, so the cycle-retry's bounded set stays at
+  `dropped_requires / dependency_edges / merged_subtasks`. The model
+  picks `conditional_drops` from prose signals (the consumer's own
+  `intent`/`scope_note` admitting conditional emission) — no
+  structural recommender, because reading prose is the model's job
+  not the code's, per CLAUDE.md's central principle.
+
+  Verified by n=3-vs-n=3 replay against the captured deps-004
+  failure (using captured prompts + the live production
+  reconciler.md + SCHEMAS["reconciler"]): baseline reproduces the
+  failure deterministically (3/3 emit `unresolvable: [deps-004]`);
+  patched resolves cleanly (3/3 emit `conditional_drops: [deps-004]`
+  with `unresolvable: []`, reasoning that quotes the planner's
+  conditional language AND the structural ground that feat-010
+  keeps Resend). Total cost ~$1.85, ~3 minutes wall-clock. 7 new
+  tests in `tests/test_reconciler_cycle_gate.py` cover the apply
+  branch (removal + depends_on pruning, silent no-op on unknown sid,
+  die() on reconciler-added target, summarizer deps-004 replay
+  shape, must-include validator accept/reject, `_check_unresolvable`
+  precedence over conditional_drops), plus an added
+  `conditional_drops` shape test and updated all-arrays-empty
+  fixture in `tests/test_reconciler_schema.py`.
+
 - **Reconciler now retries on unresolved-requires after the first
   attempt, symmetric with the cycle-resolution retry.** A captured
   summarizer run (`deps-we-need-to-migrate-this-repo-075210`) died

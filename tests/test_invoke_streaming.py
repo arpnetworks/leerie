@@ -119,6 +119,41 @@ def test_invoke_returns_final_result_event(pila, pila_dir, monkeypatch):
     assert result["structured_output"] == {"ok": True}
 
 
+def test_invoke_ignores_task_notification_result_event(pila, pila_dir,
+                                                        monkeypatch):
+    """`claude -p` can emit additional `result` events with
+    `origin: {"kind": "task-notification"}` after the worker's real
+    result, when backgrounded Bash subprocesses finish and the CLI
+    wakes the worker up to acknowledge them. Those events carry no
+    `structured_output`. Envelope capture must skip them; otherwise
+    the caller sees `structured_output: None` and misclassifies a
+    successful worker as failed. Multiple task-notification tails
+    must all be ignored — the filter is not one-shot."""
+    events = [
+        json.dumps({"type": "result", "subtype": "success",
+                    "num_turns": 21, "total_cost_usd": 0.34,
+                    "structured_output": {"status": "complete"},
+                    "is_error": False}),
+        json.dumps({"type": "result", "subtype": "success",
+                    "num_turns": 1, "total_cost_usd": 0.36,
+                    "is_error": False,
+                    "origin": {"kind": "task-notification"}}),
+        json.dumps({"type": "result", "subtype": "success",
+                    "num_turns": 2, "total_cost_usd": 0.38,
+                    "is_error": False,
+                    "origin": {"kind": "task-notification"}}),
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    result = asyncio.run(pila._invoke(
+        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
+        timeout=60, sid="t-tn", pila_dir=pila_dir,
+        verbosity="stream"))
+    assert result["num_turns"] == 21
+    assert result["structured_output"] == {"status": "complete"}
+    assert "origin" not in result
+
+
 def test_invoke_raises_when_no_result_event(pila, pila_dir, monkeypatch):
     """A worker that exits without emitting any result event (e.g. the
     process died mid-stream) raises WorkerError — same error class

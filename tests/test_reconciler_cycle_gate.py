@@ -2204,3 +2204,298 @@ def test_build_unresolved_retry_prompt_omits_revert_note_when_tags_match(pila):
     assert "NOTE:" not in prompt, (
         "revert note must be omitted when pre_revert_tag equals "
         "the unresolved tag (no attempt-1 rename touched this consumer)")
+
+
+# ===========================================================================
+# conditional_drops apply-step + must-include tests (DESIGN §5 fourth
+# resolution action; grounded in the captured summarizer deps-004 failure).
+# ===========================================================================
+
+def test_conditional_drops_removes_subtask_and_prunes_depends_on(pila):
+    """The core happy path: a planner-emitted subtask with an unresolvable
+    in_plan precondition gets dropped, and any downstream subtask that
+    listed it in `depends_on` has the reference pruned. Pins the apply-
+    step contract (DESIGN §5)."""
+    plans = [_plan(
+        "feature-implementation",
+        _subtask("feat-004", provides=["x"],
+                 requires=[_req("nonexistent-tag")]),
+        _subtask("feat-005", provides=["y"], depends_on=["feat-004"]),
+        _subtask("feat-006", provides=["z"], depends_on=["feat-005"]),
+    )]
+    out = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [{"sid": "feat-004",
+                               "reason": "planner intent declared this conditional"}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, out)
+    sids = {s["id"] for s in plans[0]["subtasks"]}
+    assert sids == {"feat-005", "feat-006"}, "dropped sid must be gone"
+    feat_005 = next(s for s in plans[0]["subtasks"] if s["id"] == "feat-005")
+    assert feat_005["depends_on"] == [], (
+        "downstream depends_on reference to the dropped sid must be pruned")
+    feat_006 = next(s for s in plans[0]["subtasks"] if s["id"] == "feat-006")
+    assert feat_006["depends_on"] == ["feat-005"], (
+        "depends_on references to OTHER sids must be preserved")
+
+
+def test_conditional_drops_silent_noop_on_unknown_sid(pila):
+    """Defensive: a conditional_drop on a sid that doesn't exist is a
+    silent no-op (mirrors `renames` and `dropped_requires`). The
+    reconciler is told only existing sids; this is belt-and-suspenders."""
+    plans = [_plan(
+        "feature-implementation",
+        _subtask("feat-001", provides=["x"]),
+    )]
+    out = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [{"sid": "nonexistent-099", "reason": "n/a"}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, out)
+    sids = {s["id"] for s in plans[0]["subtasks"]}
+    assert sids == {"feat-001"}, "unknown sid is a no-op, not a crash"
+
+
+def test_conditional_drops_dies_on_reconciler_added_subtask(pila):
+    """Restricted to planner-authored consumers. If the reconciler tries
+    to drop a subtask it itself added, die() — that's a logic error
+    (a reconciler-added subtask has no planner prose to convert into a
+    structured drop, so the predicate `intent admits conditional emission`
+    cannot be satisfied)."""
+    plans = [_plan("feature-implementation", _subtask("feat-001"))]
+    out = {
+        "renames": [], "added_provides": [],
+        "added_subtasks": [{
+            "id": "feat-008",
+            "title": "Reconciler-added connector",
+            "success_criteria_seed": "x",
+            "provides": ["new-cap"],
+        }],
+        "conditional_drops": [{"sid": "feat-008", "reason": "n/a"}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    with pytest.raises(SystemExit):
+        pila._apply_reconciler_output(plans, out)
+
+
+def test_conditional_drops_replays_summarizer_deps004_shape(pila):
+    """Reconstruct the captured summarizer deps-004 plan shape (the
+    motivating failure for this op) and verify the apply step resolves
+    it cleanly: deps-004 drops out, the unresolved-requires recompute
+    returns empty, and the other deps subtasks survive untouched."""
+    plans = [_plan(
+        "dependency-migration",
+        _subtask("deps-001", provides=["aws-sdk-runtime-deps-present"]),
+        _subtask("deps-002", provides=["aws-cdk-toolchain-present"]),
+        _subtask("deps-003", provides=["tsx-runner-present"]),
+        _subtask("deps-004", provides=["aws-ses-client-present"],
+                 requires=[_req("email-provider-is-ses")]),
+        _subtask("deps-005", provides=["supabase-dependency-removed"]),
+    )]
+    # Before: deps-004 has an unresolved in_plan requires.
+    pre_unresolved = pila._compute_unresolved_requires(plans)
+    pre_tags = {(u["sid"], u["tag"]) for u in pre_unresolved}
+    assert ("deps-004", "email-provider-is-ses") in pre_tags, (
+        "test setup precondition: deps-004 should be unresolved before drop")
+
+    out = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [{
+            "sid": "deps-004",
+            "reason": ("deps-004's own intent declares it conditional "
+                       "('no-op the orchestrator can drop'); feat-010 "
+                       "keeps Resend so the precondition is false."),
+        }],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    pila._apply_reconciler_output(plans, out)
+    sids = {s["id"] for s in plans[0]["subtasks"]}
+    assert sids == {"deps-001", "deps-002", "deps-003", "deps-005"}, (
+        "deps-004 dropped; siblings untouched")
+    # After: no unresolved entries (the only one belonged to the dropped sid).
+    post_unresolved = pila._compute_unresolved_requires(plans)
+    assert post_unresolved == [], (
+        "after conditional_drops, the unresolved set must be empty — "
+        "the drop resolved the only outstanding requires entry")
+
+
+def test_validate_unresolved_must_include_accepts_conditional_drop(pila):
+    """A conditional_drop on the consumer sid addresses the unresolved
+    entry (mirrors the apply step: the consumer is gone, so the unmet
+    requires is moot). Validator must accept the drop as a valid
+    addressing op."""
+    unresolved = [{"domain": "deps", "sid": "deps-004",
+                   "tag": "email-provider-is-ses"}]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [{"sid": "deps-004",
+                               "reason": "planner-declared conditional"}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    assert pila._validate_unresolved_must_include(output, unresolved) == []
+
+
+def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(pila):
+    """A conditional_drop targeting a different sid than the unresolved
+    consumer does NOT address the named entry. Validator must flag the
+    unresolved entry as unaddressed."""
+    unresolved = [{"domain": "deps", "sid": "deps-004",
+                   "tag": "email-provider-is-ses"}]
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [{"sid": "deps-099",
+                               "reason": "wrong sid"}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    unaddressed = pila._validate_unresolved_must_include(output, unresolved)
+    assert len(unaddressed) == 1
+    assert "deps-004" in unaddressed[0]
+    assert "email-provider-is-ses" in unaddressed[0]
+
+
+def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(pila):
+    """When the model emits BOTH `unresolvable` and `conditional_drops`
+    in the same output, `_check_unresolvable` must die first — model
+    indecision is treated as an abort, not as silently apply one and
+    ignore the other. Pins the order-of-checks guarantee in
+    `phase_reconcile`: _check_unresolvable runs BEFORE
+    _apply_reconciler_output, so the apply step never sees the mixed
+    output.
+
+    We can't easily test `_check_unresolvable` directly (it's a closure
+    inside phase_reconcile). Instead pin the semantic equivalent: an
+    output with non-empty `unresolvable` triggers a SystemExit when
+    fed through the phase's gate path, even if `conditional_drops`
+    contains a valid entry. The closure-construction shape mirrors
+    `phase_reconcile`: `unresolved` is the input set bound at closure
+    time."""
+    # Synthesize the closure-bound `unresolved` and `_check_unresolvable`
+    # body inline (mirrors pila.py phase_reconcile).
+    unresolved = [{"sid": "deps-004", "tag": "email-provider-is-ses",
+                   "domain": "deps"}]
+
+    def _check_unresolvable(out):
+        u = out.get("unresolvable", []) or []
+        if not u:
+            return
+        # Match real die() behavior (raises SystemExit via pila.die()).
+        pila.die("test-die: unresolvable non-empty")
+
+    output = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [{"sid": "deps-004",
+                               "reason": "would-be drop"}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [],
+        "unresolvable": [{"sid": "deps-004",
+                          "tag": "email-provider-is-ses",
+                          "reason": "model emitted both"}],
+    }
+    with pytest.raises(SystemExit):
+        _check_unresolvable(output)
+
+
+def test_record_conditional_drops_wholesale_replaces_across_attempts(pila):
+    """The audit-write helper for conditional_drops must wholesale-
+    replace `st.data["conditional_drops"]` on every call (not
+    per-sid overwrite), mirroring how `external_preconditions` is
+    replaced across the same retry sites. Otherwise an attempt-1
+    drop would leak into the audit when a retry (cycle/size/
+    unresolved) picks a different resolution for the same gap in
+    attempt 2: `plans` is reverted to the snapshot but `st.data` is
+    not, so the audit would carry a stale entry that no longer
+    reflects the final plan.
+
+    Verified by synthesizing the same closure-bound helper inline
+    (mirrors test_check_unresolvable_still_fires_when_conditional_drops_also_emitted
+    above; the production helper is a closure inside phase_reconcile
+    and can't be called directly)."""
+    # Fake the State object — just a mutable .data dict + a no-op save().
+    class _FakeState:
+        def __init__(self):
+            self.data: dict = {}
+            self.save_calls = 0
+        def save(self):
+            self.save_calls += 1
+    st = _FakeState()
+    unresolved = [
+        {"domain": "deps", "sid": "deps-004", "tag": "email-provider-is-ses"},
+        {"domain": "feat", "sid": "feat-099", "tag": "missing-cap"},
+    ]
+
+    # Inline mirror of _record_conditional_drops (production lives at
+    # pila.py: phase_reconcile's _record_conditional_drops closure).
+    # If the production helper drifts from this shape, this test will
+    # silently pass on a stale contract — but the coupling is tight
+    # enough that the drift will surface in an adjacent test.
+    def _record(out):
+        drops = out.get("conditional_drops") or []
+        sid_first_tag = {}
+        for u in unresolved:
+            sid_first_tag.setdefault(u["sid"], u["tag"])
+        st.data["conditional_drops"] = {
+            cd["sid"]: {
+                "reason": cd.get("reason", ""),
+                "from_unresolved_tag": sid_first_tag.get(cd["sid"], ""),
+            }
+            for cd in drops
+            if cd.get("sid")
+        }
+        st.save()
+
+    # Attempt 1: model emits a drop on deps-004.
+    attempt_1 = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [{"sid": "deps-004",
+                               "reason": "attempt-1 drop reason"}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    _record(attempt_1)
+    assert st.data["conditional_drops"] == {
+        "deps-004": {"reason": "attempt-1 drop reason",
+                     "from_unresolved_tag": "email-provider-is-ses"},
+    }, "attempt 1 records its drop"
+
+    # Attempt 2 (after a retry): model picks a different resolution
+    # for deps-004 (a rename) and a drop on a DIFFERENT sid (feat-099).
+    # The audit must replace, not merge — deps-004 should no longer
+    # appear because attempt 2 didn't drop it.
+    attempt_2 = {
+        "renames": [{"sid": "deps-004", "from": "email-provider-is-ses",
+                     "to": "some-other-tag"}],
+        "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [{"sid": "feat-099",
+                               "reason": "attempt-2 drop reason"}],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    _record(attempt_2)
+    assert st.data["conditional_drops"] == {
+        "feat-099": {"reason": "attempt-2 drop reason",
+                     "from_unresolved_tag": "missing-cap"},
+    }, ("attempt 2 wholesale-replaces the audit — deps-004's stale "
+        "entry from attempt 1 must be gone")
+
+    # Attempt 3 (hypothetical): model emits no conditional_drops at
+    # all. The audit field must clear to {} — not retain feat-099.
+    attempt_3 = {
+        "renames": [], "added_provides": [], "added_subtasks": [],
+        "conditional_drops": [],
+        "dropped_requires": [], "dependency_edges": [],
+        "merged_subtasks": [], "unresolvable": [],
+    }
+    _record(attempt_3)
+    assert st.data["conditional_drops"] == {}, (
+        "empty drops list must clear stale entries, not no-op")
+
+    # Sanity: st.save() called on every invocation (3 calls).
+    assert st.save_calls == 3

@@ -201,6 +201,14 @@ STATE_FIELDS = (
     # [str]}. Empty/absent when no drop fired. Audit trail only — the
     # run proceeds with the surviving subtasks.
     "dropped_subtasks",
+    # conditional_drops: planner-emitted consumer subtasks dropped by the
+    # reconciler's `conditional_drops` resolution op (DESIGN §5) — i.e.
+    # the planner authored the subtask as "no-op if X" and X turned out
+    # to be unresolvable. Map of sid → {reason: str, from_unresolved_tag:
+    # str}. Empty/absent when no conditional_drop fired. Distinct audit
+    # field from `dropped_subtasks` (off-tree soft drops, phase 3) so the
+    # two causes stay separately auditable.
+    "conditional_drops",
 )
 
 CATEGORIES = [
@@ -627,20 +635,27 @@ SCHEMAS: dict[str, dict] = {
         # has `requires` capability tags with no matching `provides`. The
         # worker reasons over the full task + merged subtasks (with their
         # provides, requires, depends_on, files_likely_touched) and the
-        # list of unresolved tags, then emits seven arrays:
-        #   - 3 resolution actions: renames, added_provides, added_subtasks
-        #     (close unresolved-requires gaps; the common case).
+        # list of unresolved tags, then emits eight arrays:
+        #   - 4 resolution actions: renames, added_provides, added_subtasks,
+        #     conditional_drops (close unresolved-requires gaps; the common
+        #     case). conditional_drops is the fourth — added for planner-
+        #     emitted consumers whose own `intent` declares them
+        #     conditional on an unresolvable precondition (the capability
+        #     graph has no semantics for conditional subtasks, so the
+        #     reconciler converts the planner's prose conditionality into
+        #     a structured drop).
         #   - 3 cycle-breaking actions: dropped_requires, dependency_edges,
         #     merged_subtasks (used only in retry mode, when the gate
         #     detected the first attempt's mutations closed a cycle).
         #   - 1 escape hatch: unresolvable (genuine gap with no plausible
         #     resolution; dies the run with the worker's stated reason).
         # Each array is independently optional (any can be empty). The
-        # orchestrator applies the six action arrays mechanically and
+        # orchestrator applies the seven action arrays mechanically and
         # runs Tarjan's SCC + a must-include validator over the post-
         # mutation graph; `unresolvable` aborts before any mutation.
         "type": "object",
         "required": ["renames", "added_provides", "added_subtasks",
+                     "conditional_drops",
                      "dropped_requires", "dependency_edges",
                      "merged_subtasks", "unresolvable"],
         "properties": {
@@ -698,6 +713,32 @@ SCHEMAS: dict[str, dict] = {
                         "success_criteria_seed": {"type": "string"},
                         "size": {"type": "string"},
                         "investigation_notes": {"type": "string"},
+                    },
+                },
+            },
+            "conditional_drops": {
+                # Resolution op #4: drop a planner-emitted consumer subtask
+                # whose own `intent` declares it conditional on an
+                # unresolvable in_plan precondition (DESIGN §5). Used when
+                # the planner authored a subtask as "no-op if X" and no
+                # subtask in any domain produces X. The apply step removes
+                # the named sid from its plan and prunes downstream
+                # depends_on references; the drop is recorded in
+                # state.data["conditional_drops"] for audit (distinct from
+                # state.data["dropped_subtasks"] which records off-tree
+                # soft-drops from filter_offtree_subtasks). Restricted to
+                # planner-authored consumers — the apply step die()s if
+                # the target sid carries _added_by_reconciler: true
+                # (reconciler-added subtasks have no planner prose to
+                # convert into a structured drop). Silent no-op on missing
+                # sid (mirrors `renames` / `dropped_requires`).
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["sid", "reason"],
+                    "properties": {
+                        "sid": {"type": "string"},
+                        "reason": {"type": "string"},
                     },
                 },
             },
@@ -4901,8 +4942,24 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                         for ln in summary.splitlines():
                             if ln:
                                 log(prog_prefix + ln)
-                    # Capture the final result envelope
+                    # Capture the final result envelope. Skip
+                    # `task-notification` result events: claude -p keeps
+                    # the session alive after the worker's real result if
+                    # a Bash run_in_background:true subprocess is still
+                    # pending, and emits a second `result` event when the
+                    # background task finishes. That event has
+                    # `origin: {"kind": "task-notification"}` and no
+                    # `structured_output`; capturing it overwrites the
+                    # genuine envelope and cascades into a fake
+                    # `empty_handoff` invariant violation downstream
+                    # (envelope.get("structured_output") would be None →
+                    # schema-retry → WorkerError → synthesized
+                    # incomplete-handoff with a checkpoint_path that does
+                    # not exist on disk).
                     if t == "result":
+                        if (event.get("origin") or {}).get("kind") \
+                                == "task-notification":
+                            continue
                         envelope = event
             except ValueError as e:
                 # asyncio's StreamReader raises ValueError("Separator
@@ -7350,13 +7407,15 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
     """Mutate `plans` per the reconciler's output. On success, returns
     the same `plans` list (with in-place edits on existing subtasks
     plus an appended `_reconciler` pseudo-plan for any added_subtasks).
-    On an id-collision in `added_subtasks` or a missing-id reference in
-    `dependency_edges` / `merged_subtasks`, calls `die()` — the
-    pseudo-plan is never appended and `plans` is left in an undefined
-    state (callers must deep-copy before applying if they need clean
-    reversion on failure; the cycle-resolution retry loop does this).
+    On an id-collision in `added_subtasks`, a missing-id reference in
+    `dependency_edges` / `merged_subtasks`, or a `conditional_drops`
+    target that carries `_added_by_reconciler: true`, calls `die()` —
+    the pseudo-plan is never appended and `plans` is left in an
+    undefined state (callers must deep-copy before applying if they
+    need clean reversion on failure; the cycle-resolution retry loop
+    does this).
 
-    Six action arrays consumed here, in order:
+    Seven action arrays consumed here, in order:
 
     1. `renames` rewrite a single `requires` entry on the named subtask.
     2. `added_provides` append a tag to the named subtask's `provides`.
@@ -7364,18 +7423,32 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
        to the list — schedule() flattens by id, so domain only affects
        the per-domain log line. Each added subtask is stamped with
        `_added_by_reconciler: true` for downstream traceability
-       (size gate + validate_plan error wording rely on it).
-    4. `dropped_requires` remove an `extent: in_plan` requires entry
+       (size gate + validate_plan error wording + conditional_drops'
+       planner-only guard rely on it).
+    4. `conditional_drops` remove a planner-emitted consumer subtask
+       whose own `intent` declared it conditional on an unresolvable
+       in_plan precondition (resolution op: converts the planner's
+       prose "no-op if X" into a structured drop the capability graph
+       can express). Runs after `added_subtasks` so the
+       `_added_by_reconciler` guard catches any attempt to drop a
+       reconciler-invented subtask — that op is restricted to
+       planner-authored consumers. Runs before the cycle-breaking ops
+       so they see the post-drop graph. The orchestrator removes the
+       sid from its plan and prunes downstream `depends_on` references
+       to it; the audit write (sid → reason + originating tag) happens
+       in `phase_reconcile` after this function returns. Silent no-op
+       on missing sid (mirrors `renames` / `dropped_requires`).
+    5. `dropped_requires` remove an `extent: in_plan` requires entry
        (cycle-breaking op: used when the requirement was over-specified
        — an authoring decision the same subtask records, not a code
        artifact another subtask produces). Silent no-op on missing
        sid/entry (mirrors `renames`).
-    5. `dependency_edges` append a planner-declared `depends_on` edge
+    6. `dependency_edges` append a planner-declared `depends_on` edge
        between two existing subtasks (cycle-breaking op: used when both
        sides legitimately need each other and one ordering is right).
        Both ids must exist — `die()` on a missing id. Also dies on
        `from == to` (self-loop — a subtask cannot depend on itself).
-    6. `merged_subtasks` collapse two existing subtasks into one
+    7. `merged_subtasks` collapse two existing subtasks into one
        (cycle-breaking op: used when the cycle reflects genuine
        authoring overlap — signal: shared `files_likely_touched` between
        SCC members). The surviving subtask (`into`) inherits the union
@@ -7474,11 +7547,53 @@ def _apply_reconciler_output(plans: list[dict], output: dict) -> list[dict]:
             "status": "ready",
             "subtasks": added,
         })
-        # Re-index so the cycle-breaking ops below can find added_subtasks
-        # by id (e.g. a dependency_edges entry could legitimately reference
-        # an added_subtask).
+        # Re-index so the conditional_drops + cycle-breaking ops below
+        # can find added_subtasks by id (e.g. a dependency_edges entry
+        # could legitimately reference an added_subtask). conditional_drops
+        # also reads `by_id` to enforce its `_added_by_reconciler` guard.
         for s in added:
             by_id[s["id"]] = s
+
+    # --- Resolution op #4: conditional_drops (DESIGN §5) ---
+    # Runs after added_subtasks (so the `_added_by_reconciler` guard
+    # below catches any attempt to drop a reconciler-invented subtask;
+    # this op is restricted to planner-authored consumers — a reconciler-
+    # added subtask has no planner prose to convert into a structured
+    # drop). Runs before the cycle-breaking ops (so they see the post-
+    # drop graph; a depends_on/merge targeting a dropped sid would be
+    # incoherent and the missing-id guards on those ops would catch it).
+    for cd in output.get("conditional_drops", []):
+        sid = cd["sid"]
+        s = by_id.get(sid)
+        if s is None:
+            continue  # silent no-op, mirrors `renames` / `dropped_requires`
+        if s.get("_added_by_reconciler"):
+            die(
+                f"reconciler proposed conditional_drops on {sid!r} which "
+                "was added by the reconciler itself; this op is restricted "
+                "to planner-authored consumers (the planner's prose "
+                "conditionality is what conditional_drops converts into a "
+                "structured drop — reconciler-added subtasks have no such "
+                "prose). Refine the task or re-run."
+            )
+        # Remove from its plan (dicts are shared by reference with
+        # `by_id`, so we filter every plan's subtasks list — mirrors
+        # the merged_subtasks removal below).
+        for plan in plans:
+            plan["subtasks"] = [
+                t for t in plan.get("subtasks", []) if t.get("id") != sid
+            ]
+        del by_id[sid]
+        # Prune downstream `depends_on` references — a dropped subtask
+        # can no longer satisfy any dependent. Tag-based `requires`
+        # need no rewriting here: if the dropped subtask's `provides`
+        # tag was depended on by another subtask, that becomes a fresh
+        # unresolved entry and the unresolved-retry loop handles it
+        # (or surfaces as `unresolvable` on the second pass).
+        for other_sid, other_s in by_id.items():
+            deps = other_s.get("depends_on") or []
+            if sid in deps:
+                other_s["depends_on"] = [d for d in deps if d != sid]
 
     # --- Cycle-breaking ops (apply after the resolution ops above) ---
 
@@ -7763,7 +7878,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     user_prompt = (
         "RECONCILER INPUT:\n" + json.dumps(payload, indent=2) +
         "\n\nResolve every unresolved_requires entry per your "
-        "instructions and emit the seven-array JSON output."
+        "instructions and emit the eight-array JSON output."
     )
 
     # Snapshot the pre-mutation plans + pre-mutation providers map. The
@@ -7822,10 +7937,51 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             "feature checklist."
         )
 
+    def _record_conditional_drops(out: dict) -> None:
+        """Persist each conditional_drops entry to
+        st.data["conditional_drops"] (keyed by sid → reason + the tag
+        whose resolution motivated the drop). Called after each
+        successful _apply_reconciler_output. Distinct from
+        st.data["dropped_subtasks"] which records off-tree soft-drops
+        from filter_offtree_subtasks (phase 3) — same audit shape,
+        different cause, separately auditable.
+
+        The from_unresolved_tag lookup uses the closure-scoped
+        `unresolved` set computed upstream: every consumer that ends
+        up in conditional_drops had at least one unresolved tag in
+        that set, and the lookup remembers which tag's resolution
+        the drop addressed. If a sid has multiple unresolved tags
+        (rare — most planner consumers have one unmet precondition
+        each), the first is recorded; the rest are implied by the
+        sid removal.
+
+        Wholesale-replaces st.data["conditional_drops"] on every
+        call (mirrors how _collect_external_preconditions wholesale-
+        replaces st.data["external_preconditions"] at the adjacent
+        retry sites — see this file's "...keeps the re-run idempotent"
+        docstring on that helper). Per-sid overwrite would leak stale
+        attempt-1 entries when a retry chain (size, cycle, unresolved)
+        reverts `plans` but the audit field isn't reverted. An empty
+        drops list correctly clears any prior attempt's entries."""
+        drops = out.get("conditional_drops") or []
+        sid_first_tag = {}
+        for u in unresolved:
+            sid_first_tag.setdefault(u["sid"], u["tag"])
+        st.data["conditional_drops"] = {
+            cd["sid"]: {
+                "reason": cd.get("reason", ""),
+                "from_unresolved_tag": sid_first_tag.get(cd["sid"], ""),
+            }
+            for cd in drops
+            if cd.get("sid")
+        }
+        st.save()
+
     # === Attempt 1: spawn, apply, check size, check acyclic ===
     output = await _spawn_reconciler(user_prompt)
     _check_unresolvable(output)
     _apply_reconciler_output(plans, output)
+    _record_conditional_drops(output)
 
     # Size gate: any reconciler-added subtask with `size: large` is an
     # authoring defect. Runs *before* the acyclicity gate because
@@ -7851,6 +8007,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         output2 = await _spawn_reconciler(size_retry_prompt)
         _check_unresolvable(output2)
         _apply_reconciler_output(plans, output2)
+        _record_conditional_drops(output2)
 
         # Re-run the size gate on attempt 2's output.
         oversized2 = _find_oversized_added_subtasks(plans)
@@ -7936,6 +8093,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             )
 
         _apply_reconciler_output(plans, output2)
+        _record_conditional_drops(output2)
 
         # Re-run the gate on attempt 2's output.
         post2_subtasks: dict[str, dict] = {}
@@ -8073,13 +8231,14 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 f"entries:\n{bullets}\n"
                 "Pila requires every named unresolved entry to be "
                 "addressed by at least one of renames / added_provides "
-                "/ added_subtasks / unresolvable. The retry prompt "
-                "listed the legal operations per entry; the model "
-                "defied the structural constraint. Refine the task or "
-                "re-run."
+                "/ added_subtasks / conditional_drops / unresolvable. "
+                "The retry prompt listed the legal operations per entry; "
+                "the model defied the structural constraint. Refine the "
+                "task or re-run."
             )
 
         _apply_reconciler_output(plans, output3)
+        _record_conditional_drops(output3)
 
         # Re-run the external-extent passes against attempt-2's plans
         # (mirror of the post-cycle-retry re-run; attempt-2's
@@ -8714,7 +8873,7 @@ def _build_cycle_retry_prompt(
                       if _matches_recommendation(opt, rec) else "")
             parts.append(f"    - {opt}{marker}")
     parts.append(
-        "\nEmit the same seven-array output as before, with the "
+        "\nEmit the same eight-array output as before, with the "
         "additions necessary to break every cycle. Pila will re-run "
         "cycle detection on your revised output and reject any response "
         "that still has cycles — including new cycles your revisions "
@@ -8785,7 +8944,7 @@ def _build_size_retry_prompt(
         "by exactly one subtask. Inherit `requires` and `depends_on` "
         "onto the subtask(s) that need them; do not duplicate. Each new "
         "subtask must have `size: small` or `size: medium`."
-        "\n\nEmit the same seven-array output as before, with the "
+        "\n\nEmit the same eight-array output as before, with the "
         "oversized subtask(s) replaced by the split subtasks in "
         "`added_subtasks`. Pila will re-run the size gate on your "
         "revised output and reject any response that still emits "
@@ -9099,11 +9258,17 @@ def _build_unresolved_retry_prompt(
             f"    - added_subtasks: add a new connector subtask whose "
             f"provides includes '{pre_revert_tag}'")
         parts.append(
+            f"    - conditional_drops: drop the consumer subtask "
+            f"({sid!r}) wholesale — ONLY if its own `intent` declares "
+            "it conditional on this precondition (e.g. 'no-op if X', "
+            "'conditionally add', 'otherwise this subtask is dropped'). "
+            "Reserved for planner-authored consumers.")
+        parts.append(
             f"    - unresolvable: name this as a genuine gap with a "
             "one-sentence reason (aborts the run cleanly).")
 
     parts.append(
-        "\nEmit the same seven-array output as before. Pila will "
+        "\nEmit the same eight-array output as before. Pila will "
         "re-check unresolved-requires AND re-run the cycle gate on "
         "your revised output; an attempt that still has unresolved "
         "tags will abort the run with the structured report.\n\n"
@@ -9120,7 +9285,9 @@ def _validate_unresolved_must_include(
     """For each unresolved (sid, tag), check the reconciler's revised
     output addresses it via one of: rename on that sid+tag, added_provides
     covering that tag (any sid), added_subtask whose provides includes
-    that tag, OR unresolvable on that sid+tag.
+    that tag, conditional_drops on the consumer sid (drops the
+    planner-emitted conditional consumer wholesale — DESIGN §5), OR
+    unresolvable on that sid+tag.
 
     Returns the list of unaddressed entries (rendered as "domain/sid
     requires 'tag'") — empty list means every unresolved entry was
@@ -9174,6 +9341,15 @@ def _validate_unresolved_must_include(
     unresolvable_sid_tags = {
         (u["sid"], u["tag"]) for u in output.get("unresolvable", [])
     }
+    # conditional_drops addresses an unresolved entry by removing the
+    # *consumer* sid wholesale — the unresolved tag becomes moot because
+    # the subtask requiring it ceases to exist. Matched on sid alone
+    # (not sid+tag), mirroring the apply step's keying. The
+    # `_added_by_reconciler` guard in the apply step ensures the drop is
+    # safe — it die()s if the model targets a reconciler-added subtask.
+    conditional_drop_sids = {
+        cd["sid"] for cd in output.get("conditional_drops", [])
+    }
 
     unaddressed: list[str] = []
     for u in unresolved:
@@ -9205,6 +9381,7 @@ def _validate_unresolved_must_include(
             rename_addressed
             or added_provides_addressed
             or added_subtask_addressed
+            or sid in conditional_drop_sids
             or (sid, tag) in unresolvable_sid_tags
         )
         if not addressed:

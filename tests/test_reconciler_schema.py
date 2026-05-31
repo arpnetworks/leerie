@@ -1,4 +1,4 @@
-"""Schema tests for `SCHEMAS["reconciler"]` — the seven-array output the
+"""Schema tests for `SCHEMAS["reconciler"]` — the eight-array output the
 reconciler worker emits (DESIGN §5, §14).
 
 The schema is consumed by `claude_p()` via `--json-schema` to gate the
@@ -17,7 +17,7 @@ import pytest
 
 
 def _full_valid_output() -> dict:
-    """A reconciler output with all seven arrays populated. Useful as a
+    """A reconciler output with all eight arrays populated. Useful as a
     baseline; individual tests mutate copies of this."""
     return {
         "renames": [
@@ -40,6 +40,12 @@ def _full_valid_output() -> dict:
                 "size": "small",
                 "_added_by_reconciler": True,
             },
+        ],
+        "conditional_drops": [
+            {"sid": "deps-004",
+             "reason": "deps-004's own intent declares it conditional "
+                       "('no-op the orchestrator can drop'); no subtask "
+                       "produces the precondition tag."},
         ],
         "dropped_requires": [
             {"sid": "test-002", "tag": "framework-decision-made",
@@ -75,19 +81,35 @@ def test_reconciler_schema_exists(pila):
     assert schema["type"] == "object"
 
 
-def test_reconciler_requires_all_seven_arrays(pila):
-    """All seven arrays must be present in every output — even if empty.
+def test_reconciler_requires_all_eight_arrays(pila):
+    """All eight arrays must be present in every output — even if empty.
     Each array is independently optional in content (any can be empty)
     but the field itself must be there so callers don't crash on a
-    missing key. The seven cover three resolution actions (renames,
-    added_provides, added_subtasks), three cycle-breaking actions
-    (dropped_requires, dependency_edges, merged_subtasks), and one
-    escape hatch (unresolvable)."""
+    missing key. The eight cover four resolution actions (renames,
+    added_provides, added_subtasks, conditional_drops), three
+    cycle-breaking actions (dropped_requires, dependency_edges,
+    merged_subtasks), and one escape hatch (unresolvable)."""
     schema = pila.SCHEMAS["reconciler"]
     required = set(schema["required"])
     assert required == {"renames", "added_provides", "added_subtasks",
+                        "conditional_drops",
                         "dropped_requires", "dependency_edges",
                         "merged_subtasks", "unresolvable"}
+
+
+def test_reconciler_conditional_drops_shape(pila):
+    """conditional_drops drops a planner-emitted consumer subtask whose
+    own intent declared it conditional on an unresolvable in_plan
+    precondition (DESIGN §5). Carries (sid, reason) — `reason` is
+    required so the audit field records WHY the drop happened (typically
+    a quote of the consumer's conditional intent + the structural reason
+    the precondition is false)."""
+    schema = pila.SCHEMAS["reconciler"]
+    assert "conditional_drops" in schema["properties"]
+    item = schema["properties"]["conditional_drops"]["items"]
+    assert set(item["required"]) == {"sid", "reason"}
+    assert item["properties"]["sid"]["type"] == "string"
+    assert item["properties"]["reason"]["type"] == "string"
 
 
 def test_reconciler_dropped_requires_shape(pila):
@@ -184,11 +206,14 @@ def test_reconciler_arrays_can_all_be_empty(pila):
     short-circuited before calling the worker, but the schema must
     still accept it)."""
     empty = {"renames": [], "added_provides": [], "added_subtasks": [],
+             "conditional_drops": [],
              "dropped_requires": [], "dependency_edges": [],
              "merged_subtasks": [], "unresolvable": []}
     # Reach into the schema to confirm `required` covers exactly the
-    # seven arrays — any of which being absent is a violation.
+    # eight arrays — any of which being absent is a violation.
     required = set(pila.SCHEMAS["reconciler"]["required"])
+    assert set(empty.keys()) == required, (
+        "fixture and schema must agree on the full set of required arrays")
     for field in empty:
         assert field in required
 
