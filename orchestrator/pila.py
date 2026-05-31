@@ -209,6 +209,13 @@ STATE_FIELDS = (
     # field from `dropped_subtasks` (off-tree soft drops, phase 3) so the
     # two causes stay separately auditable.
     "conditional_drops",
+    # no_work_required / no_work_reasons: set by _finish_no_work_run when
+    # every planner returns status="ready" with empty subtasks (DESIGN §8
+    # *The cleared-but-empty terminal state*). The task is already
+    # satisfied on HEAD; the orchestrator records finished_at, skips
+    # phases 3-6, and exits 0. Absent on every normal run.
+    "no_work_required",
+    "no_work_reasons",
 )
 
 CATEGORIES = [
@@ -9444,6 +9451,82 @@ def _build_predecessor_graph(
     return preds, providers, edge_sources
 
 
+def detect_no_work(plans: list[dict]) -> dict[str, str] | None:
+    """Return a `{domain: basis}` map iff *every* plan satisfies
+    `status == "ready"` and `subtasks == []` — the cleared-but-empty
+    terminal state (DESIGN §8): the planner gate cleared and confirmed
+    the task is already satisfied on HEAD. Else return None.
+
+    The basis is read from `plan["confidence"]["basis"]` (a required
+    string in the planner schema, `pila.py:587-608`). Falls back to a
+    placeholder string if the field is missing or non-string, rather
+    than raising — the orchestrator's job here is to surface the
+    planner's reasoning, not to re-validate the schema.
+
+    Returns None on the mixed and all-blocked cases so the normal
+    `schedule()` path (and its all-blocked die) still fires."""
+    if not plans:
+        return None
+    out: dict[str, str] = {}
+    for plan in plans:
+        if plan.get("status") != "ready":
+            return None
+        if plan.get("subtasks"):
+            return None
+        domain = plan.get("domain") or "<unknown>"
+        basis = ((plan.get("confidence") or {}).get("basis")
+                 if isinstance(plan.get("confidence"), dict) else None)
+        if not isinstance(basis, str) or not basis.strip():
+            basis = "<no basis given by planner>"
+        out[domain] = basis
+    return out
+
+
+def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
+    """Terminal-state handler for the cleared-but-empty case
+    (DESIGN §8 *The cleared-but-empty terminal state*). Records
+    `no_work_required=true` in state.json, writes `finished_at` to
+    state.json + run.json, logs the no-work summary, and returns.
+
+    `no_push=True` on the run.json write is load-bearing: the host
+    launcher polls `finished_at` as the "ready to push" sentinel, and
+    there is no run branch to push (none was materialized). `_derive_
+    run_status` reads `finished_at` + the missing `pushed_at` / `pr_url`
+    and renders the run as `done-local` in `pila --list`.
+
+    Does NOT invoke `finalize.sh` / `cleanup.sh` — `finalize.sh` would
+    fail its non-empty-branch check and `cleanup.sh` has no subtask
+    branches to drop."""
+    log("phase 3: nothing to schedule — every planner returned "
+        "status=ready with zero subtasks")
+    for domain, basis in no_work_map.items():
+        log(f"  {domain}: no work (basis: {basis!r})")
+    st.data["no_work_required"] = True
+    st.data["no_work_reasons"] = dict(no_work_map)
+    st.data["finished_at"] = now()
+    st.data["waves"] = []
+    st.data["subtask_status"] = {}
+    st.data["current_phase"] = "done: no work required"
+    st.save()
+    _write_run_json(
+        st.run_dir,
+        finished_at=st.data["finished_at"],
+        no_push=True,
+        no_verify=False,
+    )
+    log("done — task already satisfied on HEAD; no commits made, "
+        "working branch unchanged")
+    # Surface what the run cost — the classifier + one planner per
+    # category still ran. Same shape as phase_finalize's run-weight
+    # line so the no-work and normal paths report cost identically.
+    tel = st.data.get("telemetry")
+    if tel:
+        log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
+            f"{tel.get('input_tokens', 0):,} in / "
+            f"{tel.get('output_tokens', 0):,} out tokens "
+            f"(see {st.path})")
+
+
 def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
     """Phase 3 (pure Python): merge plans, resolve intra- and cross-domain
     dependencies, topologically sort into waves. Deterministic."""
@@ -10924,6 +11007,17 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
         task = st.data["task"]
         log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
         log(f"per-worker logs: {st.run_dir / 'logs'}/")
+        # A no-work run (DESIGN §8 *The cleared-but-empty terminal state*)
+        # is already complete — finished_at is set, no run branch was
+        # materialized, no commits exist. Falling through to phase_execute
+        # would call setup-run.sh (creating a fresh empty branch), iterate
+        # zero waves, then finalize.sh would fail its non-empty-branch
+        # check and abort with "nothing to finalize". Short-circuit here.
+        if st.data.get("no_work_required"):
+            log(f"run already completed with no work required at "
+                f"{st.data.get('finished_at', '<unknown>')} — nothing to "
+                "resume")
+            return
         if "waves" not in st.data:
             die("cannot resume — run did not reach the scheduling phase")
         # Refresh the preferences in case env vars or pila.toml
@@ -11022,6 +11116,19 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
         # scheduler builds its DAG. Short-circuits with no worker call
         # when planners agreed on vocabulary (the common case).
         plans = await phase_reconcile(plans, task, st, caps, models, efforts)
+        # Cleared-but-empty terminal state (DESIGN §8): every planner
+        # cleared its gate and confirmed the task is already satisfied
+        # on HEAD. Nothing to schedule, nothing to execute, no run
+        # branch to push. _finish_no_work_run records the outcome and
+        # we return — skipping phase_execute (which would call
+        # setup-run.sh) and phase_finalize (which would try to push a
+        # non-existent branch). Runs after phase_reconcile so a planner
+        # that emits an empty plan but the reconciler later adds
+        # subtasks is not misclassified as no-work.
+        no_work_map = detect_no_work(plans)
+        if no_work_map is not None:
+            _finish_no_work_run(st, no_work_map)
+            return
         # Surface cross-planner file-claim overlaps. Warning only — the
         # reconciler handles capability-tag drift but not file-claim
         # conflicts (yet); empirically these correlate strongly with

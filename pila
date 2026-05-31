@@ -1204,6 +1204,18 @@ RUN_ID="$(basename "$LATEST_RUN_DIR")"
 RUN_BRANCH="$(jq -r '.branch // ""' "$LATEST_RUN_DIR/run.json")"
 WORKING_BRANCH="$(jq -r '.working_branch // ""' "$LATEST_RUN_DIR/run.json")"
 
+# Honor run.json.no_push. phase_finalize writes no_push=true when the
+# user invoked --no-push, and the no-work short-circuit (DESIGN §8
+# *The cleared-but-empty terminal state*) writes it when the task was
+# already satisfied on HEAD — in that case no run branch was ever
+# materialized, so trying to `git push` it would fail with "src
+# refspec does not match any". Trust the container's intent and skip
+# push + PR.
+if [ "$(jq -r '.no_push // false' "$LATEST_RUN_DIR/run.json")" = "true" ]; then
+  echo "[pila] finalize: run.json has no_push=true; skipping push + PR" >&2
+  exit 0
+fi
+
 if [ -z "$RUN_BRANCH" ] || [ -z "$WORKING_BRANCH" ]; then
   echo "pila: error — run.json at $LATEST_RUN_DIR/run.json is missing branch info." >&2
   echo "  Skipping push + PR. Push the run branch manually if it exists." >&2

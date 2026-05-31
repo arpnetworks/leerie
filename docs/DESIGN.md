@@ -1191,6 +1191,22 @@ matching the implementer's blocked-with-evidence exit. The principle is the
 same at both layers: a worker that cannot justify its confidence in evidence
 hands the decision back to a layer that can, rather than fabricating one.
 
+**The cleared-but-empty terminal state.** Symmetric with the blocked exit
+above: a planner whose gate *does* clear can legitimately return zero
+subtasks. The contract reads "I understand the task, I investigated this
+domain, the work is already satisfied on HEAD" — distinct from blocked
+("I could not clear the gate"). When *every* planner returns
+`status: "ready"` with an empty `subtasks` array, the run has nothing to
+schedule: there is no decomposition to feed phase 3, no work to execute
+in phase 5, no run branch to integrate or push in phase 6. The
+orchestrator records `no_work_required=true` in state.json with each
+domain's `confidence.basis` quoted, writes `finished_at`, skips phases
+3–6, and exits 0. The run renders as `done-local` in `pila --list` (no
+push, no PR — there is no commit to propose). A mixed outcome (some
+ready+empty, some ready+nonempty) proceeds normally; the empty domains
+simply contribute nothing. The all-blocked case still dies — a blocker
+is a gate failure that the user must see.
+
 The structural contract of these disciplines is mechanically enforced — the
 worker's output schema requires the falsification, reconciliation, and gap
 fields to be present, so a worker that skipped them fails its own JSON gate

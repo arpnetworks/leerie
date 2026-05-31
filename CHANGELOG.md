@@ -9,6 +9,109 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Cleared-but-empty terminal state — pila exits cleanly when every
+  planner confirms "task already satisfied on HEAD".** A captured
+  finalmemoriam run (`bugfix-fix-two-pre-existing-repo-b5b64a`) died
+  at phase 3 with `pila: error: planners produced no subtasks`
+  immediately after all 3 planners (bug-fixing, testing,
+  configuration-build) cleared their evidence gates and emitted
+  `status: "ready"` with `subtasks: []`. The user had asked pila to
+  fix two defects, but commit `ff2e97f` (made before this pila run
+  started) had already shipped both fixes — and each planner
+  independently verified this: the bug-fixing planner cited the
+  StatCard binding diff, the testing planner found the regression
+  test file, and the configuration-build planner re-ran
+  `pnpm run typecheck` and confirmed exit 0. The planner prompt
+  (`prompts/planner.md:205-208`) explicitly permits empty `subtasks`
+  with `status: "ready"` — "an empty plan is a legitimate outcome of
+  a cleared evidence gate" — but the orchestrator had no code branch
+  to express that answer. `schedule()` (pila.py:9472) ran an
+  unconditional `die("planners produced no subtasks")` on any empty
+  scheduling input, treating "task already done" identically to
+  "everyone failed." This is **not** a regression from the recent
+  reconciler work; `git blame` puts the offending die at
+  `a388602` (May 26), before the conditional_drops + retry-loop
+  features. Phase 2½ never even runs in this case because there are
+  no subtasks to reconcile.
+
+  Two new helpers in `orchestrator/pila.py` add the missing branch.
+  `detect_no_work(plans) -> dict[str, str] | None` is a pure
+  predicate that returns a `{domain: confidence.basis}` map iff
+  *every* plan satisfies `status == "ready"` and `subtasks == []`;
+  it returns `None` on any mixed outcome (one or more domains have
+  subtasks → normal run proceeds) and on any blocked-only outcome
+  (the existing all-blocked die at pila.py:9533 still fires so the
+  user knows a gate failed). `_finish_no_work_run(st, no_work_map)`
+  is the terminal handler: it logs the no-work summary with each
+  planner's basis quoted, records `no_work_required=True` +
+  `no_work_reasons={domain: basis}` in state.json, writes
+  `finished_at` to state.json + run.json (with `no_push=True`
+  propagated so the launcher knows there's no branch to push), sets
+  `current_phase = "done: no work required"`, and emits the same
+  `run weight: …` telemetry line as `phase_finalize` so the user
+  sees what the run cost (classifier + N planners is non-trivial).
+  The call site sits in `_run_phases` between `phase_reconcile` and
+  `warn_cross_planner_file_overlap` / `filter_offtree_subtasks` /
+  `schedule()` — after the reconciler so a planner that emits empty
+  subtasks but the reconciler later adds connector subtasks is not
+  misclassified as no-work, and before scheduling so the bare die
+  at pila.py:9472 is unreachable on the happy path (it remains as a
+  defensive backstop for direct `schedule()` callers, e.g. tests).
+  When `detect_no_work` fires, `_run_phases` returns early — phases
+  4–6 are skipped entirely; no run branch is materialized, no
+  `setup-run.sh` is called, no PR is opened.
+
+  Two new `STATE_FIELDS` entries (`no_work_required`,
+  `no_work_reasons`) record the outcome for `pila --list` and any
+  downstream tooling that cares. No new terminal status in
+  `RUN_STATUSES` — `_derive_run_status` already keys "done" off
+  `finished_at`, so a no-work run renders as `done-local` (no push,
+  no PR — distinct from `done-pushed-no-pr` / `done-pushed-pr`).
+  Adding a 9th status would have forced churn across the table
+  formatter, every `_derive_run_status` test, and the launcher;
+  reusing the existing derivation keeps the change small.
+
+  The launcher (`pila` bash script) is patched to honor
+  `run.json.no_push` after the container exits. The launcher's own
+  `NO_PUSH` variable comes from CLI/env (`--no-push` /
+  `PILA_NO_PUSH`) — for the normal-finalize case both container and
+  launcher see the same CLI flag so no propagation is needed. The
+  no-work case breaks that symmetry: the container short-circuits
+  via "task already done," not via "user opted out of push." Without
+  the launcher patch, the launcher would try `git push -u origin
+  pila/runs/<run-id>` on a branch that was never created, fail with
+  "src refspec does not match any," write `push_error` to run.json,
+  and `pila --list` would render the run as `push-failed` instead of
+  `done-local`. The patch reads `jq '.no_push // false' run.json`
+  and exits 0 with a skip message before the push step (and before
+  the empty-branch guard, since a no-push run may legitimately have
+  no branch info). The same path now also handles any future
+  container-side short-circuit that wants to opt out of push.
+
+  Resume-of-finished-no-work-run gets its own guard at the top of
+  `_run_phases`'s resume branch: if `st.data.get("no_work_required")`,
+  log "already completed with no work required at …; nothing to
+  resume" and `return`. Without it, the resume branch would fall
+  through to `phase_execute` (running `setup-run.sh` and creating a
+  fresh empty run branch), then `phase_finalize` → `finalize.sh`
+  would fail its non-empty-branch check.
+
+  Three-layer documentation: DESIGN.md §8 *The planner gate* gains a
+  new paragraph *The cleared-but-empty terminal state* describing
+  the contract symmetrically with the existing blocked-exit
+  paragraph. IMPLEMENTATION.md's phase 3 row enumerates
+  `detect_no_work` as the first step; the planner schema description
+  notes that `ready` plans may legitimately carry an empty subtasks
+  array; the state.json field table adds rows for the two new
+  fields.
+
+  Verified by 1606 tests pass (was 1589 pre-feature; +17 net: 5
+  `detect_no_work` unit tests, 5 `_finish_no_work_run` integration
+  tests including the telemetry-line and stale-fields guards, 5
+  launcher bash-harness tests for the `no_push` honoring, and 2
+  source-text coupling tests pinning the new call site and the
+  resume guard).
+
 - **Reconciler gains an eighth action: `conditional_drops` for
   planner-declared conditional subtasks.** A captured summarizer run
   (`deps-we-need-to-migrate-this-repo-787f7a`) died at phase 2½ with
