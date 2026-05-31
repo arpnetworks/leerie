@@ -339,7 +339,7 @@ subprocess; there is no in-session agent nesting.
 |--------|---------------|---------------|---------------|---------|
 | `classifier` | `prompts/classifier.md` | opus | 1 | category set + intent questions |
 | `planner` | `prompts/planner.md` | opus | one per category (parallel) | subtask list with deps |
-| `reconciler` | `prompts/reconciler.md` | opus | 0 or 1 (spawned only when planners' capability tags don't align) | renames / added_provides / added_subtasks / unresolvable |
+| `reconciler` | `prompts/reconciler.md` | opus | 0, 1, or up to 3 (retried up to twice when its first attempt closes a dependency cycle or leaves unresolved tags) | seven arrays — `renames` / `added_provides` / `added_subtasks` (resolution); `dropped_requires` / `dependency_edges` / `merged_subtasks` (cycle-breaking, used on retry when pila's gates detect a cycle); `unresolvable` (escape hatch). DESIGN §5 |
 | `provision` | `prompts/provision.md` | opus | 0 or 1 (spawned only when the deterministic lockfile-detection table abstains — Java/Gradle, bare `pyproject.toml`, polyglot Makefile) | install recipe (argv-allowlisted) executed via `mise exec --`. See DESIGN §6½ |
 | `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `pila/subtasks/<run-id>/<subtask-id>` branch |
 | `conformer` | `prompts/conformer.md` | sonnet | one per subtask, only on the implementer's success path | advisory `conformance_warnings` on the subtask result; doc/test/rule-fix commits prefixed `conformer:` on the same branch (DESIGN §9 *Post-work conformance*) |
