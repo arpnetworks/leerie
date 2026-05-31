@@ -10141,7 +10141,9 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             # so there is no producer-tagged structured kind. "broken" is
             # the right default: a worker that ran to completion and then
             # self-reported `failed` is broken-worker territory unless we
-            # have evidence otherwise. Matches IMPLEMENTATION.md §1592.
+            # have evidence otherwise. Matches the row in IMPLEMENTATION.md's
+            # "Per-subtask checks" table in §5 ("Deterministic enforcement
+            # points").
             done = await fail(
                 "broken", res.get("summary") or "worker reported failure")
             if done is not None:

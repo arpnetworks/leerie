@@ -7,6 +7,7 @@ retryable-path return uses a kind in `_RETRYABLE_FAILURE_KINDS`.
 """
 from __future__ import annotations
 
+import ast
 import inspect
 import re
 from pathlib import Path
@@ -43,8 +44,9 @@ def test_terminal_kinds_return_false(pila, kind):
 
 def test_retryable_kinds_constant_matches_documented_set(pila):
     """The retryable enum must be exactly the three documented kinds.
-    Adding a kind requires updating IMPLEMENTATION.md §1867 in the same
-    change."""
+    Adding a kind requires updating IMPLEMENTATION.md's "The two-tier
+    retry policy" section (under §5 "Deterministic enforcement points")
+    in the same change."""
     assert pila._RETRYABLE_FAILURE_KINDS == frozenset(
         {"no_commits", "dirty_worktree", "empty_handoff"}
     )
@@ -54,8 +56,8 @@ def test_retryable_kinds_constant_matches_documented_set(pila):
 
 # Every retryable-path producer return literal. Drift here without a
 # matching change to `_RETRYABLE_FAILURE_KINDS` is caught by the test
-# below. Keep this list aligned with IMPLEMENTATION.md §1867's
-# producer table.
+# below. Keep this list aligned with the producer table in
+# IMPLEMENTATION.md's "The two-tier retry policy" section (§5).
 _PRODUCER_RETRYABLE_KINDS = {
     # check_branch_has_commits → "no_commits"
     "no_commits",
@@ -128,15 +130,14 @@ def test_settle_subtask_fail_calls_use_two_arg_signature():
     because `fail` was changed to take a structured `failure_kind`
     discriminator. The original refactor missed pila.py:10293's
     worker-self-reported-failed arm because no test exercised that
-    branch (the path is rare in production — see IMPLEMENTATION.md
-    §1592). This test parses settle_subtask's AST and asserts the
+    branch (the path is rare in production — see the "Per-subtask
+    checks" table in IMPLEMENTATION.md §5 "Deterministic enforcement
+    points"). This test parses settle_subtask's AST and asserts the
     signature is consistent across ALL call sites.
 
     Concretely guards: the worker-self-reported `status: "failed"`
     arm in settle_subtask must pass a structured kind alongside the
     worker's freeform summary."""
-    import ast
-
     source = PILA_PY.read_text()
     tree = ast.parse(source)
 
