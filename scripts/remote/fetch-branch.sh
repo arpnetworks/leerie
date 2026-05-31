@@ -74,11 +74,16 @@ fetch_branch() {
 
   # --- Step 1: discover the completed run-id on the machine ----------------
   # The orchestrator writes .pila/runs/<run-id>/run.json with finished_at
-  # when phase_finalize completes.  Pick the run whose run.json has
-  # finished_at set and pushed_at absent — same logic the host-side finalize
-  # block uses.  Use python3 (always available in the pila image) to parse
-  # the JSON safely.
-  local run_id run_branch working_branch
+  # when phase_finalize OR `_finish_no_work_run` completes. Pick the run
+  # whose run.json has finished_at set and pushed_at absent — same logic
+  # the host-side finalize block uses. Carry the run's `no_push` flag
+  # back as a fourth output line so the bundle step (Step 2) can be
+  # skipped for cleared-but-empty terminal-state runs (DESIGN §8 — no
+  # setup-run.sh ran, so there is no run branch to bundle on the
+  # machine; the state dir still needs to come back so `pila --list`
+  # shows the run as `done-local`). Use python3 (always available in
+  # the pila image) to parse the JSON safely.
+  local run_id run_branch working_branch run_no_push
   local discover_output
   discover_output="$(_fetch_machine_exec python3 -c '
 import os, json, sys
@@ -104,7 +109,8 @@ for name in os.listdir(runs_dir):
     mtime = os.stat(rj).st_mtime
     if mtime > best_mtime:
         best_mtime = mtime
-        best = (name, d.get("branch", ""), d.get("working_branch", ""))
+        best = (name, d.get("branch", ""), d.get("working_branch", ""),
+                "true" if d.get("no_push") else "false")
 
 if best is None:
     print("ERROR: no completed unpushed run found on machine")
@@ -113,6 +119,7 @@ if best is None:
 print(best[0])
 print(best[1])
 print(best[2])
+print(best[3])
 ' 2>&1)" || {
     echo "pila: fetch_branch: failed to discover completed run on machine $machine_id" >&2
     echo "  Output: $discover_output" >&2
@@ -128,6 +135,7 @@ print(best[2])
   run_id="$(printf '%s' "$discover_output" | sed -n '1p')"
   run_branch="$(printf '%s' "$discover_output" | sed -n '2p')"
   working_branch="$(printf '%s' "$discover_output" | sed -n '3p')"
+  run_no_push="$(printf '%s' "$discover_output" | sed -n '4p')"
 
   if [ -z "$run_id" ] || [ -z "$run_branch" ]; then
     echo "pila: fetch_branch: could not parse run-id or branch from machine output" >&2
@@ -139,52 +147,62 @@ print(best[2])
   export PILA_REMOTE_RUN_ID="$run_id"
 
   # --- Step 2: stream the run branch via git bundle -------------------------
-  # Create a bundle on the machine containing the run branch and all its
-  # ancestry, then pipe it to the host and fetch from it.  The host already
-  # has all history from origin (seeded via clone), so the bundle resolves
-  # cleanly against the local repo objects.
-  #
-  # Bundle path is a tmpfile on the machine; we stream via stdout and consume
-  # on the host side via `git fetch` reading from a temp bundle file.
-  local host_bundle
-  host_bundle="$(mktemp "${TMPDIR:-/tmp}/pila-bundle-XXXXXX.bundle")"
-  # shellcheck disable=SC2064
-  trap "rm -f '$host_bundle'" RETURN
+  # Skipped for cleared-but-empty terminal-state runs (no_push=true): no
+  # setup-run.sh ran on the machine, so there is no run branch to bundle.
+  # The state dir still streams back in Step 3 so `pila --list` can render
+  # the run as `done-local` and the host-side finalize block's no_push
+  # check exits 0 cleanly.
+  if [ "$run_no_push" = "true" ]; then
+    echo "[pila] remote: run.json has no_push=true; skipping branch bundle (no run branch was materialized)" >&2
+  else
+    # Create a bundle on the machine containing the run branch and all
+    # its ancestry, then pipe it to the host and fetch from it.  The host
+    # already has all history from origin (seeded via clone), so the
+    # bundle resolves cleanly against the local repo objects.
+    #
+    # Bundle path is a tmpfile on the machine; we stream via stdout and
+    # consume on the host side via `git fetch` reading from a temp
+    # bundle file.
+    local host_bundle
+    host_bundle="$(mktemp "${TMPDIR:-/tmp}/pila-bundle-XXXXXX.bundle")"
+    # shellcheck disable=SC2064
+    trap "rm -f '$host_bundle'" RETURN
 
-  echo "[pila] remote: streaming git bundle for $run_branch ..." >&2
-  # git bundle create writes the bundle to stdout when given "-" as the file.
-  # flyctl machine exec streams that stdout back to the host.
-  if ! _fetch_machine_exec \
-       git -C /work bundle create - "$run_branch" \
-       > "$host_bundle" 2>/dev/null; then
-    echo "pila: fetch_branch: failed to create git bundle on machine $machine_id" >&2
-    rm -f "$host_bundle"
-    return 1
-  fi
+    echo "[pila] remote: streaming git bundle for $run_branch ..." >&2
+    # git bundle create writes the bundle to stdout when given "-" as
+    # the file. flyctl machine exec streams that stdout back to the host.
+    if ! _fetch_machine_exec \
+         git -C /work bundle create - "$run_branch" \
+         > "$host_bundle" 2>/dev/null; then
+      echo "pila: fetch_branch: failed to create git bundle on machine $machine_id" >&2
+      rm -f "$host_bundle"
+      return 1
+    fi
 
-  if [ ! -s "$host_bundle" ]; then
-    echo "pila: fetch_branch: git bundle is empty — run branch may not exist on machine" >&2
-    rm -f "$host_bundle"
-    return 1
-  fi
+    if [ ! -s "$host_bundle" ]; then
+      echo "pila: fetch_branch: git bundle is empty — run branch may not exist on machine" >&2
+      rm -f "$host_bundle"
+      return 1
+    fi
 
-  # Verify the bundle is valid before attempting fetch.
-  if ! git -C "$USER_REPO" bundle verify "$host_bundle" >/dev/null 2>&1; then
-    echo "pila: fetch_branch: bundle verification failed — possible transfer corruption" >&2
-    rm -f "$host_bundle"
-    return 1
-  fi
+    # Verify the bundle is valid before attempting fetch.
+    if ! git -C "$USER_REPO" bundle verify "$host_bundle" >/dev/null 2>&1; then
+      echo "pila: fetch_branch: bundle verification failed — possible transfer corruption" >&2
+      rm -f "$host_bundle"
+      return 1
+    fi
 
-  # Fetch the run branch into the host repo from the bundle.
-  # `git fetch <bundle> <refspec>` creates the local branch.
-  if ! git -C "$USER_REPO" fetch "$host_bundle" \
-         "+$run_branch:$run_branch" 2>/dev/null; then
-    echo "pila: fetch_branch: git fetch from bundle failed" >&2
+    # Fetch the run branch into the host repo from the bundle.
+    # `git fetch <bundle> <refspec>` creates the local branch.
+    if ! git -C "$USER_REPO" fetch "$host_bundle" \
+           "+$run_branch:$run_branch" 2>/dev/null; then
+      echo "pila: fetch_branch: git fetch from bundle failed" >&2
+      rm -f "$host_bundle"
+      return 1
+    fi
     rm -f "$host_bundle"
-    return 1
+    echo "[pila] remote: run branch $run_branch fetched to host" >&2
   fi
-  rm -f "$host_bundle"
-  echo "[pila] remote: run branch $run_branch fetched to host" >&2
 
   # --- Step 3: stream the .pila run state directory back -------------------
   # The host-side finalize reads .pila/runs/<run-id>/run.json (for finished_at,

@@ -17,6 +17,9 @@ FETCH_SH = REPO_ROOT / "scripts" / "remote" / "fetch-branch.sh"
 
 # Python snippet that the real fetch-branch.sh sends to the machine to
 # discover the completed run-id.  We replicate its logic in the stub.
+# Keep this in lockstep with scripts/remote/fetch-branch.sh's discover
+# script (Step 1) — the no_push fourth-line output lets Step 2 skip the
+# bundle fetch for cleared-but-empty terminal-state runs (DESIGN §8).
 _DISCOVER_SNIPPET = """\
 import os, json, sys
 runs_dir = RUNS_DIR_PLACEHOLDER
@@ -39,13 +42,15 @@ for name in os.listdir(runs_dir):
     mtime = os.stat(rj).st_mtime
     if mtime > best_mtime:
         best_mtime = mtime
-        best = (name, d.get("branch", ""), d.get("working_branch", ""))
+        best = (name, d.get("branch", ""), d.get("working_branch", ""),
+                "true" if d.get("no_push") else "false")
 if best is None:
     print("ERROR: no completed unpushed run found on machine")
     sys.exit(1)
 print(best[0])
 print(best[1])
 print(best[2])
+print(best[3])
 """
 
 
@@ -260,6 +265,159 @@ def test_fetch_branch_streams_bundle_and_state(tmp_path):
 
     # Completion message should be present.
     assert "fetch complete" in result.stderr or run_id in result.stderr
+
+
+def test_fetch_branch_skips_bundle_when_no_push(tmp_path):
+    """A cleared-but-empty terminal-state run on the Fly machine
+    (DESIGN §8) has `no_push=true` in run.json and no run branch was
+    materialized (setup-run.sh never ran). fetch_branch must:
+      - succeed (return 0)
+      - skip the Step-2 bundle fetch (no run branch to bundle)
+      - still stream the Step-3 state directory back so `pila --list`
+        shows the run as `done-local` and the launcher's host-side
+        finalize block honors run.json.no_push and exits 0.
+
+    Without this skip, the bundle step would fail with "git bundle is
+    empty — run branch may not exist on machine", fetch_branch would
+    return 1, and the Fly no-work run would be misreported as a fetch
+    failure."""
+    repo = _make_git_repo(tmp_path)
+
+    run_id = "bugfix-already-done-cafe42"
+    run_branch = f"pila/runs/{run_id}"
+
+    # Critically: do NOT create the run branch in the host repo. The
+    # Fly machine never ran setup-run.sh, so the branch doesn't exist
+    # there either — and fetch_branch must not even try to bundle it.
+
+    machine_runs = tmp_path / "machine_runs"
+    run_dir = machine_runs / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "finished_at": "2026-05-31T20:00:00Z",
+        "no_push": True,
+        "branch": run_branch,
+        "working_branch": "main",
+    }))
+    (run_dir / "state.json").write_text(json.dumps({
+        "task": "fix already-done thing",
+        "no_work_required": True,
+    }))
+
+    _make_fake_flyctl(tmp_path, machine_runs, repo)
+
+    result = _run_bash(
+        f"source {FETCH_SH}; fetch_branch",
+        env={
+            "PILA_MACHINE_ID": "no-work-machine",
+            "PILA_FLY_APP": "pila",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
+        },
+    )
+    # Must succeed.
+    assert result.returncode == 0, (
+        f"fetch_branch should return 0 for no-work runs (skip bundle, "
+        f"still stream state). stderr:\n{result.stderr}"
+    )
+    # Bundle step is skipped — must log the skip and must NOT log a
+    # bundle creation or "git bundle is empty" error.
+    assert "no_push=true" in result.stderr or "skipping branch bundle" in result.stderr, (
+        f"fetch_branch should log that the bundle is skipped. "
+        f"stderr:\n{result.stderr}"
+    )
+    assert "bundle is empty" not in result.stderr, (
+        f"fetch_branch must not attempt the bundle step on no_push runs. "
+        f"stderr:\n{result.stderr}"
+    )
+    # The branch should NOT have been created in the host repo (no
+    # bundle was fetched).
+    ls_branches = subprocess.run(
+        ["git", "-C", str(repo), "branch", "--list", run_branch],
+        capture_output=True, text=True,
+    )
+    assert run_branch not in ls_branches.stdout, (
+        f"run branch {run_branch} should NOT be created for a no_push run"
+    )
+    # But the state directory MUST be streamed back so `pila --list`
+    # can render the run as done-local on the host.
+    host_run_dir = repo / ".pila" / "runs" / run_id
+    assert host_run_dir.exists(), (
+        f"host run dir not found: {host_run_dir} — Step 3 (state-dir "
+        "streaming) must still run for no_push runs"
+    )
+    assert (host_run_dir / "run.json").exists()
+    assert (host_run_dir / "state.json").exists()
+
+
+def test_fetch_branch_picks_normal_run_over_no_push(tmp_path):
+    """When the machine has both a normal completed run AND a no_push
+    run, discovery must prefer the normal run — its branch needs to
+    be fetched to enable push+PR. The no_push run is still on the
+    machine's filesystem (audit), it just isn't selected for this
+    fetch invocation. The discovery uses the most-recent mtime, so
+    we use a normal run with a newer mtime to ensure it wins
+    unambiguously."""
+    repo = _make_git_repo(tmp_path)
+
+    normal_run_id = "feat-do-something-real-123abc"
+    normal_run_branch = f"pila/runs/{normal_run_id}"
+    no_push_run_id = "bugfix-already-done-456def"
+
+    # Create the normal run branch in the host repo (so the bundle
+    # step succeeds against the stub).
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", normal_run_branch],
+        check=True, capture_output=True,
+    )
+
+    machine_runs = tmp_path / "machine_runs"
+
+    # No-push run (older mtime — written first).
+    no_push_dir = machine_runs / no_push_run_id
+    no_push_dir.mkdir(parents=True)
+    (no_push_dir / "run.json").write_text(json.dumps({
+        "finished_at": "2026-05-31T19:00:00Z",
+        "no_push": True,
+        "branch": f"pila/runs/{no_push_run_id}",
+        "working_branch": "main",
+    }))
+    (no_push_dir / "state.json").write_text("{}")
+
+    # Sleep a beat so the normal run gets a strictly newer mtime.
+    import time
+    time.sleep(0.05)
+
+    # Normal run (newer mtime).
+    normal_dir = machine_runs / normal_run_id
+    normal_dir.mkdir(parents=True)
+    (normal_dir / "run.json").write_text(json.dumps({
+        "finished_at": "2026-05-31T20:00:00Z",
+        "branch": normal_run_branch,
+        "working_branch": "main",
+    }))
+    (normal_dir / "state.json").write_text("{}")
+
+    _make_fake_flyctl(tmp_path, machine_runs, repo)
+
+    result = _run_bash(
+        f'source {FETCH_SH}; fetch_branch && echo "RUN_ID=$PILA_REMOTE_RUN_ID"',
+        env={
+            "PILA_MACHINE_ID": "mixed-machine",
+            "PILA_FLY_APP": "pila",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr:\n{result.stderr}"
+    # Discovery picked the normal run.
+    assert f"RUN_ID={normal_run_id}" in result.stdout, (
+        f"discovery should select the normal run over the no_push run "
+        f"(newer mtime + non-no_push). stdout: {result.stdout}\n"
+        f"stderr: {result.stderr}"
+    )
+    # The bundle step ran for the normal run (no skip message).
+    assert "skipping branch bundle" not in result.stderr
 
 
 def test_fetch_branch_exports_run_id(tmp_path):

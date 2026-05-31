@@ -1065,6 +1065,12 @@ except Exception:
           # Orchestration succeeded.  Stream the completed run branch and
           # .pila/runs/<run-id>/ state back so the host-side finalize block
           # (push + gh pr create) can run unchanged with host auth.
+          # For cleared-but-empty terminal-state runs (no_push=true,
+          # DESIGN §8) fetch_branch internally skips Step 2 (no run
+          # branch to bundle) but still streams the state dir back in
+          # Step 3 so `pila --list` shows the run; the launcher's
+          # host-side finalize block then honors run.json.no_push and
+          # exits 0 cleanly.
           if ! fetch_branch; then
             echo "pila: error: fetch_branch failed — run branch not fetched to host" >&2
             container_rc=1
