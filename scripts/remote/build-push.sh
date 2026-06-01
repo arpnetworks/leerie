@@ -4,7 +4,7 @@
 #
 # Unlike the local `pila` build (which bind-mounts $PILA_REPO at runtime),
 # the image produced here has the orchestrator source baked in at
-# /work/.pila-image/ via the Dockerfile's COPY instructions. A Fly Machine
+# /opt/pila-image/ via the Dockerfile's COPY instructions. A Fly Machine
 # that pulls this image can run the orchestrator without any bind mount.
 #
 # Usage:
@@ -13,28 +13,34 @@
 #   --app NAME       fly.io app name (default: PILA_FLY_APP env or "pila")
 #   --registry REG   registry prefix (default: registry.fly.io/<APP>)
 #   --tag TAG        override the full image tag (default: <REGISTRY>:<VERSION>)
-#   --push           build and push in one step
+#   --push           build and push in one step (implied by both modes below)
+#   --local-build    use local nerdctl/docker build+push (opt-in; see below)
 #   --dry-run        print commands without executing
 #   --help           show this message
 #
-# Two publish paths (choose one):
+# Default: Fly's remote builder (no local container runtime required).
+# The remote builder runs Docker inside Fly's infrastructure, authenticates
+# as the flyctl-logged-in user, and pushes to registry.fly.io implicitly.
+# Works for everyone with `flyctl auth login` succeeded. No host-side
+# Docker / Colima / Keychain dance.
 #
-#   PATH A — build locally, push to fly's private registry:
-#     ./scripts/remote/build-push.sh --app myapp --push
+# --local-build (opt-in): build locally with nerdctl or docker, then push.
+# This path requires a working Docker daemon that can authenticate to
+# registry.fly.io. In practice that means EITHER:
+#   - Docker Desktop on macOS (with `flyctl auth docker` having run within
+#     the last 5 minutes — the token expires fast)
+#   - Linux with Docker installed via apt/dnf + `flyctl auth docker`
+# It does NOT work with nerdctl-in-Colima on macOS, because nerdctl reads
+# ~/.docker/config.json but cannot resolve the `credsStore: desktop`
+# helper (it can't reach macOS Keychain from inside the Lima VM).
+# Most pila users should NOT pass --local-build.
 #
-#   PATH B — let fly build remotely (no local container runtime needed):
-#     flyctl deploy --build-only --push \
-#       --config fly.toml \
-#       --dockerfile Dockerfile
-#     # fly reads the Dockerfile, COPY instructions bake the source,
-#     # and the result is pushed to registry.fly.io/<app> automatically.
-#
-# Verification after push:
+# Verification after push (either mode):
 #   flyctl machine run registry.fly.io/<APP>:<VERSION> \
 #     --app <APP> \
-#     -- python3 /work/.pila-image/orchestrator/pila.py --version
+#     -- python3 /opt/pila-image/orchestrator/pila.py --version
 #
-# The --version fast path reads /work/.pila-image/.claude-plugin/plugin.json
+# The --version fast path reads /opt/pila-image/.claude-plugin/plugin.json
 # without starting the full orchestrator; success confirms the source is
 # present at the expected path inside the image.
 set -euo pipefail
@@ -66,6 +72,12 @@ REGISTRY=""      # resolved below after --app is parsed
 TAG_OVERRIDE=""
 PUSH=false
 DRY_RUN=false
+# BUILD_MODE: remote (default, via Fly's remote builder) or local
+# (--local-build, via nerdctl/docker on the host). The launcher exports
+# BUILD_MODE based on --local-build / PILA_LOCAL_BUILD; the --local-build
+# flag below is the standalone-CLI equivalent.
+BUILD_MODE="${BUILD_MODE:-remote}"
+[ "${PILA_LOCAL_BUILD:-0}" = "1" ] && BUILD_MODE=local
 
 # --- parse args ----------------------------------------------------------
 while [ "$#" -gt 0 ]; do
@@ -84,6 +96,8 @@ while [ "$#" -gt 0 ]; do
       TAG_OVERRIDE="${1#--tag=}" ;;
     --push)
       PUSH=true ;;
+    --local-build)
+      BUILD_MODE=local ;;
     --dry-run)
       DRY_RUN=true ;;
     --help|-h)
@@ -107,20 +121,11 @@ else
   IMAGE_TAG="$TAG_OVERRIDE"
 fi
 
-# --- detect build tool ---------------------------------------------------
-BUILD_CMD=""
-if command -v nerdctl >/dev/null 2>&1; then
-  BUILD_CMD="nerdctl"
-elif command -v docker >/dev/null 2>&1; then
-  BUILD_CMD="docker"
-elif [ "$DRY_RUN" = "false" ]; then
-  echo "build-push: neither nerdctl nor docker found on PATH." >&2
-  echo "  For PATH A (local build): install nerdctl (Linux) or Colima (macOS)." >&2
-  echo "  For PATH B (remote build via fly): flyctl deploy --build-only --push" >&2
-  exit 1
-else
-  BUILD_CMD="nerdctl"  # dry-run: assume nerdctl; commands are printed, not run
-fi
+echo "[build-push] pila version: $PILA_VERSION"
+echo "[build-push] image tag:    $IMAGE_TAG"
+echo "[build-push] build mode:   $BUILD_MODE"
+echo "[build-push] push:         $PUSH"
+[ "$DRY_RUN" = "true" ] && echo "[build-push] DRY RUN — commands printed, not executed"
 
 # --- run (or print) -------------------------------------------------------
 run() {
@@ -131,63 +136,150 @@ run() {
   fi
 }
 
-echo "[build-push] pila version: $PILA_VERSION"
-echo "[build-push] image tag:    $IMAGE_TAG"
-echo "[build-push] build tool:   $BUILD_CMD"
-echo "[build-push] push:         $PUSH"
-[ "$DRY_RUN" = "true" ] && echo "[build-push] DRY RUN — commands printed, not executed"
+# --- remote-builder path (default) ---------------------------------------
+# Uses Fly's remote builder. The fly.toml in PILA_REPO has a
+# `[build] image = "..."` line which is correct for `flyctl machine run`
+# (pila uses this elsewhere) but wrong for `flyctl deploy --build-only`:
+# it tells flyctl "the image already exists, fetch it" → flyctl skips the
+# build step → deploy fails with "Could not find image". flyctl#1686
+# documents this confusing interaction. Workaround: cp fly.toml to a tmp
+# file with the `image = ...` line stripped from the [build] section,
+# pass --config $tmp.
+_build_push_remote() {
+  local tmp_toml
+  tmp_toml="$(mktemp -t pila-build.XXXXXX.toml)"
+  # awk strips the `image = ...` line only while inside the [build] section.
+  awk '
+    /^\[build\]/ { in_build=1; print; next }
+    /^\[/ && !/^\[build\]/ { in_build=0; print; next }
+    in_build && /^[[:space:]]*image[[:space:]]*=/ { next }
+    { print }
+  ' "$PILA_REPO/fly.toml" > "$tmp_toml"
 
-# Build without HOST_UID/HOST_GID: the Dockerfile ARG defaults (501/20)
-# apply. Source is baked in via COPY instructions — no bind mount required.
-# The image is suitable for Fly.io Machines and any registry-pull environment.
-run "$BUILD_CMD" build \
-  -t "$IMAGE_TAG" \
-  "$PILA_REPO"
+  echo "[build-push] using temp fly.toml at $tmp_toml ([build] image stripped)" >&2
 
-echo "[build-push] build complete: $IMAGE_TAG"
+  # `flyctl deploy --build-only --push --remote-only` is the canonical
+  # build-and-push-without-deploying invocation (per fly community thread
+  # https://community.fly.io/t/how-to-build-and-push-docker-image-without-deploying/25746/1).
+  # --image-label pins the tag suffix to $PILA_VERSION so the result is
+  # registry.fly.io/$FLY_APP:$PILA_VERSION.
+  #
+  # --depot=false: force flyctl to use the legacy remote builder rather
+  # than depot.dev. Depot caches the resolved tag-to-digest mapping per
+  # `--image-label`, which means a rebuild with the same label (e.g.
+  # 0.2.1 → 0.2.1) returns the OLD digest even after we push new
+  # layers. The result: machines end up running the prior image. Legacy
+  # builder doesn't have this issue. Documented at
+  # https://community.fly.io/t/when-i-run-fly-deploy-with-the-image-label-flag-why-does-it-deploy-an-older-version-of-my-code/26151
+  #
+  # We run from a subshell with cwd=$PILA_REPO because `flyctl deploy`
+  # uses the cwd (or the directory containing --dockerfile) as the
+  # build context, and the Dockerfile's COPY instructions reference
+  # paths relative to that context (orchestrator/, scripts/, etc.).
+  # Without the cd, calling pila from another repo (e.g. `cd ~/myrepo
+  # && pila ... --runtime fly`) would upload the user's repo as the
+  # build context instead of pila's, and the build fails with
+  # "orchestrator: not found".
+  local rc=0
+  (
+    cd "$PILA_REPO"
+    run flyctl deploy \
+      --build-only --push --remote-only --depot=false \
+      --app "$FLY_APP" \
+      --config "$tmp_toml" \
+      --dockerfile "$PILA_REPO/Dockerfile" \
+      --image-label "$PILA_VERSION"
+  ) || rc=$?
+  rm -f "$tmp_toml"
+  if [ "$rc" -ne 0 ]; then
+    echo "build-push: remote build failed. If you have a working Docker daemon" >&2
+    echo "  with valid registry.fly.io auth (Docker Desktop + flyctl auth docker)," >&2
+    echo "  retry with --local-build." >&2
+    return 1
+  fi
+  echo "[build-push] remote build complete: $IMAGE_TAG"
+}
 
-# Verify the entrypoint and baked source after a real build.
-if [ "$DRY_RUN" = "false" ]; then
-  ENTRY="$("$BUILD_CMD" inspect "$IMAGE_TAG" \
-            --format '{{join .Config.Entrypoint " "}}' 2>/dev/null || true)"
-  EXPECTED="/work/.pila-image/scripts/container-entry.sh"
-  if [ "$ENTRY" = "$EXPECTED" ]; then
-    echo "[build-push] entrypoint OK: $ENTRY"
+# --- local-build path (opt-in: --local-build) ----------------------------
+# Builds with nerdctl or docker on the host, then pushes. Requires a
+# working Docker daemon authenticated to registry.fly.io. See the file
+# header for the (narrow) conditions under which this path works.
+_build_push_local() {
+  local build_cmd=""
+  if command -v nerdctl >/dev/null 2>&1; then
+    build_cmd="nerdctl"
+  elif command -v docker >/dev/null 2>&1; then
+    build_cmd="docker"
+  elif [ "$DRY_RUN" = "false" ]; then
+    echo "build-push: --local-build requires nerdctl or docker on PATH." >&2
+    echo "  Without it, drop --local-build to use the remote builder." >&2
+    return 1
   else
-    echo "build-push: WARNING — entrypoint mismatch" >&2
-    echo "  expected: $EXPECTED" >&2
-    echo "  got:      $ENTRY" >&2
+    build_cmd="nerdctl"  # dry-run: assume nerdctl
+  fi
+  echo "[build-push] local build tool: $build_cmd"
+
+  # Build without HOST_UID/HOST_GID: the Dockerfile ARG defaults (501/20)
+  # apply. Source is baked in via COPY instructions — no bind mount required.
+  run "$build_cmd" build \
+    -t "$IMAGE_TAG" \
+    "$PILA_REPO"
+
+  echo "[build-push] local build complete: $IMAGE_TAG"
+
+  # Verify entrypoint + smoke test --version on the built image.
+  if [ "$DRY_RUN" = "false" ]; then
+    local entry
+    entry="$("$build_cmd" inspect "$IMAGE_TAG" \
+              --format '{{join .Config.Entrypoint " "}}' 2>/dev/null || true)"
+    local expected="/opt/pila-image/scripts/container-entry.sh"
+    if [ "$entry" = "$expected" ]; then
+      echo "[build-push] entrypoint OK: $entry"
+    else
+      echo "build-push: WARNING — entrypoint mismatch" >&2
+      echo "  expected: $expected" >&2
+      echo "  got:      $entry" >&2
+    fi
+
+    echo "[build-push] smoke: pila --version (baked source, no bind mount) ..."
+    if run "$build_cmd" run --rm "$IMAGE_TAG" \
+         python3 /opt/pila-image/orchestrator/pila.py --version; then
+      echo "[build-push] smoke OK"
+    else
+      echo "build-push: WARNING — --version smoke failed (baked source not working)" >&2
+    fi
   fi
 
-  # Smoke: confirm the baked orchestrator responds to --version.
-  # Runs the container with no bind mounts — exercises the baked source path.
-  echo "[build-push] smoke: pila --version (baked source, no bind mount) ..."
-  if run "$BUILD_CMD" run --rm "$IMAGE_TAG" \
-       python3 /work/.pila-image/orchestrator/pila.py --version; then
-    echo "[build-push] smoke OK"
-  else
-    echo "build-push: WARNING — --version smoke failed (baked source not working)" >&2
+  if [ "$PUSH" = "true" ]; then
+    echo "[build-push] pushing $IMAGE_TAG ..."
+    run "$build_cmd" push "$IMAGE_TAG"
+    echo "[build-push] pushed: $IMAGE_TAG"
   fi
-fi
+}
 
-if [ "$PUSH" = "true" ]; then
-  echo "[build-push] pushing $IMAGE_TAG ..."
-  run "$BUILD_CMD" push "$IMAGE_TAG"
-  echo "[build-push] pushed: $IMAGE_TAG"
-  echo ""
-  echo "To start on Fly.io:"
-  echo "  flyctl machine run $IMAGE_TAG --app $FLY_APP"
-  echo ""
-  echo "To verify inside the machine:"
-  echo "  flyctl machine run $IMAGE_TAG --app $FLY_APP \\"
-  echo "    -- python3 /work/.pila-image/orchestrator/pila.py --version"
-else
-  echo ""
-  echo "Next steps:"
-  echo "  Push:  $BUILD_CMD push $IMAGE_TAG"
-  echo "  Or re-run with --push to push in one step:"
-  echo "    ./scripts/remote/build-push.sh --app $FLY_APP --push"
-  echo ""
-  echo "After pushing, deploy on Fly.io:"
-  echo "  flyctl machine run $IMAGE_TAG --app $FLY_APP"
-fi
+# --- dispatch -------------------------------------------------------------
+case "$BUILD_MODE" in
+  remote)
+    if [ "$PUSH" = "false" ]; then
+      echo "build-push: remote build always pushes (Fly's remote builder pushes inline)." >&2
+      echo "  Either pass --push or drop --local-build for the standalone build path." >&2
+      exit 1
+    fi
+    _build_push_remote
+    ;;
+  local)
+    _build_push_local
+    ;;
+  *)
+    echo "build-push: unknown BUILD_MODE: $BUILD_MODE (expected 'remote' or 'local')" >&2
+    exit 1
+    ;;
+esac
+
+echo ""
+echo "To start on Fly.io:"
+echo "  flyctl machine run $IMAGE_TAG --app $FLY_APP"
+echo ""
+echo "To verify inside the machine:"
+echo "  flyctl machine run $IMAGE_TAG --app $FLY_APP \\"
+echo "    -- python3 /opt/pila-image/orchestrator/pila.py --version"

@@ -93,7 +93,9 @@ def test_provision_machine_fails_when_flyctl_unauthenticated(tmp_path):
 
 def test_provision_machine_exports_machine_id_on_success(tmp_path):
     """provision_machine exports PILA_MACHINE_ID on successful create + started."""
-    # Stub flyctl: auth succeeds, machine run returns JSON with id, status returns started.
+    # Stub flyctl: auth succeeds, machine run returns text containing
+    # "Machine ID: <id>" (the real flyctl format — `flyctl machine run`
+    # does NOT support --json), status returns JSON started.
     fake_flyctl = tmp_path / "flyctl"
     fake_flyctl.write_text(
         "#!/usr/bin/env bash\n"
@@ -101,11 +103,11 @@ def test_provision_machine_exports_machine_id_on_success(tmp_path):
         "  exit 0\n"
         "fi\n"
         "if [ \"$1\" = 'machine' ] && [ \"$2\" = 'run' ]; then\n"
-        '  echo \'{"id":"test-machine-001","state":"created"}\'\n'
+        "  printf 'Success! A Machine has been launched\\n Machine ID: test-machine-001\\n State: created\\n'\n"
         "  exit 0\n"
         "fi\n"
         "if [ \"$1\" = 'machine' ] && [ \"$2\" = 'status' ]; then\n"
-        '  echo \'{"state":"started"}\'\n'
+        "  printf 'Machine ID: test-machine\\nState: started\\n'\n"
         "  exit 0\n"
         "fi\n"
         "exit 0\n"
@@ -130,11 +132,11 @@ def test_destroy_machine_called_on_exit_trap(tmp_path):
         "#!/usr/bin/env bash\n"
         "if [ \"$1\" = 'auth' ] && [ \"$2\" = 'status' ]; then exit 0; fi\n"
         "if [ \"$1\" = 'machine' ] && [ \"$2\" = 'run' ]; then\n"
-        '  echo \'{"id":"trap-test-machine","state":"created"}\'\n'
+        "  printf 'Success!\\n Machine ID: trap-test-machine\\n State: created\\n'\n"
         "  exit 0\n"
         "fi\n"
         "if [ \"$1\" = 'machine' ] && [ \"$2\" = 'status' ]; then\n"
-        '  echo \'{"state":"started"}\'; exit 0\n'
+        "  printf 'Machine ID: trap-test-machine\\nState: started\\n'; exit 0\n"
         "fi\n"
         "if [ \"$1\" = 'machine' ] && [ \"$2\" = 'destroy' ]; then\n"
         "  exit 0\n"

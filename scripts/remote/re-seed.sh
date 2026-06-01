@@ -75,9 +75,11 @@ except Exception:
 
   # --- Step 1: wake the machine if it's stopped ---------------------------
   local state
-  state="$(flyctl machine status "$mid" --app "$fly_app" --json 2>/dev/null \
-           | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state",""))' \
-           2>/dev/null || true)"
+  # flyctl machine status does NOT support --json — parse text output.
+  state="$(flyctl machine status "$mid" --app "$fly_app" 2>/dev/null \
+           | sed 's/\x1b\[[0-9;]*m//g' \
+           | awk -F': *' '/^State: / { print $2; exit }' \
+           | tr -d '[:space:]' || true)"
   case "$state" in
     started|starting) : ;;
     stopped)
@@ -107,8 +109,9 @@ except Exception:
   # yet. Re-seeding over those files silently produces a wrong PR.
   if [ "${PILA_RE_SEED_FORCE:-0}" != "1" ]; then
     local remote_dirty
-    remote_dirty="$(flyctl machine exec "$mid" --app "$fly_app" \
-                      -- git -C /work status --porcelain 2>/dev/null || true)"
+    remote_dirty="$(flyctl ssh console --app "$fly_app" --machine "$mid" \
+                      --pty=false -C "git -C /work status --porcelain" \
+                      2>/dev/null || true)"
     # Filter out .pila/ paths (worker state lives there and is expected to change).
     remote_dirty="$(printf '%s\n' "$remote_dirty" \
                       | awk 'length($0) > 0 && substr($0,4) !~ /^\.pila\// { print }')"

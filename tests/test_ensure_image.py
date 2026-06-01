@@ -33,6 +33,9 @@ set -euo pipefail
 #                     the real user cache.
 #   $PILA_REPO      → forced to a temp dir holding a stub build-push.sh.
 #   $PILA_FLY_APP   → app name (default: pila).
+#   $LOCAL_BUILD    → "true" to forward --local-build to build-push.sh.
+#   PATH            → must include a stub `flyctl` that handles
+#                     `apps list --json` and `apps create`.
 #   $1              → image tag to ensure.
 
 ensure_image() {
@@ -48,8 +51,37 @@ ensure_image() {
     return 1
   fi
   local fly_app="${PILA_FLY_APP:-pila}"
+
+  # Auto-create the Fly app if missing. flyctl apps list returns a JSON
+  # array; check for a Name match. The remote builder and registry push
+  # both require the app to exist. Idempotent on existing apps.
+  if ! flyctl apps list --json 2>/dev/null \
+       | python3 -c '
+import json, sys
+try:
+    apps = json.load(sys.stdin)
+    names = [a.get("Name") or a.get("name") for a in apps]
+    sys.exit(0 if sys.argv[1] in names else 1)
+except Exception:
+    sys.exit(1)
+' "$fly_app"; then
+    echo "[pila] remote: Fly app '$fly_app' does not exist — creating it" >&2
+    if ! flyctl apps create "$fly_app" 2>&1; then
+      echo "pila: error: flyctl apps create $fly_app failed" >&2
+      echo "  Create it manually: flyctl apps create $fly_app" >&2
+      return 1
+    fi
+  fi
+
+  # Forward --local-build to build-push.sh when the launcher was invoked
+  # with --local-build or PILA_LOCAL_BUILD=1.
+  local build_args=(--app "$fly_app" --push)
+  if [ "${LOCAL_BUILD:-false}" = "true" ]; then
+    build_args+=(--local-build)
+  fi
+
   echo "[pila] remote: ensuring image $tag is published (cache miss)" >&2
-  if ! "$build_push" --app "$fly_app" --push; then
+  if ! "$build_push" "${build_args[@]}"; then
     echo "pila: error: build-push.sh failed; remote run cannot proceed" >&2
     return 1
   fi
@@ -62,8 +94,40 @@ ensure_image "$1"
 """
 
 
-def _run(tag: str, *, env: dict, cwd: Path) -> subprocess.CompletedProcess:
+def _stub_flyctl(tmp_path: Path, existing_apps: list[str] | None = None,
+                 create_succeeds: bool = True) -> Path:
+    """Write a stub `flyctl` that handles `apps list --json` and `apps
+    create`. Records argv to flyctl.log.
+
+    existing_apps: names the stub reports as already created. If None,
+    returns an empty list (forcing auto-create path).
+    create_succeeds: whether `apps create <name>` exits 0.
+    """
+    apps = existing_apps or []
+    stub = tmp_path / "flyctl"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo \"$@\" >> {tmp_path}/flyctl.log\n"
+        'if [ "$1" = "apps" ] && [ "$2" = "list" ]; then\n'
+        '  cat <<JSON\n'
+        + "[" + ", ".join(f'{{"Name": "{n}"}}' for n in apps) + "]\n"
+        + "JSON\n"
+        '  exit 0\n'
+        'fi\n'
+        'if [ "$1" = "apps" ] && [ "$2" = "create" ]; then\n'
+        f"  exit {0 if create_succeeds else 1}\n"
+        'fi\n'
+        'exit 0\n'
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def _run(tag: str, *, env: dict, cwd: Path,
+         flyctl_dir: Path | None = None) -> subprocess.CompletedProcess:
     base_env = {k: v for k, v in os.environ.items()}
+    if flyctl_dir is not None:
+        base_env["PATH"] = f"{flyctl_dir}:{base_env.get('PATH', '')}"
     base_env.update(env)
     return subprocess.run(
         ["bash", "-c", _HARNESS, "harness", tag],
@@ -90,7 +154,8 @@ def _stub_build_push(repo: Path, *, exit_code: int = 0, log_file: Path | None = 
 
 
 def test_cache_hit_skips_build_push(tmp_path: Path):
-    """If the tag is in the cache, ensure_image returns 0 without invoking build-push."""
+    """If the tag is in the cache, ensure_image returns 0 without invoking build-push.
+    Cache hit also skips flyctl apps list (the short-circuit is the first thing)."""
     repo = tmp_path / "pila-repo"
     repo.mkdir()
     log = tmp_path / "build-push-invocations.log"
@@ -103,6 +168,7 @@ def test_cache_hit_skips_build_push(tmp_path: Path):
         "registry.fly.io/pila:0.2.1\n"
     )
 
+    # No flyctl stub needed — cache hit skips that step.
     result = _run(
         "registry.fly.io/pila:0.2.1",
         env={
@@ -118,11 +184,13 @@ def test_cache_hit_skips_build_push(tmp_path: Path):
 
 
 def test_cache_miss_invokes_build_push_and_records_tag(tmp_path: Path):
-    """On cache miss, ensure_image runs build-push.sh and appends the tag to the cache."""
+    """On cache miss, ensure_image runs build-push.sh and appends the tag to the cache.
+    With an existing Fly app, skips apps create."""
     repo = tmp_path / "pila-repo"
     repo.mkdir()
     log = tmp_path / "build-push-invocations.log"
     _stub_build_push(repo, log_file=log)
+    _stub_flyctl(tmp_path, existing_apps=["pila"])
 
     cache_home = tmp_path / "cache"
 
@@ -134,16 +202,23 @@ def test_cache_miss_invokes_build_push_and_records_tag(tmp_path: Path):
             "PILA_FLY_APP": "pila",
         },
         cwd=tmp_path,
+        flyctl_dir=tmp_path,
     )
     assert result.returncode == 0, result.stderr
     # build-push.sh should have been invoked with --app pila --push.
     assert log.exists(), "build-push.sh should be invoked on cache miss"
     invocation = log.read_text().strip()
     assert "--app pila --push" in invocation, invocation
+    # No --local-build forwarded by default.
+    assert "--local-build" not in invocation, invocation
     # Tag should now be recorded in the cache.
     cache_file = cache_home / "pila" / "published-tags.txt"
     assert cache_file.exists()
     assert "registry.fly.io/pila:9.9.9" in cache_file.read_text()
+    # flyctl apps list called, but apps create NOT called (app exists).
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert "apps list --json" in flyctl_log
+    assert "apps create" not in flyctl_log
 
 
 def test_build_push_failure_propagates(tmp_path: Path):
@@ -151,6 +226,7 @@ def test_build_push_failure_propagates(tmp_path: Path):
     repo = tmp_path / "pila-repo"
     repo.mkdir()
     _stub_build_push(repo, exit_code=2)
+    _stub_flyctl(tmp_path, existing_apps=["pila"])
 
     cache_home = tmp_path / "cache"
 
@@ -161,6 +237,7 @@ def test_build_push_failure_propagates(tmp_path: Path):
             "PILA_REPO": str(repo),
         },
         cwd=tmp_path,
+        flyctl_dir=tmp_path,
     )
     assert result.returncode == 1, result.stderr
     assert "build-push.sh failed" in result.stderr
@@ -178,6 +255,7 @@ def test_missing_build_push_script_errors(tmp_path: Path):
 
     cache_home = tmp_path / "cache"
 
+    # No flyctl stub needed — error occurs before the apps-list step.
     result = _run(
         "registry.fly.io/pila:0.0.0",
         env={
@@ -197,6 +275,7 @@ def test_positive_cache_only_unrelated_tags_still_probe(tmp_path: Path):
     repo.mkdir()
     log = tmp_path / "build-push.log"
     _stub_build_push(repo, log_file=log)
+    _stub_flyctl(tmp_path, existing_apps=["pila"])
 
     cache_home = tmp_path / "cache"
     cache_dir = cache_home / "pila"
@@ -212,6 +291,7 @@ def test_positive_cache_only_unrelated_tags_still_probe(tmp_path: Path):
             "PILA_REPO": str(repo),
         },
         cwd=tmp_path,
+        flyctl_dir=tmp_path,
     )
     assert result.returncode == 0, result.stderr
     assert log.exists(), "build-push.sh should be invoked for unrelated tag"
@@ -242,9 +322,135 @@ def test_ensure_image_harness_matches_launcher():
     sentinels = [
         'cache_file="$cache_dir/published-tags.txt"',
         'grep -Fxq "$tag" "$cache_file"',
-        '"$build_push" --app "$fly_app" --push',
+        # New (Part H): app auto-create + LOCAL_BUILD forwarding.
+        'flyctl apps list --json',
+        'flyctl apps create "$fly_app"',
+        'build_args=(--app "$fly_app" --push)',
+        'build_args+=(--local-build)',
         'printf \'%s\\n\' "$tag" >> "$cache_file"',
     ]
     for s in sentinels:
         assert s in launcher_text, f"missing in launcher: {s}"
         assert s in _HARNESS, f"missing in harness: {s}"
+
+
+# --- Part H: app auto-create + --local-build forwarding -----------------
+
+def test_missing_fly_app_triggers_apps_create(tmp_path: Path):
+    """When `flyctl apps list` doesn't include the target app, ensure_image
+    invokes `flyctl apps create <app>` before build-push.sh."""
+    repo = tmp_path / "pila-repo"
+    repo.mkdir()
+    log = tmp_path / "build-push.log"
+    _stub_build_push(repo, log_file=log)
+    # Empty app list — forces auto-create path.
+    _stub_flyctl(tmp_path, existing_apps=[])
+
+    cache_home = tmp_path / "cache"
+    result = _run(
+        "registry.fly.io/myapp:9.9.9",
+        env={
+            "XDG_CACHE_HOME": str(cache_home),
+            "PILA_REPO": str(repo),
+            "PILA_FLY_APP": "myapp",
+        },
+        cwd=tmp_path,
+        flyctl_dir=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert "apps list --json" in flyctl_log
+    assert "apps create myapp" in flyctl_log
+    assert "Fly app 'myapp' does not exist" in result.stderr
+
+
+def test_existing_fly_app_skips_apps_create(tmp_path: Path):
+    """When `flyctl apps list` includes the target app, ensure_image
+    does NOT call `flyctl apps create`."""
+    repo = tmp_path / "pila-repo"
+    repo.mkdir()
+    log = tmp_path / "build-push.log"
+    _stub_build_push(repo, log_file=log)
+    _stub_flyctl(tmp_path, existing_apps=["pila", "otherapp"])
+
+    cache_home = tmp_path / "cache"
+    result = _run(
+        "registry.fly.io/pila:9.9.9",
+        env={
+            "XDG_CACHE_HOME": str(cache_home),
+            "PILA_REPO": str(repo),
+            "PILA_FLY_APP": "pila",
+        },
+        cwd=tmp_path,
+        flyctl_dir=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert "apps list --json" in flyctl_log
+    assert "apps create" not in flyctl_log
+
+
+def test_apps_create_failure_propagates(tmp_path: Path):
+    """If `flyctl apps create` fails, ensure_image returns 1 and doesn't
+    invoke build-push.sh."""
+    repo = tmp_path / "pila-repo"
+    repo.mkdir()
+    log = tmp_path / "build-push.log"
+    _stub_build_push(repo, log_file=log)
+    _stub_flyctl(tmp_path, existing_apps=[], create_succeeds=False)
+
+    cache_home = tmp_path / "cache"
+    result = _run(
+        "registry.fly.io/pila:9.9.9",
+        env={
+            "XDG_CACHE_HOME": str(cache_home),
+            "PILA_REPO": str(repo),
+            "PILA_FLY_APP": "pila",
+        },
+        cwd=tmp_path,
+        flyctl_dir=tmp_path,
+    )
+    assert result.returncode == 1
+    assert "flyctl apps create pila failed" in result.stderr
+    assert not log.exists() or log.read_text() == "", \
+        "build-push.sh must not be invoked when apps create fails"
+
+
+def test_local_build_env_forwards_flag_to_build_push(tmp_path: Path):
+    """When LOCAL_BUILD=true is exported (mirroring --local-build /
+    PILA_LOCAL_BUILD=1 in the launcher), ensure_image forwards
+    --local-build to build-push.sh."""
+    repo = tmp_path / "pila-repo"
+    repo.mkdir()
+    log = tmp_path / "build-push.log"
+    _stub_build_push(repo, log_file=log)
+    _stub_flyctl(tmp_path, existing_apps=["pila"])
+
+    cache_home = tmp_path / "cache"
+    result = _run(
+        "registry.fly.io/pila:9.9.9",
+        env={
+            "XDG_CACHE_HOME": str(cache_home),
+            "PILA_REPO": str(repo),
+            "PILA_FLY_APP": "pila",
+            "LOCAL_BUILD": "true",
+        },
+        cwd=tmp_path,
+        flyctl_dir=tmp_path,
+    )
+    assert result.returncode == 0, result.stderr
+    invocation = log.read_text().strip()
+    assert "--local-build" in invocation, invocation
+
+
+def test_local_build_flag_consumed_by_launcher():
+    """The launcher consumes --local-build in REWRITTEN_ARGS, not forwarded to orch.
+    Also honors PILA_LOCAL_BUILD env var."""
+    pila_launcher = REPO_ROOT / "pila"
+    text = pila_launcher.read_text()
+    # The flag must be parsed early (env + arg loop).
+    assert "LOCAL_BUILD" in text
+    assert "PILA_LOCAL_BUILD" in text
+    # The flag must be in the REWRITTEN_ARGS consumption block so the
+    # orchestrator's argparse never sees it.
+    assert "--local-build)" in text

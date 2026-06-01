@@ -45,9 +45,11 @@ resume_machine() {
     # The machine might already be running (idempotency on retry).
     # Check the state directly; only error if it's not start-able.
     local state
-    state="$(flyctl machine status "$mid" --app "$fly_app" --json 2>/dev/null \
-             | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state",""))' \
-             2>/dev/null || true)"
+    # flyctl machine status does NOT support --json — parse text output.
+    state="$(flyctl machine status "$mid" --app "$fly_app" 2>/dev/null \
+             | sed 's/\x1b\[[0-9;]*m//g' \
+             | awk -F': *' '/^State: / { print $2; exit }' \
+             | tr -d '[:space:]' || true)"
     case "$state" in
       started|starting)
         : # already coming up; fall through to wait

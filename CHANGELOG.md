@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+## [0.2.5] - 2026-06-01
+
+### Fixed
+
+- **Force fresh image build by bumping pila version from 0.2.1 to
+  0.2.5** (skipping 0.2.2/0.2.3/0.2.4 because those tags were
+  already consumed by Depot's tag→digest cache during development
+  iteration). Fly's Depot remote builder caches the resolved
+  tag-to-digest mapping per `--image-label` value. Rebuilds that
+  push new layers but reuse the same label still resolve to the
+  stale digest on the registry, so machines run the prior image.
+  The community thread
+  [flyctl deploy with --image-label deploys older code](https://community.fly.io/t/when-i-run-fly-deploy-with-the-image-label-flag-why-does-it-deploy-an-older-version-of-my-code/26151)
+  documents the issue; the workaround Fly recommends is
+  `--depot=false`, now applied in `scripts/remote/build-push.sh`'s
+  remote-builder invocation. Belt-and-braces: the version bump
+  alone forces a brand-new tag with no cached digest history.
+- **Dockerfile: chown /work to pila.** Local runs bind-mount
+  `$(pwd):/work` which masks the image's `/work` permission; remote
+  (Fly) runs use the baked image's `/work` directly. Previously
+  `/work` was root-owned, so the orchestrator (running as `pila`)
+  crashed at `pila_root.mkdir('/work/.pila')` with `PermissionError`.
+  Added `RUN mkdir -p /work && chown pila:${HOST_GID} /work` before
+  the `USER pila` directive.
+- **provision.sh: parse `flyctl machine run` text output, not
+  `--json`.** `flyctl machine run` does NOT accept `--json`; the
+  call exited non-zero with "unknown flag: --json", `machine_id`
+  remained unset, and `set -u` killed the shell at the empty-check.
+  Now parses `Machine ID: <id>` from text output via awk; defensively
+  initializes `machine_id=""`.
+- **wait_for_started / resume_machine / re_seed: parse `flyctl
+  machine status` text output, not `--json`.** Same root cause as
+  above (`flyctl machine status` doesn't accept `--json` either).
+  Parses `State: <state>` from text via the same sed+awk pipeline.
+
+### Added
+
 - **Cleared-but-empty terminal state — pila exits cleanly when every
   planner confirms "task already satisfied on HEAD".** A captured
   finalmemoriam run (`bugfix-fix-two-pre-existing-repo-b5b64a`) died
@@ -969,6 +1006,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   CLI/env are session-scoped knobs; `pila.toml` is the committed
   repo default.
 
-[Unreleased]: https://github.com/enricai/pila/compare/v0.2.1...HEAD
+[Unreleased]: https://github.com/enricai/pila/compare/v0.2.5...HEAD
+[0.2.5]: https://github.com/enricai/pila/releases/tag/v0.2.5
 [0.2.1]: https://github.com/enricai/pila/releases/tag/v0.2.1
 [0.2.0]: https://github.com/enricai/pila/releases/tag/v0.2.0

@@ -30,7 +30,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `pila` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the pila image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Fast paths for `--version` skip container startup. |
 | `Dockerfile` | Image recipe (Debian 12 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `pila:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. `cd /work && exec python3 /work/.pila-image/orchestrator/pila.py "$@"`. |
-| `scripts/remote/build-push.sh` | Build and push a self-contained pila image to Fly.io's registry. The baked source at `/work/.pila-image/` lets the image run on Fly Machines without any bind mount. |
+| `scripts/remote/build-push.sh` | Build and push a self-contained pila image to Fly.io's registry. The baked source at `/work/.pila-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `PILA_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
 | `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `pila` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$PILA_REMOTE_EXIT_RC` and routes to one of three dispositions: destroy (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or stop (pause-on-failure: writes `paused_at`/`pause_reason` to the run sidecar). |
 | `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `attach.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `update_run_json()` (atomic merge of fields into `.pila/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), and `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated). Replaces four duplicated detection blocks across the remote scripts. |
 | `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch when `paused_at` is set in the run sidecar). Exports `resume_machine()`: reads `fly_machine_id` from the sidecar, runs `flyctl machine start`, waits for `started`, and clears `paused_at`/`pause_reason` from the sidecar. The launcher then runs the orchestrator inside the resumed machine with `--resume --run-id <id>`. |
@@ -222,10 +222,11 @@ local runs the launcher's `-v $PILA_REPO:/work/.pila-image:ro` bind
 mount shadows the baked copy, so development iteration (edit a file,
 run pila) still works without rebuilding the image.
 
-`scripts/remote/build-push.sh` provides the remote build path:
+`scripts/remote/build-push.sh` provides the build-and-push path. By
+default it uses Fly's remote builder (no host Docker daemon required):
 
 ```bash
-# Build locally, tag for fly.io private registry, push, and verify:
+# Default: Fly's remote builder builds + pushes (recommended):
 ./scripts/remote/build-push.sh --app <fly-app-name> --push
 
 # Verify the baked source works inside a Machine:
@@ -234,15 +235,31 @@ flyctl machine run registry.fly.io/<fly-app-name>:<VERSION> \
   -- python3 /work/.pila-image/orchestrator/pila.py --version
 ```
 
-Alternative: let fly build remotely (no local container runtime needed):
+Internally, the remote-builder path runs:
 
 ```bash
-flyctl deploy --build-only --push \
-  --config fly.toml \
-  --dockerfile Dockerfile
-# fly reads the Dockerfile, COPY bakes the source, result is pushed to
-# registry.fly.io/<app> automatically.
+flyctl deploy --build-only --push --remote-only \
+  --app <fly-app-name> \
+  --config <tmp-fly.toml> \
+  --dockerfile Dockerfile \
+  --image-label <VERSION>
 ```
+
+The `<tmp-fly.toml>` is a copy of the repo's `fly.toml` with the
+`[build] image = "..."` line stripped. That line is correct for
+`flyctl machine run` (pila uses it elsewhere) but wrong for
+`flyctl deploy --build-only`: it tells flyctl "the image already
+exists, fetch it" → flyctl skips the build step → deploy fails with
+"Could not find image" ([flyctl#1686](https://github.com/superfly/flyctl/issues/1686)).
+The awk-based strip works around it.
+
+**Opt-in: `--local-build`** (or `PILA_LOCAL_BUILD=1`). Builds with
+host `nerdctl`/`docker` and pushes from the host. Requires a working
+Docker daemon authenticated to `registry.fly.io`. Does NOT work with
+nerdctl-in-Colima on macOS — nerdctl reads `~/.docker/config.json`
+but cannot resolve `credsStore: desktop` (no access to macOS
+Keychain from inside the Lima VM). Documented in INSTALL.md for
+completeness; most users should leave it off.
 
 #### Auto-publish on first remote run (`ensure_image()` in the launcher)
 
@@ -255,13 +272,17 @@ fails at provision time with an unfriendly "manifest unknown" error.
 The launcher closes that gap with `ensure_image()` in the `RUNTIME=fly`
 branch, run before `provision_machine`:
 
-1. Probe the registry for the resolved tag via `flyctl image show
-   --image $FLY_IMAGE_TAG --app $PILA_FLY_APP` (single round-trip,
-   non-interactive, no auth prompts beyond what `flyctl auth status`
-   already provides).
-2. On hit: skip the build.
-3. On miss: invoke `scripts/remote/build-push.sh --app $PILA_FLY_APP
-   --push` and re-probe to confirm.
+1. Cache check: if `$XDG_CACHE_HOME/pila/published-tags.txt` already
+   has `$FLY_IMAGE_TAG`, skip everything.
+2. Auto-create the Fly app if it doesn't exist. `flyctl apps list
+   --json` is parsed for a name match; on miss, `flyctl apps create
+   $PILA_FLY_APP` is invoked. Idempotent — "already exists" is a
+   silent success.
+3. Invoke `scripts/remote/build-push.sh --app $PILA_FLY_APP --push`.
+   `--local-build` is forwarded if `LOCAL_BUILD=true` (set by the
+   `--local-build` CLI flag or `PILA_LOCAL_BUILD=1` env var).
+   build-push.sh handles the actual remote-vs-local mode dispatch.
+4. On success, append the tag to the positive cache.
 
 Results are cached at `$XDG_CACHE_HOME/pila/published-tags.txt` (default
 `~/.cache/pila/published-tags.txt`), one line per `<tag>` known to be

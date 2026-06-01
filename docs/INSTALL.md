@@ -250,19 +250,47 @@ worker compute from your local machine.
 
 Prerequisites for the fly runtime:
 
-1. **`flyctl` installed and authenticated** — `fly auth status` must succeed.
-   Install from https://fly.io/docs/flyctl/install/ (or `brew install flyctl`
-   on macOS).
-2. **A published pila image** — build and push with `scripts/remote/build-push.sh`
-   (see `docs/IMPLEMENTATION.md` §0.5 *Registry publish path*). The fly runtime
-   pulls this image for each worker Machine it starts. The launcher's
-   `ensure_image()` step also auto-publishes on the first remote run if the
-   tag is missing — `--no-auto-publish` opts out.
+1. **`flyctl` installed and authenticated** — `flyctl auth login` must
+   succeed. Install from https://fly.io/docs/flyctl/install/ (or
+   `brew install flyctl` on macOS). The launcher auto-installs `flyctl`
+   on first `--runtime fly` invocation if it's missing.
+2. **A Fly.io account with billing set up** — Fly Machines bill
+   per-second; you need a credit card on file. There is no free tier
+   for the kind of always-on compute pila spins up.
 
-The local `nerdctl` setup above is **not required** when using `--runtime fly`;
-pila's launcher skips the local container preflight and delegates the entire
-worker lifecycle to the Fly.io API. The local container runtime (Colima on
-macOS, containerd on Linux) is only needed for the default `local` runtime.
+That's it. The launcher handles everything else automatically on first
+`--runtime fly` invocation:
+
+- **Auto-creates the Fly app** (`flyctl apps create $PILA_FLY_APP`,
+  default `pila`) if it doesn't exist yet. Idempotent.
+- **Builds the pila image on Fly's remote builder** (no host Docker
+  daemon required) and pushes it to `registry.fly.io/$PILA_FLY_APP`.
+  This step takes ~3-5 min the first time per pila version; subsequent
+  runs reuse the cached tag.
+- **Provisions a Fly Machine** per worker, seeds repo + Claude auth,
+  and runs the orchestrator detached.
+
+The local `nerdctl` setup above is **not required** when using
+`--runtime fly`; pila's launcher skips the local container preflight
+and delegates the entire worker lifecycle to the Fly.io API. The
+local container runtime (Colima on macOS, containerd on Linux) is
+only needed for the default `local` runtime.
+
+**`--local-build` opt-in** (most users should NOT use this). Pass
+`--local-build` or set `PILA_LOCAL_BUILD=1` to build the pila image
+locally with `nerdctl`/`docker` and push to Fly's registry from your
+host. This path only works when your host's Docker daemon can
+authenticate to `registry.fly.io` — practically, that means **Docker
+Desktop on macOS** (with `flyctl auth docker` having run within the
+last 5 minutes — the token expires) or **Linux with Docker installed
+via apt/dnf** + `flyctl auth docker`. **It does NOT work with
+nerdctl-in-Colima on macOS** because nerdctl cannot reach macOS
+Keychain (where Docker Desktop's `credsStore: desktop` helper stores
+the credential). The default remote-builder path works for everyone
+with `flyctl auth login` succeeded and avoids this auth dance
+entirely; use `--local-build` only if you have a specific reason
+(e.g. you need to build an image variant the remote builder can't
+produce, or you're testing the build pipeline locally).
 
 ## What pila mounts into the container
 

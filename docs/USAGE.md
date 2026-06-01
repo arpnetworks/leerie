@@ -267,6 +267,23 @@ local-runtime auto-install in `scripts/install.sh`. Opt out with
 `--no-runtime-install` (you'll get the install hint and exit 1, same
 as today).
 
+**Fly app auto-create + remote image build.** On first `--runtime
+fly` invocation per Fly account, pila also auto-creates the Fly app
+(default name: `pila`; override with `PILA_FLY_APP=<name>`) and
+builds the pila image on Fly's remote builder. The remote build runs
+inside Fly's infrastructure — no host Docker daemon required. Takes
+~3-5 min the first time per pila version; subsequent runs reuse the
+cached registry tag and skip the build.
+
+**`--local-build` opt-in.** If you have a working Docker daemon
+authenticated to `registry.fly.io` (Docker Desktop + `flyctl auth
+docker`, or apt-installed Docker on Linux + `flyctl auth docker`),
+you can pass `--local-build` (or `PILA_LOCAL_BUILD=1`) to build the
+image on your host instead. **Most users should leave this off** —
+it doesn't work with nerdctl-in-Colima on macOS (the most common
+local setup) because nerdctl can't reach Keychain. See
+`docs/INSTALL.md` for the full caveat.
+
 ## Tuning for your workflow
 
 - `--source-of-truth codebase|research|both` — one-off CLI override;
@@ -312,14 +329,16 @@ as today).
 - `--runtime local|fly` — execution backend for per-subtask worker
   containers. Default: `local` (nerdctl on the local container
   runtime). `fly` routes each worker through Fly.io Machines instead
-  — requires `flyctl` logged in (`fly auth status`) and a published
-  pila image (built and pushed by `scripts/remote/build-push.sh`; the
-  launcher's `ensure_image()` step also auto-publishes on the first
-  remote run when the registry tag is missing — opt out with
-  `--no-auto-publish`). Also `PILA_RUNTIME`
-  env var or `runtime = fly` in `pila.toml` (committed per-repo
-  default; outranked by env and CLI). Precedence: `--runtime` →
-  `PILA_RUNTIME` → `pila.toml` → default `local`.
+  — requires only `flyctl` logged in (`flyctl auth login`). The
+  launcher auto-creates the Fly app (`PILA_FLY_APP`, default `pila`)
+  and builds the pila image on Fly's remote builder if the registry
+  tag is missing; opt out with `--no-auto-publish`. Opt into local
+  build with `--local-build` / `PILA_LOCAL_BUILD=1` (requires
+  working Docker daemon authenticated to `registry.fly.io`; see
+  INSTALL.md). Also `PILA_RUNTIME` env var or `runtime = fly` in
+  `pila.toml` (committed per-repo default; outranked by env and
+  CLI). Precedence: `--runtime` → `PILA_RUNTIME` → `pila.toml` →
+  default `local`.
 - `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70` — lower auto-compaction threshold
   for worker processes.
 

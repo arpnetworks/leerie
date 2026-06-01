@@ -1,0 +1,192 @@
+"""Tests for scripts/remote/build-push.sh — BUILD_MODE dispatch.
+
+Part H: build-push.sh defaults to BUILD_MODE=remote (Fly's remote
+builder via `flyctl deploy --build-only --push --remote-only`); the
+legacy local nerdctl/docker path is opt-in via --local-build or
+PILA_LOCAL_BUILD=1.
+
+These tests stub `flyctl` and `nerdctl`/`docker`, run build-push.sh
+in --dry-run mode where possible, and assert on:
+- Default mode is remote.
+- --local-build flips to local.
+- PILA_LOCAL_BUILD=1 flips to local.
+- Remote mode invokes `flyctl deploy --build-only --push --remote-only`
+  with `--config <tmp-fly.toml>` (the temp file has the `[build] image`
+  line stripped).
+- Local mode invokes `nerdctl build` + `nerdctl push`.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+BUILD_PUSH = REPO_ROOT / "scripts" / "remote" / "build-push.sh"
+
+
+def _stub_flyctl(tmp_path: Path, exit_code: int = 0) -> Path:
+    """Stub flyctl that records argv and exits with the given code."""
+    stub = tmp_path / "flyctl"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo \"$@\" >> {tmp_path}/flyctl.log\n"
+        f"exit {exit_code}\n"
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def _stub_container_cmd(tmp_path: Path, name: str) -> Path:
+    """Stub nerdctl/docker that records argv and exits 0 on most calls.
+    Returns a fake JSON entrypoint for `inspect`, fake stdout for `run`."""
+    stub = tmp_path / name
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo \"$@\" >> {tmp_path}/{name}.log\n"
+        'if [ "$1" = "inspect" ]; then\n'
+        '  echo "/opt/pila-image/scripts/container-entry.sh"\n'
+        '  exit 0\n'
+        'fi\n'
+        'if [ "$1" = "run" ]; then\n'
+        '  echo "pila 0.0.0-test"\n'
+        '  exit 0\n'
+        'fi\n'
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    return stub
+
+
+def _run(tmp_path: Path, *args: str, env_extra: dict | None = None,
+         stub_only: str | None = None) -> subprocess.CompletedProcess:
+    """Run build-push.sh with PATH stubbing. By default stubs both flyctl
+    and nerdctl. stub_only="flyctl" omits nerdctl/docker stubs."""
+    _stub_flyctl(tmp_path)
+    if stub_only != "flyctl":
+        _stub_container_cmd(tmp_path, "nerdctl")
+    env = dict(os.environ)
+    env["PATH"] = f"{tmp_path}:/usr/bin:/bin"
+    if env_extra:
+        env.update(env_extra)
+    return subprocess.run(
+        [str(BUILD_PUSH), *args],
+        env=env,
+        cwd=str(REPO_ROOT),
+        capture_output=True, text=True, check=False,
+    )
+
+
+# --- mode default + flag dispatch -----------------------------------------
+
+def test_default_mode_is_remote(tmp_path: Path):
+    """No flags → BUILD_MODE=remote → invokes `flyctl deploy --build-only
+    --push --remote-only --depot=false`. The --depot=false flag forces
+    the legacy remote builder to avoid Depot's tag-cache bug
+    (https://community.fly.io/t/when-i-run-fly-deploy-with-the-image-label-flag-why-does-it-deploy-an-older-version-of-my-code/26151).
+    """
+    r = _run(tmp_path, "--app", "testapp", "--push")
+    assert r.returncode == 0, r.stderr
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    assert "deploy --build-only --push --remote-only" in flyctl_log
+    assert "--depot=false" in flyctl_log, \
+        "must pass --depot=false to avoid depot's stale tag cache"
+    assert "--app testapp" in flyctl_log
+    assert "--config" in flyctl_log  # tmp fly.toml
+    # nerdctl/docker should NOT have been invoked in remote mode.
+    nerdctl_log = tmp_path / "nerdctl.log"
+    assert not nerdctl_log.exists() or nerdctl_log.read_text() == ""
+
+
+def test_local_build_flag_switches_to_local(tmp_path: Path):
+    """--local-build → BUILD_MODE=local → invokes nerdctl build + push."""
+    r = _run(tmp_path, "--app", "testapp", "--push", "--local-build")
+    assert r.returncode == 0, r.stderr
+    nerdctl_log = (tmp_path / "nerdctl.log").read_text()
+    assert "build" in nerdctl_log
+    assert "push" in nerdctl_log
+    # flyctl should NOT have been invoked in local mode.
+    flyctl_log = tmp_path / "flyctl.log"
+    assert not flyctl_log.exists() or flyctl_log.read_text() == ""
+
+
+def test_pila_local_build_env_switches_to_local(tmp_path: Path):
+    """PILA_LOCAL_BUILD=1 → BUILD_MODE=local (equivalent to --local-build)."""
+    r = _run(tmp_path, "--app", "testapp", "--push",
+             env_extra={"PILA_LOCAL_BUILD": "1"})
+    assert r.returncode == 0, r.stderr
+    nerdctl_log = (tmp_path / "nerdctl.log").read_text()
+    assert "build" in nerdctl_log
+    assert "push" in nerdctl_log
+
+
+# --- remote-mode specifics ------------------------------------------------
+
+def test_remote_mode_strips_build_image_from_fly_toml(tmp_path: Path):
+    """The tmp fly.toml passed to flyctl must NOT contain the
+    `[build] image = "..."` line, which would cause flyctl to skip the
+    build (flyctl#1686)."""
+    r = _run(tmp_path, "--app", "testapp", "--push")
+    assert r.returncode == 0, r.stderr
+    # The tmp file path is in the flyctl invocation. Extract it.
+    flyctl_log = (tmp_path / "flyctl.log").read_text()
+    import re
+    m = re.search(r"--config (\S+\.toml)", flyctl_log)
+    # In the dry-run + stub setup, --config $tmp_toml is passed but the
+    # temp file may or may not still exist after the script cleans up.
+    # Verify the construct works by reading the actual launcher stderr
+    # which announces the temp file path.
+    assert "[build] image stripped" in r.stderr, \
+        f"expected strip notice in stderr; got:\n{r.stderr}"
+
+
+def test_remote_mode_without_push_errors(tmp_path: Path):
+    """Remote mode always pushes (flyctl deploy --push is inline). If
+    --push isn't passed, error rather than silently doing nothing."""
+    r = _run(tmp_path, "--app", "testapp")
+    assert r.returncode == 1
+    assert "remote build always pushes" in r.stderr.lower() or \
+           "remote build always pushes" in r.stderr
+
+
+# --- local-mode specifics -------------------------------------------------
+
+def test_local_mode_uses_nerdctl_when_available(tmp_path: Path):
+    """Local mode picks nerdctl when both nerdctl and docker are on PATH."""
+    _stub_container_cmd(tmp_path, "docker")  # also on PATH
+    r = _run(tmp_path, "--app", "testapp", "--push", "--local-build")
+    assert r.returncode == 0, r.stderr
+    assert "local build tool: nerdctl" in r.stdout
+
+
+# --- regression: build context must be $PILA_REPO, not caller's cwd ------
+
+def test_remote_mode_cds_to_pila_repo_before_invoking_flyctl(tmp_path: Path):
+    """When `pila` is invoked from another repo (e.g. cd ~/myrepo && pila
+    --runtime fly), build-push.sh must `cd $PILA_REPO` before running
+    `flyctl deploy`. Otherwise flyctl uploads the user's repo as the
+    build context, and the Dockerfile's `COPY orchestrator/` fails
+    with "orchestrator: not found". Regression test for the Part H
+    live-test failure.
+
+    Verifies the launcher source contains the cd-into-PILA_REPO step.
+    """
+    text = BUILD_PUSH.read_text()
+    # The (cd "$PILA_REPO" ; ...) subshell pattern must wrap the
+    # flyctl deploy invocation in the remote-mode function.
+    assert 'cd "$PILA_REPO"' in text, \
+        "remote-mode flyctl invocation must run from cwd=$PILA_REPO"
+    # And the comment block explaining why must be present (a refactor
+    # that drops the cd should NOT also drop the explanation).
+    assert "build context" in text
+
+
+# --- source-text coupling for the docs -----------------------------------
+
+def test_help_mentions_local_build_caveat():
+    """build-push.sh --help must clearly state that --local-build does NOT
+    work with nerdctl-in-Colima on macOS, so users don't try it by
+    mistake."""
+    text = BUILD_PUSH.read_text()
+    assert "nerdctl-in-Colima" in text
+    assert "Most pila users should NOT" in text
