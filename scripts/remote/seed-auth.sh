@@ -39,11 +39,15 @@
 #   Claude Code CLI reads from ~/.claude/.credentials.json on Linux.
 #
 # Seeding mechanism:
-#   Files are delivered using `flyctl machine exec` with a tar pipe:
-#       tar -cC "$STAGE" . | flyctl machine exec --stdin ...  tar -xC /home/pila
-#   This is the only approach that (a) doesn't require an open SSH port,
-#   (b) works without a running sshd inside the machine, and (c) preserves
-#   file permissions (mode 0600 on credentials, 0700 on ~/.ssh / ~/.gnupg).
+#   Files are delivered via `flyctl ssh console -C` with a tar pipe:
+#       tar -cC "$STAGE" . | flyctl ssh console --pty=false \
+#         -C "sh -c 'tar -xC /home/pila && chown -R pila: /home/pila'"
+#   `ssh console -C` is the only flyctl transport that takes the command
+#   as a single string AND forwards host stdin (current flyctl dropped
+#   `--stdin` and the post-`--` argv form from `machine exec`). The
+#   trailing `chown -R pila:` is necessary because the ssh-console
+#   session lands as root by default; without it the orchestrator
+#   (running as pila) couldn't read its own credentials.
 
 set -euo pipefail
 

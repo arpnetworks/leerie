@@ -218,10 +218,12 @@ for f in sys.stdin.buffer.read().split(b"\x00"):
 # ---------------------------------------------------------------------------
 # seed_repo_dirty
 #
-# Step 2 of two-channel seeding: tar the host's `git status --porcelain`
-# dirty set and stream it into /work on the remote. Reusable on its own
-# — Phase 4 re-seed.sh calls it (without seed_repo_clone) when the user
-# resumes a paused run after editing files locally.
+# Re-seed helper used by `scripts/remote/re-seed.sh` (Phase 4) when the
+# user pauses a run, edits files locally, and resumes. Tars the host's
+# `git status --porcelain` dirty set and streams it into /work on the
+# remote. NOT called by `seed_repo()` on a fresh provision anymore —
+# `seed_repo_clone` already includes uncommitted files via
+# `git ls-files --others --exclude-standard`.
 #
 # Defensive excludes (.pila/runs/*/worktrees/* and .git/*) protect against
 # a future change that lets the dirty set name worktree paths — currently

@@ -841,19 +841,27 @@ remote run (LLM calls, worker subprocesses, git, shell tools) happens
 entirely inside the Fly Machine; the launcher's host-side role after
 provisioning is purely **to stream the orchestrator log back for the
 user's eyes**. Binding the orchestrator's *life* to that streaming
-channel — which is what `flyctl machine exec -- python3 …` does by
-default — means a closed laptop, a dropped WiFi connection, or an
-accidental Ctrl-C kills a run that the laptop wasn't doing any work for.
+channel — which is what a foreground `flyctl ssh console -C "python3
+pila.py"` would do — means a closed laptop, a dropped WiFi connection,
+or an accidental Ctrl-C kills a run that the laptop wasn't doing any
+work for.
 
-Pila therefore starts the orchestrator **detached** on the Fly Machine:
-`flyctl machine exec` invokes `setsid nohup python3 orchestrator/pila.py
-… > /work/.pila/runs/<run-id>/orchestrator.log 2>&1 < /dev/null &` and
-records the resulting pid in `orchestrator.pid`. The exec call returns
-immediately. A *second* exec call then runs `tail -F` on the
-orchestrator log purely for the user's terminal. The orchestrator is
-session leader inside the machine; the tail is an independent process
-on the host side. Stream death (Ctrl-C, broken pipe, laptop closing,
-WiFi dropping) breaks the tail, not the orchestrator.
+Pila therefore starts the orchestrator **detached** on the Fly Machine.
+The launcher pipes a small Python wrapper script via stdin to
+`flyctl ssh console --pty=false -C "python3 -"`; the wrapper does
+`subprocess.Popen(..., start_new_session=True, user="pila",
+group=<pila gid>, env={HOME=/home/pila, USER=pila, PATH=mise+bin},
+cwd="/work")` and records the resulting PID in `orchestrator.pid`.
+`start_new_session=True` is the portable equivalent of
+`setsid nohup`; running as the pila user with explicit env is
+required because the ssh-console session lands as root with
+`HOME=/root` by default (claude would look for credentials in the
+wrong place otherwise). The ssh-console call returns immediately. A
+*second* ssh-console call then pipes a tail-wrapper script to
+`sh -s` purely for the user's terminal. The orchestrator is session
+leader inside the machine; the tail is an independent process on the
+host side. Stream death (Ctrl-C, broken pipe, laptop closing, WiFi
+dropping) breaks the tail, not the orchestrator.
 
 This matches the prior-art mental model from comparable tools
 (`fly machine` itself, Claude Code's `/bg` + `claude agents`, kubectl,
@@ -924,7 +932,7 @@ preserved — `remote-task-system.md` lines 89–99 explicitly retract the
 abstract "memory-state snapshot" requirement in favor of the
 run-branch-as-durable-record contract this section relies on.
 
-Four sidecar fields on `run.json` capture remote lifecycle state:
+Six sidecar fields on `run.json` capture remote lifecycle state:
 
 - `fly_machine_id` — written by `provision.sh` immediately after
   `flyctl machine run` succeeds, so a launcher that crashes before
@@ -936,10 +944,48 @@ Four sidecar fields on `run.json` capture remote lifecycle state:
 - `killed_at` — ISO timestamp written by an explicit
   `pila --kill <run-id>`. Marks the run as terminated by user request;
   the machine has been destroyed and the run is no longer resumable.
+- `sync_failed_at` — ISO timestamp written when the clean-exit branch
+  of `decide_teardown` ran `fetch_branch` and it failed. The machine
+  is left RUNNING (not stopped — see below); the user recovers by
+  running `pila --finalize <id>` (retry sync + push) or
+  `pila --kill <id>` (destroy after manually salvaging work).
+- `sync_fail_reason` — short tag accompanying `sync_failed_at`
+  (`sync-failed-on-clean-exit`).
 
 `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive — a
-run cannot be in more than one terminal-or-paused state. The
-orchestrator's `_validate_run_json` enforces the invariant.
+run cannot be in more than one terminal-or-paused state.
+`sync_failed_at` is orthogonal (the machine is neither paused nor
+destroyed; it's running with unsynced work) but mutex-checked
+against `pushed_at` (a pushed run cannot be sync-failed) and
+`killed_at` (a destroyed machine cannot be sync-failed). The
+orchestrator's `_validate_run_json` enforces all invariants.
+
+**Sync-before-destroy (load-bearing — the "never lose work"
+contract).** The clean-exit branch (rc=0/10/75) does NOT destroy
+the machine first and hope the user runs `pila --finalize` later.
+That ordering is wrong: the orchestrator's committed work and the
+`.pila/runs/<id>/` state directory live ONLY on the machine until
+they are streamed back. Destroying the machine while the user has
+no host-side copy throws the work away unrecoverably.
+
+Instead, `decide_teardown` sources `fetch-branch.sh` and runs
+`fetch_branch` (git bundle of the run branch + tar of
+`.pila/runs/<id>/`) BEFORE calling `destroy_machine`. Only on
+confirmed sync success does it destroy. On any sync failure
+(network blip, bundle creation failure, etc.), the machine is
+LEFT RUNNING — not stopped — and a multi-line WARNING points the
+user at three recovery commands:
+
+  1. `pila --finalize <run-id>`  (retry sync + push)
+  2. `pila --attach <run-id>`    (manual inspection)
+  3. `pila --kill <run-id>`      (destroy AFTER user confirms
+                                  work is safely on host)
+
+The user owns the machine in this state. pila does NOT auto-
+destroy after a successful manual finalize either — the user must
+explicitly `--kill`. The reclassified table (line 893+) already
+documented the "destroy *after* stream-back" intent; this is the
+mechanism that enforces it.
 
 **The user-visible verb surface.** Five explicit verbs cover the
 remote run lifecycle, each doing exactly one thing:
@@ -1974,9 +2020,10 @@ becomes verified only after the corresponding code lands and a first run
 exercises it.
 
 Remote-mode features stack on the host-side finalize path described
-in §6 *Finalization*. `--runtime fly` provisioning, two-channel
-seeding, stream-back finalize, and remote pause-on-failure all depend
-on the run-branch-as-durable-record contract. Verifying them
+in §6 *Finalization*. `--runtime fly` provisioning, git-aware
+host-to-machine seeding, stream-back finalize (sync-before-destroy),
+and remote pause-on-failure all depend on the run-branch-as-durable-
+record contract. Verifying them
 end-to-end requires the local-mode finalize to be exercised first;
 stacking new features on an unproven foundation is the failure mode
 this section is meant to surface.

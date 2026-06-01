@@ -1378,10 +1378,12 @@ if [ "$RUNTIME" = "fly" ]; then
   # Ctrl-C or crash can leak a machine.
   #
   # seed-auth.sh seeds Claude config + git identity so `claude -p` workers can
-  # authenticate and commit. seed-repo.sh provides two-channel repo seeding:
-  # git clone --filter=blob:none for the committed bulk, then rsync of the local
-  # dirty set via flyctl machine exec tar. Orchestration inside the machine
-  # follows after both seedings succeed.
+  # authenticate and commit. seed-repo.sh tar-pipes a git-aware payload to /work
+  # via `flyctl ssh console -C "tar -xC /work"` — `git ls-files` honors
+  # .gitignore + `.git/` verbatim + force-include the repo's .claude/ + always
+  # skip .pila/. No in-machine `git clone` (the machine deliberately has no
+  # GitHub credentials). Orchestration inside the machine follows after both
+  # seedings succeed.
   echo "[pila] remote: starting Fly.io machine (--runtime fly / PILA_RUNTIME=fly / pila.toml runtime=fly)" >&2
 
   # Preflight: ensure flyctl is on PATH and authenticated. require_flyctl
@@ -1690,12 +1692,13 @@ PY
           _tail_script="$(render_tail_wrapper)"
 
           # Prepend an env-var assignment to the wrapper script so the
-          # run-id reaches the wrapper via $PILA_TAIL_RUN_ID even on
-          # transports that drop positional args (e.g.
-          # `flyctl ssh console --command` — see attach.sh --tail). The
-          # `flyctl machine exec ... --` path also passes "$PILA_RUN_ID"
-          # positionally; the wrapper's `${PILA_TAIL_RUN_ID:-$1}` lookup
-          # prefers the env var when present.
+          # run-id reaches the wrapper via $PILA_TAIL_RUN_ID. Current
+          # flyctl transports (ssh console -C, and the deprecated
+          # machine exec form) both pass the remote command as a
+          # single string, not as argv after `--`. The wrapper's
+          # `${PILA_TAIL_RUN_ID:-$1}` fallback consults the env var
+          # first; the env-var prefix below makes that the source of
+          # truth.
           _tail_invocation="PILA_TAIL_RUN_ID='$PILA_RUN_ID'; export PILA_TAIL_RUN_ID
 $_tail_script"
           orch_rc=0

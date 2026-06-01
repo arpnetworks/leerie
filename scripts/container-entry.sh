@@ -19,11 +19,14 @@ ulimit -c 0
 cd /work
 
 # When invoked with no args (remote/Fly path), idle as PID 1 so the
-# machine stays up. The remote launcher invokes the orchestrator via
-# `flyctl machine exec python3 pila.py ...` separately; the container
-# entrypoint just needs to keep the namespace alive. Local nerdctl
-# always passes argv (the task + flags), so this branch never fires
-# in local mode.
+# machine stays up. The remote launcher invokes the orchestrator
+# separately by piping a Python wrapper through
+# `flyctl ssh console -C "python3 -"` (the wrapper uses
+# subprocess.Popen with start_new_session=True + user="pila" so the
+# orchestrator detaches cleanly with the right identity). The
+# container entrypoint just needs to keep the namespace alive. Local
+# nerdctl always passes argv (the task + flags), so this branch
+# never fires in local mode.
 if [ "$#" -eq 0 ]; then
   exec sleep infinity
 fi

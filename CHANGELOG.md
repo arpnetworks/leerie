@@ -11,6 +11,126 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.5] - 2026-06-01
 
+This release makes `pila --runtime fly` work end-to-end. Validated by
+a live remote run on `enricai/tab-groups-focus` that opened
+[PR #1](https://github.com/enricai/tab-groups-focus/pull/1). Three
+themes: (1) catch up to current flyctl's interface, (2) make the
+in-machine environment correct for the orchestrator + workers, and
+(3) guarantee the user's work is never lost on machine teardown.
+
+### Added
+
+- **`sync_failed_at` + `sync_fail_reason` sidecar fields on
+  `run.json`** — set by `decide_teardown`'s clean-exit branch when
+  `fetch_branch` fails. Orthogonal to `paused_at`/`pushed_at`/
+  `killed_at` (the machine is neither paused nor destroyed; it's
+  running with un-synced work). Mutex-checked against `pushed_at`
+  and `killed_at` by `_validate_run_json`. Surfaces in `pila --list`
+  as new derived status `sync-failed-running`.
+- **`host_no_push` field on `fly-machine.json`** — captures the
+  user's actual `--no-push` intent at launch time. Separate from
+  `run.json.no_push` (which is the mechanism flag the launcher
+  always forces on the in-Fly orchestrator, since the machine can't
+  push). `pila --finalize` consults `host_no_push` to decide whether
+  to skip the push.
+- **`pila --finalize` already-synced fast-path** — when the host
+  already has `run.json` with `finished_at`, `state.json`, and the
+  local run branch (i.e. the auto-sync-on-teardown already ran),
+  `--finalize` short-circuits past `fetch_branch` straight to
+  `host_finalize`. This is the path the user hits after a clean
+  remote-run completion; the Fly machine is already destroyed by
+  then, so attempting to `fetch_branch` again would fail.
+- **`seed-auth.sh` pre-warms `claude --version`** — the FIRST
+  invocation of `claude --version` on a cold Fly machine takes
+  ~17 s (Node + statsig cold start); subsequent calls return in
+  <0.2 s. seed-auth runs it once as the pila user immediately
+  after credentials are in place, so the orchestrator's preflight
+  call hits warm caches.
+
+### Changed
+
+- **Orchestrator source baked at `/opt/pila-image/`** (was
+  `/work/.pila-image/`). Lives outside `/work` so the remote-seed
+  phase can `rm -rf /work` (or empty-its-contents equivalent) freely
+  without clobbering the orchestrator code. Local runs bind-mount
+  `$PILA_REPO:/opt/pila-image:ro` — same path inside the container
+  in both modes.
+- **Repo seeding is now single-channel git-aware**, not two-channel
+  clone-plus-rsync. The host has the full repo and Fly machines
+  deliberately receive no GitHub credentials (DESIGN §6
+  *Finalization*: workers commit on the machine, the host pushes
+  via `pila --finalize`), so the right design is to ship the
+  working tree directly. `seed_repo_clone` now tar-pipes a payload
+  built from `git ls-files -z --cached --others --exclude-standard`
+  (honors `.gitignore` at any depth) + `.git/` verbatim + the
+  repo's local `.claude/` verbatim (force-included even if
+  gitignored — workers need hooks/settings/plugins) − `.pila/`
+  always (host-side run state).
+- **`decide_teardown` on clean exit (rc=0/10/75) now syncs before
+  destroying.** Earlier behavior was destroy-then-rely-on-the-user-
+  to-finalize, which lost work if `fetch_branch` later failed.
+  New behavior: source `fetch-branch.sh`, run `fetch_branch` BEFORE
+  `destroy_machine`. On sync success, destroy and print the
+  finalize hint. On sync failure, leave the machine RUNNING (not
+  stopped) with `sync_failed_at` written to the sidecar and a
+  multi-line WARNING listing recovery commands (`pila --finalize`
+  to retry, `pila --attach` to inspect, `pila --kill` to destroy
+  only after work is safely on host). Matches DESIGN §6's "destroy
+  *after stream-back*" intent.
+- **Container entrypoint idles when invoked with no argv.** Fly
+  starts the entrypoint as PID 1; previously it tried to exec the
+  orchestrator with no task and exited 1, crash-looping the
+  machine. Now `cd /work && exec sleep infinity` when `$#` is 0;
+  the launcher exec's the orchestrator separately via
+  `flyctl ssh console -C "python3 -"`. Local nerdctl always
+  passes argv, so the idle branch never fires there.
+- **In-Fly orchestrator runs as the pila user with explicit env.**
+  The detached-launch wrapper passes `user="pila"`,
+  `group=<pila gid>`, `env={HOME=/home/pila, USER=pila, PATH
+  includes mise bin}`, `cwd="/work"` to `subprocess.Popen`. The
+  hallpass ssh-console session lands as root with `HOME=/root`,
+  which made claude look for credentials in the wrong place; this
+  fixes that and ensures files created by the orchestrator are
+  owned by pila.
+- **Claude home stage shrunk 642 MB → 234 MB** by adding
+  `.claude/local` to `CLAUDE_SKIP` in the launcher. That directory
+  is the host's npm install of `@anthropic-ai/claude-code` (~408
+  MB), which the pila image already installs globally via the
+  Dockerfile — pure dead weight on the seed transfer.
+- **`fetch_branch` discover step captures stderr to a separate
+  tmpfile** rather than merging via `2>&1`. flyctl's "Connecting
+  to fdaa:..." stderr was being parsed as the first stdout line,
+  shifting the discovered run_id / branch / no_push by one and
+  corrupting the bundle target. The runtime symptom was a silent
+  "empty bundle" error against a non-existent branch.
+- **`fetch_branch` skips the bundle by probing branch existence**
+  (`git rev-parse --verify refs/heads/<branch>`) rather than by
+  reading `run.json.no_push`. The latter is the mechanism flag the
+  launcher forces on the in-Fly orchestrator (not a user-intent
+  flag); using it as a proxy for "no branch was materialized"
+  conflated the two cases. After tar-extracting the run state dir
+  to the host, the mechanism flag is stripped from the host-side
+  `run.json` so `host_finalize` doesn't conflate intent either.
+- **`/work` is emptied via `find /work -mindepth 1 -maxdepth 1
+  -exec rm -rf {} +`** rather than `rm -rf /work && mkdir -p /work`.
+  The latter replaces the directory's inode; any process holding a
+  prior fd (the ssh-console shell about to spawn the orchestrator)
+  ends up with a stale cwd, producing `getcwd: ENOENT` cascades
+  inside child processes.
+- **All `flyctl machine exec ... -- argv` call sites migrated to
+  `flyctl ssh console -C "<cmd>"`.** Current flyctl dropped both
+  `--stdin` on `machine exec` and the post-`--` argv form. ssh
+  console is the only flyctl transport that (a) takes the command
+  as a single string and (b) forwards host stdin. Affects
+  seed-auth, seed-repo, fetch-branch, re-seed, the launcher's
+  detached-orchestrator launch, the handover-cat for bootstrap
+  resolution, and the tail-wrapper stream.
+- **`_check_claude_cli_version` timeout bumped 10 s → 30 s**
+  (orchestrator preflight). Combined with the seed-auth pre-warm
+  this is belt-and-braces — the warm cache makes the call return
+  in <0.2 s, but the larger timeout protects against transient
+  network slowness on the statsig call.
+
 ### Fixed
 
 - **Force fresh image build by bumping pila version from 0.2.1 to
@@ -43,6 +163,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   machine status` text output, not `--json`.** Same root cause as
   above (`flyctl machine status` doesn't accept `--json` either).
   Parses `State: <state>` from text via the same sed+awk pipeline.
+- **`/work/.pila`, `/work/.pila/runs`, and the run dir are all
+  chowned to pila** by the detached-orchestrator launch wrapper.
+  Previously only the deepest run dir was chowned; the orchestrator
+  (as pila) then failed when promoting a bootstrap-id dir to its
+  final id with `PermissionError` against the root-owned parent.
+- **`require_fly_ssh` skips `flyctl ssh issue` when the ssh-agent
+  already has a Fly cert.** Detected via `ssh-add -l` showing any
+  `(ED25519-CERT)` entry (regular SSH key authentication doesn't
+  put certs in the agent — only Fly's hallpass does for this user).
+  Survives Fly cert-API outages where the issue endpoint returns
+  500 even though the existing cert is still valid for hours.
+- **Hallpass cold-start wait (`wait_for_fly_ssh_ready`)** polls
+  `flyctl ssh console --pty=false -C true` against the target
+  machine until success (bounded by ~60 s). Without this, the
+  first ssh-console call against a freshly-started machine would
+  EOF with "handshake failed" — hallpass takes 5-30 s to come up
+  after `flyctl machine start` reports "started".
+- **Retry on transient `tunnel unavailable`.** A cold flyctl agent
+  occasionally returns "Error: tunnel unavailable: Error contacting
+  Fly.io API when probing 'personal': timed out (context deadline
+  exceeded)" within ~7 s on its first ssh-console call.
+  `flyctl agent restart` reliably clears it; the launcher does
+  this once on the documented transient pattern, then retries.
+- **`COPYFILE_DISABLE=1` on host-side `tar -c`** silences macOS BSD
+  tar's `LIBARCHIVE.xattr.com.apple.provenance` warnings the remote
+  GNU tar otherwise emits per-file. Cosmetic; no-op on Linux hosts.
+- **Git identity written to `/home/pila/.gitconfig`** (was
+  `--global`, which under su-as-root would land in `/root/.gitconfig`
+  where the pila user can't read it).
+- **`chown pila:` (numeric primary group)** in seed-auth and
+  seed-repo, not `chown pila:pila`. The pila user's primary GID is
+  numeric (HOST_GID, defaults to 20 / staff on macOS hosts) and is
+  not necessarily a group literally named `pila`.
 
 ### Added
 

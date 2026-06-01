@@ -8,7 +8,7 @@
 # so the existing host-side finalize block (git push + gh pr create) can run
 # unchanged with the host's own auth.
 #
-# Two-channel fetch (mirror of seed-repo.sh's two-channel seed):
+# Two-channel fetch back to host:
 #
 #   1. Run branch — git bundle piped from machine to host, then fetched into
 #      the host's local repo.  A bundle is the correct mechanism because the
@@ -19,6 +19,10 @@
 #   2. Run state — .pila/runs/<run-id>/ tarred on the machine and piped to the
 #      host.  The host-side finalize reads run.json and state.json from this
 #      directory; they are not in git.
+#
+# (The seed direction — host to machine — is single-channel: tar-pipe a
+# git-aware payload of `git ls-files` + `.git/` + force-included `.claude/`
+# minus `.pila/` directly to /work. See scripts/remote/seed-repo.sh.)
 #
 # Usage (called by the pila launcher after remote orchestration exits 0):
 #

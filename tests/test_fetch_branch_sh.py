@@ -112,6 +112,14 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path, git_repo: Path) ->
         '  python3*-c*)\n'
         f'    exec python3 {discover_py}\n'
         '    ;;\n'
+        '  git*rev-parse*--verify*)\n'
+        # rewrite "git -C /work rev-parse --verify refs/heads/<branch>"
+        # → "git -C $REPO rev-parse --verify refs/heads/<branch>" so the
+        # probe consults the test fixture's local refs.
+        '    NEWCMD="${CMD//\\/work/$REPO}"\n'
+        '    eval "$NEWCMD"\n'
+        '    exit $?\n'
+        '    ;;\n'
         '  git*bundle*create*)\n'
         # rewrite "git -C /work bundle create - <branch>" → "git -C $REPO bundle create - <branch>"
         '    NEWCMD="${CMD//\\/work/$REPO}"\n'
@@ -279,35 +287,41 @@ def test_fetch_branch_streams_bundle_and_state(tmp_path):
     assert "fetch complete" in result.stderr or run_id in result.stderr
 
 
-def test_fetch_branch_skips_bundle_when_no_push(tmp_path):
+def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
     """A cleared-but-empty terminal-state run on the Fly machine
-    (DESIGN §8) has `no_push=true` in run.json and no run branch was
-    materialized (setup-run.sh never ran). fetch_branch must:
-      - succeed (return 0)
-      - skip the Step-2 bundle fetch (no run branch to bundle)
-      - still stream the Step-3 state directory back so `pila --list`
-        shows the run as `done-local` and the launcher's host-side
-        finalize block honors run.json.no_push and exits 0.
+    (DESIGN §8) finishes cleanly but never ran setup-run.sh, so the
+    run branch was never materialized. fetch_branch must:
+      - probe branch existence on the machine via
+        `git rev-parse --verify refs/heads/<branch>`
+      - skip the bundle step when the probe fails (exit non-zero)
+      - succeed overall (return 0)
+      - still stream the state directory back so `pila --list`
+        shows the run as `done-local`.
 
-    Without this skip, the bundle step would fail with "git bundle is
-    empty — run branch may not exist on machine", fetch_branch would
-    return 1, and the Fly no-work run would be misreported as a fetch
-    failure."""
+    Critically, fetch_branch must NOT use `run.json.no_push` as a
+    proxy for "no branch was materialized" — `no_push=true` is the
+    mechanism flag the launcher always forces on the in-Fly
+    orchestrator (the machine can't push). Using it as the probe
+    would also skip the bundle for runs the user wants pushed.
+
+    Without the branch-existence probe, the bundle step would fail
+    with "git bundle is empty — run branch may not exist on machine"
+    and the no-work run would be misreported as a fetch failure."""
     repo = _make_git_repo(tmp_path)
 
     run_id = "bugfix-already-done-cafe42"
     run_branch = f"pila/runs/{run_id}"
 
-    # Critically: do NOT create the run branch in the host repo. The
-    # Fly machine never ran setup-run.sh, so the branch doesn't exist
-    # there either — and fetch_branch must not even try to bundle it.
+    # Critically: do NOT create the run branch in the host repo or
+    # any test fixture — the stub's git rev-parse --verify probe will
+    # see no such ref and fetch_branch must skip the bundle step.
 
     machine_runs = tmp_path / "machine_runs"
     run_dir = machine_runs / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "finished_at": "2026-05-31T20:00:00Z",
-        "no_push": True,
+        "no_push": True,  # mechanism flag from in-Fly orchestrator; NOT the trigger
         "branch": run_branch,
         "working_branch": "main",
     }))
@@ -329,18 +343,18 @@ def test_fetch_branch_skips_bundle_when_no_push(tmp_path):
     )
     # Must succeed.
     assert result.returncode == 0, (
-        f"fetch_branch should return 0 for no-work runs (skip bundle, "
+        f"fetch_branch should return 0 for no-branch runs (skip bundle, "
         f"still stream state). stderr:\n{result.stderr}"
     )
-    # Bundle step is skipped — must log the skip and must NOT log a
-    # bundle creation or "git bundle is empty" error.
-    assert "no_push=true" in result.stderr or "skipping branch bundle" in result.stderr, (
-        f"fetch_branch should log that the bundle is skipped. "
-        f"stderr:\n{result.stderr}"
+    # Bundle step is skipped — must log the skip and must NOT attempt
+    # a bundle (which would fail).
+    assert "not present on machine" in result.stderr or "skipping bundle" in result.stderr, (
+        f"fetch_branch should log that the bundle is skipped on missing "
+        f"branch. stderr:\n{result.stderr}"
     )
     assert "bundle is empty" not in result.stderr, (
-        f"fetch_branch must not attempt the bundle step on no_push runs. "
-        f"stderr:\n{result.stderr}"
+        f"fetch_branch must not attempt the bundle step when the branch "
+        f"is missing. stderr:\n{result.stderr}"
     )
     # The branch should NOT have been created in the host repo (no
     # bundle was fetched).

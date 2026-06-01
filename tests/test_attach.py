@@ -458,8 +458,13 @@ def test_destroy_removes_pid_keyed_record(tmp_path: Path):
     user_repo = tmp_path / "user-repo"
     user_repo.mkdir()
     # Run-in-subshell so the EXIT trap fires; then check the directory.
+    # On clean exit decide_teardown runs `_try_fetch_branch_for_teardown`
+    # BEFORE destroy_machine — we override it to return success (the
+    # real one needs the live flyctl tunnel + a completed run on the
+    # machine, neither of which exist in this stubbed harness).
     result = _run_bash(
         f"( source {PROVISION_SH}; "
+        f"  _try_fetch_branch_for_teardown() {{ return 0; }}; "
         f"  USER_REPO={user_repo}; export USER_REPO; "
         f"  provision_machine; "
         f"  echo \"during=$(ls {user_repo}/.pila/remote/ 2>/dev/null | wc -l)\"; "

@@ -142,13 +142,25 @@ def test_stop_machine_calls_flyctl_stop(tmp_path: Path):
 
 # --- provision.sh: decide_teardown classification -------------------------
 
-def _decide_teardown_with_rc(tmp_path: Path, rc: str, run_id: str = "test-run-001") -> tuple[subprocess.CompletedProcess, Path]:
+def _decide_teardown_with_rc(
+    tmp_path: Path,
+    rc: str,
+    run_id: str = "test-run-001",
+    fetch_branch_succeeds: bool = True,
+) -> tuple[subprocess.CompletedProcess, Path]:
     """Run decide_teardown with PILA_REMOTE_EXIT_RC=$rc.
 
     Sets up:
       - stub flyctl that records argv
       - USER_REPO with a .pila/runs/$run_id/run.json sidecar
       - PILA_MACHINE_ID=mach-test
+      - On clean-exit branches (rc=0/10/75) decide_teardown calls
+        `_try_fetch_branch_for_teardown` BEFORE destroy_machine.
+        We override that helper to return either 0 (success — the
+        host now has the work, destroy proceeds) or 1 (sync
+        failed — machine stays running, sync_failed_at written).
+        Tests that don't care about the fetch step set
+        fetch_branch_succeeds=True (default).
 
     Returns (CompletedProcess, sidecar Path).
     """
@@ -158,8 +170,15 @@ def _decide_teardown_with_rc(tmp_path: Path, rc: str, run_id: str = "test-run-00
     run_dir.mkdir(parents=True)
     sidecar = run_dir / "run.json"
     sidecar.write_text(json.dumps({"run_id": run_id, "branch": f"pila/runs/{run_id}"}))
+    fetch_rc = "0" if fetch_branch_succeeds else "1"
     script = (
         f"source {PROVISION_SH}; "
+        # Override the fetch_branch helper. The real one sources
+        # fetch-branch.sh and runs fetch_branch against the live
+        # flyctl tunnel — both unstubbable here. Tests assert the
+        # decide_teardown dispositions, not fetch_branch internals
+        # (those are covered in test_fetch_branch_sh.py).
+        f"_try_fetch_branch_for_teardown() {{ return {fetch_rc}; }}; "
         f"PILA_MACHINE_ID=mach-test; "
         f"decide_teardown"
     )
@@ -200,6 +219,37 @@ def test_decide_teardown_rc75_destroys(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
     assert "machine destroy mach-test" in invocations
+
+
+def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
+    """rc=0 with fetch_branch FAILURE → leave machine RUNNING; write
+    sync_failed_at to the sidecar; print recovery WARNING.
+
+    This is the load-bearing "never lose work" branch: even on clean
+    orchestrator exit, if the sync step that pulls the run branch +
+    state back to the host can't succeed, the machine must NOT be
+    destroyed — the user's paid LLM work is still on it. The user
+    sees a multi-line WARNING and recovers via `pila --finalize`,
+    `pila --attach`, or finally `pila --kill` once work is safe."""
+    result, sidecar = _decide_teardown_with_rc(
+        tmp_path, "0", run_id="my-run", fetch_branch_succeeds=False,
+    )
+    assert result.returncode == 0, result.stderr
+    invocations = (tmp_path / "flyctl.log").read_text() if (tmp_path / "flyctl.log").exists() else ""
+    # Machine must NOT be destroyed and must NOT be stopped — the
+    # whole point is to leave it running so the user can recover.
+    assert "machine destroy" not in invocations
+    assert "machine stop" not in invocations
+    # Sidecar must record the failure for `pila --list` to surface.
+    data = json.loads(sidecar.read_text())
+    assert data.get("sync_failed_at") is not None
+    assert data.get("sync_fail_reason") == "sync-failed-on-clean-exit"
+    assert data.get("fly_machine_id") == "mach-test"
+    # Recovery guidance must be printed.
+    assert "sync from machine to host FAILED" in result.stderr
+    assert "pila --finalize my-run" in result.stderr
+    assert "pila --attach my-run" in result.stderr
+    assert "pila --kill my-run" in result.stderr
 
 
 def test_decide_teardown_rc130_detaches(tmp_path: Path):
