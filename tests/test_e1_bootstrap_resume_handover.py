@@ -185,9 +185,13 @@ def test_not_resumed_skips_rewrite(tmp_path: Path):
 def test_no_handover_leaves_bootstrap_id_unchanged(tmp_path: Path):
     """If the machine doesn't have a handover file (orchestrator hadn't
     yet renamed before pause), the launcher leaves PILA_RUN_ID alone
-    and proceeds with the bootstrap id — the orchestrator's resume will
-    work in that case because the bootstrap dir still exists on the
-    machine."""
+    and proceeds with the bootstrap id. The downstream orchestrator
+    then needs the F1 carve-out in resolve_run_id to accept the
+    explicit `_bootstrap-*` --run-id (the default discover_runs filter
+    would otherwise skip the bootstrap dir and die). This test only
+    covers the launcher-side rewrite (or lack thereof); the
+    orchestrator-side carve-out is tested in
+    test_resolve_run_id.py::test_resolve_explicit_bootstrap_id_accepted_when_state_json_exists."""
     # Stub flyctl that returns nothing (no handover).
     stub = tmp_path / "flyctl"
     stub.write_text(

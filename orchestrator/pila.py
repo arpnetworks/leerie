@@ -1982,12 +1982,29 @@ def resolve_run_id(pila_root: Path, cli_run_id: str | None) -> str:
       where there's only one run in flight.
     - Else die: multiple runs and no `--run-id` is ambiguous.
 
+    Bootstrap-id carve-out: when `cli_run_id` is `_bootstrap-<hex>` AND
+    a matching dir exists on disk with a `state.json`, accept it even
+    though `discover_runs` filters bootstrap dirs by default. This
+    handles the narrow case where the user paused a remote run via
+    `pila --stop` *before* phase_classify completed: the run dir on
+    the machine is still `_bootstrap-<hex>`, the handover file doesn't
+    exist yet, and the launcher's E1 logic correctly leaves
+    PILA_RUN_ID alone. The orchestrator then needs to resume against
+    the bootstrap dir without dying. DESIGN §6 *Detached orchestrator
+    (remote mode)*.
+
     Never guesses across multiple runs. `--resume` against an ambiguous
     repo is a hard error, not a heuristic."""
     runs = discover_runs(pila_root)
     if cli_run_id is not None:
         for r in runs:
             if r["run_id"] == cli_run_id:
+                return cli_run_id
+        # Bootstrap-id carve-out (see docstring): allow explicit
+        # _bootstrap-* even though discover_runs filters those out.
+        if cli_run_id.startswith("_bootstrap-"):
+            candidate = pila_root / "runs" / cli_run_id
+            if (candidate / "state.json").is_file():
                 return cli_run_id
         available = ", ".join(r["run_id"] for r in runs) or "(none)"
         die(
