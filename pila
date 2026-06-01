@@ -1322,6 +1322,52 @@ except Exception:
       _provisioned=true
     fi
 
+    # E1: when resuming a bootstrap-id paused via `pila --stop`, the
+    # orchestrator on the machine has already renamed its run dir to
+    # the final id via State.rename_to. Resuming with --run-id
+    # _bootstrap-XXX would die in resolve_run_id (which skips
+    # `_bootstrap-*` dirs). The orchestrator wrote the final id back to
+    # /work/.pila/launcher-<bootstrap>.runid before renaming — read it
+    # over SSH, then rewrite PILA_RUN_ID and the --run-id element of
+    # REWRITTEN_ARGS before the orchestrator is exec'd. Migrate the
+    # host-side run dir (D2 created `_bootstrap-XXX/run.json`) to the
+    # final id so `pila --list` and subsequent verbs find the run by
+    # its real name.
+    if [ "$_resumed" = "true" ] && \
+       [ -n "$PILA_RUN_ID" ] && \
+       [[ "$PILA_RUN_ID" == _bootstrap-* ]]; then
+      _bootstrap_pid="$PILA_RUN_ID"
+      _final_id="$(flyctl machine exec "$PILA_MACHINE_ID" \
+                     --app "$FLY_APP" \
+                     -- cat "/work/.pila/launcher-${_bootstrap_pid}.runid" \
+                     2>/dev/null | head -1 | tr -d '[:space:]' || true)"
+      if [ -n "$_final_id" ] && [ "$_final_id" != "$_bootstrap_pid" ]; then
+        echo "[pila] remote: bootstrap id ${_bootstrap_pid} promoted to ${_final_id} on machine — rewriting PILA_RUN_ID" >&2
+        # Migrate host-side run dir if needed.
+        _host_boot_dir="$USER_REPO/.pila/runs/${_bootstrap_pid}"
+        _host_final_dir="$USER_REPO/.pila/runs/${_final_id}"
+        if [ -d "$_host_boot_dir" ] && [ ! -d "$_host_final_dir" ]; then
+          mv "$_host_boot_dir" "$_host_final_dir" 2>/dev/null || true
+        fi
+        # Rewrite PILA_RUN_ID and any `--run-id <bootstrap>` element in
+        # REWRITTEN_ARGS (the user typed `--resume --run-id <bootstrap>`,
+        # the loop at line ~920 passed it through).
+        PILA_RUN_ID="$_final_id"
+        export PILA_RUN_ID
+        _rewritten_count="${#REWRITTEN_ARGS[@]}"
+        _i=0
+        while [ "$_i" -lt "$_rewritten_count" ]; do
+          if [ "${REWRITTEN_ARGS[$_i]}" = "--run-id" ] && \
+             [ "$((_i + 1))" -lt "$_rewritten_count" ] && \
+             [ "${REWRITTEN_ARGS[$((_i + 1))]}" = "$_bootstrap_pid" ]; then
+            REWRITTEN_ARGS[$((_i + 1))]="$_final_id"
+            break
+          fi
+          _i=$((_i + 1))
+        done
+      fi
+    fi
+
     if [ "$_provisioned" = "true" ]; then
       # Machine is running and reachable. Seed Claude config + git identity
       # so `claude -p` workers can authenticate and commit, then seed the
