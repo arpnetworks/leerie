@@ -297,7 +297,12 @@ case "${1:-}" in
     destroy_machine
     # Bootstrap run.json from fly-machine.json if needed (in-flight
     # kill before classify) so killed_at + fly_machine_id are recorded
-    # somewhere `pila --list` will find them.
+    # host-side for forensics. Note: a bootstrap-id killed run does NOT
+    # appear in `pila --list` because `discover_runs` requires
+    # state.json (which only the orchestrator writes); the run.json
+    # written here is for audit-trail purposes only. Non-bootstrap kills
+    # already have state.json from a prior fetch_branch or local run,
+    # so they do appear in --list with status=killed-remote.
     if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
       _ensure_run_json "$_kill_run_dir" || true
       _kill_sidecar="$_kill_run_dir/run.json"
