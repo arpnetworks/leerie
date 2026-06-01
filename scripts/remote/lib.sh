@@ -307,8 +307,17 @@ wait_for_fly_ssh_ready() {
   local attempts=0
   local max_attempts=12
   while [ "$attempts" -lt "$max_attempts" ]; do
-    if timeout 10 flyctl ssh console --app "$fly_app" \
-         --machine "$machine_id" --pty=false -C "true" >/dev/null 2>&1; then
+    # `</dev/null` is load-bearing: if stdin is a TTY (the normal
+    # case when pila is run interactively), flyctl ssh console hangs
+    # after the SSH session is established — empirically observed,
+    # 11+ minutes without returning. Detaching stdin lets flyctl
+    # complete the -C "true" command and exit cleanly in <5 s.
+    # `--kill-after=2` ensures `timeout` escalates SIGTERM to
+    # SIGKILL after a 2 s grace period; some flyctl code paths
+    # ignore SIGTERM while waiting on the WireGuard tunnel.
+    if timeout --kill-after=2 10 flyctl ssh console --app "$fly_app" \
+         --machine "$machine_id" --pty=false -C "true" \
+         </dev/null >/dev/null 2>&1; then
       return 0
     fi
     attempts=$((attempts + 1))
