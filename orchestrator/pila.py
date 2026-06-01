@@ -1784,17 +1784,19 @@ def compute_subtask_branch(run_id: str, sid: str) -> str:
 # --- run.json sidecar invariants (IMPLEMENTATION.md §8) -----------------
 
 def _validate_run_json(data: dict) -> None:
-    """Enforce the four logical invariants on a `run.json` sidecar.
+    """Enforce the logical invariants on a `run.json` sidecar.
 
     1. `pushed_at` and `push_error` are mutually exclusive (at most one
        is non-null).
     2. `pr_url` and `pr_error` are mutually exclusive.
     3. If `pr_url` is set, `pushed_at` must be set (cannot have a PR
        without a successful push).
-    4. `paused_at` and `pushed_at` are mutually exclusive (a run cannot
-       be both paused and finalized). If `paused_at` is set,
-       `fly_machine_id` must also be set — you cannot pause a run
-       without knowing where to resume it.
+    4. `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive
+       (a run cannot be in more than one terminal-or-paused state).
+    5. If `paused_at` is set, `fly_machine_id` must also be set — you
+       cannot pause a run without knowing where to resume it.
+    6. If `killed_at` is set, `fly_machine_id` must also be set — you
+       cannot have destroyed a machine you don't have a pointer to.
 
     Raises ValueError on any violation. Caller (e.g., `pila --list`)
     decides whether to die, warn, or render as `status=corrupt-sidecar`."""
@@ -1805,6 +1807,7 @@ def _validate_run_json(data: dict) -> None:
     pr_url = data.get("pr_url")
     pr_error = data.get("pr_error")
     paused_at = data.get("paused_at")
+    killed_at = data.get("killed_at")
     fly_machine_id = data.get("fly_machine_id")
     if pushed_at is not None and push_error is not None:
         raise ValueError(
@@ -1821,15 +1824,22 @@ def _validate_run_json(data: dict) -> None:
             "run.json invariant: pr_url is set but pushed_at is null; "
             "PR cannot succeed without a successful push"
         )
-    if paused_at is not None and pushed_at is not None:
+    # Mutual-exclusion across the three terminal/paused markers.
+    _set_states = sum(1 for v in (paused_at, pushed_at, killed_at) if v is not None)
+    if _set_states > 1:
         raise ValueError(
-            "run.json invariant: paused_at and pushed_at are both set; "
-            "a run cannot be both paused and finalized"
+            "run.json invariant: paused_at / pushed_at / killed_at are mutually "
+            "exclusive; at most one may be non-null"
         )
     if paused_at is not None and fly_machine_id is None:
         raise ValueError(
             "run.json invariant: paused_at is set but fly_machine_id is null; "
             "you cannot pause a run without knowing where to resume it"
+        )
+    if killed_at is not None and fly_machine_id is None:
+        raise ValueError(
+            "run.json invariant: killed_at is set but fly_machine_id is null; "
+            "you cannot have destroyed a machine you don't have a pointer to"
         )
 
 
@@ -2067,7 +2077,7 @@ def _format_age(seconds: float) -> str:
 
 # --- run status (consumed by `pila --list`) -------------------------
 
-# The seven derived statuses returned by `_derive_run_status`. Status is
+# The nine derived statuses returned by `_derive_run_status`. Status is
 # *derived* from run.json + state.json fields, not stored, so the value
 # rendered by --list is always consistent with the actual on-disk state.
 RUN_STATUSES = (
@@ -2079,6 +2089,7 @@ RUN_STATUSES = (
     "push-failed",
     "pr-failed",
     "paused-remote",
+    "killed-remote",
 )
 
 
@@ -2092,16 +2103,14 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
       4. pr_url set                → `done-pushed-pr`.
       5. pushed_at set             → `done-pushed-no-pr`.
       6. finished_at set           → `done-local` (run completed, --no-push).
-      7. paused_at set             → `paused-remote` (remote pause-on-failure).
-      8. otherwise                 → `in-progress`.
+      7. killed_at set             → `killed-remote` (explicit --kill).
+      8. paused_at set             → `paused-remote` (pause-on-failure or --stop).
+      9. otherwise                 → `in-progress`.
 
-    Precedence note: push/PR errors fire before the paused-remote check
+    Precedence note: push/PR errors fire before the paused/killed checks
     because a finalize that failed mid-write should surface as the error
-    it actually is, not as a pause. The invariant
-    (paused_at xor pushed_at) means a paused run can't have pushed_at,
-    but it can in principle have a stale push_error from a prior attempt
-    — checking errors first makes the rendered status match the action
-    the user needs to take.
+    it actually is. killed_at fires before paused_at because the kill
+    verb supersedes any prior pause state (the machine was destroyed).
 
     state_json is currently unused in the derivation but accepted for
     forward-compat: future statuses (e.g., 'blocked') may consult
@@ -2122,17 +2131,20 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
         return "done-pushed-no-pr"
     if rj.get("finished_at"):
         return "done-local"
+    if rj.get("killed_at"):
+        return "killed-remote"
     if rj.get("paused_at"):
         return "paused-remote"
     return "in-progress"
 
 
-def _collect_run_rows(pila_root: Path) -> list[tuple[str, str, str, str]]:
-    """Build (run_id, started_at, status, branch) rows for every run
-    under `pila_root/runs/`. Pure data-gathering; rendering is the
-    caller's concern."""
+def _collect_run_rows(pila_root: Path) -> list[tuple[str, str, str, str, str]]:
+    """Build (run_id, started_at, status, machine, branch) rows for every
+    run under `pila_root/runs/`. Pure data-gathering; rendering is the
+    caller's concern. `machine` is the Fly Machine ID for remote runs and
+    empty string for local runs."""
     runs = discover_runs(pila_root)
-    rows: list[tuple[str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, str]] = []
     for state in runs:
         run_id = state["run_id"]
         run_dir = pila_root / "runs" / run_id
@@ -2148,48 +2160,64 @@ def _collect_run_rows(pila_root: Path) -> list[tuple[str, str, str, str]]:
         status = _derive_run_status(run_json, state)
         started_at = state.get("started_at") or "—"
         branch = (run_json or {}).get("branch") or compute_run_branch(run_id)
-        rows.append((run_id[:50], started_at, status, branch))
+        machine = (run_json or {}).get("fly_machine_id") or ""
+        rows.append((run_id[:50], started_at, status, machine, branch))
     return rows
 
 
-def _render_run_table(rows: list[tuple[str, str, str, str]]) -> None:
-    """Print rows as a columnar table with auto-sized columns."""
-    w_id = max(len("run_id"), *(len(r[0]) for r in rows))
-    w_st = max(len("started_at"), *(len(r[1]) for r in rows))
-    w_status = max(len("status"), *(len(r[2]) for r in rows))
-    w_br = max(len("branch"), *(len(r[3]) for r in rows))
-    fmt = f"{{:<{w_id}}}  {{:<{w_st}}}  {{:<{w_status}}}  {{:<{w_br}}}"
-    print(fmt.format("run_id", "started_at", "status", "branch"))
-    print(fmt.format("-" * w_id, "-" * w_st, "-" * w_status, "-" * w_br))
-    for r in rows:
-        print(fmt.format(*r))
+def _render_run_table(rows: list[tuple[str, str, str, str, str]]) -> None:
+    """Print rows as a columnar table with auto-sized columns. The
+    `machine` column is auto-hidden when no row has a non-empty value."""
+    has_machine = any(r[3] for r in rows)
+    if has_machine:
+        w_id = max(len("run_id"), *(len(r[0]) for r in rows))
+        w_st = max(len("started_at"), *(len(r[1]) for r in rows))
+        w_status = max(len("status"), *(len(r[2]) for r in rows))
+        w_mach = max(len("machine"), *(len(r[3]) for r in rows))
+        w_br = max(len("branch"), *(len(r[4]) for r in rows))
+        fmt = f"{{:<{w_id}}}  {{:<{w_st}}}  {{:<{w_status}}}  {{:<{w_mach}}}  {{:<{w_br}}}"
+        print(fmt.format("run_id", "started_at", "status", "machine", "branch"))
+        print(fmt.format("-" * w_id, "-" * w_st, "-" * w_status, "-" * w_mach, "-" * w_br))
+        for r in rows:
+            print(fmt.format(r[0], r[1], r[2], r[3], r[4]))
+    else:
+        w_id = max(len("run_id"), *(len(r[0]) for r in rows))
+        w_st = max(len("started_at"), *(len(r[1]) for r in rows))
+        w_status = max(len("status"), *(len(r[2]) for r in rows))
+        w_br = max(len("branch"), *(len(r[4]) for r in rows))
+        fmt = f"{{:<{w_id}}}  {{:<{w_st}}}  {{:<{w_status}}}  {{:<{w_br}}}"
+        print(fmt.format("run_id", "started_at", "status", "branch"))
+        print(fmt.format("-" * w_id, "-" * w_st, "-" * w_status, "-" * w_br))
+        for r in rows:
+            print(fmt.format(r[0], r[1], r[2], r[4]))
 
 
-def list_runs(pila_root: Path) -> None:
+def list_runs(pila_root: Path, status_filter: str | None = None) -> None:
     """Render a sortable columnar table of runs to stdout. Used by
     `pila --list`. Reads run.json sidecar (commit 4) for status
     derivation; falls back to state.json fields for runs without a
-    sidecar (e.g., extremely-early failures before the rename, though
-    discover_runs filters those out)."""
+    sidecar.
+
+    `status_filter` (if given) restricts the table to rows whose derived
+    status matches. Validated against `RUN_STATUSES` by argparse before
+    this is called; an unknown value here renders an empty table."""
     rows = _collect_run_rows(pila_root)
+    if status_filter is not None:
+        rows = [r for r in rows if r[2] == status_filter]
     if not rows:
-        print("no runs under .pila/runs/")
+        if status_filter is not None:
+            print(f"no runs with status={status_filter}")
+        else:
+            print("no runs under .pila/runs/")
         return
     _render_run_table(rows)
 
 
 def list_paused_runs(pila_root: Path) -> None:
-    """Filter the run table to paused-remote entries. Used by
-    `pila --list-paused`. Reads the same sidecar source as `list_runs`;
-    the filter is on the derived status, not on `paused_at` directly,
-    so that the precedence rules in `_derive_run_status` apply (a
-    paused run that also has `push_error` renders as `push-failed`,
-    not `paused-remote`)."""
-    rows = [r for r in _collect_run_rows(pila_root) if r[2] == "paused-remote"]
-    if not rows:
-        print("no paused remote runs")
-        return
-    _render_run_table(rows)
+    """Deprecated alias: routes through `list_runs(status_filter=
+    "paused-remote")`. The new equivalent is `pila --list --status
+    paused-remote`. Kept for backward-compat."""
+    list_runs(pila_root, status_filter="paused-remote")
 
 
 def _read_toml_key(path: Path, key: str) -> str | None:
@@ -11172,10 +11200,24 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
         # phase_classify's worker (the classifier log under logs/)
         # survive the rename because they reference inodes, not paths.
         if st.run_id.startswith("_bootstrap-"):
+            bootstrap_run_id = st.run_id
             final_run_id = compute_run_id(
                 st.data.get("categories", []), task, st.data["started_at"])
             log(f"run id: {final_run_id}")
             st.rename_to(final_run_id)
+            # Handover file for the remote-mode launcher's tail wrapper. The
+            # launcher generated the bootstrap id host-side and is tailing
+            # `.pila/runs/<bootstrap_id>/orchestrator.log`. After this rename
+            # that path is gone; the launcher's wrapper polls
+            # `.pila/launcher-<bootstrap_id>.runid` to discover the final id
+            # and re-targets the tail. See DESIGN §6 *Detached orchestrator
+            # (remote mode)*. Safe (and harmless) for local runs — the file
+            # is just never read.
+            try:
+                handover = st.pila_root / f"launcher-{bootstrap_run_id}.runid"
+                handover.write_text(final_run_id + "\n")
+            except OSError:
+                pass
             # All subsequent calls in this function pass the new dir;
             # phase_execute / phase_finalize internally re-derive their
             # working dir from st.path.parent, so they automatically
@@ -11275,12 +11317,18 @@ def main() -> None:
                          "enumerate.")
     ap.add_argument("--list", action="store_true", dest="list_runs",
                     help="enumerate in-flight and completed runs in this "
-                         "repository (run id, started, status, branch). "
-                         "Exits without running orchestrate. Default: off")
+                         "repository (run id, started, status, machine, "
+                         "branch). The machine column auto-hides when no "
+                         "remote runs are present. Exits without running "
+                         "orchestrate. Default: off")
+    ap.add_argument("--status", metavar="STATE", dest="status_filter",
+                    choices=RUN_STATUSES,
+                    help=f"with --list, restrict the table to runs whose "
+                         f"derived status matches STATE. One of: "
+                         f"{', '.join(RUN_STATUSES)}.")
     ap.add_argument("--list-paused", action="store_true", dest="list_paused",
-                    help="like --list but filters to paused remote runs "
-                         "(DESIGN §6 Remote pause-on-failure). Exits "
-                         "without running orchestrate. Default: off")
+                    help="DEPRECATED: alias for --list --status paused-remote. "
+                         "Kept for backward-compat; prefer the explicit form.")
     ap.add_argument("--answers", metavar="FILE",
                     help="JSON file of pre-supplied clarification answers")
     ap.add_argument("--clarify", action="store_true",
@@ -11492,7 +11540,7 @@ def main() -> None:
     # be inspecting runs from outside a git repo.
     if args.list_runs:
         pila_root = Path(".pila").resolve()
-        list_runs(pila_root)
+        list_runs(pila_root, status_filter=args.status_filter)
         return
     if args.list_paused:
         pila_root = Path(".pila").resolve()
@@ -11545,6 +11593,14 @@ def main() -> None:
         # Auto-pick if exactly one run exists; die with the available list
         # if multiple are in flight unless --run-id picks one explicitly.
         run_id = resolve_run_id(pila_root, args.run_id)
+    elif args.run_id and args.run_id.startswith("_bootstrap-"):
+        # Launcher-supplied bootstrap id (DESIGN §6 *Detached orchestrator
+        # (remote mode)*). The remote-mode launcher generates the bootstrap
+        # id host-side so it can start tailing `orchestrator.log` before the
+        # orchestrator has produced output. We honor it verbatim — the
+        # subsequent `State.rename_to` after phase_classify promotes it to
+        # the final `<short_category>-<slug>-<6hex>` as usual.
+        run_id = args.run_id
     else:
         # Bootstrap directory: keyed on the current wall-clock time so two
         # concurrent invocations don't pick the same one. Renamed to the

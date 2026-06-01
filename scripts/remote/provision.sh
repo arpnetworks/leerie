@@ -58,20 +58,8 @@ MACHINE_START_TIMEOUT="${PILA_MACHINE_START_TIMEOUT:-120}"
 # Exported machine ID — empty until provision_machine succeeds.
 PILA_MACHINE_ID=""
 
-# --- require flyctl -------------------------------------------------------
-require_flyctl() {
-  if ! command -v flyctl >/dev/null 2>&1; then
-    echo "pila: flyctl not found on PATH." >&2
-    echo "  Install from https://fly.io/docs/flyctl/install/" >&2
-    echo "  or: brew install flyctl (macOS)" >&2
-    return 1
-  fi
-  if ! flyctl auth status >/dev/null 2>&1; then
-    echo "pila: flyctl is not authenticated." >&2
-    echo "  Run: flyctl auth login" >&2
-    return 1
-  fi
-}
+# require_flyctl now lives in lib.sh (sourced above) with auto-install
+# support. Inline detection here has been removed to avoid drift.
 
 # --- stop machine --------------------------------------------------------
 # Pause-on-failure path: preserves the machine's filesystem on its Fly
@@ -134,16 +122,38 @@ decide_teardown() {
     return 0
   fi
   case "$rc" in
-    0|10|75|130|143)
-      # Success (0), needs-answers re-run (10), rate-limit (75),
-      # host-side cancel (130/143): full reap. Per-DESIGN §6, state is
-      # in the run branch or about to be re-fetched; the machine's
-      # in-memory state has no further value.
+    0|10|75)
+      # Genuine terminal exits of the *run*:
+      #   0   — orchestrator finished cleanly (the tail wrapper detected
+      #         orchestrator-pid exit and printed the finalize hint).
+      #   10  — EXIT_NEEDS_ANSWERS (plugin re-run).
+      #   75  — EX_TEMPFAIL (rate-limit, parse-fail).
+      # The orchestrator is gone; the machine has no further value.
+      # Per DESIGN §6, state is in the run branch or about to be re-fetched.
       destroy_machine
       ;;
+    130|143)
+      # Host-side SIGINT (130) / SIGTERM (143). With the detached
+      # orchestrator (DESIGN §6 *Detached orchestrator (remote mode)*),
+      # these signals reach the *tail wrapper* on the host, not the
+      # orchestrator. The orchestrator is still running on the machine.
+      # Leave the machine alone and print reattach hints.
+      echo "" >&2
+      echo "[pila] detached from run ${PILA_RUN_ID:-<unknown>} (machine $mid still running)" >&2
+      if [ -n "${PILA_RUN_ID:-}" ]; then
+        echo "       reattach:  pila --attach $PILA_RUN_ID --tail" >&2
+        echo "       pause:     pila --stop $PILA_RUN_ID" >&2
+        echo "       destroy:   pila --kill $PILA_RUN_ID" >&2
+      else
+        echo "       reattach:  pila --attach <run-id> --tail" >&2
+        echo "       (run-id was not exported; check pila --list for the active machine)" >&2
+      fi
+      # Intentionally no stop/destroy — the orchestrator must keep running.
+      ;;
     *)
-      # Pause: stop the machine (preserves filesystem on the Fly volume)
-      # and surface the failure to the user via the run sidecar.
+      # Unknown non-zero: pause. Stop the machine (preserves filesystem on
+      # the Fly volume) and surface the failure to the user via the run
+      # sidecar.
       local reason="${PILA_PAUSE_REASON:-worker-error}"
       local sidecar=""
       if [ -n "${USER_REPO:-}" ] && [ -n "${PILA_RUN_ID:-}" ]; then
@@ -162,8 +172,8 @@ decide_teardown() {
         echo "  run-id:  $PILA_RUN_ID" >&2
         echo "  resume:  pila --resume --run-id $PILA_RUN_ID --runtime fly" >&2
       fi
-      echo "  attach:  flyctl ssh console -a $FLY_APP --machine $mid" >&2
-      echo "  kill:    flyctl machine destroy $mid -a $FLY_APP --force" >&2
+      echo "  attach:  pila --attach ${PILA_RUN_ID:-<run-id>} --tail" >&2
+      echo "  kill:    pila --kill ${PILA_RUN_ID:-<run-id>}" >&2
       if [ -n "${PILA_PAUSE_NOTIFY_CMD:-}" ]; then
         eval "$PILA_PAUSE_NOTIFY_CMD" || true
       fi

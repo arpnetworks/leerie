@@ -31,10 +31,10 @@ inside the container (DESIGN §6 / §0.5 below).
 | `Dockerfile` | Image recipe (Debian 12 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `pila:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. `cd /work && exec python3 /work/.pila-image/orchestrator/pila.py "$@"`. |
 | `scripts/remote/build-push.sh` | Build and push a self-contained pila image to Fly.io's registry. The baked source at `/work/.pila-image/` lets the image run on Fly Machines without any bind mount. |
-| `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `pila` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$PILA_REMOTE_EXIT_RC` and routes to stop (pause-on-failure: writes `paused_at`/`pause_reason` to the run sidecar) or destroy (success, cancellation, rate-limit). |
-| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, and `re-seed.sh`. Exports `update_run_json()` (atomic merge of fields into `.pila/runs/<run-id>/run.json` on the host) and `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout). |
+| `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `pila` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$PILA_REMOTE_EXIT_RC` and routes to one of three dispositions: destroy (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or stop (pause-on-failure: writes `paused_at`/`pause_reason` to the run sidecar). |
+| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `attach.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `update_run_json()` (atomic merge of fields into `.pila/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), and `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated). Replaces four duplicated detection blocks across the remote scripts. |
 | `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch when `paused_at` is set in the run sidecar). Exports `resume_machine()`: reads `fly_machine_id` from the sidecar, runs `flyctl machine start`, waits for `started`, and clears `paused_at`/`pause_reason` from the sidecar. The launcher then runs the orchestrator inside the resumed machine with `--resume --run-id <id>`. |
-| `scripts/remote/attach.sh` | PTY-attach helper (invoked via `pila --attach`). Resolves the Fly Machine ID for a given run (or the only active record under `.pila/remote/`) and `exec`s `flyctl ssh console` to open a real PTY into the machine over Fly's WireGuard mesh. `--tail` mode replaces the bare-shell command with `tail -F` of the orchestrator log. No sshd in the image, no key management: hallpass is platform-injected by Fly. |
+| `scripts/remote/attach.sh` | PTY-attach helper (invoked via `pila --attach`). Resolves the Fly Machine ID for a given run (or the only active record under `.pila/remote/`) and `exec`s `flyctl ssh console` to open a real PTY into the machine over Fly's WireGuard mesh. `--tail` mode replaces the bare-shell command with `tail -F /work/.pila/runs/<run-id>/orchestrator.log` — the canonical way to reattach to a detached run after Ctrl-C or laptop disconnect. No sshd in the image, no key management: hallpass is platform-injected by Fly. |
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Exports `re_seed()`: reads `fly_machine_id` from the run sidecar, wakes the machine via `flyctl machine start` if stopped, runs a safety check that refuses re-seed when machine-side `/work` has uncommitted tracked changes (unless `PILA_RE_SEED_FORCE=1`), then calls `seed_repo_dirty` from `seed-repo.sh`. Invoked by the launcher's `--re-seed <run-id>` fast-path and by the auto-re-seed step in the `--resume <run-id> --runtime fly` flow. |
 | `scripts/remote/seed-repo.sh` | Two-channel repo seeding helper (sourced by the `pila` launcher after `provision_machine()` succeeds). Exports three functions: `seed_repo_clone` (Step 1: `git clone --filter=blob:none` on the remote machine via `flyctl machine exec`), `seed_repo_dirty` (Step 2: compute the local dirty set via `git status --porcelain`, pack as tar, pipe via `flyctl machine exec tar`), and the wrapper `seed_repo` (= `seed_repo_clone && seed_repo_dirty`). After seeding, `/work` on the machine mirrors the developer's working tree. `re-seed.sh` (Phase 4) reuses `seed_repo_dirty` standalone. |
 | `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by the `pila` launcher after remote orchestration succeeds). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.pila/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry; (2) creates a `git bundle` of `pila/runs/<run-id>` on the machine and pipes it to the host where `git fetch` materialises the branch; (3) tars `.pila/runs/<run-id>/` from the machine and extracts it on the host so the existing host-side finalize block (push + `gh pr create`) can run unchanged. |
@@ -2272,15 +2272,27 @@ two functions:
   that are already in a terminal state.
 - **`decide_teardown()`** — the trap entry point. Classifies
   `$PILA_REMOTE_EXIT_RC` (set by the launcher just before exit) and
-  dispatches to `stop_machine` (pause branch, for unknown non-zero
-  failures) or `destroy_machine` (zero, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75,
-  SIGINT=130, SIGTERM=143). On the stop branch, writes `paused_at` and
-  `pause_reason` to the run sidecar. Idempotent (the trap fires on every
-  exit, including success).
+  dispatches one of three ways:
+  - `destroy_machine` for genuine terminal exits (rc=0, EXIT_NEEDS_ANSWERS=10,
+    EX_TEMPFAIL=75): the orchestrator exited cleanly and the machine has no
+    further value.
+  - **Detach** for rc=130/143 (host-side SIGINT/SIGTERM): the user pressed
+    Ctrl-C or the local stream broke (laptop closed, WiFi dropped). Since the
+    orchestrator on the machine was started detached (`setsid nohup`, see
+    *Worker auth + config seeding* below), it is still running. The function
+    leaves the machine alone, prints a one-line "detached" banner with the
+    reattach / pause / kill commands, and returns.
+  - `stop_machine` for unknown non-zero failures (worker error,
+    orchestrator exception): preserves the machine's filesystem on its Fly
+    volume so the user can attach to inspect and then `pila --resume`. On the
+    stop branch, writes `paused_at` and `pause_reason` to the run sidecar.
+
+  Idempotent (the trap fires on every exit, including success).
 
 The classification table is the canonical authority on which exit
-codes are treated as pause-worthy; DESIGN §6 *Remote pause-on-failure
-(Fly.io)* documents the rationale.
+codes are treated as which disposition; DESIGN §6 *Detached orchestrator
+(remote mode)* and *Remote pause-on-failure (Fly.io)* document the
+rationale.
 
 Environment variables consumed by `provision.sh`:
 
@@ -2298,8 +2310,15 @@ using `$PILA_FLY_APP` and `$PILA_VERSION`, or overridden by setting
 `PILA_FLY_IMAGE` in the environment.
 
 `provision_machine` requires `flyctl` on `PATH` and `flyctl auth status`
-to succeed. Missing/unauthenticated `flyctl` produces an actionable error
-with install instructions rather than a cryptic failure mid-run.
+to succeed. The launcher's `RUNTIME=fly` preflight calls `require_flyctl`
+from `scripts/remote/lib.sh` *before* sourcing any other remote script —
+that helper detects missing `flyctl` and prompts for `brew install
+flyctl` (macOS) or the Fly install script (Linux), then prompts for
+`flyctl auth login` if unauthenticated. The auto-install mirrors the
+local-runtime auto-install in `scripts/install.sh:200-208` and respects
+`--no-runtime-install` / `PILA_NO_RUNTIME_INSTALL=1` (falls back to
+hint-and-exit-1). By the time `provision_machine` runs, `flyctl` is
+guaranteed to be on PATH and authenticated.
 
 #### Worker auth + config seeding (`scripts/remote/seed-auth.sh`)
 
@@ -2336,17 +2355,47 @@ Git-push auth (SSH keys, `.netrc`, `~/.config/gh`) is **not** seeded — that
 auth lives on the host per DESIGN §6 *Finalization* and is not needed inside
 the remote machine for `claude -p` worker authentication or `git commit`.
 
-After seeding completes the launcher runs the orchestrator inside the
-machine via `flyctl machine exec -- python3 /work/.pila-image/orchestrator/pila.py --no-push ...`,
-streaming its output back to the host terminal. `--no-push` is always
-injected so the remote orchestrator's `phase_finalize` does not attempt
-a push itself — push is always the host launcher's responsibility.
+After seeding completes the launcher starts the orchestrator inside the
+machine **detached** — see DESIGN §6 *Detached orchestrator (remote
+mode)* for the rationale. The launcher generates the run-id host-side
+(slug + suffix, same pattern as today's orchestrator-side generator) and
+passes it explicitly via `--run-id <id>`, so it knows the
+`orchestrator.log` path before the orchestrator has produced any output.
+The detach is two `flyctl machine exec` calls:
 
-Once the remote orchestrator exits 0, `fetch_branch()` (from
-`scripts/remote/fetch-branch.sh`) streams the completed run branch and
-state directory back to the host (see §0 *Files table* and the
-`fetch-branch.sh` section below), after which the existing host-side
-finalize block (push + `gh pr create`) runs unchanged.
+```bash
+# 1. Background launch — returns immediately. setsid makes the
+#    orchestrator a session leader so SIGHUP from the exec channel
+#    closing does not propagate. nohup is a belt-and-braces. stdout/
+#    stderr go to a log file the machine owns; stdin is /dev/null.
+flyctl machine exec "$PILA_MACHINE_ID" --app "$FLY_APP" -- \
+  sh -c 'mkdir -p /work/.pila/runs/'"$PILA_RUN_ID"'/ && \
+         setsid nohup python3 /work/.pila-image/orchestrator/pila.py \
+           --no-push --run-id '"$PILA_RUN_ID"' '"${REWRITTEN_ARGS[*]@Q}"' \
+           > /work/.pila/runs/'"$PILA_RUN_ID"'/orchestrator.log 2>&1 \
+           < /dev/null & \
+         echo $! > /work/.pila/runs/'"$PILA_RUN_ID"'/orchestrator.pid'
+
+# 2. Tail the orchestrator log for the user's terminal. This is a
+#    separate exec session; its death does not touch the orchestrator.
+flyctl machine exec "$PILA_MACHINE_ID" --app "$FLY_APP" -- \
+  tail -F /work/.pila/runs/"$PILA_RUN_ID"/orchestrator.log
+```
+
+`--no-push` is always injected so the remote orchestrator's
+`phase_finalize` does not attempt a push itself — push is always the
+host launcher's responsibility, run via `pila --finalize <run-id>` after
+reattach (see *Detached run finalization* below).
+
+When the tail's exec session ends (the orchestrator wrote its final log
+line and exited, or the user pressed Ctrl-C, or the laptop disconnected),
+the launcher's EXIT trap classifies the rc via `decide_teardown` per the
+table above — destroy only for known terminal exits, detach for
+SIGINT/SIGTERM, stop for unknown errors. **The launcher cannot directly
+call `fetch_branch` from here because it no longer waits for orchestrator
+completion** — the tail ends before the orchestrator finishes the work,
+or after it finishes but the launcher has no way to read its rc. See
+*Detached run finalization* below for how `fetch_branch` runs.
 
 Maps to `DESIGN.md`: §6 (container boundary / teardown / finalization), `remote-task-system.md`
 §"microVM = 1 Colima" (lines 163–206) and §"The hard problem is auth-crossing"
@@ -2468,9 +2517,14 @@ Schema for the record (both paths):
 ```
 
 `--tail` mode replaces the bash session with
-`tail -F /work/.pila/runs/<id>/logs/*.log` for the
-failure-inspection use case. Default is a bare bash shell at
-`/work` with `$PS1` set to `pila@<run-id>:\w$`.
+`tail -F /work/.pila/runs/<run-id>/orchestrator.log` — the canonical
+way to reattach to a detached run after Ctrl-C, a closed laptop, or any
+other client disconnect. This is the orchestrator's own log (produced by
+the `setsid nohup` invocation in *Worker auth + config seeding*), not
+the per-worker logs. For per-worker logs, drop the shell and tail
+manually: `tail -F /work/.pila/runs/<run-id>/logs/*.log`. Default
+attach mode is a bare bash shell at `/work` with `$PS1` set to
+`pila@<run-id>:\w$`.
 
 **Hallpass note (verification gate).** Fly's hallpass is platform-
 injected into machines launched via `flyctl machine run`. The
@@ -2533,6 +2587,112 @@ orchestrator (same convention as `--no-runtime-install`,
 `--no-auto-publish`).
 
 Maps to `DESIGN.md`: §6 *Mid-run re-seed (remote mode)*.
+
+#### Explicit pause and destroy verbs (`pila --stop`, `pila --kill`)
+
+The detached orchestrator (DESIGN §6 *Detached orchestrator (remote
+mode)*) decouples the user's local terminal from the run's lifetime.
+Ctrl-C no longer means "destroy" — it means "stop watching." So the
+destructive and pause actions need explicit verbs.
+
+Two new launcher flags, routed at the top of `pila` alongside
+`--attach` (line ~63):
+
+- **`pila --stop <run-id>`** — clean pause. Reads `fly_machine_id`
+  from `$USER_REPO/.pila/runs/<run-id>/run.json`, sources
+  `provision.sh`, exports `PILA_MACHINE_ID` and `FLY_APP`, calls
+  `stop_machine()`. Then calls `update_run_json` from `lib.sh` to set
+  `paused_at = <iso_now>` and `pause_reason = "user-requested"` on
+  the sidecar. The run is resumable via the existing
+  `pila --resume --run-id <id> --runtime fly` path. Errors with an
+  actionable message if the sidecar is missing or `fly_machine_id`
+  is null (the latter means the run was launched locally, not via
+  `--runtime fly`).
+- **`pila --kill <run-id> [--force]`** — destroy. Same sidecar
+  resolution. Prompts the user to type the run-id to confirm (unless
+  `--force` / `PILA_FORCE_KILL=1`), then calls `destroy_machine()`.
+  Sets `killed_at = <iso_now>` on the sidecar. The run is no longer
+  resumable.
+
+  Recovery path for the orphan case: `pila --kill --machine-id <id>
+  --app <app>` allows destruction by machine-id directly when the
+  sidecar is missing or unreadable (e.g., `.pila/` was deleted but
+  the machine is still running on Fly).
+
+Both verbs route before any runtime preflight (same pattern as
+`--attach`), call `require_flyctl` from `lib.sh`, and exit without
+ever sourcing `seed-auth.sh` / `seed-repo.sh`. They are read-only
+with respect to the local repo (except for the sidecar update) and
+do not require `--no-runtime-install` handling — `require_flyctl`
+respects it.
+
+The `killed_at` field is added to `RUN_STATUSES` in `orchestrator/pila.py`
+as a new terminal state (`killed-remote`); `_derive_run_status` reads it
+before `paused_at`. `_validate_run_json` enforces that `paused_at`,
+`pushed_at`, and `killed_at` are mutually exclusive (same invariant
+pattern as today's `paused_at` vs `pushed_at`).
+
+Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*, *The
+user-visible verb surface*.
+
+#### Unified `pila --list` (machine column + `--status` filter)
+
+`list_runs()` in `orchestrator/pila.py` is extended to surface remote
+runs alongside local runs in a single table.
+
+Changes:
+
+- `_collect_run_rows()` reads `fly_machine_id` from `run.json` and
+  appends it to each row tuple. Empty string for local runs.
+- `_render_run_table()` adds a `machine` column between `status` and
+  `branch`. Column auto-hides when no row in the result set has a
+  non-empty value (so pure-local users see no extra noise).
+- New `--status <state>` argparse flag on `--list`. Filters rows to
+  only those whose derived status matches. `<state>` accepts any
+  value in `RUN_STATUSES` (`in-progress`, `done-local`,
+  `done-pushed-pr`, `paused-remote`, `killed-remote`, …). Invalid
+  values produce an argparse error listing the allowed set.
+- `--list-paused` is deprecated. The existing flag continues to work
+  and `list_paused_runs` is kept as a thin alias that calls
+  `list_runs(pila_root, status_filter="paused-remote")` — preserves
+  every existing import site and test against `list_paused_runs`.
+  `--help` marks `--list-paused` as deprecated and recommends
+  `--list --status paused-remote`.
+
+Maps to `DESIGN.md`: §6 *The user-visible verb surface*.
+
+#### Detached run finalization (`pila --finalize <run-id>`)
+
+With the detached orchestrator, the launcher cannot synchronously wait
+for orchestrator completion and call `fetch_branch` — the tail's exec
+session ends before (or independent of) the orchestrator's actual exit.
+Two surfaces address this together:
+
+1. **`orchestrator.pid` on the machine.** The detached-launch sh wrapper
+   records the orchestrator's pid in
+   `/work/.pila/runs/<run-id>/orchestrator.pid` immediately after
+   backgrounding. `pila --attach --tail` watches this pid (via a small
+   `while kill -0 $pid; do sleep 1; done` loop alongside the `tail -F`)
+   and, when the pid disappears, prints a one-line banner:
+   `[pila] orchestrator exited cleanly — run "pila --finalize <run-id>"
+   to push and open a PR`. The tail then exits.
+2. **`pila --finalize <run-id>`** — new launcher fast-path that runs the
+   post-orchestrator block the launcher used to run inline: source
+   `fetch-branch.sh`, call `fetch_branch`, source the host-side
+   finalize block (push + `gh pr create`). The verb is idempotent — if
+   the run branch is already pushed (`pushed_at` set), it short-
+   circuits with "already finalized."
+
+This matches the convention that destructive and side-effecting actions
+are explicit verbs (DESIGN §6 *The user-visible verb surface*) rather
+than implicit consequences of stream timing.
+
+Optional convenience: `pila --attach --tail --auto-finalize` runs
+`pila --finalize` automatically when the pid-watch detects clean exit,
+for users who want zero-touch finalization when they happen to be
+watching.
+
+Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*.
 
 ---
 
@@ -2618,17 +2778,19 @@ discovery without parsing the full `state.json`):
 | `pr_url` | str \| null | the PR URL `gh` returned; null until PR creation succeeds |
 | `pr_error` | str \| null | captured `gh` stderr if PR creation failed; logical invariant — `pr_error` can be set only after `pushed_at` is set |
 | `fly_machine_id` | str \| null | Fly Machine ID for a remote (`--runtime fly`) run; written by `scripts/remote/provision.sh` immediately after `flyctl machine run` succeeds, so a launcher that crashes before classifying still leaves a recoverable pointer. Null for local runs. |
-| `paused_at` | ISO-8601 str \| null | when the remote run was paused on failure (machine stopped, not destroyed); set by the launcher's EXIT trap on the pause branch. Null for successful runs and for runs the user cancelled. |
-| `pause_reason` | str \| null | short tag identifying which failure path triggered the pause (`worker-error`, `orchestrator-exception`, `finalize-failed`). Null when `paused_at` is null. |
+| `paused_at` | ISO-8601 str \| null | when the remote run was paused — either on failure (set by the launcher's EXIT trap on the pause branch) or by explicit user request (`pila --stop <run-id>`). Null for successful runs, killed runs, and runs the user merely detached from. |
+| `pause_reason` | str \| null | short tag identifying which path set `paused_at` (`worker-error`, `orchestrator-exception`, `finalize-failed`, `user-requested`). Null when `paused_at` is null. |
+| `killed_at` | ISO-8601 str \| null | when the remote run was explicitly destroyed by `pila --kill <run-id>`. The Fly Machine has been destroyed and the run is no longer resumable. Null for any other terminal state. |
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `pila: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped (`--no-push`), or had not yet run; the launcher uses its deterministic fallback in that case. |
 | `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
 
-`_validate_run_json(data)` enforces four invariants on read:
+`_validate_run_json(data)` enforces five invariants on read:
 - `pushed_at` and `push_error` are mutually exclusive (at most one is non-null).
 - `pr_url` and `pr_error` are mutually exclusive.
 - If `pr_url` is set, `pushed_at` must be set (cannot have a PR without a push).
-- `paused_at` and `pushed_at` are mutually exclusive (a run cannot be both paused and finalized). If `paused_at` is set, `fly_machine_id` must also be set (you cannot pause a run without knowing where to resume it).
+- `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive (a run cannot be in more than one terminal-or-paused state). If `paused_at` is set, `fly_machine_id` must also be set (you cannot pause a run without knowing where to resume it). If `killed_at` is set, `fly_machine_id` must also be set (you cannot have destroyed a machine you don't have a pointer to).
+- `killed_at` runs are not resumable; `--resume` against a killed run errors with "run was killed at <ts>; start a new run instead."
 
 A corrupt sidecar is flagged but does not block the rest of the system; `pila --list` will render that run with `status=corrupt-sidecar` and the user can inspect or delete the file.
 
@@ -2643,13 +2805,12 @@ A corrupt sidecar is flagged but does not block the rest of the system; `pila --
 | `done-pushed-no-pr` | `pushed_at` set but `pr_url` not | rare: push succeeded, PR wasn't attempted (e.g., gh removed between push and PR) |
 | `done-local` | `finished_at` set, no `pushed_at` | the user passed `--no-push`; push manually if desired |
 | `paused-remote` | `paused_at` is set | inspect/attach to the Fly Machine, then `pila --resume --run-id <id> --runtime fly` (DESIGN §6 *Remote pause-on-failure*) |
+| `killed-remote` | `killed_at` is set | terminal state — the machine was destroyed by `pila --kill`. Not resumable; start a new run instead. |
 | `in-progress` | none of the above | the run is still active (or died very early); resume with `--resume --run-id <id>` |
 
-`RUN_STATUSES` in `pila.py` declares the eight values; a test coupling check asserts the tuple matches every value `_derive_run_status` can return.
+`RUN_STATUSES` in `pila.py` declares the nine values; a test coupling check asserts the tuple matches every value `_derive_run_status` can return.
 
-`pila --list-paused` filters the run table to only `paused-remote`
-entries. Same short-circuit shape as `--list`: runs before any git/CLI
-preflight, exits without invoking the orchestrator.
+`pila --list --status <state>` filters the table to runs whose derived status matches. `<state>` accepts any value in `RUN_STATUSES`; invalid values produce an argparse error listing the allowed set. `pila --list-paused` is a deprecated alias for `pila --list --status paused-remote` and continues to work. Both short-circuit before any git/CLI preflight, the same as `--list`.
 
 `state.json` fields. This table is canonical: every field the orchestrator
 writes to `st.data` must appear here, and every field listed here must be

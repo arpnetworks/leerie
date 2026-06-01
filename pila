@@ -55,6 +55,68 @@ IMAGE_TAG="pila:$PILA_VERSION"
 # overrides, telemetry knobs, etc.), which a launcher-side summary would
 # silently truncate. The first --help pays a one-time image-build cost; every
 # subsequent invocation reuses the cached image and starts in ~2s.
+
+# --- _resolve_fly_machine_id_from_run_dir -------------------------------
+# Read fly_machine_id from a run's host-side sidecar. Tries
+# fly-machine.json first, then run.json — mirrors the resolution order
+# in scripts/remote/attach.sh so the `--stop`/`--kill`/`--finalize`
+# fast-paths also work during the in-flight bootstrap window (when the
+# host has fly-machine.json but no run.json yet — DESIGN §6 Detached
+# orchestrator (remote mode)).
+#
+# Echoes the machine id to stdout, empty string on miss. Used by
+# `_kill_bootstrap_minimal_run_json` and the verbs below.
+_resolve_fly_machine_id_from_run_dir() {
+  local run_dir="$1"
+  local candidate
+  for candidate in "$run_dir/fly-machine.json" "$run_dir/run.json"; do
+    if [ -f "$candidate" ]; then
+      python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    mid = d.get("fly_machine_id")
+    print(mid if mid else "")
+except Exception:
+    pass
+' "$candidate"
+      return 0
+    fi
+  done
+  return 0
+}
+
+# --- _ensure_run_json --------------------------------------------------
+# If run_dir has fly-machine.json but no run.json, bootstrap a minimal
+# run.json so subsequent `update_run_json` writes (paused_at,
+# killed_at, etc.) have a file to merge into. Idempotent.
+_ensure_run_json() {
+  local run_dir="$1"
+  local sidecar="$run_dir/run.json"
+  if [ -f "$sidecar" ]; then
+    return 0
+  fi
+  local fmj="$run_dir/fly-machine.json"
+  if [ ! -f "$fmj" ]; then
+    return 1
+  fi
+  python3 -c '
+import json, sys
+fmj = sys.argv[1]
+sidecar = sys.argv[2]
+try:
+    d = json.load(open(fmj))
+except Exception:
+    d = {}
+out = {
+    "fly_machine_id": d.get("fly_machine_id"),
+}
+with open(sidecar, "w") as f:
+    json.dump(out, f, indent=2)
+    f.write("\n")
+' "$fmj" "$sidecar"
+}
+
 case "${1:-}" in
   --version)
     echo "pila $PILA_VERSION"
@@ -104,6 +166,227 @@ case "${1:-}" in
     # shellcheck disable=SC1091
     . "$PILA_REPO/scripts/remote/re-seed.sh"
     re_seed
+    exit $?
+    ;;
+  --stop)
+    # Fast-path: explicit pause of a remote run (DESIGN §6 *The user-
+    # visible verb surface*). Reads fly_machine_id from the run sidecar
+    # and calls stop_machine. Resumable via --resume.
+    shift
+    USER_REPO="${USER_REPO:-$PWD}"
+    export USER_REPO
+    _stop_run_id="${1:-}"
+    if [ -z "$_stop_run_id" ]; then
+      echo "pila: --stop requires a <run-id>" >&2
+      echo "  Usage: pila --stop <run-id>" >&2
+      exit 1
+    fi
+    _stop_run_dir="$USER_REPO/.pila/runs/$_stop_run_id"
+    if [ ! -d "$_stop_run_dir" ]; then
+      echo "pila: --stop: no run dir at $_stop_run_dir" >&2
+      echo "  Check 'pila --list' for active runs." >&2
+      exit 1
+    fi
+    # Source provision.sh FIRST — it resets PILA_MACHINE_ID="" at
+    # load time (intended for provision_machine's create flow). Sourcing
+    # after setting PILA_MACHINE_ID would clobber our resolver result.
+    FLY_APP="${PILA_FLY_APP:-pila}"
+    export FLY_APP
+    export PILA_RUN_ID="$_stop_run_id"
+    # shellcheck disable=SC1091
+    . "$PILA_REPO/scripts/remote/provision.sh"
+    require_flyctl || exit 1
+    # Try fly-machine.json first (in-flight bootstrap case), then
+    # run.json — matches scripts/remote/attach.sh's resolution order.
+    PILA_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_stop_run_dir")"
+    if [ -z "$PILA_MACHINE_ID" ]; then
+      echo "pila: --stop: $_stop_run_id has no fly_machine_id (was it a local run?)" >&2
+      exit 1
+    fi
+    export PILA_MACHINE_ID
+    # Bootstrap a minimal run.json if only fly-machine.json exists, so
+    # update_run_json has a file to merge paused_at into.
+    _ensure_run_json "$_stop_run_dir" || true
+    _stop_sidecar="$_stop_run_dir/run.json"
+    echo "[pila] --stop: pausing machine $PILA_MACHINE_ID (run $PILA_RUN_ID)" >&2
+    stop_machine
+    update_run_json "$_stop_sidecar" \
+      paused_at "$(iso_now)" \
+      pause_reason "user-requested" \
+      fly_machine_id "$PILA_MACHINE_ID" || true
+    echo "[pila] --stop: paused. Resume via: pila --resume --run-id $PILA_RUN_ID --runtime fly" >&2
+    exit 0
+    ;;
+  --kill)
+    # Fast-path: explicit destroy of a remote run's machine (DESIGN §6
+    # *The user-visible verb surface*). Confirmation prompt unless --force.
+    # NOT resumable afterwards — sets killed_at on the sidecar.
+    shift
+    USER_REPO="${USER_REPO:-$PWD}"
+    export USER_REPO
+    _kill_run_id=""
+    _kill_machine_id=""
+    _kill_force=0
+    _kill_app=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --force) _kill_force=1; shift ;;
+        --machine-id) _kill_machine_id="$2"; shift 2 ;;
+        --machine-id=*) _kill_machine_id="${1#--machine-id=}"; shift ;;
+        --app) _kill_app="$2"; shift 2 ;;
+        --app=*) _kill_app="${1#--app=}"; shift ;;
+        --*) echo "pila: unknown --kill flag: $1" >&2; exit 1 ;;
+        *)
+          if [ -z "$_kill_run_id" ]; then _kill_run_id="$1"; shift
+          else echo "pila: unexpected --kill arg: $1" >&2; exit 1
+          fi
+          ;;
+      esac
+    done
+    [ -n "${PILA_FORCE_KILL:-}" ] && _kill_force=1
+    FLY_APP="${_kill_app:-${PILA_FLY_APP:-pila}}"
+    export FLY_APP
+    _kill_run_dir=""
+    _kill_sidecar=""
+    if [ -n "$_kill_run_id" ]; then
+      _kill_run_dir="$USER_REPO/.pila/runs/$_kill_run_id"
+      if [ ! -d "$_kill_run_dir" ] && [ -z "$_kill_machine_id" ]; then
+        echo "pila: --kill: no run dir at $_kill_run_dir" >&2
+        echo "  Pass --machine-id <id> to destroy an orphan machine without a sidecar." >&2
+        exit 1
+      fi
+      if [ -d "$_kill_run_dir" ] && [ -z "$_kill_machine_id" ]; then
+        # Try fly-machine.json first (in-flight bootstrap case), then
+        # run.json — matches scripts/remote/attach.sh's resolution order.
+        _kill_machine_id="$(_resolve_fly_machine_id_from_run_dir "$_kill_run_dir")"
+      fi
+    fi
+    if [ -z "$_kill_machine_id" ]; then
+      echo "pila: --kill: no fly_machine_id found." >&2
+      echo "  Usage: pila --kill <run-id> [--force]" >&2
+      echo "  Orphan: pila --kill --machine-id <id> [--app <app>]" >&2
+      exit 1
+    fi
+    if [ "$_kill_force" != "1" ]; then
+      # D3: context-aware confirmation label. When the user invoked the
+      # orphan path (machine-id only, no run-id), asking for the run-id
+      # is confusing — they have no run-id, only a machine-id.
+      if [ -n "$_kill_run_id" ]; then
+        _kill_prompt_target="$_kill_run_id"
+        _kill_prompt_label="run-id"
+      else
+        _kill_prompt_target="$_kill_machine_id"
+        _kill_prompt_label="machine-id"
+      fi
+      printf "This will destroy machine %s (run %s). Type the %s to confirm: " \
+        "$_kill_machine_id" "$_kill_prompt_target" "$_kill_prompt_label" >&2
+      read -r _kill_confirm
+      if [ "$_kill_confirm" != "$_kill_prompt_target" ]; then
+        echo "pila: --kill: confirmation mismatch; aborted." >&2
+        exit 1
+      fi
+    fi
+    # Source provision.sh BEFORE setting PILA_MACHINE_ID — it resets
+    # PILA_MACHINE_ID="" at load time, which would clobber our value.
+    # shellcheck disable=SC1091
+    . "$PILA_REPO/scripts/remote/provision.sh"
+    require_flyctl || exit 1
+    PILA_MACHINE_ID="$_kill_machine_id"
+    export PILA_MACHINE_ID
+    echo "[pila] --kill: destroying machine $PILA_MACHINE_ID" >&2
+    destroy_machine
+    # Bootstrap run.json from fly-machine.json if needed (in-flight
+    # kill before classify) so killed_at + fly_machine_id are recorded
+    # somewhere `pila --list` will find them.
+    if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
+      _ensure_run_json "$_kill_run_dir" || true
+      _kill_sidecar="$_kill_run_dir/run.json"
+      if [ -f "$_kill_sidecar" ]; then
+        update_run_json "$_kill_sidecar" \
+          killed_at "$(iso_now)" \
+          fly_machine_id "$_kill_machine_id" || true
+      fi
+    fi
+    echo "[pila] --kill: destroyed. Run is no longer resumable." >&2
+    exit 0
+    ;;
+  --finalize)
+    # Fast-path: post-detach finalization (DESIGN §6 *Detached
+    # orchestrator (remote mode)*). The detached orchestrator ran on the
+    # Fly Machine; the launcher couldn't synchronously call fetch_branch
+    # because it no longer waits for orchestrator exit. This verb runs
+    # the post-orchestrator block: fetch_branch + push + gh pr create.
+    shift
+    USER_REPO="${USER_REPO:-$PWD}"
+    export USER_REPO
+    _fin_run_id="${1:-}"
+    if [ -z "$_fin_run_id" ]; then
+      echo "pila: --finalize requires a <run-id>" >&2
+      echo "  Usage: pila --finalize <run-id>" >&2
+      exit 1
+    fi
+    _fin_run_dir="$USER_REPO/.pila/runs/$_fin_run_id"
+    if [ ! -d "$_fin_run_dir" ]; then
+      echo "pila: --finalize: no run dir at $_fin_run_dir" >&2
+      exit 1
+    fi
+    # Short-circuit if already finalized (only possible once run.json
+    # exists, i.e. after fetch_branch has run at least once).
+    _fin_sidecar="$_fin_run_dir/run.json"
+    if [ -f "$_fin_sidecar" ]; then
+      _already="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print("yes" if d.get("pushed_at") else "")
+except Exception:
+    pass
+' "$_fin_sidecar")"
+      if [ -n "$_already" ]; then
+        echo "[pila] --finalize: run $_fin_run_id is already pushed; nothing to do." >&2
+        exit 0
+      fi
+    fi
+    FLY_APP="${PILA_FLY_APP:-pila}"
+    export FLY_APP PILA_RUN_ID="$_fin_run_id"
+    # Source provision.sh BEFORE setting PILA_MACHINE_ID — provision.sh
+    # resets PILA_MACHINE_ID="" at load time and would clobber our value.
+    # shellcheck disable=SC1091
+    . "$PILA_REPO/scripts/remote/provision.sh"
+    # shellcheck disable=SC1091
+    . "$PILA_REPO/scripts/remote/fetch-branch.sh"
+    require_flyctl || exit 1
+    # Try fly-machine.json first (in-flight bootstrap case), then
+    # run.json — matches scripts/remote/attach.sh's resolution order.
+    PILA_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_fin_run_dir")"
+    if [ -z "$PILA_MACHINE_ID" ]; then
+      echo "pila: --finalize: $_fin_run_id has no fly_machine_id" >&2
+      exit 1
+    fi
+    export PILA_MACHINE_ID
+    echo "[pila] --finalize: streaming completed run from machine $PILA_MACHINE_ID" >&2
+    if ! fetch_branch; then
+      echo "pila: error: fetch_branch failed" >&2
+      exit 1
+    fi
+    # fetch_branch sets PILA_REMOTE_RUN_ID to the discovered final run-id
+    # (which may differ from $_fin_run_id if the user passed a bootstrap
+    # id). Use the discovered id to locate the run dir host-side.
+    _fetched_run_id="${PILA_REMOTE_RUN_ID:-$_fin_run_id}"
+    _fetched_run_dir="$USER_REPO/.pila/runs/$_fetched_run_id"
+    if [ ! -d "$_fetched_run_dir" ]; then
+      echo "pila: error: fetch_branch succeeded but $_fetched_run_dir missing" >&2
+      exit 1
+    fi
+    # Detect --no-verify from $@ for consistency with normal post-run path.
+    NO_VERIFY_PUSH=false
+    for _a in "$@"; do
+      [ "$_a" = "--no-verify" ] && NO_VERIFY_PUSH=true
+    done
+    export NO_VERIFY_PUSH
+    # shellcheck disable=SC1091
+    . "$PILA_REPO/scripts/host-finalize.sh"
+    host_finalize "$_fetched_run_dir"
     exit $?
     ;;
 esac
@@ -936,6 +1219,35 @@ if [ "$RUNTIME" = "fly" ]; then
   # follows after both seedings succeed.
   echo "[pila] remote: starting Fly.io machine (--runtime fly / PILA_RUNTIME=fly / pila.toml runtime=fly)" >&2
 
+  # Preflight: ensure flyctl is on PATH and authenticated. require_flyctl
+  # in lib.sh handles auto-install on first --runtime fly use (parallels
+  # the local-runtime auto-install in scripts/install.sh). Respects
+  # --no-runtime-install / PILA_NO_RUNTIME_INSTALL=1 (falls back to
+  # hint+exit). Must run before ensure_image (which uses flyctl to push)
+  # and before any other remote script is sourced.
+  # shellcheck disable=SC1091
+  . "$PILA_REPO/scripts/remote/lib.sh"
+  if ! require_flyctl; then
+    exit 1
+  fi
+
+  # Generate a bootstrap run-id host-side if the user did not pass --run-id.
+  # The orchestrator runs detached on the Fly Machine and the launcher's
+  # tail needs to know which orchestrator.log path to follow *before* the
+  # orchestrator has produced any output. The bootstrap id matches today's
+  # orchestrator-side pre-classification pattern (`_bootstrap-<6hex>`); the
+  # orchestrator will rename the dir to a category-prefixed final id at the
+  # end of phase_classify (State.rename_to). The launcher's tail wrapper
+  # handles the rename by polling for the final id afterwards. See DESIGN
+  # §6 *Detached orchestrator (remote mode)*.
+  if [ -z "$PILA_RUN_ID" ]; then
+    PILA_RUN_ID="_bootstrap-$(python3 -c "import secrets; print(secrets.token_hex(3))")"
+    export PILA_RUN_ID
+    # Append --run-id to REWRITTEN_ARGS so the orchestrator inside the
+    # machine uses the same id (matches the --resume --run-id plumbing).
+    REWRITTEN_ARGS+=("--run-id" "$PILA_RUN_ID")
+  fi
+
   FLY_IMAGE_TAG="$(resolve_fly_image_tag)"
   export FLY_IMAGE_TAG
 
@@ -1041,53 +1353,114 @@ except Exception:
         _seed_ok=false
       fi
       if [ "$_seed_ok" = "true" ]; then
-        # Run the orchestrator inside the machine.  Pass all REWRITTEN_ARGS
-        # so the remote run receives the same flags as a local run (task,
-        # --runtime fly already there, --no-push if set, etc.).
-        # flyctl machine exec streams stdout/stderr back to this terminal.
-        # Note: --runtime fly flows through REWRITTEN_ARGS so the orchestrator
-        # inside the machine knows it is a remote run and adjusts accordingly.
-        echo "[pila] remote: machine $PILA_MACHINE_ID seeded — starting orchestrator" >&2
-        orch_rc=0
-        flyctl machine exec "$PILA_MACHINE_ID" \
-          --app "$FLY_APP" \
-          -- python3 /work/.pila-image/orchestrator/pila.py \
-               --no-push \
-               ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} \
-          || orch_rc=$?
+        # Start the orchestrator detached on the Fly Machine. setsid makes
+        # it a session leader so SIGHUP from the exec channel closing does
+        # not reach it; nohup is belt-and-braces. stdout/stderr go to a log
+        # file the machine owns; stdin is /dev/null. The launcher generated
+        # the bootstrap run-id host-side and passed it via --run-id in
+        # REWRITTEN_ARGS, so the path is known before the orchestrator
+        # produces any output. DESIGN §6 *Detached orchestrator (remote
+        # mode)*.
+        echo "[pila] remote: machine $PILA_MACHINE_ID seeded — starting orchestrator (detached)" >&2
 
-        if [ "$orch_rc" -ne 0 ]; then
-          # Propagate the orchestrator's exit code.  Non-zero means the run
-          # failed; do not attempt to fetch the branch (nothing useful there).
-          echo "pila: error: remote orchestrator exited $orch_rc" >&2
-          container_rc=$orch_rc
+        # Detached-launch wrapper. Uses a python3 heredoc instead of
+        # `sh -c "...setsid nohup..."` for three reasons:
+        #   (a) argv goes via sys.argv — no shell quoting needed for the
+        #       run-id or REWRITTEN_ARGS, so chars like ' or $ or \n
+        #       cannot break the wrapper or alter the orchestrator argv.
+        #   (b) start_new_session=True is equivalent to setsid and works
+        #       on every Python ≥ 3.2 — no dependency on the remote
+        #       shell understanding `setsid` (busybox sh does not).
+        #   (c) Launcher errors from python (not from sh quoting) surface
+        #       on stderr without the outer 2>&1 redirect, so a failed
+        #       launch is diagnosable.
+        if ! flyctl machine exec "$PILA_MACHINE_ID" \
+               --app "$FLY_APP" \
+               -- python3 - "$PILA_RUN_ID" "${REWRITTEN_ARGS[@]}" <<'PY'
+import os, subprocess, sys
+
+run_id = sys.argv[1]
+orch_args = sys.argv[2:]
+
+run_dir = f"/work/.pila/runs/{run_id}"
+os.makedirs(run_dir, exist_ok=True)
+
+log_path = f"{run_dir}/orchestrator.log"
+pid_path = f"{run_dir}/orchestrator.pid"
+
+with open(log_path, "ab") as log_f:
+    p = subprocess.Popen(
+        [
+            "python3",
+            "/work/.pila-image/orchestrator/pila.py",
+            "--no-push",
+            *orch_args,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=log_f,
+        start_new_session=True,
+    )
+
+with open(pid_path, "w") as pid_f:
+    pid_f.write(f"{p.pid}\n")
+PY
+        then
+          echo "pila: error: failed to start detached orchestrator on machine $PILA_MACHINE_ID" >&2
+          container_rc=1
         else
-          # Orchestration succeeded.  Stream the completed run branch and
-          # .pila/runs/<run-id>/ state back so the host-side finalize block
-          # (push + gh pr create) can run unchanged with host auth.
-          # For cleared-but-empty terminal-state runs (no_push=true,
-          # DESIGN §8) fetch_branch internally skips Step 2 (no run
-          # branch to bundle) but still streams the state dir back in
-          # Step 3 so `pila --list` shows the run; the launcher's
-          # host-side finalize block then honors run.json.no_push and
-          # exits 0 cleanly.
-          if ! fetch_branch; then
-            echo "pila: error: fetch_branch failed — run branch not fetched to host" >&2
-            container_rc=1
-          else
-            container_rc=0
-            # Phase 3: promote the PID-keyed attach pointer to a run-keyed
-            # one so post-run `pila --attach <run-id>` works. fetch_branch
-            # sets PILA_REMOTE_RUN_ID; if it's set and the PID record is
-            # still present, move it into the run dir.
-            if [ -n "${PILA_REMOTE_RUN_ID:-}" ]; then
-              _pid_record="$USER_REPO/.pila/remote/$$.json"
-              _run_record="$USER_REPO/.pila/runs/$PILA_REMOTE_RUN_ID/fly-machine.json"
-              if [ -f "$_pid_record" ] && [ -d "$USER_REPO/.pila/runs/$PILA_REMOTE_RUN_ID" ]; then
-                mv "$_pid_record" "$_run_record" || true
-              fi
-            fi
+          # Phase 3: promote the PID-keyed attach pointer to a run-keyed
+          # one immediately — we already know the (bootstrap) run-id. The
+          # orchestrator will rename the run dir at classify time; the
+          # launcher's tail wrapper handles the rename via the handover
+          # file the orchestrator writes (see DESIGN §6).
+          _pid_record="$USER_REPO/.pila/remote/$$.json"
+          mkdir -p "$USER_REPO/.pila/runs/$PILA_RUN_ID" 2>/dev/null || true
+          _run_record="$USER_REPO/.pila/runs/$PILA_RUN_ID/fly-machine.json"
+          if [ -f "$_pid_record" ]; then
+            cp "$_pid_record" "$_run_record" 2>/dev/null || true
           fi
+
+          # Tail the orchestrator log for the user's terminal. This is a
+          # separate exec session; its death (Ctrl-C, broken pipe, laptop
+          # closing) does NOT propagate to the orchestrator. After the
+          # orchestrator's State.rename_to promotes the bootstrap dir, it
+          # writes the final run-id to /work/.pila/launcher-<bootstrap>.runid;
+          # the wrapper script reads that, re-tails the new path, and on
+          # orchestrator-pid exit prints a finalize hint and ends.
+          echo "[pila] remote: tailing orchestrator log (Ctrl-C to detach — orchestrator keeps running)" >&2
+
+          # The remote tail wrapper is shared with `pila --attach --tail`
+          # via render_tail_wrapper in scripts/remote/lib.sh (already
+          # sourced above). It handles the `_bootstrap-<6hex>` →
+          # final-id rename transparently and prints the finalize hint
+          # when the orchestrator pid disappears.
+          _tail_script="$(render_tail_wrapper)"
+
+          # Prepend an env-var assignment to the wrapper script so the
+          # run-id reaches the wrapper via $PILA_TAIL_RUN_ID even on
+          # transports that drop positional args (e.g.
+          # `flyctl ssh console --command` — see attach.sh --tail). The
+          # `flyctl machine exec ... --` path also passes "$PILA_RUN_ID"
+          # positionally; the wrapper's `${PILA_TAIL_RUN_ID:-$1}` lookup
+          # prefers the env var when present.
+          _tail_invocation="PILA_TAIL_RUN_ID='$PILA_RUN_ID'; export PILA_TAIL_RUN_ID
+$_tail_script"
+          orch_rc=0
+          flyctl machine exec "$PILA_MACHINE_ID" \
+            --app "$FLY_APP" \
+            -- sh -c "$_tail_invocation" -- "$PILA_RUN_ID" \
+            || orch_rc=$?
+
+          # On a clean tail exit (the orchestrator's pid disappeared), we
+          # cannot read the orchestrator's true exit code — it ran detached.
+          # The decide_teardown trap classifies based on PILA_REMOTE_EXIT_RC
+          # which here reflects the TAIL's exit, not the orchestrator's.
+          # Per the reclassified table (DESIGN §6), tail-exit cleanly
+          # (rc=0 from the wrapper) is treated as "user can finalize"; the
+          # launcher does NOT call fetch_branch from here — `pila --finalize`
+          # does that. See *Detached run finalization* in IMPLEMENTATION.md.
+          container_rc=$orch_rc
         fi
       fi
     else
@@ -1206,28 +1579,6 @@ if [ -z "$LATEST_RUN_DIR" ]; then
   exit 0
 fi
 
-RUN_ID="$(basename "$LATEST_RUN_DIR")"
-RUN_BRANCH="$(jq -r '.branch // ""' "$LATEST_RUN_DIR/run.json")"
-WORKING_BRANCH="$(jq -r '.working_branch // ""' "$LATEST_RUN_DIR/run.json")"
-
-# Honor run.json.no_push. phase_finalize writes no_push=true when the
-# user invoked --no-push, and the no-work short-circuit (DESIGN §8
-# *The cleared-but-empty terminal state*) writes it when the task was
-# already satisfied on HEAD — in that case no run branch was ever
-# materialized, so trying to `git push` it would fail with "src
-# refspec does not match any". Trust the container's intent and skip
-# push + PR.
-if [ "$(jq -r '.no_push // false' "$LATEST_RUN_DIR/run.json")" = "true" ]; then
-  echo "[pila] finalize: run.json has no_push=true; skipping push + PR" >&2
-  exit 0
-fi
-
-if [ -z "$RUN_BRANCH" ] || [ -z "$WORKING_BRANCH" ]; then
-  echo "pila: error — run.json at $LATEST_RUN_DIR/run.json is missing branch info." >&2
-  echo "  Skipping push + PR. Push the run branch manually if it exists." >&2
-  exit 1
-fi
-
 # Detect --no-verify from $@ (CLI-only; not an env var).
 NO_VERIFY_PUSH=false
 for arg in "$@"; do
@@ -1235,134 +1586,10 @@ for arg in "$@"; do
     NO_VERIFY_PUSH=true
   fi
 done
+export NO_VERIFY_PUSH
 
-# Helper: merge fields into run.json atomically via jq + temp + mv.
-# Each call takes one or more `key=value` pairs. Empty string for value
-# becomes JSON null (matches Python's `None`-as-null).
-update_run_json() {
-  local sidecar tmp
-  sidecar="$LATEST_RUN_DIR/run.json"
-  tmp="$sidecar.tmp"
-  local jq_filter='.'
-  for kv in "$@"; do
-    local key="${kv%%=*}"
-    local val="${kv#*=}"
-    if [ -z "$val" ]; then
-      jq_filter="${jq_filter} | .${key} = null"
-    else
-      # Use jq's --arg for safe string interpolation.
-      jq_filter="${jq_filter} | .${key} = \$${key}"
-    fi
-  done
-  local args=()
-  for kv in "$@"; do
-    local key="${kv%%=*}"
-    local val="${kv#*=}"
-    [ -z "$val" ] || args+=(--arg "$key" "$val")
-  done
-  jq "${args[@]+"${args[@]}"}" "$jq_filter" "$sidecar" > "$tmp"
-  mv "$tmp" "$sidecar"
-}
-
-# --- step 1: push -------------------------------------------------------
-PUSH_ARGS=(git -C "$USER_REPO" push -u origin "$RUN_BRANCH")
-[ "$NO_VERIFY_PUSH" = "true" ] && PUSH_ARGS+=(--no-verify)
-
-echo "[pila] finalize: pushing $RUN_BRANCH to origin$([ "$NO_VERIFY_PUSH" = "true" ] && echo " (--no-verify)")" >&2
-if ! push_stderr="$("${PUSH_ARGS[@]}" 2>&1 >/dev/null)"; then
-  update_run_json "pushed_at=" "push_error=${push_stderr:-git push failed}" \
-                  "pr_url=" "pr_error="
-  echo "pila: error: git push failed for branch \`$RUN_BRANCH\`." >&2
-  echo "  Local state is intact:" >&2
-  echo "    - run branch:     $RUN_BRANCH (holds all wave merges)" >&2
-  echo "    - working branch: $WORKING_BRANCH (unchanged from run start; the intended PR base)" >&2
-  echo "  Resolve and retry manually:" >&2
-  echo "    git push -u origin $RUN_BRANCH$([ "$NO_VERIFY_PUSH" = "true" ] && echo " --no-verify")" >&2
-  echo "  Push stderr was:" >&2
-  printf '    %s\n' "$push_stderr" >&2
-  exit 1
-fi
-PUSHED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-update_run_json "pushed_at=$PUSHED_AT" "push_error="
-echo "[pila] finalize: pushed $RUN_BRANCH" >&2
-
-# --- step 2: PR creation ------------------------------------------------
-# Primary path: the pr_writer worker (DESIGN §6 *Finalization*) ran
-# before this script and wrote pr_title + pr_body to run.json. Use them
-# when present so the PR respects the target repo's PR template.
-#
-# Fallback path: when pr_writer errored, schema-failed, or was skipped,
-# pr_title / pr_body are absent (or empty) — compose a deterministic body
-# from state.json, mirroring `compose_pr_body` in orchestrator/pila.py.
-STATE_JSON="$LATEST_RUN_DIR/state.json"
-RUN_JSON="$LATEST_RUN_DIR/run.json"
-
-PR_TITLE_LLM="$(jq -r '.pr_title // ""' "$RUN_JSON")"
-PR_BODY_LLM="$(jq -r '.pr_body // ""' "$RUN_JSON")"
-
-if [ -n "$PR_TITLE_LLM" ] && [ -n "$PR_BODY_LLM" ]; then
-  # Launcher prepends "pila: " so pila-opened PRs stay easy to spot in
-  # lists. The worker MUST NOT include the prefix itself (its prompt
-  # says so); if it ever did, we'd render "pila: pila: <title>".
-  PR_TITLE="pila: $PR_TITLE_LLM"
-  PR_BODY="$PR_BODY_LLM"
-else
-  # Deterministic fallback. Extract fields with safe defaults
-  # (n/a for missing/null).
-  or_na() { [ -n "$1" ] && [ "$1" != "null" ] && printf '%s' "$1" || printf 'n/a'; }
-
-  TASK="$(jq -r '.task // ""' "$STATE_JSON")"
-  FIRST_CAT="$(or_na "$(jq -r '.categories[0] // ""' "$STATE_JSON")")"
-  SOURCE_OF_TRUTH="$(or_na "$(jq -r '.answers.source_of_truth // ""' "$STATE_JSON")")"
-  STARTED_AT="$(or_na "$(jq -r '.started_at // ""' "$STATE_JSON")")"
-  FINISHED_AT="$(or_na "$(jq -r '.finished_at // ""' "$STATE_JSON")")"
-  WAVE_COUNT="$(jq -r '.waves | length' "$STATE_JSON")"
-  SUBTASK_COUNT="$(jq -r '[.waves[] | length] | add // 0' "$STATE_JSON")"
-  WORKER_COUNT="$(or_na "$(jq -r '.worker_count // ""' "$STATE_JSON")")"
-  WORKING_BRANCH_DISPLAY="$(or_na "$WORKING_BRANCH")"
-
-  PR_TITLE="pila: $RUN_ID"
-  PR_BODY="$(cat <<EOF
-## Task
-
-$TASK
-
-## Classification
-
-- Category: $FIRST_CAT
-- Source of truth: $SOURCE_OF_TRUTH
-
-## Run summary
-
-- Run ID: $RUN_ID
-- Started: $STARTED_AT
-- Finished: $FINISHED_AT
-- Waves: $WAVE_COUNT, subtasks: $SUBTASK_COUNT
-- Workers: $WORKER_COUNT
-- Generated by pila on \`$WORKING_BRANCH_DISPLAY\`.
-
-See \`.pila/runs/$RUN_ID/state.json\` for full run state.
-EOF
-)"
-fi
-
-echo "[pila] finalize: opening PR against $WORKING_BRANCH" >&2
-if ! pr_output="$(echo "$PR_BODY" | gh pr create \
-                  --base "$WORKING_BRANCH" \
-                  --head "$RUN_BRANCH" \
-                  --title "$PR_TITLE" \
-                  --body-file - 2>&1)"; then
-  # PR-creation failure is NON-fatal — the push succeeded.
-  update_run_json "pr_url=" "pr_error=${pr_output:-gh pr create failed}"
-  echo "⚠  \`gh pr create\` failed; branch was pushed successfully." >&2
-  echo "  Pushed branch: $RUN_BRANCH (on origin)" >&2
-  echo "  Open the PR manually:" >&2
-  echo "    gh pr create --base $WORKING_BRANCH --head $RUN_BRANCH" >&2
-  echo "  Or via the GitHub web UI for the repo." >&2
-  echo "  gh stderr was:" >&2
-  printf '    %s\n' "$pr_output" >&2
-  exit 0
-fi
-PR_URL="$(printf '%s' "$pr_output" | tail -n 1)"
-update_run_json "pr_url=$PR_URL" "pr_error="
-echo "[pila] finalize: opened PR $PR_URL" >&2
+# Push + PR creation are shared with the `pila --finalize <run-id>`
+# fast-path; both source scripts/host-finalize.sh and call host_finalize.
+# shellcheck disable=SC1091
+. "$PILA_REPO/scripts/host-finalize.sh"
+host_finalize "$LATEST_RUN_DIR" || exit $?

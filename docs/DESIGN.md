@@ -833,6 +833,43 @@ modes) is *not* an abnormal exit. The user already got an actionable
 error message; running a worktree cleanup pass is correct (the run was
 mid-flight) but it is silent unless there were worktrees to clean.
 
+**Detached orchestrator (remote mode).** In local mode the orchestrator
+is PID 1 of the container — its lifetime *is* the run's lifetime, and
+the user's terminal owns that container directly via `nerdctl run`. In
+remote mode the same coupling would be a mistake. The actual work of a
+remote run (LLM calls, worker subprocesses, git, shell tools) happens
+entirely inside the Fly Machine; the launcher's host-side role after
+provisioning is purely **to stream the orchestrator log back for the
+user's eyes**. Binding the orchestrator's *life* to that streaming
+channel — which is what `flyctl machine exec -- python3 …` does by
+default — means a closed laptop, a dropped WiFi connection, or an
+accidental Ctrl-C kills a run that the laptop wasn't doing any work for.
+
+Pila therefore starts the orchestrator **detached** on the Fly Machine:
+`flyctl machine exec` invokes `setsid nohup python3 orchestrator/pila.py
+… > /work/.pila/runs/<run-id>/orchestrator.log 2>&1 < /dev/null &` and
+records the resulting pid in `orchestrator.pid`. The exec call returns
+immediately. A *second* exec call then runs `tail -F` on the
+orchestrator log purely for the user's terminal. The orchestrator is
+session leader inside the machine; the tail is an independent process
+on the host side. Stream death (Ctrl-C, broken pipe, laptop closing,
+WiFi dropping) breaks the tail, not the orchestrator.
+
+This matches the prior-art mental model from comparable tools
+(`fly machine` itself, Claude Code's `/bg` + `claude agents`, kubectl,
+tmux): **sessions are the unit of management, not terminals**. Pila's
+session is the run; the local terminal is just one of many ways to
+observe it.
+
+The run-id is the bridge. With detached invocation the launcher needs
+the run-id *before* starting the orchestrator (so it knows which
+`orchestrator.log` path to tail), but today's orchestrator generates
+its run-id internally during phase 0. The launcher therefore generates
+the slug + suffix host-side using the same pattern and passes it as
+`--run-id <id>` — reusing the plumbing that `--resume` already
+establishes. The orchestrator's `--run-id` short-circuit accepts the
+explicit value and skips auto-generation.
+
 **Remote pause-on-failure (Fly.io).** Local mode reaps the container's
 PID namespace on every exit (success or failure) because the host
 filesystem holds the durable record. Remote mode has the same durable
@@ -845,16 +882,32 @@ recently-edited files that haven't yet been committed to a per-subtask
 branch).
 
 The compromise: classify the orchestrator's exit code on the host side
-and route to either *stop* (preserves volume, frees compute) or
-*destroy* (full reap). Classification:
+and route to either *stop* (preserves volume, frees compute), *destroy*
+(full reap), or *leave alone* (the user merely detached the local
+stream — the orchestrator on the machine is still working). With the
+detached orchestrator above, the classification is no longer "how did
+the orchestrator's run exit?" but "what just happened on the host
+side?" — because the launcher process now exits when the *tail*
+finishes, not when the orchestrator finishes. The reclassified table:
 
 | Exit | Meaning | Disposition |
 |---|---|---|
-| `0` | success — finalize ran | destroy after stream-back |
+| `0` | tail saw orchestrator exit cleanly via `orchestrator.pid` | destroy after stream-back |
 | `EXIT_NEEDS_ANSWERS=10` | clarification (plugin re-runs) | destroy (nothing to inspect) |
 | `75` (EX_TEMPFAIL) | rate-limit, parse-fail | destroy (state in run branch; cheaper to re-provision) |
-| `130` / `143` | host-side SIGINT / SIGTERM | destroy (user cancelled) |
+| `130` / `143` | host-side SIGINT / SIGTERM | **detach: leave machine alone, print reattach hints** |
 | any other non-zero | worker/orchestrator failure | **pause: stop machine, write sidecar, notify** |
+
+The Ctrl-C row is the load-bearing change. Earlier versions of pila
+treated rc=130 as "user cancelled, destroy the machine" — but with the
+detach, rc=130 only means "user stopped watching." The orchestrator on
+the machine has not been signalled and is still running. Destroying it
+on Ctrl-C would be exactly the behavior the detach was introduced to
+prevent. The launcher therefore prints a small banner listing the
+reattach, pause, and destroy commands and exits without touching the
+machine. The user can then come back hours or days later and either
+`pila --attach --tail` to watch progress, `pila --stop` to pause
+cleanly, or `pila --kill` to explicitly destroy.
 
 The decision lives in the launcher (`scripts/remote/provision.sh`'s
 EXIT trap), not the orchestrator. Per §6 *Worker subtree termination*
@@ -871,41 +924,62 @@ preserved — `remote-task-system.md` lines 89–99 explicitly retract the
 abstract "memory-state snapshot" requirement in favor of the
 run-branch-as-durable-record contract this section relies on.
 
-Three sidecar fields on `run.json` capture pause state:
+Four sidecar fields on `run.json` capture remote lifecycle state:
 
 - `fly_machine_id` — written by `provision.sh` immediately after
   `flyctl machine run` succeeds, so a launcher that crashes before
   classifying still leaves a recoverable pointer to the machine.
-- `paused_at` — ISO timestamp written by the EXIT trap on the pause
-  branch.
+- `paused_at` — ISO timestamp written either by the EXIT trap on the
+  pause-on-failure branch or by an explicit `pila --stop <run-id>`.
 - `pause_reason` — short tag (`worker-error`, `orchestrator-exception`,
-  `finalize-failed`).
+  `finalize-failed`, `user-requested`).
+- `killed_at` — ISO timestamp written by an explicit
+  `pila --kill <run-id>`. Marks the run as terminated by user request;
+  the machine has been destroyed and the run is no longer resumable.
 
-`paused_at` and `pushed_at` are mutually exclusive — a run cannot be
-both paused and finalized. The orchestrator's `_validate_run_json`
-enforces the invariant.
+`paused_at`, `pushed_at`, and `killed_at` are mutually exclusive — a
+run cannot be in more than one terminal-or-paused state. The
+orchestrator's `_validate_run_json` enforces the invariant.
 
-The user-visible surfaces are: a launcher-printed notification block
-on the pause branch (machine ID, attach command, resume command, kill
-command); `pila --list-paused`, which filters runs by `paused_at`;
-and `pila --resume --run-id <id> --runtime fly`, which reads the
-sidecar, calls `flyctl machine start`, re-runs the seed step for any
-host-side dirty edits (§ Mid-run re-seed, follow-up), and continues
-the run.
+**The user-visible verb surface.** Five explicit verbs cover the
+remote run lifecycle, each doing exactly one thing:
+
+| Verb | Effect |
+|---|---|
+| `pila "task" --runtime fly` | Provision machine, detach orchestrator, tail log |
+| `pila --attach <run-id> --tail` | Reattach to a running or paused run's log |
+| `pila --stop <run-id>` | Clean pause (`flyctl machine stop`); resumable |
+| `pila --resume --run-id <id> --runtime fly` | Wake a paused machine, re-seed dirty edits, continue |
+| `pila --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
+
+Plus `pila --list` (unified across local and remote, with `--status
+<state>` filtering — `--list-paused` becomes a deprecated alias for
+`--list --status paused-remote`).
+
+This separation matches the convention every comparable tool follows:
+`fly machine start` / `stop` / `destroy` are distinct verbs;
+kubectl's `delete` is distinct from a watched stream ending;
+tmux's `kill-session` is distinct from `detach`. Ctrl-C as a
+destructive verb was an artifact of the lifetime coupling — once the
+coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
+this terminal-side activity") and destruction needs its own verb.
 
 **Interactive attach over PTY in remote mode.** The attach channel
 is the §6 isolation boundary's terminal-side surface — not a new
 privileged channel. `pila --attach <run-id>` `exec`s
 `flyctl ssh console` against the run's Fly Machine, which proxies
 through Fly's hallpass + WireGuard mesh and gives the user a real
-PTY at `/work`. No sshd in the image, no key management, no public
+PTY at `/work`. `pila --attach <run-id> --tail` is the same channel
+but runs `tail -F /work/.pila/runs/<run-id>/orchestrator.log` instead
+of a shell — this is the canonical way to watch a detached run's
+progress after the initial launcher exits or after a deliberate
+Ctrl-C detach. No sshd in the image, no key management, no public
 exposure; isolation inherits from the same WireGuard mesh the
 launcher already uses for `flyctl machine exec`.
 
 The orchestrator is unaware of attach — it's a launcher-host gesture
 (mirrors §6's "container/process isolation is the launcher's
-concern"). The same mechanism serves three roles from
-`remote-task-system.md`:
+concern"). The same mechanism serves four roles:
 
 1. The "feels-local" interactive terminal — a developer can drop in
    to inspect what a worker is doing.
@@ -916,6 +990,10 @@ concern"). The same mechanism serves three roles from
 3. The failure-inspection surface — the paused-machine state from
    the pause-on-failure path is reachable via exactly the same
    command. No second mechanism is needed.
+4. **The detached-run reattach surface** — after a Ctrl-C detach or
+   a closed-laptop disconnect, `pila --attach <run-id> --tail` picks
+   up the orchestrator log stream where it left off. The orchestrator
+   never noticed; only the local view paused.
 
 State contract: `scripts/remote/provision.sh` writes a PID-keyed
 record at `$USER_REPO/.pila/remote/$$.json` immediately after

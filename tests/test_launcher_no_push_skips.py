@@ -133,23 +133,26 @@ def test_no_push_null_proceeds_to_push(tmp_path):
 # ----- source-text coupling: the harness must match the real launcher ------
 
 def test_launcher_pila_contains_the_no_push_check():
-    """Pin the real launcher source so a refactor that removes or
+    """Pin the host-finalize source so a refactor that removes or
     rewords the no_push check fails THIS test instead of silently
     breaking the no-work flow. Mirrors the pattern in
     test_finalize_sh_behavior.py and test_orchestrate_call_sites.py.
-    """
-    launcher = (REPO_ROOT / "pila").read_text()
-    # The exact jq invocation we mirror in the harness.
+
+    Note: the no_push check moved from `pila` (inline at finalize) into
+    `scripts/host-finalize.sh` (the extracted host_finalize function)
+    as part of Audit Drift 7. The pin now targets that file."""
+    host_finalize = (REPO_ROOT / "scripts" / "host-finalize.sh").read_text()
+    # The jq invocation in the extracted host_finalize function.
     assert (
-        "$(jq -r '.no_push // false' \"$LATEST_RUN_DIR/run.json\")"
-        in launcher
+        '$(jq -r \'.no_push // false\' "$run_json")'
+        in host_finalize
     ), (
-        "the launcher must read `.no_push` from run.json and honor "
+        "host_finalize must read `.no_push` from run.json and honor "
         "true. Without it, a no-work pila run (DESIGN §8) tries to "
         "push a non-existent branch and the launcher writes "
         "push_error to run.json."
     )
     # And the skip+exit must be on the true branch.
     assert (
-        "skipping push + PR" in launcher
+        "skipping push + PR" in host_finalize
     ), "the launcher's no_push skip must log a recognizable message"

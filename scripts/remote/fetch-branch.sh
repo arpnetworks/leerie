@@ -65,9 +65,16 @@ fetch_branch() {
     echo "pila: fetch_branch: USER_REPO is not set" >&2
     return 1
   fi
-  if ! command -v flyctl >/dev/null 2>&1; then
-    echo "pila: fetch_branch: flyctl not found on PATH" >&2
-    return 1
+  # flyctl presence + auth via the shared helper from lib.sh. The launcher's
+  # RUNTIME=fly preflight already calls require_flyctl; this is belt-and-
+  # braces for callers that source fetch-branch.sh standalone.
+  if ! command -v require_flyctl >/dev/null 2>&1; then
+    if ! command -v flyctl >/dev/null 2>&1; then
+      echo "pila: fetch_branch: flyctl not found on PATH" >&2
+      return 1
+    fi
+  else
+    require_flyctl || return 1
   fi
 
   echo "[pila] remote: fetching completed run from machine $machine_id ..." >&2

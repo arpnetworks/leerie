@@ -143,7 +143,7 @@ def test_accepts_paused_remote(pila):
 
 def test_rejects_paused_and_pushed_both_set(pila):
     """A run cannot be both paused and finalized."""
-    with pytest.raises(ValueError, match="paused_at and pushed_at"):
+    with pytest.raises(ValueError, match="mutually exclusive"):
         pila._validate_run_json(_minimal_run_json(
             paused_at="2026-05-29T16:00:00+00:00",
             fly_machine_id="abc",
@@ -165,6 +165,44 @@ def test_accepts_fly_machine_id_alone(pila):
     pila._validate_run_json(_minimal_run_json(
         fly_machine_id="148e445b911389",
     ))
+
+
+# --- killed_at invariants (DESIGN §6 *The user-visible verb surface*) -----
+
+def test_accepts_killed_remote(pila):
+    """Valid killed run: killed_at + fly_machine_id, nothing else."""
+    pila._validate_run_json(_minimal_run_json(
+        killed_at="2026-05-29T16:00:00+00:00",
+        fly_machine_id="148e445b911389",
+    ))
+
+
+def test_rejects_killed_without_fly_machine_id(pila):
+    """Cannot have killed a machine you don't have a pointer to."""
+    with pytest.raises(ValueError, match="killed_at is set but fly_machine_id"):
+        pila._validate_run_json(_minimal_run_json(
+            killed_at="2026-05-29T16:00:00+00:00",
+        ))
+
+
+def test_rejects_killed_and_paused_both_set(pila):
+    """paused_at and killed_at are mutually exclusive."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        pila._validate_run_json(_minimal_run_json(
+            killed_at="2026-05-29T16:00:00+00:00",
+            paused_at="2026-05-29T15:00:00+00:00",
+            fly_machine_id="abc",
+        ))
+
+
+def test_rejects_killed_and_pushed_both_set(pila):
+    """killed_at and pushed_at are mutually exclusive."""
+    with pytest.raises(ValueError, match="mutually exclusive"):
+        pila._validate_run_json(_minimal_run_json(
+            killed_at="2026-05-29T16:00:00+00:00",
+            pushed_at="2026-05-29T15:00:00+00:00",
+            fly_machine_id="abc",
+        ))
 
 
 # --- defensive cases -------------------------------------------------------

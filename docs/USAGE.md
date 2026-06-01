@@ -215,6 +215,58 @@ branches yourself, resolve, and resume.
 `state['completed_waves']`; finished waves are not re-run. The full state
 schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
 
+## Walking away from a remote run (`--runtime fly`)
+
+Remote runs are designed to outlive your local terminal. The
+orchestrator runs detached inside the Fly Machine; your local terminal
+is only watching the log stream. Five verbs cover the full lifecycle:
+
+| You did | Pila did | Verb to come back |
+|---|---|---|
+| `pila "task" --runtime fly` | provisioned a Fly Machine, started the orchestrator detached, opened a tail of its log on your terminal | — (you're attached) |
+| pressed Ctrl-C | detached your local tail; orchestrator on the machine is still running | `pila --attach <run-id> --tail` |
+| closed your laptop / lost WiFi | same as Ctrl-C — the tail broke but the orchestrator did not | `pila --attach <run-id> --tail` |
+| ran `pila --stop <run-id>` | stopped the machine cleanly via `flyctl machine stop`; filesystem preserved on Fly volume | `pila --resume --run-id <id> --runtime fly` |
+| ran `pila --kill <run-id>` | destroyed the machine via `flyctl machine destroy`; run is over | start a new run; this one is gone |
+
+**The "close your laptop" workflow.** Start the run, watch it for a
+few minutes to make sure it's healthy, then Ctrl-C the tail. You'll
+see a one-line banner:
+
+```
+[pila] detached from run <id> (machine <mid> still running)
+       reattach:  pila --attach <id> --tail
+       pause:     pila --stop <id>
+       destroy:   pila --kill <id>
+```
+
+Close your laptop, go wherever. When you come back, `pila --attach
+<id> --tail` picks up the orchestrator log where it left off. The
+orchestrator never noticed you were gone.
+
+**Listing runs.** `pila --list` shows every run (local and remote) in
+one table, with the Fly Machine ID column populated for remote runs.
+Filter by status with `pila --list --status <state>` (e.g.
+`paused-remote`, `killed-remote`, `in-progress`). The taxonomy lives in
+`RUN_STATUSES` in `orchestrator/pila.py`; `pila --list --status ?`
+prints the full set.
+
+> **In-flight detached runs** — runs that are still in the bootstrap
+> phase (before classify completes, ~1 min) won't show up in `pila
+> --list` yet, because `state.json` lives on the Fly Machine until
+> `pila --finalize` streams it back. **The detach banner that prints
+> when you Ctrl-C is the canonical source of the run-id during that
+> window** — copy it. Once classify completes the run appears in
+> `pila --list` with its final category-prefixed id.
+
+**`flyctl` auto-install.** The first time you pass `--runtime fly` on
+a machine without `flyctl`, pila offers to install it (`brew install
+flyctl` on macOS, `curl -L https://fly.io/install.sh | sh` on Linux)
+and prompts for `flyctl auth login`. The pattern mirrors the
+local-runtime auto-install in `scripts/install.sh`. Opt out with
+`--no-runtime-install` (you'll get the install hint and exit 1, same
+as today).
+
 ## Tuning for your workflow
 
 - `--source-of-truth codebase|research|both` — one-off CLI override;

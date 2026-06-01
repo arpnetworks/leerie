@@ -285,8 +285,14 @@ def test_attach_default_command_is_bash(tmp_path: Path):
     assert "exec bash" in invocations
 
 
-def test_attach_tail_mode_replaces_bash_with_tail(tmp_path: Path):
-    """--tail replaces the bash shell with tail -F of the orchestrator log."""
+def test_attach_tail_mode_uses_orchestrator_log_wrapper(tmp_path: Path):
+    """--tail invokes the shared render_tail_wrapper script (which tails
+    orchestrator.log, not per-worker logs). Audit Drift 1+3 fix.
+
+    Also verifies the run-id is delivered to the wrapper via
+    PILA_TAIL_RUN_ID env var (Part D D1 fix): `flyctl ssh console
+    --command` ignores positional args after `--`, so the run-id must
+    be embedded in the script body itself."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
     run_dir = user_repo / ".pila" / "runs" / "my-run-004"
@@ -303,9 +309,67 @@ def test_attach_tail_mode_replaces_bash_with_tail(tmp_path: Path):
     )
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
+    # The wrapper script is passed via --command. It targets
+    # orchestrator.log (canonical detached-run log per DESIGN §6).
     assert "tail -F" in invocations
-    assert "/work/.pila/runs/my-run-004/logs" in invocations
+    assert "orchestrator.log" in invocations
+    # And NOT the old per-worker tail path.
+    assert "/logs/*.log" not in invocations
+    # And NOT a bare shell.
     assert "exec bash" not in invocations
+    # D1 regression guard: the run-id must reach the wrapper via env
+    # var (not positional, which flyctl ssh console drops).
+    assert "PILA_TAIL_RUN_ID='my-run-004'" in invocations or \
+           "PILA_TAIL_RUN_ID=my-run-004" in invocations, \
+           f"run-id missing from --command; flyctl invocation was:\n{invocations}"
+
+
+def test_attach_tail_with_all_logs_uses_per_worker_logs(tmp_path: Path):
+    """--tail --all-logs falls back to the legacy per-worker globbed tail
+    for users who want to inspect individual worker output."""
+    _stub_flyctl(tmp_path)
+    user_repo = tmp_path / "user-repo"
+    run_dir = user_repo / ".pila" / "runs" / "my-run-004b"
+    run_dir.mkdir(parents=True)
+    (run_dir / "fly-machine.json").write_text(json.dumps({
+        "fly_machine_id": "mach-alllogs",
+    }))
+    result = _run_bash(
+        f"{ATTACH_SH} my-run-004b --tail --all-logs",
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "USER_REPO": str(user_repo),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    invocations = (tmp_path / "flyctl.log").read_text()
+    assert "tail -F" in invocations
+    assert "/work/.pila/runs/my-run-004b/logs/*.log" in invocations
+
+
+def test_attach_tail_without_run_id_errors(tmp_path: Path):
+    """--tail without <run-id> can no longer fall back to globbed tail
+    (the wrapper needs a per-run id) — error with a useful hint."""
+    _stub_flyctl(tmp_path)
+    user_repo = tmp_path / "user-repo"
+    # Create an active record so attach.sh resolves a machine.
+    remote_dir = user_repo / ".pila" / "remote"
+    remote_dir.mkdir(parents=True)
+    # Simulate an active record by using the current launcher's PID
+    # (the test runs under its own PID, so we use a PID known to exist).
+    import os as _os
+    (remote_dir / f"{_os.getpid()}.json").write_text(json.dumps({
+        "fly_machine_id": "mach-norunid",
+    }))
+    result = _run_bash(
+        f"{ATTACH_SH} --tail",
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "USER_REPO": str(user_repo),
+        },
+    )
+    assert result.returncode == 1, result.stderr
+    assert "requires a <run-id>" in result.stderr
 
 
 def test_attach_app_flag_overrides_default(tmp_path: Path):

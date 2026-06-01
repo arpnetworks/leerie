@@ -195,20 +195,42 @@ def test_decide_teardown_rc75_destroys(tmp_path: Path):
     assert "machine destroy mach-test" in invocations
 
 
-def test_decide_teardown_rc130_destroys(tmp_path: Path):
-    """rc=130 (SIGINT) → destroy."""
-    result, sidecar = _decide_teardown_with_rc(tmp_path, "130")
+def test_decide_teardown_rc130_detaches(tmp_path: Path):
+    """rc=130 (SIGINT) → DETACH: leave machine alone, print reattach hints.
+
+    With the detached orchestrator (DESIGN §6), SIGINT on the launcher means
+    the user stopped watching the local tail — not that they want to destroy
+    the run. The orchestrator on the machine is still running. The trap
+    must neither destroy nor stop the machine, and must print the hints
+    that point to --attach / --stop / --kill."""
+    result, sidecar = _decide_teardown_with_rc(tmp_path, "130", run_id="my-run-abc")
     assert result.returncode == 0, result.stderr
-    invocations = (tmp_path / "flyctl.log").read_text()
-    assert "machine destroy mach-test" in invocations
+    # No flyctl invocations at all — the stub never gets called.
+    log = tmp_path / "flyctl.log"
+    assert not log.exists() or log.read_text() == "", \
+        f"expected no flyctl calls for rc=130, got: {log.read_text() if log.exists() else ''!r}"
+    # Sidecar must be unchanged (no paused_at, no killed_at).
+    data = json.loads(sidecar.read_text())
+    assert data.get("paused_at") is None
+    assert data.get("killed_at") is None
+    # Detach hints must appear in stderr.
+    assert "detached from run my-run-abc" in result.stderr
+    assert "pila --attach my-run-abc --tail" in result.stderr
+    assert "pila --stop my-run-abc" in result.stderr
+    assert "pila --kill my-run-abc" in result.stderr
 
 
-def test_decide_teardown_rc143_destroys(tmp_path: Path):
-    """rc=143 (SIGTERM) → destroy."""
-    result, sidecar = _decide_teardown_with_rc(tmp_path, "143")
+def test_decide_teardown_rc143_detaches(tmp_path: Path):
+    """rc=143 (SIGTERM) → same detach behavior as SIGINT."""
+    result, sidecar = _decide_teardown_with_rc(tmp_path, "143", run_id="my-run-xyz")
     assert result.returncode == 0, result.stderr
-    invocations = (tmp_path / "flyctl.log").read_text()
-    assert "machine destroy mach-test" in invocations
+    log = tmp_path / "flyctl.log"
+    assert not log.exists() or log.read_text() == "", \
+        f"expected no flyctl calls for rc=143"
+    data = json.loads(sidecar.read_text())
+    assert data.get("paused_at") is None
+    assert data.get("killed_at") is None
+    assert "detached from run my-run-xyz" in result.stderr
 
 
 def test_decide_teardown_rc1_pauses(tmp_path: Path):

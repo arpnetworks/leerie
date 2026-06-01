@@ -143,13 +143,13 @@ def test_list_runs_falls_back_to_compute_run_branch(pila, tmp_path, capsys):
     assert "pila/runs/feat-a-aaaaaa" in out
 
 
-# --- list_paused_runs (Phase 2) -------------------------------------------
+# --- list_paused_runs (deprecated alias for --list --status paused-remote)
 
 def test_list_paused_runs_empty(pila, tmp_path, capsys):
-    """No runs at all → 'no paused remote runs'."""
+    """No runs at all → empty-with-filter message."""
     pila.list_paused_runs(tmp_path)
     out = capsys.readouterr().out
-    assert "no paused remote runs" in out
+    assert "no runs" in out and "paused-remote" in out
 
 
 def test_list_paused_runs_filters_to_paused_only(pila, tmp_path, capsys):
@@ -192,4 +192,73 @@ def test_list_paused_excludes_paused_with_push_error(pila, tmp_path, capsys):
     out = capsys.readouterr().out
     # Excluded — its derived status is push-failed.
     assert "feat-mixed-ddddd" not in out
-    assert "no paused remote runs" in out
+
+
+# --- machine column + --status filter (DESIGN §6 unified --list) ----------
+
+def test_list_runs_machine_column_appears_for_remote_runs(pila, tmp_path, capsys):
+    """When any run has fly_machine_id, the table includes a `machine`
+    column with that value."""
+    _make_run(tmp_path, "feat-r-aaaaaa",
+              {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"},
+              run_json={
+                  "paused_at": "2026-05-29T11:00:00+00:00",
+                  "fly_machine_id": "mach-abc123",
+              })
+    pila.list_runs(tmp_path)
+    out = capsys.readouterr().out
+    assert "machine" in out
+    assert "mach-abc123" in out
+
+
+def test_list_runs_machine_column_hidden_when_no_remote_runs(pila, tmp_path, capsys):
+    """Pure-local users see no machine column noise."""
+    _make_run(tmp_path, "feat-l-aaaaaa",
+              {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"})
+    pila.list_runs(tmp_path)
+    out = capsys.readouterr().out
+    # Header should NOT contain "machine"
+    header_line = out.split("\n", 1)[0]
+    assert "machine" not in header_line
+
+
+def test_list_runs_status_filter_in_progress(pila, tmp_path, capsys):
+    """--list --status in-progress filters to running runs."""
+    _make_run(tmp_path, "feat-running-aaaaa",
+              {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"})
+    _make_run(tmp_path, "feat-paused-bbbbb",
+              {"started_at": "2026-05-29T11:00:00+00:00", "task": "y"},
+              run_json={
+                  "paused_at": "2026-05-29T12:00:00+00:00",
+                  "fly_machine_id": "mach-paused",
+              })
+    pila.list_runs(tmp_path, status_filter="in-progress")
+    out = capsys.readouterr().out
+    assert "feat-running-aaaaa" in out
+    assert "feat-paused-bbbbb" not in out
+
+
+def test_list_runs_status_filter_killed_remote(pila, tmp_path, capsys):
+    """--list --status killed-remote isolates killed runs."""
+    _make_run(tmp_path, "feat-killed-aaaaa",
+              {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"},
+              run_json={
+                  "killed_at": "2026-05-29T11:00:00+00:00",
+                  "fly_machine_id": "mach-killed",
+              })
+    _make_run(tmp_path, "feat-running-bbbbb",
+              {"started_at": "2026-05-29T11:00:00+00:00", "task": "y"})
+    pila.list_runs(tmp_path, status_filter="killed-remote")
+    out = capsys.readouterr().out
+    assert "feat-killed-aaaaa" in out
+    assert "killed-remote" in out
+    assert "feat-running-bbbbb" not in out
+
+
+def test_list_runs_status_filter_empty_match_message(pila, tmp_path, capsys):
+    """Filter that matches nothing prints a useful empty message."""
+    _make_run(tmp_path, "feat-a-aaaaaa",
+              {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"})
+    pila.list_runs(tmp_path, status_filter="killed-remote")
+    out = capsys.readouterr().out
+    assert "no runs" in out and "killed-remote" in out
