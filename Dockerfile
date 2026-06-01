@@ -3,14 +3,17 @@
 # Built locally on first `pila` run; tagged `pila:<VERSION>` so a pila upgrade
 # rebuilds once and reuses layers thereafter.
 #
-# LOCAL MODE: the launcher bind-mounts $PILA_HOME → /work/.pila-image:ro at
+# LOCAL MODE: the launcher bind-mounts $PILA_HOME → /opt/pila-image:ro at
 # runtime, shadowing the baked-in COPY layers. Editing orchestrator/pila.py
 # on the host takes effect on the next run without an image rebuild.
 #
 # REGISTRY / FLY MODE: the COPY instructions below bake orchestrator/,
-# scripts/, prompts/, and .claude-plugin/ into /work/.pila-image/ so the
+# scripts/, prompts/, and .claude-plugin/ into /opt/pila-image/ so the
 # image is self-contained without a bind-mount. An image rebuild IS required
 # after source changes.
+#
+# Lives at /opt/pila-image/ (NOT /work/.pila-image/) so the remote-seed
+# phase can `rm -rf /work` without clobbering the orchestrator code.
 
 FROM debian:13-slim
 
@@ -164,18 +167,25 @@ RUN mkdir -p /home/pila/.local/share/mise \
     && chown -R pila:"${HOST_GID}" /home/pila/.local /home/pila/.cache /home/pila/.gnupg \
     && chmod 700 /home/pila/.gnupg
 
-# Bake the orchestrator source into the image at /work/.pila-image/ so the
+# Bake the orchestrator source into the image at /opt/pila-image/ so the
 # image is self-contained on Fly.io Machines (no host bind mount available).
-# On local runs the launcher's `-v $PILA_REPO:/work/.pila-image:ro` shadows
-# this baked copy, so development iteration (edit + run) works without
-# rebuilding the image. COPY runs as root; chown transfers ownership to pila.
-COPY orchestrator/ /work/.pila-image/orchestrator/
-COPY scripts/ /work/.pila-image/scripts/
-COPY prompts/ /work/.pila-image/prompts/
-COPY .claude-plugin/ /work/.pila-image/.claude-plugin/
-RUN chown -R pila:"${HOST_GID}" /work/.pila-image
+# Lives OUTSIDE /work so the remote-seed phase can `rm -rf /work` without
+# clobbering the orchestrator code. Local runs bind-mount the host pila
+# repo at /opt/pila-image:ro (see launcher) — same path inside the
+# container, so /opt/pila-image/orchestrator/pila.py works identically
+# in both modes. COPY runs as root; chown transfers ownership to pila.
+COPY orchestrator/ /opt/pila-image/orchestrator/
+COPY scripts/ /opt/pila-image/scripts/
+COPY prompts/ /opt/pila-image/prompts/
+COPY .claude-plugin/ /opt/pila-image/.claude-plugin/
+RUN chown -R pila:"${HOST_GID}" /opt/pila-image
+# /work must be writable by pila for the orchestrator to create
+# /work/.pila on remote (Fly Machine) runs. Local runs bind-mount
+# $(pwd):/work which masks the image's /work permission; remote runs
+# use the image's /work directly, so it must be owned by pila.
+RUN mkdir -p /work && chown pila:"${HOST_GID}" /work
 
 USER pila
 WORKDIR /work
 
-ENTRYPOINT ["/work/.pila-image/scripts/container-entry.sh"]
+ENTRYPOINT ["/opt/pila-image/scripts/container-entry.sh"]

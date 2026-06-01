@@ -1643,11 +1643,17 @@ def _check_claude_cli_version() -> None:
     """die() if `claude` is too old for --json-schema. Without this, a
     stale CLI surfaces as a cryptic 'unknown option' wrapped in the
     smoke-test error path — actionable for nobody. Existence on PATH is
-    already enforced earlier in main() via shutil.which()."""
+    already enforced earlier in main() via shutil.which().
+
+    Timeout is 30 s (not 10 s) because on a freshly-provisioned Fly
+    machine the first `claude --version` invocation can take ~17 s —
+    the Node runtime warms up, statsig fetches feature flags, etc.
+    Subsequent calls return in <0.2 s. 30 s is a generous ceiling
+    above the observed cold-start time."""
     try:
         out = subprocess.run(
             ["claude", "--version"],
-            capture_output=True, text=True, timeout=10, check=False,
+            capture_output=True, text=True, timeout=30, check=False,
         )
     except subprocess.TimeoutExpired:
         die("`claude --version` timed out — investigate the CLI install.")
@@ -1840,6 +1846,30 @@ def _validate_run_json(data: dict) -> None:
         raise ValueError(
             "run.json invariant: killed_at is set but fly_machine_id is null; "
             "you cannot have destroyed a machine you don't have a pointer to"
+        )
+    # `sync_failed_at`: set by decide_teardown's clean-exit branch when
+    # fetch_branch fails. The machine is left RUNNING (work-preserving)
+    # and the user is told to recover manually + then `pila --kill`.
+    # Orthogonal to paused/pushed/killed — the machine isn't paused or
+    # killed, just has un-synced work — so no mutual exclusion with the
+    # other terminal states. Mutex'd against pushed/killed (a synced+
+    # pushed run cannot also be sync-failed; a destroyed machine cannot
+    # be sync-failed).
+    sync_failed_at = data.get("sync_failed_at")
+    if sync_failed_at is not None and pushed_at is not None:
+        raise ValueError(
+            "run.json invariant: sync_failed_at and pushed_at are both set; "
+            "a successfully pushed run cannot also be sync-failed"
+        )
+    if sync_failed_at is not None and killed_at is not None:
+        raise ValueError(
+            "run.json invariant: sync_failed_at and killed_at are both set; "
+            "a destroyed machine cannot also be sync-failed"
+        )
+    if sync_failed_at is not None and fly_machine_id is None:
+        raise ValueError(
+            "run.json invariant: sync_failed_at is set but fly_machine_id is null; "
+            "the running machine needs a pointer for the user to recover via --finalize/--kill"
         )
 
 
@@ -2107,6 +2137,7 @@ RUN_STATUSES = (
     "pr-failed",
     "paused-remote",
     "killed-remote",
+    "sync-failed-running",
 )
 
 
@@ -2119,15 +2150,20 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
       3. pr_error set              → `pr-failed`.
       4. pr_url set                → `done-pushed-pr`.
       5. pushed_at set             → `done-pushed-no-pr`.
-      6. finished_at set           → `done-local` (run completed, --no-push).
-      7. killed_at set             → `killed-remote` (explicit --kill).
-      8. paused_at set             → `paused-remote` (pause-on-failure or --stop).
-      9. otherwise                 → `in-progress`.
+      6. sync_failed_at set        → `sync-failed-running` (machine still up,
+                                     work not on host yet — recover via
+                                     `pila --finalize` then `--kill`).
+      7. finished_at set           → `done-local` (run completed, --no-push).
+      8. killed_at set             → `killed-remote` (explicit --kill).
+      9. paused_at set             → `paused-remote` (pause-on-failure or --stop).
+     10. otherwise                 → `in-progress`.
 
     Precedence note: push/PR errors fire before the paused/killed checks
     because a finalize that failed mid-write should surface as the error
-    it actually is. killed_at fires before paused_at because the kill
-    verb supersedes any prior pause state (the machine was destroyed).
+    it actually is. sync_failed_at fires before finished_at because the
+    user must address the failed sync before treating the run as locally
+    complete. killed_at fires before paused_at because the kill verb
+    supersedes any prior pause state (the machine was destroyed).
 
     state_json is currently unused in the derivation but accepted for
     forward-compat: future statuses (e.g., 'blocked') may consult
@@ -2146,6 +2182,8 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
         return "done-pushed-pr"
     if rj.get("pushed_at"):
         return "done-pushed-no-pr"
+    if rj.get("sync_failed_at"):
+        return "sync-failed-running"
     if rj.get("finished_at"):
         return "done-local"
     if rj.get("killed_at"):

@@ -181,6 +181,7 @@ def test_status_table_lists_every_value_used(pila):
         "done-pushed-no-pr", "done-pushed-pr",
         "push-failed", "pr-failed",
         "paused-remote", "killed-remote",
+        "sync-failed-running",
     }
     assert set(pila.RUN_STATUSES) == expected
 
@@ -194,4 +195,52 @@ def test_push_error_priority_over_pr_url(pila):
         "pr_url": "https://gh.com/pr/1",
     }
     # _validate_run_json rejects this combo → corrupt-sidecar.
+    assert pila._derive_run_status(rj, {}) == "corrupt-sidecar"
+
+
+def test_sync_failed_at_surfaces_as_sync_failed_running(pila):
+    """sync_failed_at set + fly_machine_id set + no killed_at → status
+    is `sync-failed-running`. This is the orchestrator-finished-but-
+    fetch_branch-failed state where the machine is still running on
+    Fly with un-synced work."""
+    rj = {
+        "finished_at": "2026-06-01T18:43:33Z",
+        "sync_failed_at": "2026-06-01T18:43:34Z",
+        "sync_fail_reason": "sync-failed-on-clean-exit",
+        "fly_machine_id": "abc123",
+    }
+    assert pila._derive_run_status(rj, {}) == "sync-failed-running"
+
+
+def test_sync_failed_takes_precedence_over_done_local(pila):
+    """When both finished_at and sync_failed_at are set, sync-failed
+    wins — the user must address the failed sync before the run is
+    considered locally complete."""
+    rj = {
+        "finished_at": "2026-06-01T18:43:33Z",
+        "sync_failed_at": "2026-06-01T18:43:34Z",
+        "fly_machine_id": "abc123",
+    }
+    assert pila._derive_run_status(rj, {}) == "sync-failed-running"
+
+
+def test_sync_failed_at_requires_fly_machine_id(pila):
+    """sync_failed_at without fly_machine_id is an invariant violation;
+    the validator rejects it → corrupt-sidecar."""
+    rj = {
+        "finished_at": "2026-06-01T18:43:33Z",
+        "sync_failed_at": "2026-06-01T18:43:34Z",
+        # No fly_machine_id.
+    }
+    assert pila._derive_run_status(rj, {}) == "corrupt-sidecar"
+
+
+def test_sync_failed_and_pushed_are_mutex(pila):
+    """sync_failed_at and pushed_at cannot both be set — invariant
+    violation → corrupt-sidecar."""
+    rj = {
+        "pushed_at": "2026-06-01T18:43:33Z",
+        "sync_failed_at": "2026-06-01T18:43:34Z",
+        "fly_machine_id": "abc123",
+    }
     assert pila._derive_run_status(rj, {}) == "corrupt-sidecar"

@@ -165,7 +165,7 @@ kill "$TAIL_PID" 2>/dev/null || true
 wait "$TAIL_PID" 2>/dev/null || true
 
 echo "" >&2
-echo "[pila] remote: orchestrator exited — run 'pila --finalize ${ID}' to push and open a PR" >&2
+echo "[pila] remote: orchestrator exited — syncing run branch + state to host..." >&2
 
 # Auto-finalize hook: when the calling host sets AUTO_FINALIZE_TOKEN,
 # print it as the wrapper's last stderr line. The host-side caller
@@ -235,6 +235,91 @@ require_flyctl() {
   fi
   return 0
 }
+
+# --- require_fly_ssh ------------------------------------------------------
+# Ensure the host's SSH agent has a Fly-issued certificate for SSH-based
+# file transfer via `flyctl ssh console -C "..." < tar`. Certs expire after
+# 24 hours; if missing/expired the SSH attempts hang or error. Pila uses
+# SSH for seeding repo+auth into the machine because flyctl removed
+# `--stdin` from `machine exec` and the alternative argv-based payload
+# transfer hits ARG_MAX on macOS for typical Claude config (~640 MB).
+#
+# Idempotent: a successful `flyctl ssh console --pty=false -C true
+# --machine <non-existent>` against the target app proves the cert is
+# valid (returns "no started VMs" with rc=1 but doesn't hang).
+#
+# This is best-effort: if `flyctl ssh issue` fails (e.g. user is on a
+# restricted org), seed-auth will surface the original SSH error.
+require_fly_ssh() {
+  local fly_app="${1:-$PILA_FLY_APP}"
+  local fly_org="${PILA_FLY_ORG:-personal}"
+  # Probe: a quick ssh attempt against a non-existent machine. Fly's
+  # error is "no started VMs" which means auth succeeded; any other
+  # error (hangs, "could not connect to WireGuard", etc.) means we
+  # need to issue a fresh cert.
+  if echo | timeout 8 flyctl ssh console --app "$fly_app" \
+       --machine "probe-nonexistent" --pty=false -C "true" 2>&1 \
+     | grep -qE "no started VMs|app.*not.*found"; then
+    return 0
+  fi
+  # If the agent ALREADY has an SSH cert, the probe might have failed
+  # for an unrelated reason (transient WireGuard hiccup, Fly API 500
+  # during the cert-issuance outage we observed 2026-06-01). Skip
+  # the `flyctl ssh issue` step — the existing cert is almost
+  # certainly Fly's (regular SSH key authentication doesn't put
+  # certs in the agent; only Fly does for this user).
+  if ssh-add -l 2>/dev/null | grep -qE "CERT\)"; then
+    echo "[pila] remote: ssh-agent has cert(s); skipping issue step" >&2
+    return 0
+  fi
+  echo "[pila] remote: issuing Fly SSH certificate (24h) for org=$fly_org" >&2
+  if ! flyctl ssh issue --agent --hours 24 "$fly_org" >/dev/null 2>&1; then
+    # Best-effort: if we have ANY ssh-add cert, hope it's a Fly one
+    # and let the subsequent ssh console attempt either succeed or
+    # surface the real error.
+    if ssh-add -l >/dev/null 2>&1; then
+      echo "pila: warning: flyctl ssh issue failed (possible Fly API outage); proceeding with existing agent state" >&2
+      return 0
+    fi
+    echo "pila: warning: flyctl ssh issue failed and no ssh-agent cert available; seed-auth may fail" >&2
+    return 1
+  fi
+  return 0
+}
+
+# --- wait_for_fly_ssh_ready ----------------------------------------------
+# Block until hallpass (Fly's in-machine SSH daemon) is ready to accept
+# connections. require_fly_ssh proves the cert is valid; this proves the
+# *target machine* will actually answer. A freshly-started machine takes
+# 5-30 s for hallpass to come up after `flyctl machine start` reports
+# "started", so naively running `ssh console -C "tar -x"` against it
+# yields "ssh: handshake failed: EOF".
+#
+# Strategy: probe with `ssh console --pty=false -C true` against the
+# actual machine ID; success exits 0, EOF/connection errors retry.
+# Bounded by 60 s total (12 attempts × 5 s sleep).
+#
+# Usage:
+#   wait_for_fly_ssh_ready "$FLY_APP" "$machine_id"
+wait_for_fly_ssh_ready() {
+  local fly_app="$1"
+  local machine_id="$2"
+  local attempts=0
+  local max_attempts=12
+  while [ "$attempts" -lt "$max_attempts" ]; do
+    if timeout 10 flyctl ssh console --app "$fly_app" \
+         --machine "$machine_id" --pty=false -C "true" >/dev/null 2>&1; then
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    if [ "$attempts" -lt "$max_attempts" ]; then
+      sleep 5
+    fi
+  done
+  echo "pila: warning: machine $machine_id did not accept SSH within 60s" >&2
+  return 1
+}
+
 
 # Internal: install flyctl via the OS-appropriate path with user prompt.
 _require_flyctl_install() {

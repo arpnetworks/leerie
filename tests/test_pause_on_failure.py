@@ -39,8 +39,15 @@ def _make_flyctl_stub(tmp_path: Path, *, behavior: str) -> Path:
     """Write a stub flyctl that records its argv to flyctl.log.
 
     behavior options:
-      "happy"  — auth ok, machine run returns JSON id, status started, stop/destroy ok
+      "happy"  — auth ok, machine run returns text "Machine ID: mach-001",
+                 status returns JSON {state:started}, stop/destroy ok
       "stop_ok" — machine stop returns 0
+
+    Note: `flyctl machine run` does NOT support --json (only certain
+    other subcommands do, e.g. `flyctl machine status --json`). The
+    real flyctl output is human-readable text containing a line like
+    "Machine ID: <id>", which provision.sh parses via awk.
+    `flyctl machine status` DOES accept --json.
     """
     log = tmp_path / "flyctl.log"
     fake = tmp_path / "flyctl"
@@ -49,8 +56,8 @@ def _make_flyctl_stub(tmp_path: Path, *, behavior: str) -> Path:
         f'echo "$@" >> "{log}"\n'
         "case \"$1 $2\" in\n"
         "  'auth status') exit 0 ;;\n"
-        "  'machine run') echo '{\"id\":\"mach-001\",\"state\":\"created\"}'; exit 0 ;;\n"
-        "  'machine status') echo '{\"state\":\"started\"}'; exit 0 ;;\n"
+        "  'machine run') printf 'Success! A Machine has been launched\\n Machine ID: mach-001\\n State: created\\n'; exit 0 ;;\n"
+        "  'machine status') printf 'Machine ID: mach-001\\nState: started\\n'; exit 0 ;;\n"
         "  'machine stop') exit 0 ;;\n"
         "  'machine destroy') exit 0 ;;\n"
         "  'machine start') exit 0 ;;\n"
@@ -360,7 +367,7 @@ def test_resume_machine_refuses_destroyed_machine(tmp_path: Path):
         "case \"$1 $2\" in\n"
         "  'auth status') exit 0 ;;\n"
         "  'machine start') exit 1 ;;\n"
-        "  'machine status') echo '{\"state\":\"destroyed\"}'; exit 0 ;;\n"
+        "  'machine status') printf 'Machine ID: mach-001\\nState: destroyed\\n'; exit 0 ;;\n"
         "esac\n"
         "exit 0\n"
     )

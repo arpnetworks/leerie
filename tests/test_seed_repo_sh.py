@@ -71,44 +71,10 @@ def test_seed_repo_fails_when_flyctl_missing():
     assert "flyctl" in result.stderr.lower()
 
 
-def test_seed_repo_fails_when_origin_missing(tmp_path):
-    """seed_repo returns 1 when the git repo has no origin remote."""
-    # Create a bare local git repo with no remote.
-    repo = tmp_path / "myrepo"
-    repo.mkdir()
-    subprocess.run(
-        ["git", "-C", str(repo), "init"],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "Test"],
-        check=True, capture_output=True,
-    )
-
-    # Create a stub flyctl that is present.
-    fake_flyctl = tmp_path / "flyctl"
-    fake_flyctl.write_text("#!/usr/bin/env bash\nexit 0\n")
-    fake_flyctl.chmod(0o755)
-
-    result = _run_bash(
-        f"source {SEED_SH}; seed_repo",
-        env={
-            "PILA_MACHINE_ID": "test-machine-001",
-            "USER_REPO": str(repo),
-            "PATH": f"{tmp_path}:/usr/bin:/bin",
-        },
-    )
-    assert result.returncode != 0
-    assert "origin" in result.stderr.lower() or "remote" in result.stderr.lower()
-
-
-def test_seed_repo_clones_and_syncs_delta(tmp_path):
-    """seed_repo runs git clone on remote then tars the dirty set."""
-    # Set up a local git repo with an origin remote and a dirty file.
+def test_seed_repo_succeeds_without_origin_remote(tmp_path):
+    """seed_repo no longer requires a git remote — the tar-pipe path
+    delivers the whole tree (including .git) from the host, so a
+    no-remote repo seeds normally."""
     repo = tmp_path / "myrepo"
     repo.mkdir()
     subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
@@ -120,9 +86,156 @@ def test_seed_repo_clones_and_syncs_delta(tmp_path):
         ["git", "-C", str(repo), "config", "user.name", "Test"],
         check=True, capture_output=True,
     )
-    # Add a committed file and an untracked dirty file.
-    tracked = repo / "README.md"
-    tracked.write_text("hello")
+
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    fake_flyctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo \"flyctl $*\" >> {exec_log}\n"
+        "cat > /dev/null\n"  # drain stdin so the tar producer doesn't SIGPIPE
+        "exit 0\n"
+    )
+    fake_flyctl.chmod(0o755)
+
+    result = _run_bash(
+        f"source {SEED_SH}; seed_repo",
+        env={
+            "PILA_MACHINE_ID": "test-machine-001",
+            "PILA_FLY_APP": "pila",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+
+
+def test_seed_repo_git_aware_excludes_and_includes(tmp_path):
+    """seed_repo's tar payload obeys .gitignore (skipping build artifacts),
+    hard-skips .pila/, hard-includes .claude/, and always includes .git/.
+    Verifies the full git-ls-files + force-include pipeline."""
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True, capture_output=True,
+    )
+    # .gitignore excludes build artifacts AND .claude/ (the latter is
+    # the common case — we want to force-include it despite this).
+    (repo / ".gitignore").write_text("build/\n*.log\n.claude/\n")
+    # Tracked source file.
+    (repo / "src.py").write_text("print('hi')")
+    # Untracked-not-ignored file (rides along).
+    (repo / "untracked.txt").write_text("untracked")
+    # Gitignored build artifact (must NOT ride along).
+    (repo / "build").mkdir()
+    (repo / "build" / "out.bin").write_text("artifact")
+    # Gitignored log file (must NOT ride along).
+    (repo / "debug.log").write_text("noise")
+    # Host run state (must NOT ride along, even though not in .gitignore).
+    (repo / ".pila" / "runs" / "old").mkdir(parents=True)
+    (repo / ".pila" / "runs" / "old" / "state.json").write_text("{}")
+    # Repo-local Claude settings (gitignored, but force-include).
+    (repo / ".claude" / "hooks").mkdir(parents=True)
+    (repo / ".claude" / "settings.local.json").write_text('{"x": 1}')
+    (repo / ".claude" / "hooks" / "pre-tool-use.sh").write_text("#!/bin/sh\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", ".gitignore", "src.py"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"],
+        check=True, capture_output=True,
+    )
+
+    # Stub flyctl: capture stdin into a tar file we can inspect.
+    captured_tar = tmp_path / "captured.tar"
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    fake_flyctl.write_text(
+        "#!/usr/bin/env bash\n"
+        f"echo \"flyctl $*\" >> {exec_log}\n"
+        # If the -C arg contains "tar -xC /work", we're the tar receiver:
+        # capture stdin into the tarfile for later inspection.
+        # Any other invocation: drain stdin and exit 0.
+        'for arg in "$@"; do\n'
+        f'  if [ "$arg" = "tar -xC /work" ]; then cat > "{captured_tar}"; exit 0; fi\n'
+        'done\n'
+        "cat > /dev/null\n"
+        "exit 0\n"
+    )
+    fake_flyctl.chmod(0o755)
+
+    result = _run_bash(
+        f"source {SEED_SH}; seed_repo",
+        env={
+            "PILA_MACHINE_ID": "test-machine-gitaware",
+            "PILA_FLY_APP": "pila",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert captured_tar.exists(), "tar payload was never captured"
+
+    # Extract and check.
+    extract_dir = tmp_path / "extracted"
+    extract_dir.mkdir()
+    subprocess.run(
+        ["tar", "-xf", str(captured_tar), "-C", str(extract_dir)],
+        check=True, capture_output=True,
+    )
+    landed = {
+        str(p.relative_to(extract_dir))
+        for p in extract_dir.rglob("*")
+        if p.is_file()
+    }
+
+    # Tracked + untracked-not-ignored ride along.
+    assert "src.py" in landed
+    assert "untracked.txt" in landed
+    assert ".gitignore" in landed
+    # Gitignored artifacts do NOT ride along.
+    assert "build/out.bin" not in landed, (
+        f"gitignored build artifact leaked into seed: {landed}"
+    )
+    assert "debug.log" not in landed, (
+        f"gitignored log file leaked into seed: {landed}"
+    )
+    # .pila/ never rides along regardless of .gitignore.
+    assert not any(p.startswith(".pila/") for p in landed), (
+        f"host .pila/ leaked into seed: {landed}"
+    )
+    # .claude/ rides along EVEN THOUGH .gitignore lists it.
+    assert ".claude/settings.local.json" in landed, (
+        f".claude/ should be force-included; got: {landed}"
+    )
+    assert ".claude/hooks/pre-tool-use.sh" in landed
+    # .git/ rides along (worker needs full history for worktrees).
+    assert any(p.startswith(".git/") for p in landed), (
+        f".git/ must be force-included; got: {landed}"
+    )
+
+
+def test_seed_repo_tar_pipes_full_tree(tmp_path):
+    """seed_repo wipes /work and tar-pipes the host tree (including .git)
+    via flyctl ssh console -C "tar -xC /work"."""
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True, capture_output=True,
+    )
+    (repo / "README.md").write_text("hello")
     subprocess.run(
         ["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True
     )
@@ -130,28 +243,15 @@ def test_seed_repo_clones_and_syncs_delta(tmp_path):
         ["git", "-C", str(repo), "commit", "-m", "init"],
         check=True, capture_output=True,
     )
-    untracked = repo / "local_notes.txt"
-    untracked.write_text("my notes")
+    # An untracked file — must still ride along in the tar pipe.
+    (repo / "local_notes.txt").write_text("my notes")
 
-    # Add a fake origin remote pointing at a local bare clone (won't be
-    # actually cloned — we stub flyctl machine exec).
-    origin_dir = tmp_path / "origin.git"
-    origin_dir.mkdir()
-    subprocess.run(["git", "init", "--bare", str(origin_dir)], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "remote", "add", "origin", str(origin_dir)],
-        check=True, capture_output=True,
-    )
-
-    # Stub flyctl: machine exec records its arguments to a log file.
-    # Drain stdin so the tar producer doesn't get SIGPIPE (simulates flyctl
-    # forwarding stdin to the remote command, which consumes it).
     exec_log = tmp_path / "exec_log.txt"
     fake_flyctl = tmp_path / "flyctl"
     fake_flyctl.write_text(
         "#!/usr/bin/env bash\n"
         f"echo \"flyctl $*\" >> {exec_log}\n"
-        # Consume all stdin so the tar producer doesn't get SIGPIPE.
+        # Drain stdin so the tar producer doesn't get SIGPIPE.
         "cat > /dev/null\n"
         "exit 0\n"
     )
@@ -167,77 +267,17 @@ def test_seed_repo_clones_and_syncs_delta(tmp_path):
         },
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
-
-    # Verify git clone was invoked on the remote.
     assert exec_log.exists(), "flyctl was never called"
     log_text = exec_log.read_text()
-    assert "git clone" in log_text, f"git clone not in flyctl calls:\n{log_text}"
-    assert "--filter=blob:none" in log_text, (
-        "partial clone flag missing — shallow clone disqualified by worktree constraint"
+    # The /work wipe step.
+    assert "rm -rf /work" in log_text, (
+        f"Expected /work wipe via ssh console -C; got:\n{log_text}"
     )
-    assert "/work" in log_text, "clone target /work not specified"
-
-    # Verify tar/rsync step was invoked (dirty set includes local_notes.txt).
-    assert "tar" in log_text, f"tar delta step not called:\n{log_text}"
-
-
-def test_seed_repo_clean_tree_skips_delta(tmp_path):
-    """seed_repo skips the delta step when the working tree is clean."""
-    repo = tmp_path / "myrepo"
-    repo.mkdir()
-    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
-        check=True, capture_output=True,
+    # The tar pipe target.
+    assert "tar -xC /work" in log_text, (
+        f"Expected tar-pipe target on remote; got:\n{log_text}"
     )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "Test"],
-        check=True, capture_output=True,
-    )
-    tracked = repo / "README.md"
-    tracked.write_text("hello")
-    subprocess.run(
-        ["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "commit", "-m", "init"],
-        check=True, capture_output=True,
-    )
-    # No untracked/modified files — clean tree.
-    origin_dir = tmp_path / "origin.git"
-    origin_dir.mkdir()
-    subprocess.run(["git", "init", "--bare", str(origin_dir)], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "remote", "add", "origin", str(origin_dir)],
-        check=True, capture_output=True,
-    )
-
-    exec_log = tmp_path / "exec_log.txt"
-    fake_flyctl = tmp_path / "flyctl"
-    fake_flyctl.write_text(
-        "#!/usr/bin/env bash\n"
-        f"echo \"flyctl $*\" >> {exec_log}\n"
-        "exit 0\n"
-    )
-    fake_flyctl.chmod(0o755)
-
-    result = _run_bash(
-        f"source {SEED_SH}; seed_repo",
-        env={
-            "PILA_MACHINE_ID": "test-machine-clean",
-            "PILA_FLY_APP": "pila",
-            "USER_REPO": str(repo),
-            "PATH": f"{tmp_path}:/usr/bin:/bin",
-        },
-    )
-    assert result.returncode == 0, f"stderr: {result.stderr}"
-    assert "clean" in result.stderr.lower() or "no delta" in result.stderr.lower(), (
-        f"Expected clean-tree message in stderr:\n{result.stderr}"
-    )
-
-    log_text = exec_log.read_text() if exec_log.exists() else ""
-    # git clone should still run; tar delta should NOT.
-    assert "git clone" in log_text
-    assert "tar" not in log_text, (
-        "tar was called for a clean tree — unnecessary uplink traffic"
+    # We must NOT see git clone — that's the removed channel.
+    assert "git clone" not in log_text, (
+        f"git clone should be gone (was the SSH-keys-on-Fly bug); got:\n{log_text}"
     )

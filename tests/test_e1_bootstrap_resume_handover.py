@@ -46,9 +46,9 @@ if [ "$_resumed" = "true" ] && \\
    [ -n "$PILA_RUN_ID" ] && \\
    [[ "$PILA_RUN_ID" == _bootstrap-* ]]; then
   _bootstrap_pid="$PILA_RUN_ID"
-  _final_id="$(flyctl machine exec "$PILA_MACHINE_ID" \\
-                 --app "$FLY_APP" \\
-                 -- cat "/work/.pila/launcher-${_bootstrap_pid}.runid" \\
+  _final_id="$(flyctl ssh console --app "$FLY_APP" \\
+                 --machine "$PILA_MACHINE_ID" --pty=false \\
+                 -C "cat /work/.pila/launcher-${_bootstrap_pid}.runid" \\
                  2>/dev/null | head -1 | tr -d '[:space:]' || true)"
   if [ -n "$_final_id" ] && [ "$_final_id" != "$_bootstrap_pid" ]; then
     echo "[pila] remote: bootstrap id ${_bootstrap_pid} promoted to ${_final_id} on machine — rewriting PILA_RUN_ID" >&2
@@ -88,13 +88,15 @@ def _stub_flyctl_returns_handover(tmp_path: Path, final_id: str) -> Path:
     stub.write_text(
         "#!/usr/bin/env bash\n"
         f"echo \"$@\" >> {tmp_path}/flyctl.log\n"
-        "# When the launcher does `flyctl machine exec ... cat /work/...runid`,\n"
-        "# our stub prints the test's handover file. Match by checking for `cat`.\n"
+        "# When the launcher does `flyctl ssh console ... -C 'cat /work/...runid'`,\n"
+        "# our stub prints the test's handover file. Match by `cat` in the -C arg.\n"
         'for a in "$@"; do\n'
-        '  if [ "$a" = "cat" ]; then\n'
-        f"    cat {handover}\n"
-        "    exit 0\n"
-        "  fi\n"
+        '  case "$a" in\n'
+        '    *cat*launcher-*.runid*)\n'
+        f"      cat {handover}\n"
+        "      exit 0\n"
+        '      ;;\n'
+        '  esac\n'
         "done\n"
         "exit 0\n"
     )
@@ -223,8 +225,8 @@ def test_launcher_e1_block_pinned():
     launcher = PILA.read_text()
     # The bootstrap-id branch guard.
     assert '[[ "$PILA_RUN_ID" == _bootstrap-* ]]' in launcher
-    # The handover-cat flyctl exec.
-    assert 'cat "/work/.pila/launcher-${_bootstrap_pid}.runid"' in launcher
+    # The handover-cat flyctl ssh console invocation.
+    assert 'cat /work/.pila/launcher-${_bootstrap_pid}.runid' in launcher
     # The notification banner.
     assert 'promoted to' in launcher
     # The REWRITTEN_ARGS array element rewrite.

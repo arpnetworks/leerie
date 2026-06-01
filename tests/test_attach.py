@@ -405,8 +405,8 @@ def test_provision_writes_pid_keyed_record(tmp_path: Path):
         f'echo "$@" >> "{log}"\n'
         "case \"$1 $2\" in\n"
         "  'auth status') exit 0 ;;\n"
-        "  'machine run') echo '{\"id\":\"mach-001\",\"state\":\"created\"}'; exit 0 ;;\n"
-        "  'machine status') echo '{\"state\":\"started\"}'; exit 0 ;;\n"
+        "  'machine run') printf 'Success!\\n Machine ID: mach-001\\n State: created\\n'; exit 0 ;;\n"
+        "  'machine status') printf 'Machine ID: mach-001\\nState: started\\n'; exit 0 ;;\n"
         "esac\n"
         "exit 0\n"
     )
@@ -448,8 +448,8 @@ def test_destroy_removes_pid_keyed_record(tmp_path: Path):
         f'echo "$@" >> "{log}"\n'
         "case \"$1 $2\" in\n"
         "  'auth status') exit 0 ;;\n"
-        "  'machine run') echo '{\"id\":\"mach-001\",\"state\":\"created\"}'; exit 0 ;;\n"
-        "  'machine status') echo '{\"state\":\"started\"}'; exit 0 ;;\n"
+        "  'machine run') printf 'Success!\\n Machine ID: mach-001\\n State: created\\n'; exit 0 ;;\n"
+        "  'machine status') printf 'Machine ID: mach-001\\nState: started\\n'; exit 0 ;;\n"
         "  'machine destroy') exit 0 ;;\n"
         "esac\n"
         "exit 0\n"

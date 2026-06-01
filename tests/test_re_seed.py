@@ -67,10 +67,27 @@ def _stub_flyctl(tmp_path: Path, *, remote_status: str = "started",
         f'STATE_FILE="{state_file}"\n'
         "case \"$1 $2\" in\n"
         "  'auth status') exit 0 ;;\n"
-        '  "machine status") printf "{\\"state\\":\\"%s\\"}" "$(cat $STATE_FILE)"; exit 0 ;;\n'
+        '  "machine status") printf "Machine ID: mach-test\\nState: %s\\n" "$(cat $STATE_FILE)"; exit 0 ;;\n'
         '  "machine start") echo "started" > "$STATE_FILE"; exit 0 ;;\n'
         '  "machine stop") echo "stopped" > "$STATE_FILE"; exit 0 ;;\n'
         '  "machine destroy") echo "destroyed" > "$STATE_FILE"; exit 0 ;;\n'
+        '  "ssh issue") exit 0 ;;\n'
+        '  "ssh console")\n'
+        # Parse -C "<cmd>" from the remaining args to route output.
+        '    cmd=""\n'
+        '    while [ $# -gt 0 ]; do\n'
+        '      case "$1" in\n'
+        '        -C) cmd="$2"; shift 2 ;;\n'
+        '        *) shift ;;\n'
+        '      esac\n'
+        '    done\n'
+        '    case "$cmd" in\n'
+        f'      *"git -C /work status"*) printf "%s" "{remote_dirty}"; exit 0 ;;\n'
+        '      *tar*-xzf*) cat > /dev/null; exit 0 ;;\n'
+        '      *tar*-xC*) cat > /dev/null; exit 0 ;;\n'
+        '      *) cat > /dev/null; exit 0 ;;\n'
+        '    esac\n'
+        '    ;;\n'
         "esac\n"
         'if [ "$1" = "machine" ] && [ "$2" = "exec" ]; then\n'
         "  found_dashes=0\n"
@@ -197,8 +214,9 @@ def test_re_seed_starts_stopped_machine_and_calls_dirty(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
     assert "machine start mach-001" in invocations
-    # tar pipe should have been invoked for the dirty file.
-    assert "machine exec" in invocations
+    # tar pipe should have been invoked for the dirty file (via ssh console -C).
+    assert "ssh console" in invocations
+    assert "tar -C /work -xzf -" in invocations
 
 
 def test_re_seed_skips_start_when_machine_already_started(tmp_path: Path):

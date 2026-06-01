@@ -354,41 +354,137 @@ except Exception:
     fi
     FLY_APP="${PILA_FLY_APP:-pila}"
     export FLY_APP PILA_RUN_ID="$_fin_run_id"
-    # Source provision.sh BEFORE setting PILA_MACHINE_ID — provision.sh
-    # resets PILA_MACHINE_ID="" at load time and would clobber our value.
-    # shellcheck disable=SC1091
-    . "$PILA_REPO/scripts/remote/provision.sh"
-    # shellcheck disable=SC1091
-    . "$PILA_REPO/scripts/remote/fetch-branch.sh"
-    require_flyctl || exit 1
-    # Try fly-machine.json first (in-flight bootstrap case), then
-    # run.json — matches scripts/remote/attach.sh's resolution order.
-    PILA_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_fin_run_dir")"
-    if [ -z "$PILA_MACHINE_ID" ]; then
-      echo "pila: --finalize: $_fin_run_id has no fly_machine_id" >&2
-      exit 1
+    # Detect "already synced" — the auto-sync path in decide_teardown's
+    # rc=0 branch may have already pulled the branch + state to the
+    # host BEFORE destroying the machine. In that case, run.json has
+    # finished_at, state.json exists, the run branch is local, and
+    # the machine is gone. Skip fetch_branch and go straight to
+    # host_finalize.
+    _already_synced="false"
+    if [ -f "$_fin_run_dir/run.json" ] && [ -f "$_fin_run_dir/state.json" ]; then
+      _has_finished="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print("yes" if d.get("finished_at") else "")
+except Exception:
+    pass
+' "$_fin_run_dir/run.json")"
+      if [ -n "$_has_finished" ]; then
+        _run_branch="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("branch") or "")
+except Exception:
+    pass
+' "$_fin_run_dir/run.json")"
+        if [ -n "$_run_branch" ] && \
+           git -C "$USER_REPO" rev-parse --verify "refs/heads/$_run_branch" >/dev/null 2>&1; then
+          _already_synced="true"
+        fi
+      fi
     fi
-    export PILA_MACHINE_ID
-    echo "[pila] --finalize: streaming completed run from machine $PILA_MACHINE_ID" >&2
-    if ! fetch_branch; then
-      echo "pila: error: fetch_branch failed" >&2
-      exit 1
+
+    if [ "$_already_synced" = "true" ]; then
+      echo "[pila] --finalize: run already synced to host; skipping fetch_branch" >&2
+      _fetched_run_id="$_fin_run_id"
+      _fetched_run_dir="$_fin_run_dir"
+    else
+      # Source provision.sh BEFORE setting PILA_MACHINE_ID — provision.sh
+      # resets PILA_MACHINE_ID="" at load time and would clobber our value.
+      # shellcheck disable=SC1091
+      . "$PILA_REPO/scripts/remote/provision.sh"
+      # shellcheck disable=SC1091
+      . "$PILA_REPO/scripts/remote/fetch-branch.sh"
+      require_flyctl || exit 1
+      # Try fly-machine.json first (in-flight bootstrap case), then
+      # run.json — matches scripts/remote/attach.sh's resolution order.
+      PILA_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_fin_run_dir")"
+      if [ -z "$PILA_MACHINE_ID" ]; then
+        echo "pila: --finalize: $_fin_run_id has no fly_machine_id and is not already synced" >&2
+        exit 1
+      fi
+      export PILA_MACHINE_ID
+      echo "[pila] --finalize: streaming completed run from machine $PILA_MACHINE_ID" >&2
+      if ! fetch_branch; then
+        echo "pila: error: fetch_branch failed" >&2
+        exit 1
+      fi
+      # fetch_branch sets PILA_REMOTE_RUN_ID to the discovered final run-id
+      # (which may differ from $_fin_run_id if the user passed a bootstrap
+      # id). Use the discovered id to locate the run dir host-side.
+      _fetched_run_id="${PILA_REMOTE_RUN_ID:-$_fin_run_id}"
+      _fetched_run_dir="$USER_REPO/.pila/runs/$_fetched_run_id"
+      if [ ! -d "$_fetched_run_dir" ]; then
+        echo "pila: error: fetch_branch succeeded but $_fetched_run_dir missing" >&2
+        exit 1
+      fi
     fi
-    # fetch_branch sets PILA_REMOTE_RUN_ID to the discovered final run-id
-    # (which may differ from $_fin_run_id if the user passed a bootstrap
-    # id). Use the discovered id to locate the run dir host-side.
-    _fetched_run_id="${PILA_REMOTE_RUN_ID:-$_fin_run_id}"
-    _fetched_run_dir="$USER_REPO/.pila/runs/$_fetched_run_id"
-    if [ ! -d "$_fetched_run_dir" ]; then
-      echo "pila: error: fetch_branch succeeded but $_fetched_run_dir missing" >&2
-      exit 1
-    fi
-    # Detect --no-verify from $@ for consistency with normal post-run path.
+    # Detect --no-verify and --no-push from $@ for consistency with the
+    # normal post-run path.
     NO_VERIFY_PUSH=false
+    _FINALIZE_NO_PUSH=false
     for _a in "$@"; do
       [ "$_a" = "--no-verify" ] && NO_VERIFY_PUSH=true
+      [ "$_a" = "--no-push" ] && _FINALIZE_NO_PUSH=true
     done
     export NO_VERIFY_PUSH
+    # IMPORTANT: the launcher passes --no-push to the in-Fly orchestrator
+    # because the Fly machine cannot push (no GitHub SSH key on the
+    # machine by design). That writes no_push=true to run.json on the
+    # machine, which fetch_branch copies to the host. The user's actual
+    # intent is recorded host-side in the bootstrap dir's
+    # fly-machine.json (host_no_push field, set at launch time). On
+    # --finalize:
+    #   - if --no-push is on the --finalize CLI, skip push (user
+    #     explicitly opted out at finalize time).
+    #   - else, if host_no_push=true was recorded at launch, skip push
+    #     (user opted out at launch).
+    #   - else, clear the in-Fly orchestrator's no_push=true so the
+    #     host pushes. The orchestrator's no_push was a mechanism flag,
+    #     not a user-intent flag.
+    if [ "$_FINALIZE_NO_PUSH" = "false" ]; then
+      # Look for the host-side no-push intent record. It may live in
+      # the bootstrap-id dir (if --finalize was called with a bootstrap
+      # id) or the final-id dir (post-rename).
+      _host_intent=""
+      for _candidate in "$USER_REPO/.pila/runs/$_fin_run_id" "$_fetched_run_dir"; do
+        if [ -f "$_candidate/fly-machine.json" ]; then
+          _host_intent="$(python3 -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+    print("true" if data.get("host_no_push") else "false")
+except Exception:
+    print("")
+' "$_candidate/fly-machine.json" 2>/dev/null || true)"
+          if [ -n "$_host_intent" ]; then break; fi
+        fi
+      done
+      if [ "$_host_intent" = "true" ]; then
+        echo "[pila] finalize: host_no_push was set at launch — skipping push" >&2
+        _FINALIZE_NO_PUSH=true
+      fi
+      # Clear the in-Fly orchestrator's mechanism-flag no_push so
+      # host_finalize doesn't conflate it with user intent.
+      if [ "$_FINALIZE_NO_PUSH" = "false" ]; then
+        _fetched_run_json="$_fetched_run_dir/run.json"
+        if [ -f "$_fetched_run_json" ]; then
+          python3 - "$_fetched_run_json" <<'PY'
+import json, os, sys
+path = sys.argv[1]
+data = json.load(open(path))
+if data.get("no_push") is True:
+    data.pop("no_push", None)
+    tmp = path + ".tmp"
+    json.dump(data, open(tmp, "w"), indent=2)
+    open(tmp, "a").write("\n")
+    os.replace(tmp, path)
+PY
+        fi
+      fi
+    fi
     # shellcheck disable=SC1091
     . "$PILA_REPO/scripts/host-finalize.sh"
     host_finalize "$_fetched_run_dir"
@@ -484,6 +580,27 @@ esac
 for arg in "$@"; do
   if [ "$arg" = "--no-auto-publish" ]; then
     NO_AUTO_PUBLISH=true
+  fi
+done
+
+# --- local-build opt-in (most users should leave this off) ---------------
+# Default: ensure_image() invokes build-push.sh in its remote-builder mode
+# (Fly's infra builds + pushes; no host Docker daemon required).
+# --local-build on the CLI or PILA_LOCAL_BUILD=1 in the env forces the
+# legacy local-build path (nerdctl/docker build + push). The local path
+# only works on hosts with a working Docker daemon authenticated to
+# registry.fly.io (Docker Desktop + `flyctl auth docker`, OR Linux with
+# apt-installed Docker). It does NOT work with nerdctl-in-Colima on macOS
+# because nerdctl cannot reach macOS Keychain (where Docker Desktop's
+# `credsStore: desktop` helper stores the registry credential).
+# The orchestrator never sees this flag — consumed by REWRITTEN_ARGS below.
+case "${PILA_LOCAL_BUILD:-}" in
+  1|true|TRUE|yes|YES) LOCAL_BUILD=true ;;
+  *)                   LOCAL_BUILD=false ;;
+esac
+for arg in "$@"; do
+  if [ "$arg" = "--local-build" ]; then
+    LOCAL_BUILD=true
   fi
 done
 
@@ -913,6 +1030,11 @@ for arg in "$@"; do
     --no-auto-publish)
       # Launcher-only flag; consumed by ensure_image() in the remote path.
       ;;
+    --local-build)
+      # Launcher-only flag; consumed by ensure_image() to forward
+      # --local-build to build-push.sh (legacy local nerdctl/docker
+      # build instead of the default Fly remote builder).
+      ;;
     --no-re-seed)
       # Launcher-only flag (Phase 4); consumed by the auto-re-seed-on-resume
       # block. The orchestrator's argparse doesn't know it.
@@ -992,6 +1114,14 @@ CLAUDE_SKIP=(
   chrome            # Chrome integration state
   ralph-state       # plugin state from prior sessions
   .last-cleanup     # cleanup marker (regenerates)
+  # ~400 MB host npm install of the CLI; the pila image installs
+  # @anthropic-ai/claude-code globally via the Dockerfile, so this is
+  # pure dead weight on the wire to Fly. Local nerdctl runs bind-mount
+  # the host $HOME/.claude so they pick up the local install regardless.
+  # NOTE: keep .claude/plugins/cache — that's where installed plugins
+  # actually live (per installed_plugins.json's installPath); workers
+  # may invoke them.
+  local
 )
 if command -v rsync >/dev/null 2>&1; then
   EXCLUDES=()
@@ -1197,8 +1327,38 @@ ensure_image() {
     return 1
   fi
   local fly_app="${PILA_FLY_APP:-pila}"
+
+  # Auto-create the Fly app if missing. flyctl apps list returns a JSON
+  # array; check for a Name match. The remote builder and registry push
+  # both require the app to exist. Idempotent on existing apps.
+  if ! flyctl apps list --json 2>/dev/null \
+       | python3 -c '
+import json, sys
+try:
+    apps = json.load(sys.stdin)
+    names = [a.get("Name") or a.get("name") for a in apps]
+    sys.exit(0 if sys.argv[1] in names else 1)
+except Exception:
+    sys.exit(1)
+' "$fly_app"; then
+    echo "[pila] remote: Fly app '$fly_app' does not exist — creating it" >&2
+    if ! flyctl apps create "$fly_app" 2>&1; then
+      echo "pila: error: flyctl apps create $fly_app failed" >&2
+      echo "  Create it manually: flyctl apps create $fly_app" >&2
+      return 1
+    fi
+  fi
+
+  # Forward --local-build to build-push.sh when the launcher was invoked
+  # with --local-build or PILA_LOCAL_BUILD=1. Default is remote builder
+  # (no host Docker daemon required).
+  local build_args=(--app "$fly_app" --push)
+  if [ "${LOCAL_BUILD:-false}" = "true" ]; then
+    build_args+=(--local-build)
+  fi
+
   echo "[pila] remote: ensuring image $tag is published (cache miss)" >&2
-  if ! "$build_push" --app "$fly_app" --push; then
+  if ! "$build_push" "${build_args[@]}"; then
     echo "pila: error: build-push.sh failed; remote run cannot proceed" >&2
     return 1
   fi
@@ -1342,9 +1502,9 @@ except Exception:
        [ -n "$PILA_RUN_ID" ] && \
        [[ "$PILA_RUN_ID" == _bootstrap-* ]]; then
       _bootstrap_pid="$PILA_RUN_ID"
-      _final_id="$(flyctl machine exec "$PILA_MACHINE_ID" \
-                     --app "$FLY_APP" \
-                     -- cat "/work/.pila/launcher-${_bootstrap_pid}.runid" \
+      _final_id="$(flyctl ssh console --app "$FLY_APP" \
+                     --machine "$PILA_MACHINE_ID" --pty=false \
+                     -C "cat /work/.pila/launcher-${_bootstrap_pid}.runid" \
                      2>/dev/null | head -1 | tr -d '[:space:]' || true)"
       if [ -n "$_final_id" ] && [ "$_final_id" != "$_bootstrap_pid" ]; then
         echo "[pila] remote: bootstrap id ${_bootstrap_pid} promoted to ${_final_id} on machine — rewriting PILA_RUN_ID" >&2
@@ -1425,37 +1585,78 @@ except Exception:
         #   (c) Launcher errors from python (not from sh quoting) surface
         #       on stderr without the outer 2>&1 redirect, so a failed
         #       launch is diagnosable.
-        if ! flyctl machine exec "$PILA_MACHINE_ID" \
-               --app "$FLY_APP" \
-               -- python3 - "$PILA_RUN_ID" "${REWRITTEN_ARGS[@]}" <<'PY'
-import os, subprocess, sys
-
-run_id = sys.argv[1]
-orch_args = sys.argv[2:]
-
-run_dir = f"/work/.pila/runs/{run_id}"
+        # flyctl `machine exec` dropped both `--stdin` and the post-`--`
+        # argv form. Switch to `ssh console -C "<cmd>"` which (a) takes
+        # the remote command as a single string and (b) forwards host
+        # stdin. The Python launcher is built host-side with the argv
+        # JSON literal embedded into the source, then piped to
+        # `python3 -` on the machine — python reads its program from
+        # stdin, no remote-shell argv quoting in play.
+        _launch_argv_json="$(python3 -c '
+import json, sys
+print(json.dumps(sys.argv[1:]))
+' "$PILA_RUN_ID" "${REWRITTEN_ARGS[@]}")"
+        _launch_script="$(cat <<PY
+import os, pwd, subprocess
+argv = ${_launch_argv_json}
+run_id = argv[0]
+orch_args = argv[1:]
+run_dir = "/work/.pila/runs/" + run_id
 os.makedirs(run_dir, exist_ok=True)
-
-log_path = f"{run_dir}/orchestrator.log"
-pid_path = f"{run_dir}/orchestrator.pid"
-
+# Make /work/.pila, /work/.pila/runs, and the run dir itself writable
+# by pila — os.makedirs created them as root (this wrapper runs as
+# root via ssh-console). The orchestrator runs as pila and may need
+# to create sibling run dirs (bootstrap → final id rename, etc).
+pila_pw = pwd.getpwnam("pila")
+for d in ("/work/.pila", "/work/.pila/runs", run_dir):
+    try:
+        os.chown(d, pila_pw.pw_uid, pila_pw.pw_gid)
+    except OSError:
+        pass
+log_path = run_dir + "/orchestrator.log"
+pid_path = run_dir + "/orchestrator.pid"
+# Build the env from scratch — ssh-console sets HOME=/root which would
+# point claude at the wrong credentials dir. Pin HOME=/home/pila and
+# leave PATH alone (the image's PATH includes mise + Claude Code CLI
+# under /usr/local/share/mise/installs/node/lts-current/bin).
+child_env = dict(os.environ)
+child_env["HOME"] = "/home/pila"
+child_env["USER"] = "pila"
+child_env["LOGNAME"] = "pila"
+# Ensure the launcher's PATH includes the mise-managed claude binary.
+# (The Dockerfile installs claude into the mise-managed node prefix;
+# fly's hallpass ssh session inherits a minimal PATH that may not
+# include /usr/local/share/mise/...; add it defensively.)
+extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
+if extra_path not in child_env.get("PATH", ""):
+    child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
 with open(log_path, "ab") as log_f:
     p = subprocess.Popen(
-        [
-            "python3",
-            "/work/.pila-image/orchestrator/pila.py",
-            "--no-push",
-            *orch_args,
-        ],
+        ["python3", "/opt/pila-image/orchestrator/pila.py", "--no-push", *orch_args],
         stdin=subprocess.DEVNULL,
         stdout=log_f,
         stderr=log_f,
         start_new_session=True,
+        # cwd=/work so the orchestrator's os.getcwd() returns /work
+        # regardless of the launching shell's (possibly stale) cwd.
+        cwd="/work",
+        # Run as the pila user — the Fly image's USER pila line only
+        # applies to the entrypoint; ssh-console sessions land as root,
+        # and any process we spawn here inherits root unless we set
+        # this explicitly. The orchestrator needs to run as pila so
+        # claude finds creds at /home/pila/.claude/.credentials.json
+        # and so files it creates are owned by pila (not root).
+        user="pila",
+        group=pila_pw.pw_gid,
+        env=child_env,
     )
-
 with open(pid_path, "w") as pid_f:
-    pid_f.write(f"{p.pid}\n")
+    pid_f.write(str(p.pid) + "\n")
 PY
+)"
+        if ! printf '%s' "$_launch_script" \
+             | flyctl ssh console --app "$FLY_APP" --machine "$PILA_MACHINE_ID" \
+                 --pty=false -C "python3 -"
         then
           echo "pila: error: failed to start detached orchestrator on machine $PILA_MACHINE_ID" >&2
           container_rc=1
@@ -1498,9 +1699,13 @@ PY
           _tail_invocation="PILA_TAIL_RUN_ID='$PILA_RUN_ID'; export PILA_TAIL_RUN_ID
 $_tail_script"
           orch_rc=0
-          flyctl machine exec "$PILA_MACHINE_ID" \
-            --app "$FLY_APP" \
-            -- sh -c "$_tail_invocation" -- "$PILA_RUN_ID" \
+          # ssh console -C takes the command as a single string and
+          # forwards stdin. Pipe the wrapper script (with the env-var
+          # preamble) to `sh -s` so quoting is wholly host-side.
+          printf '%s' "$_tail_invocation" \
+            | flyctl ssh console --app "$FLY_APP" \
+                --machine "$PILA_MACHINE_ID" --pty=false \
+                -C "sh -s" \
             || orch_rc=$?
 
           # On a clean tail exit (the orchestrator's pid disappeared), we
@@ -1575,7 +1780,7 @@ else
     -e PILA_INSPECT_DIRS= \
     --mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared \
     -v "$USER_REPO:/work" \
-    -v "$PILA_REPO:/work/.pila-image:ro" \
+    -v "$PILA_REPO:/opt/pila-image:ro" \
     ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"} \
     ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} \
     ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \

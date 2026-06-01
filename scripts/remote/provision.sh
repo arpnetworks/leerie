@@ -104,14 +104,48 @@ destroy_machine() {
   PILA_MACHINE_ID=""
 }
 
+# --- _try_fetch_branch_for_teardown --------------------------------------
+# Source fetch-branch.sh (idempotent — safe to re-source) and run
+# fetch_branch against the live machine. Returns 0 on success (state
+# + run branch are on the host), 1 on any failure (network, missing
+# run dir on machine, etc).
+#
+# Called from decide_teardown's clean-exit branch BEFORE destroy_machine,
+# so a failure here means we keep the machine running rather than
+# destroying work-in-progress.
+#
+# Requires: PILA_MACHINE_ID, USER_REPO, FLY_APP in scope (already set
+# by the time decide_teardown runs, since provision_machine populates
+# them).
+_try_fetch_branch_for_teardown() {
+  # PILA_REPO (set by the launcher) or PILA_HOME (set by some callers
+  # for compat) points at the pila install dir. Fall back to deriving
+  # it from this file's location if neither is set (e.g. provision.sh
+  # sourced standalone in a test).
+  local _pila_dir="${PILA_REPO:-${PILA_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
+  if [ ! -f "$_pila_dir/scripts/remote/fetch-branch.sh" ]; then
+    echo "pila: _try_fetch_branch_for_teardown: fetch-branch.sh missing at $_pila_dir" >&2
+    return 1
+  fi
+  # shellcheck disable=SC1091
+  . "$_pila_dir/scripts/remote/fetch-branch.sh"
+  if ! fetch_branch; then
+    return 1
+  fi
+  return 0
+}
+
 # --- decide_teardown (registered as EXIT/INT/TERM trap) ------------------
 # Classifies $PILA_REMOTE_EXIT_RC (set by the launcher just before exit)
 # and dispatches to stop_machine (pause-on-failure) or destroy_machine.
 # Classification table is documented in DESIGN §6 Remote pause-on-failure.
 #
-# Pause branch: writes paused_at + pause_reason to the run sidecar so the
-# resume path can find the machine later, and so `pila --list-paused`
-# surfaces the run.
+# Clean-exit branch (rc=0/10/75): syncs run state to the host via
+# _try_fetch_branch_for_teardown BEFORE destroying the machine. If
+# sync fails, leaves machine running so the user can recover.
+#
+# Pause branch (other non-zero): writes paused_at + pause_reason to
+# the run sidecar so the resume path can find the machine later.
 #
 # Idempotent: the trap fires on every exit, including success; the
 # stop/destroy primitives no-op on an empty PILA_MACHINE_ID.
@@ -128,9 +162,58 @@ decide_teardown() {
       #         orchestrator-pid exit and printed the finalize hint).
       #   10  — EXIT_NEEDS_ANSWERS (plugin re-run).
       #   75  — EX_TEMPFAIL (rate-limit, parse-fail).
-      # The orchestrator is gone; the machine has no further value.
-      # Per DESIGN §6, state is in the run branch or about to be re-fetched.
-      destroy_machine
+      #
+      # SAFETY-CRITICAL: pull the run branch + state dir to the host
+      # BEFORE destroying the machine. If we destroy first and then
+      # try to fetch, the user has paid for LLM work that is now
+      # unrecoverable. This is a one-way ratchet: machine destruction
+      # is gated on confirmed host-side state.
+      #
+      # On sync failure we leave the machine RUNNING (not stopped) so
+      # the user can investigate without first having to start a
+      # paused machine. They explicitly destroy via `pila --kill`
+      # when they've recovered the work.
+      if _try_fetch_branch_for_teardown; then
+        echo "[pila] remote: run branch + state synced to host" >&2
+        if [ -n "${PILA_REMOTE_RUN_ID:-}" ]; then
+          echo "[pila] remote: run 'pila --finalize $PILA_REMOTE_RUN_ID' to push and open a PR" >&2
+        fi
+        destroy_machine
+      else
+        local sync_reason="sync-failed-on-clean-exit"
+        local sidecar=""
+        if [ -n "${USER_REPO:-}" ] && [ -n "${PILA_RUN_ID:-}" ]; then
+          sidecar="$USER_REPO/.pila/runs/$PILA_RUN_ID/run.json"
+        fi
+        if [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
+          update_run_json "$sidecar" \
+            sync_failed_at "$(iso_now)" \
+            sync_fail_reason "$sync_reason" \
+            fly_machine_id "$mid" || true
+        fi
+        echo "" >&2
+        echo "================================================================" >&2
+        echo "pila: WARNING — sync from machine to host FAILED." >&2
+        echo "  The orchestrator finished cleanly but the run branch + state" >&2
+        echo "  could not be pulled back. The machine is being LEFT RUNNING" >&2
+        echo "  so your work is not lost. Recover manually:" >&2
+        echo "" >&2
+        echo "    1. Investigate / retry sync:" >&2
+        echo "         pila --finalize ${PILA_RUN_ID:-<run-id>}" >&2
+        echo "       (this calls fetch_branch + host push; safe to retry)" >&2
+        echo "" >&2
+        echo "    2. Or attach + inspect manually:" >&2
+        echo "         pila --attach ${PILA_RUN_ID:-<run-id>}" >&2
+        echo "" >&2
+        echo "    3. When your work is safely on the host, destroy the" >&2
+        echo "       machine:" >&2
+        echo "         pila --kill ${PILA_RUN_ID:-<run-id>}" >&2
+        echo "" >&2
+        echo "  Machine: $mid (still running on Fly)" >&2
+        echo "================================================================" >&2
+        # Intentionally NO stop_machine, NO destroy_machine. The user
+        # owns this machine until they explicitly --kill it.
+      fi
       ;;
     130|143)
       # Host-side SIGINT (130) / SIGTERM (143). With the detached
@@ -183,6 +266,15 @@ decide_teardown() {
 }
 
 # --- wait for machine to reach state "started" ---------------------------
+# flyctl machine status does NOT accept --json (same caveat as
+# `flyctl machine run` — see comment block in provision_machine). Parse
+# the text output instead. The output begins with lines like:
+#   Machine ID: <id>
+#   Instance ID: <iid>
+#   State: <state>
+# We extract "State: " case-insensitively from the prefix-aligned format
+# (note: lower in the output there's also a table with "State │ <state>"
+# in box-drawing characters — we match the first standalone "State:" line).
 wait_for_started() {
   local mid="$1"
   local deadline=$(( $(date +%s) + MACHINE_START_TIMEOUT ))
@@ -190,10 +282,10 @@ wait_for_started() {
   echo "[pila] remote: waiting for machine $mid to start (timeout: ${MACHINE_START_TIMEOUT}s)..." >&2
   while true; do
     state="$(flyctl machine status "$mid" \
-               --app "$FLY_APP" \
-               --json 2>/dev/null \
-             | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d.get("state",""))' \
-             2>/dev/null || true)"
+               --app "$FLY_APP" 2>/dev/null \
+             | sed 's/\x1b\[[0-9;]*m//g' \
+             | awk -F': *' '/^State: / { print $2; exit }' \
+             | tr -d '[:space:]' || true)"
     case "$state" in
       started)
         echo "[pila] remote: machine $mid is started" >&2
@@ -231,25 +323,25 @@ provision_machine() {
   echo "[pila] remote: creating machine (app=$FLY_APP region=$FLY_REGION image=$FLY_IMAGE_TAG)..." >&2
 
   # flyctl machine run --detach starts the machine without streaming its
-  # output. --json produces a single JSON object whose 'id' field is the
-  # machine ID. --skip-launch tells the Machine not to run its entrypoint
-  # yet (we'll start it explicitly below via flyctl machine start); this
-  # allows us to capture the ID before the workload begins.
-  #
-  # If --skip-launch is unavailable (older flyctl), fall back to --detach
-  # only: the machine starts immediately and we capture the ID from JSON.
-  local create_output machine_id
+  # output. Note: flyctl machine run does NOT accept --json (only some
+  # other subcommands do — `flyctl machine status --json` for example).
+  # The text output contains a line like "Machine ID: <id>" which we
+  # parse via awk. Defensively initialize machine_id="" so any future
+  # parser failure doesn't trigger set -u at the empty-check below.
+  local create_output=""
+  local machine_id=""
   if create_output="$(flyctl machine run "$FLY_IMAGE_TAG" \
        --app "$FLY_APP" \
        --region "$FLY_REGION" \
        --vm-cpus "$FLY_VM_CPUS" \
        --vm-memory "$FLY_VM_MEMORY" \
        --detach \
-       --json \
        2>&1)"; then
+    # Extract the first whitespace-delimited token after "Machine ID:".
+    # Tolerant of ANSI color codes by stripping ESC[<...>m sequences first.
     machine_id="$(printf '%s' "$create_output" \
-                  | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["id"])' \
-                  2>/dev/null || true)"
+                  | sed 's/\x1b\[[0-9;]*m//g' \
+                  | awk '/Machine ID:/ { for (i=1; i<=NF; i++) if ($i == "ID:") { print $(i+1); exit } }')"
   fi
 
   if [ -z "$machine_id" ]; then
@@ -290,15 +382,21 @@ provision_machine() {
     local remote_dir="$USER_REPO/.pila/remote"
     mkdir -p "$remote_dir"
     local pid_record="$remote_dir/$$.json"
-    python3 - "$pid_record" "$machine_id" "$FLY_APP" "${PILA_RUN_ID:-}" "$$" <<'PY'
+    # Record the USER's launch-time --no-push intent here so the host's
+    # `pila --finalize` step can distinguish "user opted out of pushing"
+    # from "the in-Fly orchestrator was told not to push because it
+    # can't reach github" (the latter is a mechanism flag the launcher
+    # forces, NOT a user-intent flag).
+    python3 - "$pid_record" "$machine_id" "$FLY_APP" "${PILA_RUN_ID:-}" "$$" "${NO_PUSH:-false}" <<'PY'
 import json, sys, datetime
-path, mid, app, run_id, pid = sys.argv[1:]
+path, mid, app, run_id, pid, no_push = sys.argv[1:]
 data = {
     "fly_app": app,
     "fly_machine_id": mid,
     "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     "run_id": run_id or None,
     "launcher_pid": int(pid),
+    "host_no_push": no_push in ("true", "1", "yes"),
 }
 with open(path, "w") as f:
     json.dump(data, f, indent=2)

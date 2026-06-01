@@ -2,7 +2,7 @@
 # container-entry.sh — PID 1 of the pila container.
 #
 # Bind-mounted from $PILA_HOME/scripts/container-entry.sh on the host to
-# /work/.pila-image/scripts/container-entry.sh inside the container, and
+# /opt/pila-image/scripts/container-entry.sh inside the container, and
 # referenced by Dockerfile's ENTRYPOINT.
 #
 # All it does: cd into the user's repo (bind-mounted at /work) and exec the
@@ -17,4 +17,15 @@ set -e
 # shellcheck disable=SC3045  # ulimit -c is non-POSIX but supported by dash (Debian's /bin/sh) and bash
 ulimit -c 0
 cd /work
-exec python3 /work/.pila-image/orchestrator/pila.py "$@"
+
+# When invoked with no args (remote/Fly path), idle as PID 1 so the
+# machine stays up. The remote launcher invokes the orchestrator via
+# `flyctl machine exec python3 pila.py ...` separately; the container
+# entrypoint just needs to keep the namespace alive. Local nerdctl
+# always passes argv (the task + flags), so this branch never fires
+# in local mode.
+if [ "$#" -eq 0 ]; then
+  exec sleep infinity
+fi
+
+exec python3 /opt/pila-image/orchestrator/pila.py "$@"

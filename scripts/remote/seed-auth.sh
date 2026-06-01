@@ -79,21 +79,73 @@ seed_auth() {
   # We explicitly exclude git/ssh/gnupg material — those are git-push auth
   # which lives on the host per DESIGN §6 *Finalization*. Workers only need
   # Claude auth + git identity; SSH keys for pushing are the host's concern.
-  if ! tar -cC "$STAGE" \
-       --exclude='.gitconfig' \
-       --exclude='.gitconfig.local' \
-       --exclude='.gitignore' \
-       --exclude='.gitignore_global' \
-       --exclude='.git-credentials' \
-       --exclude='.netrc' \
-       --exclude='.ssh' \
-       --exclude='.gnupg' \
-       --exclude='.config' \
-       . \
-       | flyctl machine exec "$machine_id" \
-           --app "$FLY_APP" \
-           --stdin \
-           -- tar -xC /home/pila 2>&1; then
+  # Current flyctl removed `--stdin` from `machine exec`. Use
+  # `flyctl ssh console -C` instead: it forwards host stdin to the
+  # remote command and supports arbitrarily large payloads (we
+  # routinely transfer ~640 MB of Claude plugins/agents). Requires
+  # an active Fly SSH cert in the host's ssh-agent — require_fly_ssh
+  # ensures that.
+  # require_fly_ssh lives in lib.sh (sourced by provision.sh, which the
+  # launcher sources before seed-auth.sh). Defensive check for callers
+  # that source seed-auth.sh standalone (e.g. tests).
+  if command -v require_fly_ssh >/dev/null 2>&1; then
+    if ! require_fly_ssh "$FLY_APP"; then
+      echo "pila: seed_auth: Fly SSH setup failed; cannot seed config" >&2
+      return 1
+    fi
+  fi
+  # hallpass takes 5-30 s to come up after machine start; wait so the
+  # tar-pipe below doesn't fail with "handshake failed: EOF".
+  if command -v wait_for_fly_ssh_ready >/dev/null 2>&1; then
+    echo "[pila] remote: waiting for hallpass (SSH) on $machine_id..." >&2
+    wait_for_fly_ssh_ready "$FLY_APP" "$machine_id" || true
+  fi
+  # COPYFILE_DISABLE=1 tells macOS BSD tar to skip the per-file
+  # LIBARCHIVE.xattr.com.apple.provenance extended attribute that
+  # GNU tar on Debian doesn't understand — silences a per-file
+  # "Ignoring unknown extended header keyword" warning. No effect on Linux.
+  #
+  # Single attempt + one retry after `flyctl agent restart` if the
+  # failure matches the transient "tunnel unavailable" pattern
+  # observed on cold-start probes. Same retry shape as seed-repo.sh.
+  local tar_rc=0 attempt err_log
+  for attempt in 1 2; do
+    err_log="$(mktemp)"
+    COPYFILE_DISABLE=1 tar -cC "$STAGE" \
+         --exclude='.gitconfig' \
+         --exclude='.gitconfig.local' \
+         --exclude='.gitignore' \
+         --exclude='.gitignore_global' \
+         --exclude='.git-credentials' \
+         --exclude='.netrc' \
+         --exclude='.ssh' \
+         --exclude='.gnupg' \
+         --exclude='.config' \
+         . \
+         | flyctl ssh console \
+             --app "$FLY_APP" \
+             --machine "$machine_id" \
+             --pty=false \
+             -C "sh -c 'tar -xC /home/pila && chown -R pila: /home/pila'" 2>"$err_log"
+    tar_rc=${PIPESTATUS[1]}
+    if [ "$tar_rc" -eq 0 ]; then
+      rm -f "$err_log"
+      break
+    fi
+    if [ "$attempt" -eq 1 ] \
+       && grep -qE "tunnel unavailable|context deadline exceeded|i/o timeout" "$err_log"; then
+      cat "$err_log" >&2
+      echo "[pila] remote: tunnel unavailable; restarting flyctl agent and retrying once..." >&2
+      flyctl agent restart >/dev/null 2>&1 || true
+      sleep 2
+      rm -f "$err_log"
+      continue
+    fi
+    cat "$err_log" >&2
+    rm -f "$err_log"
+    break
+  done
+  if [ "$tar_rc" -ne 0 ]; then
     echo "pila: seed_auth: failed to seed Claude config files into machine $machine_id" >&2
     return 1
   fi
@@ -112,11 +164,15 @@ seed_auth() {
     local creds_json
     creds_json="$(printf '{"claudeAiOauth":{"accessToken":"%s"}}' \
                          "$CLAUDE_CODE_OAUTH_TOKEN")"
+    # Pipe the small creds JSON through ssh console (same mechanism as
+    # the tar-pipe above; the cert was already issued by the
+    # require_fly_ssh call earlier in this function).
     if ! printf '%s' "$creds_json" \
-         | flyctl machine exec "$machine_id" \
+         | flyctl ssh console \
              --app "$FLY_APP" \
-             --stdin \
-             -- sh -c 'cat > /home/pila/.claude/.credentials.json && chmod 600 /home/pila/.claude/.credentials.json' 2>&1; then
+             --machine "$machine_id" \
+             --pty=false \
+             -C "sh -c 'cat > /home/pila/.claude/.credentials.json && chmod 600 /home/pila/.claude/.credentials.json && chown pila: /home/pila/.claude/.credentials.json'" 2>&1; then
       echo "pila: seed_auth: failed to write credentials JSON from CLAUDE_CODE_OAUTH_TOKEN" >&2
       return 1
     fi
@@ -144,20 +200,37 @@ seed_auth() {
     return 1
   fi
 
-  if ! flyctl machine exec "$machine_id" \
-         --app "$FLY_APP" \
-         -- git config --global user.name "$git_name" 2>&1; then
-    echo "pila: seed_auth: failed to set git user.name on machine $machine_id" >&2
-    return 1
-  fi
-  if ! flyctl machine exec "$machine_id" \
-         --app "$FLY_APP" \
-         -- git config --global user.email "$git_email" 2>&1; then
-    echo "pila: seed_auth: failed to set git user.email on machine $machine_id" >&2
+  # Stream git identity over ssh-console's stdin so names with quotes
+  # (O'Brien, "Smith, Jr.") can't break host-side quoting.
+  #
+  # Write to /home/pila/.gitconfig directly (not --global, which would
+  # write to root's home since the ssh-console session lands as root)
+  # and chown afterwards. The orchestrator runs as the pila user and
+  # reads ~/.gitconfig from /home/pila.
+  if ! printf '%s\n%s\n' "$git_name" "$git_email" \
+       | flyctl ssh console --app "$FLY_APP" --machine "$machine_id" \
+           --pty=false \
+           -C "sh -c 'IFS= read -r n; IFS= read -r e; \
+              git config --file /home/pila/.gitconfig user.name \"\$n\" && \
+              git config --file /home/pila/.gitconfig user.email \"\$e\" && \
+              chown pila: /home/pila/.gitconfig'" >/dev/null 2>&1; then
+    echo "pila: seed_auth: failed to set git identity on machine $machine_id" >&2
     return 1
   fi
 
   echo "[pila] remote: git identity set (${git_name} <${git_email}>)" >&2
+
+  # Pre-warm the Claude CLI. The very first `claude --version` on a
+  # cold Fly machine takes ~17 s (Node runtime warm-up, statsig
+  # network call, etc); the orchestrator's preflight has a tight
+  # timeout. Running it once here as the pila user makes the
+  # orchestrator's subsequent call complete in <0.2 s. Failure
+  # here is non-fatal — the orchestrator will still try.
+  echo "[pila] remote: pre-warming Claude CLI..." >&2
+  flyctl ssh console --app "$FLY_APP" --machine "$machine_id" --pty=false \
+    -C "su pila -c 'HOME=/home/pila PATH=/usr/local/share/mise/installs/node/lts-current/bin:/usr/bin:/bin claude --version'" \
+    >/dev/null 2>&1 || true
+
   echo "[pila] remote: seed_auth complete" >&2
   return 0
 }

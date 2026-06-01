@@ -89,28 +89,40 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path, git_repo: Path) ->
     stub = tmp_path / "flyctl"
     stub.write_text(
         "#!/usr/bin/env bash\n"
-        # Args layout: machine exec <id> --app <app> -- <cmd...>
-        # Positions:   $1      $2   $3  $4    $5    $6  $7...
-        # Skip the first 6 tokens to reach the actual command.
-        "shift 6\n"
+        # New flyctl call shape (post-`--stdin` removal): the launcher
+        # now uses `flyctl ssh console --app <app> --machine <id>
+        # --pty=false -C "<cmd-string>"`. The command is a single
+        # shell-quoted string; we eval it after rewriting the in-machine
+        # paths to point at the test fixtures.
         f'REPO={git_repo}\n'
         f'MRUNS={machine_runs_dir}\n'
-        'case "$1" in\n'
-        '  python3)\n'
-        # The real script passes -c '<snippet>'.  We ignore $2 (-c) and $3
-        # (the snippet) and run our helper instead.
+        # Parse out the -C argument.
+        'CMD=""\n'
+        'while [ $# -gt 0 ]; do\n'
+        '  case "$1" in\n'
+        '    -C) CMD="$2"; shift 2 ;;\n'
+        '    auth) shift; case "$1" in status) exit 0 ;; esac ;;\n'
+        '    *) shift ;;\n'
+        '  esac\n'
+        'done\n'
+        '[ -z "$CMD" ] && exit 0\n'
+        # Rewrite in-machine paths to the local fixture paths.
+        '# discover_run_for_fetch python3 -c \'<script>\' — match on python3 -c\n'
+        'case "$CMD" in\n'
+        '  python3*-c*)\n'
         f'    exec python3 {discover_py}\n'
         '    ;;\n'
-        '  git)\n'
-        # "git -C /work bundle create - <branch>" -> "git -C $REPO bundle create - <branch>"
-        # After shift 6: $1=git $2=-C $3=/work $4=bundle $5=create $6=- $7=<branch>
-        # We want: git -C $REPO $4 $5 $6 $7... i.e. ${@:4}
-        '    exec git -C "$REPO" "${@:4}"\n'
+        '  git*bundle*create*)\n'
+        # rewrite "git -C /work bundle create - <branch>" → "git -C $REPO bundle create - <branch>"
+        '    NEWCMD="${CMD//\\/work/$REPO}"\n'
+        '    eval "$NEWCMD"\n'
+        '    exit $?\n'
         '    ;;\n'
-        '  tar)\n'
-        # "tar -cC /work/.pila/runs <run-id>" -> "tar -cC $MRUNS <run-id>"
-        # After shift 6: $1=tar $2=-cC $3=/work/.pila/runs $4=<run-id>
-        '    exec tar -cC "$MRUNS" "${@:4}"\n'
+        '  tar*-cC*/work/.pila/runs*)\n'
+        # rewrite "tar -cC /work/.pila/runs <run-id>" → "tar -cC $MRUNS <run-id>"
+        '    NEWCMD="${CMD//\\/work\\/.pila\\/runs/$MRUNS}"\n'
+        '    eval "$NEWCMD"\n'
+        '    exit $?\n'
         '    ;;\n'
         '  *) exit 0 ;;\n'
         'esac\n'

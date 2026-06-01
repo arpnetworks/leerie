@@ -39,14 +39,22 @@ set -euo pipefail
 FLY_APP="${PILA_FLY_APP:-pila}"
 
 # ---------------------------------------------------------------------------
-# machine_exec <cmd>...
+# _fetch_machine_exec <cmd>...
 #
-# Run a command on the Fly Machine via flyctl machine exec.
+# Run a command on the Fly Machine. Current flyctl `machine exec`
+# accepts only a single command-string argument (post-`--` argv was
+# removed alongside `--stdin`). Use `ssh console -C` and join the
+# argv into a single shell-escaped string so the remote shell sees
+# the same effective command.
 # ---------------------------------------------------------------------------
 _fetch_machine_exec() {
-  flyctl machine exec "$PILA_MACHINE_ID" \
-    --app "$FLY_APP" \
-    -- "$@"
+  local cmd
+  cmd="$(python3 -c '
+import shlex, sys
+print(" ".join(shlex.quote(a) for a in sys.argv[1:]))
+' "$@")"
+  flyctl ssh console --app "$FLY_APP" --machine "$PILA_MACHINE_ID" \
+    --pty=false -C "$cmd"
 }
 
 # ---------------------------------------------------------------------------
@@ -92,6 +100,15 @@ fetch_branch() {
   # the pila image) to parse the JSON safely.
   local run_id run_branch working_branch run_no_push
   local discover_output
+  # NOTE: 2>/dev/null (not 2>&1) — flyctl ssh console prints
+  # "Connecting to fdaa:..." to stderr, and merging that into stdout
+  # would shift every parsed line by one, corrupting run_id /
+  # run_branch / working_branch / no_push. The python script writes
+  # its diagnostics with sys.exit(1) on stderr-only paths, so losing
+  # stderr is acceptable; the host-side error message below conveys
+  # the failure type adequately.
+  local _discover_err
+  _discover_err="$(mktemp)"
   discover_output="$(_fetch_machine_exec python3 -c '
 import os, json, sys
 
@@ -127,11 +144,14 @@ print(best[0])
 print(best[1])
 print(best[2])
 print(best[3])
-' 2>&1)" || {
+' 2>"$_discover_err")" || {
     echo "pila: fetch_branch: failed to discover completed run on machine $machine_id" >&2
     echo "  Output: $discover_output" >&2
+    echo "  Stderr: $(cat "$_discover_err")" >&2
+    rm -f "$_discover_err"
     return 1
   }
+  rm -f "$_discover_err"
 
   # Check for ERROR prefix from the Python script
   if printf '%s' "$discover_output" | grep -q "^ERROR:"; then
@@ -154,13 +174,24 @@ print(best[3])
   export PILA_REMOTE_RUN_ID="$run_id"
 
   # --- Step 2: stream the run branch via git bundle -------------------------
-  # Skipped for cleared-but-empty terminal-state runs (no_push=true): no
-  # setup-run.sh ran on the machine, so there is no run branch to bundle.
-  # The state dir still streams back in Step 3 so `pila --list` can render
-  # the run as `done-local` and the host-side finalize block's no_push
-  # check exits 0 cleanly.
-  if [ "$run_no_push" = "true" ]; then
-    echo "[pila] remote: run.json has no_push=true; skipping branch bundle (no run branch was materialized)" >&2
+  # Probe whether the run branch actually exists on the machine. Two
+  # scenarios where it doesn't:
+  #   (a) cleared-but-empty terminal-state run (DESIGN §6) — the
+  #       orchestrator exited cleanly because the task was already
+  #       satisfied on HEAD; setup-run.sh never ran; no branch.
+  #   (b) some other early-failure / placeholder case.
+  # In both, skip the bundle step.
+  #
+  # We CANNOT trust run.json.no_push as a proxy: the in-Fly launcher
+  # always passes --no-push to the orchestrator (the machine can't
+  # push) so no_push=true is a mechanism flag, not a "no branch was
+  # materialized" signal.
+  local _branch_present="false"
+  if _fetch_machine_exec git -C /work rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
+    _branch_present="true"
+  fi
+  if [ "$_branch_present" = "false" ]; then
+    echo "[pila] remote: run branch $run_branch not present on machine; skipping bundle" >&2
   else
     # Create a bundle on the machine containing the run branch and all
     # its ancestry, then pipe it to the host and fetch from it.  The host
@@ -228,6 +259,33 @@ print(best[3])
   fi
 
   echo "[pila] remote: run state directory fetched to $host_pila_runs/$run_id" >&2
+
+  # The in-Fly orchestrator was launched with --no-push by the launcher
+  # because the machine can't push (no GitHub SSH key by design). That
+  # forced no_push=true into run.json on the machine — a mechanism
+  # flag, NOT a user-intent flag. Strip it from the host-side run.json
+  # so host_finalize doesn't conflate it with the user's actual
+  # no-push preference. The user's true intent is recorded in
+  # fly-machine.json's `host_no_push` (set at launch time by
+  # provision.sh) and consulted by the launcher's --finalize handler.
+  local _host_run_json="$host_pila_runs/$run_id/run.json"
+  if [ -f "$_host_run_json" ]; then
+    python3 - "$_host_run_json" <<'PY' || true
+import json, os, sys
+path = sys.argv[1]
+try:
+    data = json.load(open(path))
+except Exception:
+    sys.exit(0)
+if data.get("no_push") is True:
+    data.pop("no_push", None)
+    tmp = path + ".tmp"
+    json.dump(data, open(tmp, "w"), indent=2)
+    open(tmp, "a").write("\n")
+    os.replace(tmp, path)
+PY
+  fi
+
   echo "[pila] remote: fetch complete — run $run_id ready for host-side finalize" >&2
   return 0
 }
