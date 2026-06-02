@@ -1072,16 +1072,17 @@ laptop state" = host commits plus host dirty edits):
    branch, and silently clobbering them produces a wrong PR.
    `--force` bypasses.
 3. `seed_repo_dirty` — recompute `git status --porcelain` on the
-   host, tar the dirty set, pipe via `flyctl machine exec`. The
-   full-history clone on the machine is preserved (never
-   re-cloned, which would obliterate the run branch).
+   host, rsync the dirty set over `flyctl ssh console -C "rsync
+   --server ..."` (via the `fly_rsync_wrapper` helper in
+   `lib.sh`). The full-history clone on the machine is preserved
+   (never re-cloned, which would obliterate the run branch).
 
 The dirty set is computed on the host where worktree paths
 (`.pila/runs/<run-id>/worktrees/...`) structurally cannot appear,
 because worktrees live only on the machine. A defensive
-`tar --exclude='.pila/runs/*/worktrees/*' --exclude='.git/*'` flag
-protects against a future change that lets host-side paths name
-worktree files.
+filter excludes `.pila/runs/*/worktrees/*` and `.git/*` paths
+before handing the file list to rsync's `--files-from=-` — protects
+against a future change that lets host-side paths name worktree files.
 
 Resume auto-re-seeds by default. `--no-re-seed` opts out for the
 rate-limit auto-resume case where no host edits happened. The

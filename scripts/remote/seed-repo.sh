@@ -2,26 +2,65 @@
 # scripts/remote/seed-repo.sh — seed the developer's working tree into a
 # Fly.io Machine for one pila remote run.
 #
-# Single-channel seeding: tar the host's working tree (including .git
-# and any uncommitted/untracked files) and pipe it to /work on the
-# remote via `flyctl ssh console -C "tar -xC /work"`. The same
-# transport is used for the Claude config seed (~640 MB) so the
-# scale is well-validated.
+# Two-phase seeding:
 #
-# This replaces an older two-channel design that ran `git clone
-# --filter=blob:none` from origin inside the machine and then
-# rsync'd the dirty delta separately. The clone path required SSH
-# keys / known_hosts on the Fly machine for the git remote — which
-# pila intentionally does not deploy (DESIGN §6 *Finalization*:
-# workers commit on the machine, the host pushes via
-# `pila --finalize`; no long-lived push tokens on Fly). Tar-piping
-# from the host removes that requirement entirely: the laptop
-# already has the full repo, including `.git`, including
-# uncommitted files.
+#   1. `seed_repo_clone` — laptop creates `git bundle` for the parent
+#      repo and each submodule (recursive); pipes each bundle to the
+#      machine via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"`.
+#      Machine then `git clone`s from the parent bundle file on local
+#      disk, wires each submodule URL to point at its bundle, and runs
+#      `git -c protocol.file.allow=always submodule update --recursive`
+#      (the protocol-flag is required by git 2.38+ for file://-style
+#      URLs, per CVE-2022-39253). Delivers committed state only.
+#
+#   2. `seed_repo_dirty` — laptop rsync's the dirty/untracked delta
+#      (uncommitted edits, untracked-not-ignored files, forced-in
+#      `.claude/`) into /work via the existing `fly_rsync_wrapper`
+#      from lib.sh. Same helper used by `re-seed.sh` for the Phase 4
+#      mid-run re-seed flow. Delivers uncommitted state.
+#
+# Why bundles instead of a tar pipe or pure rsync:
+#   macOS BSD `tar -c` normalizes filenames NFC → NFD when archiving
+#   (libarchive behavior; documented). The Linux receiver writes NFD
+#   bytes to disk; git's index still holds the NFC bytes (because the
+#   index was built on macOS where APFS normalizes at the syscall
+#   layer). Result: filenames with `ó`, `ñ`, emoji, etc. show as
+#   untracked + missing on the machine even when clean on the host,
+#   and any submodule containing such a file flags the parent ` M`.
+#   This broke `~/src/enric/api`'s preflight in the live test on
+#   2026-06-01.
+#
+#   Bundles sidestep the problem entirely because the bundle file
+#   stores pack-format binary objects (tree entries by raw bytes);
+#   the receiving Linux git creates filenames natively on disk from
+#   those objects. No filename ever serializes through the transport
+#   layer where normalization could intervene. rsync (used for the
+#   dirty delta) also preserves filename bytes verbatim.
+#
+# Why bundle each submodule separately:
+#   `git bundle create --all` packs only the host repo's own refs.
+#   Submodule objects live in `.git/modules/<sm>/` and are NOT
+#   included in the parent's bundle. We bundle each submodule
+#   separately, transfer each, and on the machine point each
+#   submodule's URL at its bundle file (via `git config
+#   submodule.<name>.url`) before submodule update.
+#
+# Transport is the SAME `flyctl ssh console -C "sh -c 'cat > ...'"`
+# pipe pila uses for the Claude home stage (~234 MB, proven) and the
+# reverse direction in `fetch-branch.sh` (which moves bundles
+# machine → host). The `sh -c` wrapper is load-bearing: bare
+# `-C "cat > /tmp/..."` is parsed by flyctl as if `>` were a `cat`
+# argument and fails with `cat: invalid option -- 'c'`.
+#
+# Fly machines deliberately receive no GitHub credentials (DESIGN §6
+# *Finalization*: workers commit on the machine, the host pushes via
+# `pila --finalize`; no long-lived push tokens on Fly). Bundling from
+# the host satisfies the no-credentials constraint without an
+# in-machine `git clone` against origin.
 #
 # After seeding, /work on the machine mirrors the developer's working
-# tree: same tracked files, same uncommitted edits, same untracked
-# files, full git history.
+# tree: same committed state, same uncommitted edits, same untracked
+# files, full git history, submodule working trees populated.
 #
 # Usage (called by the pila launcher after provision_machine succeeds):
 #
@@ -33,33 +72,19 @@
 #   PILA_MACHINE_ID   — ID of the started Fly Machine (set by provision.sh)
 #   PILA_FLY_APP      — Fly.io app name (default: "pila")
 #   USER_REPO         — absolute path to the local git repo (set by launcher)
-#   PILA_GIT_REMOTE   — kept for backward compat (unused by the tar-pipe path)
 #
-# Requires: flyctl on PATH and authenticated; tar.
+# Requires (host): flyctl on PATH and authenticated; git; python3;
+#                  rsync (for the dirty-delta phase).
+# Requires (machine, baked into the image): git; rsync.
 
 set -euo pipefail
 
-FLY_APP="${PILA_FLY_APP:-pila}"
-GIT_REMOTE="${PILA_GIT_REMOTE:-origin}"
+# --- shared lib (fly_rsync_wrapper / iso_now / require_flyctl / etc.) -----
+_SEED_REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+. "$_SEED_REPO_DIR/lib.sh"
 
-# ---------------------------------------------------------------------------
-# machine_exec <cmd>...
-#
-# Run a command on the Fly Machine via `flyctl machine exec`.
-# Streams stdout/stderr to the caller's stderr for visibility.
-# ---------------------------------------------------------------------------
-machine_exec() {
-  # Current flyctl `machine exec` accepts only a single command-string
-  # arg (post-`--` argv was removed). Shell-quote the argv and pipe
-  # through ssh console -C, which forwards both stdin and exit code.
-  local cmd
-  cmd="$(python3 -c '
-import shlex, sys
-print(" ".join(shlex.quote(a) for a in sys.argv[1:]))
-' "$@")"
-  flyctl ssh console --app "$FLY_APP" --machine "$PILA_MACHINE_ID" \
-    --pty=false -C "$cmd"
-}
+FLY_APP="${PILA_FLY_APP:-pila}"
 
 # ---------------------------------------------------------------------------
 # _seed_repo_preflight
@@ -93,27 +118,24 @@ _seed_repo_preflight() {
 # ---------------------------------------------------------------------------
 # seed_repo_clone
 #
-# Tar-pipe the host's working tree (including .git, including any
-# uncommitted/untracked files) to /work on the remote. Always wipes
-# /work first — call this only on a fresh provision, never on resume.
+# Bundle the host's committed state (parent + every submodule), pipe
+# each bundle to the machine via ssh-console, and have the machine
+# clone from those bundle files on its local disk. Always wipes /work
+# first — call this only on a fresh provision, never on resume.
 #
-# This replaces the old `git clone --filter=blob:none` from origin
-# inside the machine, which required SSH keys + known_hosts for the
-# git remote that pila deliberately does not deploy to Fly (DESIGN §6
-# *Finalization*: no long-lived push tokens on the machine).
-#
-# The host has the entire repo on disk; piping it up via the same
-# ssh-console transport already proven for the 640 MB Claude config
-# seed is faster than a re-clone over the public internet for any
-# repo small enough to fit on a developer laptop. .git includes the
-# full object database, so worktrees on the machine work normally.
+# Why bundles instead of tar or rsync: the bundle file is pack-format
+# binary; tree entries are stored as raw bytes; the receiving Linux
+# git materializes filenames natively from those objects. macOS BSD
+# tar's NFC→NFD filename normalization (the bug that triggered this
+# whole rewrite) doesn't apply because filenames don't transit the
+# wire as strings — only commit-hash refs and packed objects do.
 # ---------------------------------------------------------------------------
 seed_repo_clone() {
   _seed_repo_preflight || return 1
 
-  # Ensure SSH cert is valid and hallpass is ready before the tar
-  # pipe. Both helpers are no-ops when called against an already-
-  # warm machine, so the cost is one fast probe.
+  # Ensure SSH cert is valid and hallpass is ready before the pipe.
+  # Both helpers are no-ops when called against an already-warm
+  # machine, so the cost is one fast probe.
   if command -v require_fly_ssh >/dev/null 2>&1; then
     if ! require_fly_ssh "$FLY_APP"; then
       echo "pila: seed_repo: Fly SSH setup failed; cannot seed repo" >&2
@@ -124,7 +146,7 @@ seed_repo_clone() {
     wait_for_fly_ssh_ready "$FLY_APP" "$PILA_MACHINE_ID" || true
   fi
 
-  echo "[pila] remote: seeding — tar-piping $USER_REPO (full tree + .git) to /work ..." >&2
+  echo "[pila] remote: seeding — bundling $USER_REPO (parent + submodules) to /work ..." >&2
 
   # Empty /work's CONTENTS but preserve the directory inode. A bare
   # `rm -rf /work && mkdir -p /work` replaces the inode, which leaves
@@ -134,81 +156,91 @@ seed_repo_clone() {
   # error retrieving current directory` from sub-shells, and claude
   # --version timing out (its node runtime tries to stat ".").
   #
-  # find -delete on /work/* preserves the /work inode itself.
+  # Also reset the bundle staging dirs in case a prior paused run
+  # left them behind.
   if ! flyctl ssh console --app "$FLY_APP" --machine "$PILA_MACHINE_ID" \
-         --pty=false -C "sh -c 'find /work -mindepth 1 -maxdepth 1 -exec rm -rf {} + && chown pila: /work'" >/dev/null 2>&1; then
+         --pty=false -C "sh -c 'find /work -mindepth 1 -maxdepth 1 -exec rm -rf {} + && chown pila: /work && rm -rf /tmp/pila-seed.bundle /tmp/pila-subs && mkdir -p /tmp/pila-subs'" >/dev/null 2>&1; then
     echo "pila: seed_repo: failed to reset /work on machine $PILA_MACHINE_ID" >&2
     return 1
   fi
 
-  # Build the seed file list:
-  #   1. Tracked + untracked-not-ignored (git ls-files), filtered to
-  #      drop any .pila/ entries even if the user's .gitignore lacks
-  #      them. .pila/ is host-side run state; the machine must not
-  #      see prior runs.
-  #   2. .claude/ verbatim (force-include even if .gitignore'd —
-  #      most repo-level .gitignore files list .claude/, but workers
-  #      need the repo's hooks/settings/plugins to run).
-  #   3. .git/ verbatim (workers need full history for worktrees).
+  # 1. Bundle the parent repo and pipe it to /tmp/pila-seed.bundle on
+  #    the machine. `git bundle create - --all` packs every ref into a
+  #    single pack-format binary stream on stdout.
   #
-  # The pipeline was verified end-to-end against a fixture repo with
-  # tracked + untracked + gitignored + .pila/ + .claude/ + .git/.
-  # Output extracted contained exactly the expected paths and
-  # `git log` worked on the extracted copy.
-  #
-  # COPYFILE_DISABLE=1 silences GNU tar's "Ignoring unknown extended
-  # header keyword 'LIBARCHIVE.xattr.com.apple.provenance'" warnings
-  # on the remote when the host is macOS. No-op on Linux.
-  #
-  # Wrap the pipeline in a single attempt + one retry after `flyctl
-  # agent restart` if the failure matches the transient "tunnel
-  # unavailable" pattern. Observed on cold-start probes: a fresh
-  # flyctl agent occasionally returns "tunnel unavailable" within
-  # ~7s; restarting the agent reliably clears it.
-  local tar_rc=0 attempt err_log
-  for attempt in 1 2; do
-    err_log="$(mktemp)"
-    {
-      ( cd "$USER_REPO" && \
-        git ls-files -z --cached --others --exclude-standard \
-          | python3 -c '
-import sys
-for f in sys.stdin.buffer.read().split(b"\x00"):
-    if not f or f.startswith(b".pila/") or f == b".pila":
-        continue
-    sys.stdout.buffer.write(f + b"\x00")
-' )
-      if [ -d "$USER_REPO/.claude" ]; then
-        ( cd "$USER_REPO" && find .claude -print0 )
-      fi
-      if [ -d "$USER_REPO/.git" ]; then
-        ( cd "$USER_REPO" && find .git -print0 )
-      fi
-    } \
-      | COPYFILE_DISABLE=1 tar -C "$USER_REPO" --null -T - -cf - 2>/dev/null \
-      | flyctl ssh console --app "$FLY_APP" --machine "$PILA_MACHINE_ID" \
-          --pty=false -C "sh -c 'tar -xC /work && chown -R pila: /work'" >/dev/null 2>"$err_log"
-    tar_rc=${PIPESTATUS[2]}
-    if [ "$tar_rc" -eq 0 ]; then
-      rm -f "$err_log"
-      break
-    fi
-    if [ "$attempt" -eq 1 ] \
-       && grep -qE "tunnel unavailable|context deadline exceeded|i/o timeout" "$err_log"; then
-      cat "$err_log" >&2
-      echo "[pila] remote: tunnel unavailable; restarting flyctl agent and retrying once..." >&2
-      flyctl agent restart >/dev/null 2>&1 || true
-      sleep 2
-      rm -f "$err_log"
-      continue
-    fi
-    cat "$err_log" >&2
-    rm -f "$err_log"
-    break
-  done
+  #    The receiver MUST be wrapped in `sh -c '...'`; without it, the
+  #    remote treats `>` as an argument to `cat` rather than a shell
+  #    redirect and fails with `cat: invalid option -- 'c'`.
+  if ! git -C "$USER_REPO" bundle create - --all 2>/dev/null \
+        | flyctl ssh console --quiet --app "$FLY_APP" \
+            --machine "$PILA_MACHINE_ID" --pty=false \
+            -C "sh -c 'cat > /tmp/pila-seed.bundle'" >/dev/null 2>&1; then
+    echo "pila: seed_repo: failed to pipe parent bundle to machine" >&2
+    return 1
+  fi
 
-  if [ "$tar_rc" -ne 0 ]; then
-    echo "pila: seed_repo: tar transfer to /work failed (exit $tar_rc)" >&2
+  # 2. Bundle each submodule recursively, pipe each into
+  #    /tmp/pila-subs/<flattened-displaypath>.bundle. The display-path
+  #    flattening (`/` → `_`) is applied identically here and in the
+  #    machine-side clone script (step 3) so both sides agree on the
+  #    filename for nested submodules like `vendor/foo` → `vendor_foo`.
+  #
+  #    `git submodule foreach --recursive` walks every nested submodule.
+  #    Inside the foreach, $displaypath is git's superproject-relative
+  #    path. We export host-side env vars the foreach body needs.
+  if [ -f "$USER_REPO/.gitmodules" ]; then
+    if ! (
+      cd "$USER_REPO" && \
+      PILA_FLY_APP="$FLY_APP" PILA_MACHINE_ID="$PILA_MACHINE_ID" \
+      git submodule --quiet foreach --recursive '
+        bn="$(printf %s "$displaypath" | tr / _).bundle"
+        # The `-C` arg must be `sh -c "..."` not bare `cat > ...`;
+        # without the shell wrapper the remote treats `>` as an arg to
+        # `cat`. Single-quote the inner script for the foreach context.
+        git bundle create - --all 2>/dev/null \
+          | flyctl ssh console --quiet --app "$PILA_FLY_APP" \
+              --machine "$PILA_MACHINE_ID" --pty=false \
+              -C "sh -c '\''cat > /tmp/pila-subs/$bn'\''" >/dev/null 2>&1 \
+          || { echo "pila: seed_repo: failed to pipe submodule $displaypath bundle" >&2; exit 1; }
+      '
+    ); then
+      echo "pila: seed_repo: submodule bundling failed" >&2
+      return 1
+    fi
+  fi
+
+  # 3. Machine-side: clone from /tmp/pila-seed.bundle into /work, wire
+  #    each submodule's URL to its bundle file (in `.git/config`, NOT
+  #    `.gitmodules` — we never modify the committed file), then
+  #    submodule update. Finally chown -R pila: /work so the
+  #    orchestrator (which runs as pila) owns its working tree.
+  #
+  #    `git clone` against a bundle file path Just Works — git
+  #    recognizes the bundle header and treats the file like a remote.
+  if ! flyctl ssh console --app "$FLY_APP" --machine "$PILA_MACHINE_ID" \
+         --pty=false -C 'sh -c '"'"'
+set -e
+# `protocol.file.allow=always` is required for submodule update to
+# accept file://-style local paths (bundle files on disk). Git 2.38+
+# blocks `file` by default per CVE-2022-39253. We trust local paths
+# because we just put them there.
+git clone /tmp/pila-seed.bundle /work
+cd /work
+if [ -f .gitmodules ]; then
+  git submodule init
+  git submodule status | awk "{print \$2}" | while read sm; do
+    bn=$(printf %s "$sm" | tr / _).bundle
+    if [ -f "/tmp/pila-subs/$bn" ]; then
+      git config "submodule.$sm.url" "/tmp/pila-subs/$bn"
+    fi
+  done
+  git -c protocol.file.allow=always submodule update --recursive
+fi
+chown -R pila: /work
+# Clean up the bundle tmpfiles — they served their purpose.
+rm -rf /tmp/pila-seed.bundle /tmp/pila-subs
+'"'" >/dev/null 2>&1; then
+    echo "pila: seed_repo: machine-side clone from bundle failed" >&2
     return 1
   fi
 
@@ -218,17 +250,23 @@ for f in sys.stdin.buffer.read().split(b"\x00"):
 # ---------------------------------------------------------------------------
 # seed_repo_dirty
 #
-# Re-seed helper used by `scripts/remote/re-seed.sh` (Phase 4) when the
-# user pauses a run, edits files locally, and resumes. Tars the host's
-# `git status --porcelain` dirty set and streams it into /work on the
-# remote. NOT called by `seed_repo()` on a fresh provision anymore —
-# `seed_repo_clone` already includes uncommitted files via
-# `git ls-files --others --exclude-standard`.
+# Rsync the dirty/untracked delta from host to /work on the machine.
+# Called by both the fresh-provision path (after `seed_repo_clone`
+# delivers committed state, this fills in uncommitted edits) AND by
+# `scripts/remote/re-seed.sh` (Phase 4) when the user pauses a run,
+# edits files locally, and resumes.
 #
-# Defensive excludes (.pila/runs/*/worktrees/* and .git/*) protect against
-# a future change that lets the dirty set name worktree paths — currently
-# the host can't produce those paths because worktrees live only on the
-# machine, but the safety belt prevents silent clobbering.
+# The dirty set is `git status --porcelain` of the host repo, filtered:
+#   - Modified-but-uncommitted tracked files
+#   - Untracked-not-ignored files
+#   - Defensive excludes for `.pila/runs/*/worktrees/*` (host-side
+#     worktree paths can't structurally appear today but the exclude
+#     prevents silent clobbering if the upstream behavior ever changes)
+#   - Defensive excludes for `.git/*` (same shape)
+#
+# Transport: rsync over `flyctl ssh console -C "rsync --server ..."`
+# via the `fly_rsync_wrapper` helper in lib.sh. rsync preserves
+# filename bytes verbatim (NFC stays NFC on the Linux receiver).
 # ---------------------------------------------------------------------------
 seed_repo_dirty() {
   _seed_repo_preflight || return 1
@@ -265,13 +303,15 @@ seed_repo_dirty() {
   file_count="$(printf '%s\n' "$dirty_files" | wc -l | tr -d ' ')"
   echo "[pila] remote: seeding — syncing $file_count dirty file(s)/dir(s)..." >&2
 
-  # Defensive --exclude flags: structural protection in case a future
-  # change lets host-side dirty paths cross the boundary.
+  # rsync the dirty delta. Same NFC-preservation reason as
+  # seed_repo_clone — if a paused-and-edited file has non-ASCII chars
+  # in its name, host-side tar -c would normalize to NFD and the
+  # parent repo on the machine would flag dirty after the re-seed.
   #
-  # Current flyctl removed `--stdin` from `machine exec`. Use
-  # `flyctl ssh console -C` instead — it forwards host stdin to the
-  # remote command and handles arbitrarily large payloads.
-  # Defensive: see comment in seed-auth.sh for require_fly_ssh.
+  # Defensive: the dirty set comes from `git status --porcelain` which
+  # operates on the parent repo. Excluding .pila/runs/*/worktrees/*
+  # and .git/* structurally protects against any future change that
+  # lets those paths surface in the porcelain output.
   if command -v require_fly_ssh >/dev/null 2>&1; then
     if ! require_fly_ssh "$FLY_APP"; then
       echo "pila: seed_repo: Fly SSH setup failed; cannot transfer delta" >&2
@@ -281,37 +321,67 @@ seed_repo_dirty() {
   if command -v wait_for_fly_ssh_ready >/dev/null 2>&1; then
     wait_for_fly_ssh_ready "$FLY_APP" "$PILA_MACHINE_ID" || true
   fi
-  local tar_rc=0
-  {
-    printf '%s\n' "$dirty_files" \
-      | while IFS= read -r f; do printf '%s\0' "$f"; done \
-      | COPYFILE_DISABLE=1 tar -C "$USER_REPO" \
-            --exclude='.pila/runs/*/worktrees/*' \
-            --exclude='.git/*' \
-            --null -T - \
-            -czf - 2>/dev/null
-  } | flyctl ssh console \
-        --app "$FLY_APP" \
-        --machine "$PILA_MACHINE_ID" \
-        --pty=false \
-        -C "tar -C /work -xzf -" >/dev/null 2>&1 || tar_rc=$?
 
-  if [ "$tar_rc" -ne 0 ]; then
-    echo "pila: seed_repo: tar delta transfer failed (exit $tar_rc)" >&2
+  local rsync_rc=0
+  local file_list wrapper
+  file_list="$(mktemp -t pila-reseed-list.XXXXXX)"
+  wrapper="$(fly_rsync_wrapper "$FLY_APP")"
+
+  # Build NUL-delimited file list, filtering out worktree + .git paths.
+  printf '%s\n' "$dirty_files" \
+    | python3 -c '
+import sys
+for line in sys.stdin.read().splitlines():
+    if not line:
+        continue
+    if line.startswith(".git/") or line == ".git":
+        continue
+    # Defensive: drop worktree paths if they ever surface.
+    if "/.pila/runs/" in line and "/worktrees/" in line:
+        continue
+    sys.stdout.buffer.write(line.encode() + b"\x00")
+' > "$file_list"
+
+  PILA_FLY_APP="$FLY_APP" rsync -a -H \
+    --from0 --files-from="$file_list" \
+    -e "$wrapper" \
+    "$USER_REPO/" "$PILA_MACHINE_ID:/work/" \
+    >/dev/null 2>&1
+  rsync_rc=$?
+
+  if [ "$rsync_rc" -ne 0 ]; then
+    rm -f "$file_list" "$wrapper"
+    echo "pila: seed_repo: rsync delta transfer failed (exit $rsync_rc)" >&2
     return 1
   fi
 
+  # Chown the freshly-rsync'd paths. Keep it broad — rsync may have
+  # touched directories above the dirty files too.
+  if ! flyctl ssh console --app "$FLY_APP" --machine "$PILA_MACHINE_ID" \
+         --pty=false -C "chown -R pila: /work" >/dev/null 2>&1; then
+    rm -f "$file_list" "$wrapper"
+    echo "pila: seed_repo: chown -R pila: /work after delta failed" >&2
+    return 1
+  fi
+
+  rm -f "$file_list" "$wrapper"
   echo "[pila] remote: seeding complete" >&2
 }
 
 # ---------------------------------------------------------------------------
 # seed_repo
 #
-# Used on fresh provisions. seed_repo_clone now tar-pipes the entire
-# working tree (including uncommitted files) so the dirty-rsync that
-# used to follow is redundant here. re-seed.sh still calls
-# seed_repo_dirty directly when the user pauses + edits + resumes.
+# Used on fresh provisions. Two phases:
+#   1. seed_repo_clone — bundles parent + submodules, machine clones from
+#      bundles. Delivers committed state only.
+#   2. seed_repo_dirty — rsync's the dirty/untracked delta plus
+#      forced-in .claude/, completing the working tree state on the
+#      machine.
+#
+# re-seed.sh still calls seed_repo_dirty directly when the user
+# pauses + edits + resumes.
 # ---------------------------------------------------------------------------
 seed_repo() {
-  seed_repo_clone
+  seed_repo_clone || return 1
+  seed_repo_dirty
 }

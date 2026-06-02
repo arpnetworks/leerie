@@ -56,15 +56,31 @@ def _stub_flyctl(tmp_path: Path, *, remote_status: str = "started",
     The state is stored in a file so `machine start` can flip the
     reported `machine status` from stopped → started, matching real Fly
     behaviour.
+
+    For `ssh console -C "rsync --server ..."` (which seed_repo_dirty
+    now uses), the rsync command line is rewritten to substitute /work
+    with tmp_path/machine-work, and the rewritten command is exec'd
+    locally so the rsync protocol actually completes successfully.
+
+    Also writes a `timeout` stub into tmp_path. lib.sh's require_fly_ssh
+    and wait_for_fly_ssh_ready wrap flyctl in `timeout <secs>` and macOS
+    doesn't ship `timeout` in /usr/bin. The stub skips the time cap and
+    exec's the real (stubbed) child.
     """
     log = tmp_path / "flyctl.log"
     state_file = tmp_path / "stub-machine-state"
     state_file.write_text(remote_status)
+    # Where the rsync receiver will write into. Tests don't typically
+    # inspect this content (re-seed tests focus on control flow, not
+    # transferred bytes), but rsync needs a real dest to talk to.
+    machine_work = tmp_path / "machine-work"
+    machine_work.mkdir(exist_ok=True)
     fake = tmp_path / "flyctl"
     fake.write_text(
         "#!/usr/bin/env bash\n"
         f'echo "$@" >> "{log}"\n'
         f'STATE_FILE="{state_file}"\n'
+        f'MACHINE_WORK="{machine_work}"\n'
         "case \"$1 $2\" in\n"
         "  'auth status') exit 0 ;;\n"
         '  "machine status") printf "Machine ID: mach-test\\nState: %s\\n" "$(cat $STATE_FILE)"; exit 0 ;;\n'
@@ -73,16 +89,33 @@ def _stub_flyctl(tmp_path: Path, *, remote_status: str = "started",
         '  "machine destroy") echo "destroyed" > "$STATE_FILE"; exit 0 ;;\n'
         '  "ssh issue") exit 0 ;;\n'
         '  "ssh console")\n'
-        # Parse -C "<cmd>" from the remaining args to route output.
+        # Parse -C "<cmd>" and --machine "<id>" from the remaining args.
         '    cmd=""\n'
+        '    machine=""\n'
         '    while [ $# -gt 0 ]; do\n'
         '      case "$1" in\n'
         '        -C) cmd="$2"; shift 2 ;;\n'
+        '        --machine) machine="$2"; shift 2 ;;\n'
         '        *) shift ;;\n'
         '      esac\n'
         '    done\n'
+        # require_fly_ssh probe: machine is "probe-nonexistent". Emit
+        # the magic string require_fly_ssh greps for and exit nonzero.
+        '    if [ "$machine" = "probe-nonexistent" ]; then\n'
+        '      echo "Error: no started VMs" >&2\n'
+        '      exit 1\n'
+        '    fi\n'
         '    case "$cmd" in\n'
         f'      *"git -C /work status"*) printf "%s" "{remote_dirty}"; exit 0 ;;\n'
+        '      "true") exit 0 ;;\n'
+        '      chown*) exit 0 ;;\n'
+        '      rsync*)\n'
+        # Rewrite the trailing "/work" → tmp_path/machine-work so the
+        # rsync receiver actually has a real dest. Then exec it.
+        '        local_cmd="${cmd// \\/work/ $MACHINE_WORK}"\n'
+        '        eval "$local_cmd"\n'
+        '        exit $?\n'
+        '        ;;\n'
         '      *tar*-xzf*) cat > /dev/null; exit 0 ;;\n'
         '      *tar*-xC*) cat > /dev/null; exit 0 ;;\n'
         '      *) cat > /dev/null; exit 0 ;;\n'
@@ -112,6 +145,19 @@ def _stub_flyctl(tmp_path: Path, *, remote_status: str = "started",
         "exit 0\n"
     )
     fake.chmod(0o755)
+
+    # Stub `timeout` so require_fly_ssh / wait_for_fly_ssh_ready work on
+    # macOS hosts where /usr/bin doesn't include it. Tests pin PATH to
+    # tmp_path:/usr/bin:/bin which excludes Homebrew.
+    timeout_stub = tmp_path / "timeout"
+    timeout_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        "while [[ \"$1\" == --* ]]; do shift; done\n"
+        "shift  # discard the seconds arg\n"
+        'exec "$@"\n'
+    )
+    timeout_stub.chmod(0o755)
+
     return fake
 
 
@@ -214,9 +260,11 @@ def test_re_seed_starts_stopped_machine_and_calls_dirty(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
     assert "machine start mach-001" in invocations
-    # tar pipe should have been invoked for the dirty file (via ssh console -C).
+    # rsync should have been invoked for the dirty file (via ssh console -C).
+    # seed_repo_dirty now uses rsync over flyctl ssh console (was tar in
+    # the older two-channel design).
     assert "ssh console" in invocations
-    assert "tar -C /work -xzf -" in invocations
+    assert "rsync --server" in invocations
 
 
 def test_re_seed_skips_start_when_machine_already_started(tmp_path: Path):

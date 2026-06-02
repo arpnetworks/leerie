@@ -9,6 +9,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+## [0.2.6] - 2026-06-01
+
+This release fixes a hard failure on `--runtime fly` against any repo
+whose tracked or submodule content contains non-ASCII filenames. Live
+validation: clean preflight + bundle clone with intact NFC bytes on
+`~/src/enric/api` (the `📄Plan de implementación.pdf` inside the
+`data` submodule).
+
+### Fixed
+
+- **Seed transport for `--runtime fly` no longer corrupts UTF-8
+  filenames in submodules.** macOS BSD `tar -c` normalizes filenames
+  NFC → NFD when archiving (libarchive behavior). The Linux receiver
+  on the Fly machine stored NFD bytes; git's index from macOS still
+  held NFC bytes. Filenames with `ó`, `ñ`, emoji, etc. showed as
+  untracked + missing on the machine; a single such file inside a
+  submodule made the parent flag ` M`, failing preflight. Discovered
+  on the api repo's `📄Plan de implementación.pdf` (NFC `c3 b3` on
+  host → NFD `6f cc 81` on machine after BSD tar transport).
+
+### Changed
+
+- **`scripts/remote/seed-repo.sh` `seed_repo_clone` rewritten** to use
+  `git bundle` instead of `tar` for committed state. Bundles store
+  pack-format binary objects; filenames are materialized natively on
+  the Linux receiver from raw bytes in tree objects, with no
+  transport-layer normalization possible. Two-phase seed:
+  (1) host creates a `git bundle` for the parent and each submodule,
+      pipes each to the machine via `flyctl ssh console -C "sh -c 'cat > ...'"`;
+      machine `git clone`s from the parent bundle, wires each
+      submodule's URL (in `.git/config`, NOT `.gitmodules`) to its
+      respective bundle file, and runs `git -c protocol.file.allow=always
+      submodule update --recursive` (the `protocol.file.allow` flag is
+      required by git 2.38+ for file://-style submodule URLs per
+      CVE-2022-39253).
+  (2) host then rsync's the dirty/untracked delta plus the forced-in
+      `.claude/` directory (same code path as `seed_repo_dirty` for
+      `re-seed.sh`).
+
+  Same `flyctl ssh console` pipe pila already uses elsewhere (Claude
+  home stage, `fetch-branch.sh`). The `cat > ...` receiver MUST be
+  wrapped in `sh -c '...'`; bare `cat > ...` fails with `cat: invalid
+  option -- 'c'` because flyctl's `-C` arg isn't shell-evaluated by
+  default.
+
+- **Dockerfile adds `rsync` to the base apt install layer.**
+  `seed_repo_dirty` rsync's the dirty delta to the machine; without
+  rsync installed, the remote `rsync --server` invocation fails with
+  `executable file not found in $PATH`. ~1 MB image cost; comparable
+  to `procps`/`build-essential`.
+
 ## [0.2.5] - 2026-06-01
 
 This release makes `pila --runtime fly` work end-to-end. Validated by
@@ -1159,7 +1210,8 @@ in-machine environment correct for the orchestrator + workers, and
   CLI/env are session-scoped knobs; `pila.toml` is the committed
   repo default.
 
-[Unreleased]: https://github.com/enricai/pila/compare/v0.2.5...HEAD
+[Unreleased]: https://github.com/enricai/pila/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/enricai/pila/releases/tag/v0.2.6
 [0.2.5]: https://github.com/enricai/pila/releases/tag/v0.2.5
 [0.2.1]: https://github.com/enricai/pila/releases/tag/v0.2.1
 [0.2.0]: https://github.com/enricai/pila/releases/tag/v0.2.0

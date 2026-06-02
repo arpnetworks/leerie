@@ -70,6 +70,70 @@ iso_now() {
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))'
 }
 
+# --- fly_rsync_wrapper ---------------------------------------------------
+# Emit (to stdout) the absolute path of a single-use shell script that
+# rsync's `-e` flag accepts, so rsync transports its protocol over
+# `flyctl ssh console -C "<remote-cmd>"` instead of plain ssh.
+#
+# Why this exists:
+#   Host-side BSD `tar -c` normalizes filenames NFC → NFD when archiving
+#   on macOS (libarchive behavior; documented). On the Linux receiver,
+#   the NFD bytes don't match git's NFC index entries, so the working
+#   tree on the machine looks dirty after a clean seed of a repo whose
+#   filenames contain non-ASCII characters (the live case that exposed
+#   this: a PDF with `ó` and 📄 inside a submodule). `rsync` preserves
+#   filename bytes verbatim — verified empirically.
+#
+#   But `rsync` needs an SSH transport, and `flyctl ssh console` is not
+#   a drop-in SSH client (no agent forwarding, no port forwarding, no
+#   plain stdin command — only `--command "<string>"`). This wrapper
+#   bridges the gap: rsync invokes us as
+#     <wrapper> <host> rsync --server -se ...
+#   we strip the host, quote the rest, and pass it to ssh console as a
+#   single `-C` arg. The "host" rsync passes is whatever appears before
+#   the `:` in the rsync destination path; we use the Fly machine ID.
+#
+# Usage:
+#   local wrapper
+#   wrapper="$(fly_rsync_wrapper "$FLY_APP")"
+#   trap 'rm -f "$wrapper"' EXIT
+#   PILA_FLY_APP="$FLY_APP" rsync -a --from0 --files-from=/tmp/list \
+#     -e "$wrapper" "$USER_REPO/" "$PILA_MACHINE_ID:/work/"
+#
+# The wrapper exports `PILA_FLY_APP` (from the caller's env) and uses it
+# to address the right app; the machine ID arrives via rsync's host arg.
+#
+# Returns: prints the wrapper's path to stdout. Caller is responsible
+# for `rm -f` on the path when done.
+fly_rsync_wrapper() {
+  local fly_app="${1:-${PILA_FLY_APP:-pila}}"
+  local wrapper
+  wrapper="$(mktemp -t pila-fly-rsync.XXXXXX)"
+  # The wrapper itself is portable POSIX sh. The heredoc is UNquoted so
+  # we can bake the resolved $fly_app value into the wrapper at emit
+  # time (default for $PILA_FLY_APP). Every OTHER variable inside is
+  # escaped with `\$` so it's evaluated when rsync invokes the wrapper
+  # later, not when the heredoc is expanded host-side.
+  cat > "$wrapper" <<WRAPPER
+#!/bin/sh
+# rsync -e wrapper for flyctl ssh console.
+# Invoked by rsync as: <this-script> <host> <remote-cmd> [args...]
+# We pass <remote-cmd> [args...] as a single -C string to flyctl.
+set -e
+FLY_APP="\${PILA_FLY_APP:-$fly_app}"
+MACHINE="\$1"
+shift
+# Build the remote command string. printf %q is bash-only; use a
+# portable sh approach: join with spaces, no quoting. rsync's remote
+# args (rsync --server --sender -se.iLsfxC . /path) don't contain
+# shell metachars in practice and don't need re-quoting.
+CMD="\$*"
+exec flyctl ssh console --quiet --app "\$FLY_APP" --machine "\$MACHINE" --pty=false -C "\$CMD"
+WRAPPER
+  chmod 755 "$wrapper"
+  echo "$wrapper"
+}
+
 # --- render_tail_wrapper -------------------------------------------------
 # Emit a POSIX-sh script (to stdout) that:
 #   1. If $1 looks like a bootstrap id (`_bootstrap-<hex>`), waits for the

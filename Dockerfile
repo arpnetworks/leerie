@@ -24,11 +24,15 @@ FROM debian:13-slim
 # (pila.py:925) calls between waves. Without it the walk silently degrades
 # to no-op via the OSError catch — correctness is fine, but the documented
 # fast-happy-path is gone. ~1MB image cost.
+# rsync is the receiver for the dirty-delta phase of seed-repo.sh
+# (`seed_repo_dirty` rsync's uncommitted edits + untracked files + the
+# repo-local `.claude/` directory after the bundle clone completes).
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git openssh-client \
       python3 python3-pip \
       procps \
       build-essential \
+      rsync \
     && rm -rf /var/lib/apt/lists/*
 
 # Python runtime deps. See docs/IMPLEMENTATION.md §0 "Python runtime"

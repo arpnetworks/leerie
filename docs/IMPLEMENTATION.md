@@ -37,7 +37,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/remote/attach.sh` | PTY-attach helper (invoked via `pila --attach`). Resolves the Fly Machine ID for a given run (or the only active record under `.pila/remote/`) and `exec`s `flyctl ssh console` to open a real PTY into the machine over Fly's WireGuard mesh. `--tail` mode replaces the bare-shell command with `tail -F /work/.pila/runs/<run-id>/orchestrator.log` — the canonical way to reattach to a detached run after Ctrl-C or laptop disconnect. No sshd in the image, no key management: hallpass is platform-injected by Fly. |
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Exports `re_seed()`: reads `fly_machine_id` from the run sidecar, wakes the machine via `flyctl machine start` if stopped, runs a safety check that refuses re-seed when machine-side `/work` has uncommitted tracked changes (unless `PILA_RE_SEED_FORCE=1`), then calls `seed_repo_dirty` from `seed-repo.sh`. Invoked by the launcher's `--re-seed <run-id>` fast-path and by the auto-re-seed step in the `--resume <run-id> --runtime fly` flow. |
 | `scripts/remote/seed-auth.sh` | Seeds Claude config + git identity into the provisioned Fly Machine. Tar-pipes the host's `$STAGE` (Keychain-extracted OAuth credentials + projects-stripped `~/.claude.json` + `.claude/` subdirs, with `.claude/local` skipped — ~408 MB host npm install duplicated by the Dockerfile's globally-installed claude binary) to `/home/pila/` via `flyctl ssh console -C "tar -xC /home/pila"`. Writes git identity to `/home/pila/.gitconfig` (not `--global`, which would land in `/root/.gitconfig` under the ssh-console session's default root user). Pre-warms `claude --version` once as the pila user so the orchestrator's preflight call hits warm caches (the FIRST claude invocation on a cold Fly machine takes ~17 s — Node + statsig cold start — and would otherwise exceed the orchestrator's preflight timeout). |
-| `scripts/remote/seed-repo.sh` | Single-channel git-aware repo seeding helper (sourced by the `pila` launcher after `provision_machine()` succeeds). Exports `seed_repo_clone` (wipe `/work` contents but preserve the inode; tar-pipe a git-aware payload — `git ls-files -z --cached --others --exclude-standard` honors `.gitignore`, plus `.git/` verbatim for full history, plus the repo's local `.claude/` verbatim (force-included even if gitignored), minus `.pila/` always (host-side run state)), `seed_repo_dirty` (the dirty-rsync helper retained for the Phase 4 `re-seed.sh` flow), and the wrapper `seed_repo`. After seeding, `/work` on the machine mirrors the developer's working tree. No in-machine `git clone` — the host already has the repo, and Fly machines deliberately receive no GitHub credentials. |
+| `scripts/remote/seed-repo.sh` | Two-phase bundle + delta repo seeding helper (sourced by the `pila` launcher after `provision_machine()` succeeds). Exports `seed_repo_clone` (wipe `/work` contents but preserve the inode; create `git bundle` for the parent and each submodule; pipe each bundle via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"` — `sh -c` is required because bare `cat > ...` fails on flyctl's `-C`; have the machine `git clone` from the parent bundle, wire submodule URLs to their per-submodule bundles, run `git -c protocol.file.allow=always submodule update --recursive` — `protocol.file.allow` is required by git 2.38+ for file://-style submodule URLs per CVE-2022-39253 — then chown to pila; clean up the bundle tmpfiles), `seed_repo_dirty` (rsync the dirty/untracked delta plus force-included `.claude/`, used by both fresh-seed delta and the Phase 4 `re-seed.sh` flow), and the wrapper `seed_repo`. Bundles sidestep macOS BSD tar's NFC→NFD filename normalization, which corrupted submodule working trees containing non-ASCII filenames on the Linux receiver. No in-machine `git clone` from origin — Fly machines deliberately receive no GitHub credentials. |
 | `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `pila --finalize` fast-path). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.pila/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry (stderr is captured to a tmpfile, NOT merged via `2>&1`, because `flyctl ssh console`'s "Connecting to ..." stderr would shift parsed-line indices and corrupt the discovered branch name); (2) probes whether the run branch actually exists on the machine via `git rev-parse --verify refs/heads/<branch>` — only then bundles. A missing branch is the cleared-but-empty terminal-state case (DESIGN §6); the `no_push` flag on `run.json` is NOT used as a proxy because it's a mechanism flag the launcher forces (the in-Fly orchestrator can't push), not a user-intent flag; (3) tars `.pila/runs/<run-id>/` from the machine and extracts it on the host; (4) strips the mechanism-flag `no_push=true` from the host-side `run.json` after extraction, so `host_finalize` doesn't conflate it with user intent (which is recorded separately in `fly-machine.json` as `host_no_push`). |
 | `scripts/host-finalize.sh` | Host-side push + PR creation block, sourced by both the normal post-run code path in `pila` and the `pila --finalize <run-id>` fast-path. Exports `host_finalize <run-dir>`: honors `run.json.no_push` (skip), short-circuits when `pushed_at` is already set (idempotent), runs `git push -u origin <run-branch>` (with `--no-verify` if `NO_VERIFY_PUSH=true`), then `gh pr create` (using `pr_title`/`pr_body` from `run.json` if the pr_writer worker populated them, otherwise the deterministic fallback). PR-creation failure is non-fatal (push already succeeded). Replaces ~140 lines of inline launcher code with a single function call so the two callers stay in sync. |
 
@@ -548,9 +548,10 @@ pila/
 │       │                           ~/.claude.json + ~/.claude/ (minus .claude/local) + git identity
 │       │                           to /home/pila/ via `flyctl ssh console -C "tar -xC ..."`,
 │       │                           then pre-warms `claude --version` for orchestrator preflight
-│       ├── seed-repo.sh           Single-channel git-aware repo seeding (sourced by launcher after
-│       │                           provision); seed_repo(): tar-pipe of git ls-files + .git +
-│       │                           force-included .claude + skip .pila — no in-machine git clone
+│       ├── seed-repo.sh           Two-phase bundle + delta repo seeding (sourced by launcher after
+│       │                           provision); seed_repo(): git bundle parent + submodules
+│       │                           piped via ssh-console → machine clones from bundles on disk,
+│       │                           then rsync's dirty delta + .claude/ — no in-machine git clone
 │       └── fetch-branch.sh        Post-run stream-back (sourced by decide_teardown BEFORE
 │                                   destroy_machine on clean exit, and by `pila --finalize`);
 │                                   fetch_branch(): git bundle pipe + state tar-pipe → host repo
@@ -2524,55 +2525,88 @@ Maps to `DESIGN.md`: §6 (container boundary / teardown / finalization),
 
 #### Repo seeding (`scripts/remote/seed-repo.sh`)
 
-Single-channel git-aware seeding: the host has the full repo, so tar-pipe
-the right subset to `/work` on the machine in one shot. No in-machine
-`git clone` — Fly machines deliberately receive no GitHub credentials
-(DESIGN §6 *Finalization* / `remote-task-system.md` lines 232–253: the
-host pushes via `pila --finalize`, not the machine).
+Two-phase bundle-then-rsync seeding: the host has the full repo, so
+pack its committed state as a `git bundle` and pipe it to the
+machine; the machine clones from the bundle on its local disk; the
+host then rsync's the small dirty/untracked delta to fill in
+uncommitted edits, untracked files, and forced-in `.claude/`. No
+in-machine `git clone` from origin — Fly machines deliberately receive
+no GitHub credentials (DESIGN §6 *Finalization* / `remote-task-system.md`
+lines 232–253: the host pushes via `pila --finalize`, not the machine).
 
-The payload, built host-side, is:
+**Phase 1: bundle clone (`seed_repo_clone`).**
 
-1. **Tracked + untracked-not-ignored files** via `git ls-files -z
-   --cached --others --exclude-standard`, run from `$USER_REPO`. This
-   honors `.gitignore` at any nesting depth — `node_modules/`, build
-   artifacts, etc. are skipped automatically. A small Python filter
-   drops any `.pila/` entries (the host's local run state — the machine
-   must NOT see prior runs).
+1. **Parent repo bundle.** Host runs `git -C "$USER_REPO" bundle
+   create - --all 2>/dev/null` and pipes the output stream straight to
+   `flyctl ssh console --pty=false -C "sh -c 'cat > /tmp/pila-seed.bundle'"`
+   on the machine. `--all` packs every ref into one pack-format binary
+   stream. The `sh -c '...'` wrapper is load-bearing — bare
+   `-C "cat > /tmp/..."` is parsed by flyctl as if `>` were a `cat`
+   argument and fails with `cat: invalid option -- 'c'`.
 
-2. **`.git/` verbatim** via `find .git -print0`, force-included even
-   though git treats it specially. Workers need full history for
-   per-subtask worktrees; bundle / shallow clone don't suffice.
+2. **Submodule bundles, recursive.** Host runs `git submodule --quiet
+   foreach --recursive 'git bundle create - --all | flyctl ssh
+   console -C "sh -c '\''cat > /tmp/pila-subs/<flat-displaypath>.bundle'\''"'`
+   so each submodule's pack data lands as its own file on the machine.
+   The flat-displaypath name (`/` → `_`) gives unambiguous filenames
+   for nested submodules.
 
-3. **`.claude/` verbatim** via `find .claude -print0`, force-included
-   even if the repo's `.gitignore` excludes it (it commonly does). The
-   repo-level `.claude/` holds hooks / settings / plugins workers need.
+3. **Machine-side clone + submodule update.** A single
+   `flyctl ssh console -C "sh -c '<script>'"` call:
+   - `git clone /tmp/pila-seed.bundle /work` (treats the bundle file
+     like a remote; recreates `.git/` and checks out HEAD).
+   - For each submodule, `git config submodule.<name>.url
+     /tmp/pila-subs/<bn>.bundle` (sets the URL in `.git/config`, NOT
+     `.gitmodules` — we never modify the committed file).
+   - `git -c protocol.file.allow=always submodule update --recursive`
+     (clones each submodule from its bundle file). The
+     `protocol.file.allow=always` flag is load-bearing — git 2.38+
+     blocks the `file` protocol by default per CVE-2022-39253, which
+     would otherwise abort the submodule clone with `fatal: transport
+     'file' not allowed`.
+   - `chown -R pila: /work` (orchestrator runs as pila).
+   - `rm -rf /tmp/pila-seed.bundle /tmp/pila-subs` (bundles served
+     their purpose; tmpfs space reclaimed).
 
-The combined NUL-stream is piped to `tar -C "$USER_REPO" --null -T -
--cf -`, then to `flyctl ssh console --pty=false -C "tar -xC /work"`.
-
-Before extraction, `/work` is emptied via `find /work -mindepth 1
+Before the clone runs, `/work` is emptied via `find /work -mindepth 1
 -maxdepth 1 -exec rm -rf {} +`. Note the `find ... -exec rm` form
 preserves the `/work` inode itself — a naive `rm -rf /work && mkdir
 -p /work` would replace the inode and leave any process holding a
 prior fd (the ssh-console shell, the orchestrator about to be
 spawned) with a stale cwd, producing `getcwd: ENOENT` cascades.
 
-After extraction, `/work` is chowned to the pila user (the ssh-console
-session runs as root by default; the orchestrator runs as pila).
+**Why bundles instead of tar (the previous mechanism):** macOS BSD
+`tar -c` normalizes filenames NFC → NFD when archiving (libarchive
+behavior). The Linux receiver wrote NFD bytes to disk; git's index
+from macOS still held NFC bytes (because the index was built on
+APFS, which normalizes at the syscall layer). Result: filenames
+with `ó`, `ñ`, emoji, etc. showed as untracked + missing on the
+machine, and a single such file inside a submodule made the parent
+flag ` M`, failing preflight. Verified empirically on the live api
+repo's `📄Plan de implementación.pdf` (NFC `c3 b3` on host → NFD
+`6f cc 81` on machine after BSD tar transport). Bundles sidestep
+the issue entirely because the bundle file stores pack-format
+binary objects; filenames are materialized natively on the receiving
+Linux git from raw bytes in tree objects — no transport-layer
+normalization decision ever happens.
 
-`COPYFILE_DISABLE=1` is set on the host-side `tar -c` to silence
-macOS BSD tar's per-file `LIBARCHIVE.xattr.com.apple.provenance`
-warnings that GNU tar on Debian otherwise emits noisily. No effect
-on Linux hosts.
+**Phase 2: dirty delta (`seed_repo_dirty`).** Same call path as
+`re-seed.sh` (Phase 4 mid-run re-rsync) but called automatically by
+`seed_repo` immediately after the bundle clone succeeds. Computes the
+dirty set from `git status --porcelain` on the host:
+- Modified-but-uncommitted tracked files
+- Untracked-not-ignored files
+- Defensive excludes for `.pila/runs/*/worktrees/*` and `.git/*`
+- Forced-in `.claude/` (workers need it, often gitignored)
+
+The dirty set is rsync'd over `flyctl ssh console -C "rsync --server
+..."` via `fly_rsync_wrapper` (lib.sh). NFC byte preservation is
+free with rsync; the bundle path doesn't need it (filenames don't
+transit at all), but the delta does.
 
 The script is **sourced** (not exec'd) by the launcher — the same
 pattern as `provision.sh` — so `seed_repo()` runs in the launcher's
 process after `provision_machine()` exports `$PILA_MACHINE_ID`.
-
-`seed_repo_dirty` remains exported for the Phase 4 `re-seed.sh`
-flow (mid-run host-side edits while the orchestrator is paused).
-Fresh-provision `seed_repo()` no longer calls it — the git-aware
-seed above already includes uncommitted files.
 
 Environment variables consumed by `seed-repo.sh`:
 
@@ -2582,7 +2616,7 @@ Environment variables consumed by `seed-repo.sh`:
 | `PILA_FLY_APP` | `pila` | Fly.io app name |
 | `USER_REPO` | — | Absolute path to the local git repo (set by launcher) |
 
-Requires: `flyctl` on `PATH` (authenticated); `git`; `tar`; `python3`.
+Requires: `flyctl` on `PATH` (authenticated); `git`; `python3`; `rsync`.
 
 #### Run branch stream-back (`scripts/remote/fetch-branch.sh`)
 
