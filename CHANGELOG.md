@@ -7,38 +7,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
-- **Repo-local `.claude/` now correctly transported to the Fly
-  machine when `.gitignore` excludes it.** The bundle-based seed
-  introduced in 0.2.6 (commit `c68991e`) inadvertently dropped the
-  force-include of gitignored `.claude/` that the prior tar pipeline
-  did via `find .claude -print0`. Bundles only carry committed state;
-  `seed_repo_dirty` only shipped `git status --porcelain` output
-  (which omits gitignored entries). Net result before the fix: any
-  pila user with `.claude/` in `.gitignore` lost their repo-local
-  hooks/agents/skills/commands on `--runtime fly`. Restored by
-  walking `find .claude -type f` host-side in `seed_repo_dirty` and
-  appending entries to the dirty file list (so the existing rsync
-  delivers them).
-
-- **`.pila/` no longer leaks to the machine from `git status
-  --porcelain` output.** The python filter in `seed_repo_dirty` was
-  missing the equivalent of the prior pipeline's `f.startswith(b".pila/")
-  or f == b".pila"` guard. Untracked `.pila/` (the host-side run
-  state, present on every `pila` invocation) would have rsync'd to
-  the machine on the dirty-delta step. Restored alongside the
-  `.claude/` force-include.
-
-- **Test coverage restored**: `test_seed_repo_respects_gitignore_and_force_includes_claude`
-  ports the prior `test_seed_repo_git_aware_excludes_and_includes`
-  test forward to the bundle+rsync world (asserts gitignored
-  `.claude/` IS shipped, gitignored build artifacts are NOT, `.pila/`
-  is NOT). Bundle-pipe assertions also strengthened to mechanically
-  enforce the `sh -c '...'` wrapper and the `protocol.file.allow=always`
-  flag (a revert of either would now break tests instead of only
-  surfacing as a live-run failure).
-
 ### Added
 
 ## [0.2.6] - 2026-06-01
@@ -60,6 +28,37 @@ validation: clean preflight + bundle clone with intact NFC bytes on
   submodule made the parent flag ` M`, failing preflight. Discovered
   on the api repo's `📄Plan de implementación.pdf` (NFC `c3 b3` on
   host → NFD `6f cc 81` on machine after BSD tar transport).
+
+- **Repo-local `.claude/` correctly transported to the Fly
+  machine when `.gitignore` excludes it.** The bundle-based seed
+  introduced earlier in this release (commit `c68991e`) inadvertently
+  dropped the force-include of gitignored `.claude/` that the prior
+  tar pipeline did via `find .claude -print0`. Bundles only carry
+  committed state; `seed_repo_dirty` only shipped `git status
+  --porcelain` output (which omits gitignored entries). Net result
+  before this follow-up fix: any pila user with `.claude/` in
+  `.gitignore` lost their repo-local hooks/agents/skills/commands on
+  `--runtime fly`. Restored by walking `find .claude -type f`
+  host-side in `seed_repo_dirty` and appending entries to the dirty
+  file list (so the existing rsync delivers them). Shipped in commit
+  `94cfbc7`.
+
+- **`.pila/` no longer leaks to the machine from `git status
+  --porcelain` output.** The python filter in `seed_repo_dirty` was
+  missing the equivalent of the prior pipeline's `f.startswith(b".pila/")
+  or f == b".pila"` guard. Untracked `.pila/` (the host-side run
+  state, present on every `pila` invocation) would have rsync'd to
+  the machine on the dirty-delta step. Restored alongside the
+  `.claude/` force-include (`94cfbc7`).
+
+- **Test coverage restored**: `test_seed_repo_respects_gitignore_and_force_includes_claude`
+  ports the prior `test_seed_repo_git_aware_excludes_and_includes`
+  test forward to the bundle+rsync world (asserts gitignored
+  `.claude/` IS shipped, gitignored build artifacts are NOT, `.pila/`
+  is NOT). Bundle-pipe assertions also strengthened to mechanically
+  enforce the `sh -c '...'` wrapper and the `protocol.file.allow=always`
+  flag (a revert of either would now break tests instead of only
+  surfacing as a live-run failure).
 
 ### Changed
 

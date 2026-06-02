@@ -10,7 +10,7 @@
 #
 # Usage (invoked from the pila launcher):
 #
-#   source scripts/remote/provision.sh    # for wait_for_started, machine_exec
+#   source scripts/remote/provision.sh    # for wait_for_started
 #   source scripts/remote/seed-repo.sh    # for seed_repo_dirty
 #   source scripts/remote/re-seed.sh
 #   re_seed                                # reads fly_machine_id from sidecar
