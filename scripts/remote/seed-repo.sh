@@ -95,11 +95,11 @@ FLY_APP="${LEERIE_FLY_APP:-leerie}"
 # ---------------------------------------------------------------------------
 _seed_repo_preflight() {
   if [ -z "${LEERIE_MACHINE_ID:-}" ]; then
-    echo "leerie: seed_repo: LEERIE_MACHINE_ID is not set" >&2
+    remote_log "seed_repo: LEERIE_MACHINE_ID is not set"
     return 1
   fi
   if [ -z "${USER_REPO:-}" ]; then
-    echo "leerie: seed_repo: USER_REPO is not set" >&2
+    remote_log "seed_repo: USER_REPO is not set"
     return 1
   fi
   # flyctl presence + auth via the shared helper from lib.sh. The launcher's
@@ -107,7 +107,7 @@ _seed_repo_preflight() {
   # braces for callers that source seed-repo.sh standalone.
   if ! command -v require_flyctl >/dev/null 2>&1; then
     if ! command -v flyctl >/dev/null 2>&1; then
-      echo "leerie: seed_repo: flyctl not found on PATH" >&2
+      remote_log "seed_repo: flyctl not found on PATH"
       return 1
     fi
   else
@@ -138,7 +138,7 @@ seed_repo_clone() {
   # machine, so the cost is one fast probe.
   if command -v require_fly_ssh >/dev/null 2>&1; then
     if ! require_fly_ssh "$FLY_APP"; then
-      echo "leerie: seed_repo: Fly SSH setup failed; cannot seed repo" >&2
+      remote_log "seed_repo: Fly SSH setup failed; cannot seed repo"
       return 1
     fi
   fi
@@ -146,7 +146,7 @@ seed_repo_clone() {
     wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID" || true
   fi
 
-  echo "[leerie] remote: seeding — bundling $USER_REPO (parent + submodules) to /work ..." >&2
+  remote_log "remote: seeding — bundling $USER_REPO (parent + submodules) to /work ..."
 
   # Empty /work's CONTENTS but preserve the directory inode. A bare
   # `rm -rf /work && mkdir -p /work` replaces the inode, which leaves
@@ -160,7 +160,7 @@ seed_repo_clone() {
   # left them behind.
   if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
          --pty=false -C "sh -c 'find /work -mindepth 1 -maxdepth 1 -exec rm -rf {} + && chown leerie: /work && rm -rf /tmp/leerie-seed.bundle /tmp/leerie-subs && mkdir -p /tmp/leerie-subs'" >/dev/null 2>&1; then
-    echo "leerie: seed_repo: failed to reset /work on machine $LEERIE_MACHINE_ID" >&2
+    remote_log "seed_repo: failed to reset /work on machine $LEERIE_MACHINE_ID"
     return 1
   fi
 
@@ -175,7 +175,7 @@ seed_repo_clone() {
         | flyctl ssh console --quiet --app "$FLY_APP" \
             --machine "$LEERIE_MACHINE_ID" --pty=false \
             -C "sh -c 'cat > /tmp/leerie-seed.bundle'" >/dev/null 2>&1; then
-    echo "leerie: seed_repo: failed to pipe parent bundle to machine" >&2
+    remote_log "seed_repo: failed to pipe parent bundle to machine"
     return 1
   fi
 
@@ -204,7 +204,7 @@ seed_repo_clone() {
           || { echo "leerie: seed_repo: failed to pipe submodule $displaypath bundle" >&2; exit 1; }
       '
     ); then
-      echo "leerie: seed_repo: submodule bundling failed" >&2
+      remote_log "seed_repo: submodule bundling failed"
       return 1
     fi
   fi
@@ -240,11 +240,11 @@ chown -R leerie: /work
 # Clean up the bundle tmpfiles — they served their purpose.
 rm -rf /tmp/leerie-seed.bundle /tmp/leerie-subs
 '"'" >/dev/null 2>&1; then
-    echo "leerie: seed_repo: machine-side clone from bundle failed" >&2
+    remote_log "seed_repo: machine-side clone from bundle failed"
     return 1
   fi
 
-  echo "[leerie] remote: repo seeded to /work" >&2
+  remote_log "remote: repo seeded to /work"
 }
 
 # ---------------------------------------------------------------------------
@@ -313,7 +313,7 @@ seed_repo_dirty() {
   fi
 
   if [ -z "$dirty_files" ] && [ -z "$claude_files" ]; then
-    echo "[leerie] remote: seeding — working tree is clean; no delta to sync" >&2
+    remote_log "remote: seeding — working tree is clean; no delta to sync"
     return 0
   fi
 
@@ -322,7 +322,7 @@ seed_repo_dirty() {
   local file_count
   file_count="$(printf '%s\n%s\n' "$dirty_files" "$claude_files" \
                  | grep -c -v '^$' || true)"
-  echo "[leerie] remote: seeding — syncing $file_count dirty / forced-include file(s)..." >&2
+  remote_log "remote: seeding — syncing $file_count dirty / forced-include file(s)..."
 
   # rsync the dirty delta. rsync preserves filename bytes verbatim
   # (NFC stays NFC on the Linux receiver), important for the same
@@ -334,7 +334,7 @@ seed_repo_dirty() {
   # lets those paths surface in the porcelain output.
   if command -v require_fly_ssh >/dev/null 2>&1; then
     if ! require_fly_ssh "$FLY_APP"; then
-      echo "leerie: seed_repo: Fly SSH setup failed; cannot transfer delta" >&2
+      remote_log "seed_repo: Fly SSH setup failed; cannot transfer delta"
       return 1
     fi
   fi
@@ -381,7 +381,7 @@ for line in sys.stdin.read().splitlines():
 
   if [ "$rsync_rc" -ne 0 ]; then
     rm -f "$file_list" "$wrapper"
-    echo "leerie: seed_repo: rsync delta transfer failed (exit $rsync_rc)" >&2
+    remote_log "seed_repo: rsync delta transfer failed (exit $rsync_rc)"
     return 1
   fi
 
@@ -390,12 +390,12 @@ for line in sys.stdin.read().splitlines():
   if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
          --pty=false -C "chown -R leerie: /work" >/dev/null 2>&1; then
     rm -f "$file_list" "$wrapper"
-    echo "leerie: seed_repo: chown -R leerie: /work after delta failed" >&2
+    remote_log "seed_repo: chown -R leerie: /work after delta failed"
     return 1
   fi
 
   rm -f "$file_list" "$wrapper"
-  echo "[leerie] remote: seeding complete" >&2
+  remote_log "remote: seeding complete"
 }
 
 # ---------------------------------------------------------------------------

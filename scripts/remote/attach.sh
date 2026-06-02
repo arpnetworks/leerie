@@ -113,7 +113,7 @@ if [ -z "$ATTACH_MACHINE_ID" ] && [ -z "$ATTACH_RUN_ID" ]; then
   fi
   case "${#ACTIVE[@]}" in
     0)
-      echo "leerie: no active remote machine" >&2
+      remote_log "no active remote machine"
       echo "  No records under $LEERIE_DIR/remote/ and no <run-id> given." >&2
       echo "  $_ATTACH_USAGE" >&2
       exit 1
@@ -129,7 +129,7 @@ except Exception:
 " "${ACTIVE[0]}" 2>/dev/null || true)"
       ;;
     *)
-      echo "leerie: multiple active remote machines — pass --attach <run-id> to disambiguate:" >&2
+      remote_log "multiple active remote machines — pass --attach <run-id> to disambiguate:"
       for f in "${ACTIVE[@]}"; do
         python3 -c "
 import json, sys
@@ -147,17 +147,17 @@ fi
 
 if [ -z "$ATTACH_MACHINE_ID" ]; then
   if [ -n "$ATTACH_RUN_ID" ]; then
-    echo "leerie: no fly_machine_id recorded for run $ATTACH_RUN_ID" >&2
+    remote_log "no fly_machine_id recorded for run $ATTACH_RUN_ID"
     echo "  Looked in: $LEERIE_DIR/runs/$ATTACH_RUN_ID/fly-machine.json" >&2
     echo "             $LEERIE_DIR/runs/$ATTACH_RUN_ID/run.json" >&2
   else
-    echo "leerie: could not resolve fly_machine_id" >&2
+    remote_log "could not resolve fly_machine_id"
   fi
   exit 1
 fi
 
 # --- build the ssh command ----------------------------------------------
-echo "[leerie] attach: flyctl ssh console -a $ATTACH_APP --machine $ATTACH_MACHINE_ID" >&2
+remote_log "attach: flyctl ssh console -a $ATTACH_APP --machine $ATTACH_MACHINE_ID"
 
 if [ "$ATTACH_TAIL" = "true" ]; then
   if [ "$ATTACH_ALL_LOGS" = "true" ]; then
@@ -224,7 +224,7 @@ if [ "$ATTACH_TAIL" = "true" ]; then
     if [ "$rc" -eq 0 ]; then
       final_id="$(grep -oE "${AUTO_FINALIZE_TOKEN}[^ ]+" "$_stderr_capture" 2>/dev/null | tail -1 | sed "s|^${AUTO_FINALIZE_TOKEN}||")"
       if [ -n "$final_id" ]; then
-        echo "[leerie] auto-finalize: running 'leerie --finalize $final_id'" >&2
+        remote_log "auto-finalize: running 'leerie --finalize $final_id'"
         # exec back into leerie itself. The LEERIE env vars the original
         # invocation set are still in scope. Use portable cd+pwd to
         # resolve $0's directory (macOS pre-Monterey has no realpath).

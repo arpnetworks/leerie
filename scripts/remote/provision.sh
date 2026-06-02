@@ -70,7 +70,7 @@ stop_machine() {
   if [ -z "$mid" ]; then
     return 0
   fi
-  echo "[leerie] remote: stopping machine $mid (paused)..." >&2
+  remote_log "remote: stopping machine $mid (paused)..."
   flyctl machine stop "$mid" --app "$FLY_APP" 2>/dev/null || true
   # Don't clear LEERIE_MACHINE_ID — the launcher's notification block
   # needs it to print the attach/resume commands.
@@ -83,18 +83,18 @@ destroy_machine() {
   if [ -z "$mid" ]; then
     return 0
   fi
-  echo "[leerie] remote: destroying machine $mid ..." >&2
+  remote_log "remote: destroying machine $mid ..."
   if flyctl machine destroy "$mid" \
        --app "$FLY_APP" \
        --force \
        2>/dev/null; then
-    echo "[leerie] remote: machine $mid destroyed" >&2
+    remote_log "remote: machine $mid destroyed"
   else
     # destroy can fail if the machine was already stopped/destroyed by Fly.
     # Attempt stop first as a fallback, then a second destroy.
     flyctl machine stop "$mid" --app "$FLY_APP" 2>/dev/null || true
     flyctl machine destroy "$mid" --app "$FLY_APP" --force 2>/dev/null || true
-    echo "[leerie] remote: machine $mid stop+destroy attempted (may already be gone)" >&2
+    remote_log "remote: machine $mid stop+destroy attempted (may already be gone)"
   fi
   # Drop the PID-keyed attach pointer (Phase 3) — the machine no longer
   # exists, so attach should report "no active remote machine" next time.
@@ -124,7 +124,7 @@ _try_fetch_branch_for_teardown() {
   # sourced standalone in a test).
   local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
   if [ ! -f "$_leerie_dir/scripts/remote/fetch-branch.sh" ]; then
-    echo "leerie: _try_fetch_branch_for_teardown: fetch-branch.sh missing at $_leerie_dir" >&2
+    remote_log "_try_fetch_branch_for_teardown: fetch-branch.sh missing at $_leerie_dir"
     return 1
   fi
   # shellcheck disable=SC1091
@@ -174,9 +174,9 @@ decide_teardown() {
       # paused machine. They explicitly destroy via `leerie --kill`
       # when they've recovered the work.
       if _try_fetch_branch_for_teardown; then
-        echo "[leerie] remote: run branch + state synced to host" >&2
+        remote_log "remote: run branch + state synced to host"
         if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
-          echo "[leerie] remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR" >&2
+          remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR"
         fi
         destroy_machine
       else
@@ -193,7 +193,7 @@ decide_teardown() {
         fi
         echo "" >&2
         echo "================================================================" >&2
-        echo "leerie: WARNING — sync from machine to host FAILED." >&2
+        remote_log "WARNING — sync from machine to host FAILED."
         echo "  The orchestrator finished cleanly but the run branch + state" >&2
         echo "  could not be pulled back. The machine is being LEFT RUNNING" >&2
         echo "  so your work is not lost. Recover manually:" >&2
@@ -222,7 +222,7 @@ decide_teardown() {
       # orchestrator. The orchestrator is still running on the machine.
       # Leave the machine alone and print reattach hints.
       echo "" >&2
-      echo "[leerie] detached from run ${LEERIE_RUN_ID:-<unknown>} (machine $mid still running)" >&2
+      remote_log "detached from run ${LEERIE_RUN_ID:-<unknown>} (machine $mid still running)"
       if [ -n "${LEERIE_RUN_ID:-}" ]; then
         echo "       reattach:  leerie --attach $LEERIE_RUN_ID --tail" >&2
         echo "       pause:     leerie --stop $LEERIE_RUN_ID" >&2
@@ -250,7 +250,7 @@ decide_teardown() {
       fi
       stop_machine
       echo "" >&2
-      echo "[leerie] PAUSED: machine $mid (rc=$rc, reason=$reason)" >&2
+      remote_log "PAUSED: machine $mid (rc=$rc, reason=$reason)"
       if [ -n "${LEERIE_RUN_ID:-}" ]; then
         echo "  run-id:  $LEERIE_RUN_ID" >&2
         echo "  resume:  leerie --resume --run-id $LEERIE_RUN_ID --runtime fly" >&2
@@ -279,7 +279,7 @@ wait_for_started() {
   local mid="$1"
   local deadline=$(( $(date +%s) + MACHINE_START_TIMEOUT ))
   local state=""
-  echo "[leerie] remote: waiting for machine $mid to start (timeout: ${MACHINE_START_TIMEOUT}s)..." >&2
+  remote_log "remote: waiting for machine $mid to start (timeout: ${MACHINE_START_TIMEOUT}s)..."
   while true; do
     state="$(flyctl machine status "$mid" \
                --app "$FLY_APP" 2>/dev/null \
@@ -288,16 +288,16 @@ wait_for_started() {
              | tr -d '[:space:]' || true)"
     case "$state" in
       started)
-        echo "[leerie] remote: machine $mid is started" >&2
+        remote_log "remote: machine $mid is started"
         return 0
         ;;
       failed|stopped|destroyed|replacing)
-        echo "leerie: machine $mid entered state '$state' — cannot proceed" >&2
+        remote_log "machine $mid entered state '$state' — cannot proceed"
         return 1
         ;;
     esac
     if [ "$(date +%s)" -ge "$deadline" ]; then
-      echo "leerie: timed out waiting for machine $mid to start (${MACHINE_START_TIMEOUT}s)" >&2
+      remote_log "timed out waiting for machine $mid to start (${MACHINE_START_TIMEOUT}s)"
       return 1
     fi
     sleep 2
@@ -312,7 +312,7 @@ wait_for_started() {
 # Returns:  0 on success; 1 on failure (machine is destroyed before returning).
 provision_machine() {
   if [ -z "${FLY_IMAGE_TAG:-}" ]; then
-    echo "leerie: FLY_IMAGE_TAG is not set — cannot start a Fly Machine" >&2
+    remote_log "FLY_IMAGE_TAG is not set — cannot start a Fly Machine"
     echo "  Build and push the leerie image first:" >&2
     echo "    ./scripts/remote/build-push.sh --app $FLY_APP --push" >&2
     return 1
@@ -320,7 +320,7 @@ provision_machine() {
 
   require_flyctl || return 1
 
-  echo "[leerie] remote: creating machine (app=$FLY_APP region=$FLY_REGION image=$FLY_IMAGE_TAG)..." >&2
+  remote_log "remote: creating machine (app=$FLY_APP region=$FLY_REGION image=$FLY_IMAGE_TAG)..."
 
   # flyctl machine run --detach starts the machine without streaming its
   # output. Note: flyctl machine run does NOT accept --json (only some
@@ -345,12 +345,12 @@ provision_machine() {
   fi
 
   if [ -z "$machine_id" ]; then
-    echo "leerie: failed to create Fly Machine — flyctl output:" >&2
+    remote_log "failed to create Fly Machine — flyctl output:"
     printf '  %s\n' "$create_output" >&2
     return 1
   fi
 
-  echo "[leerie] remote: created machine $machine_id" >&2
+  remote_log "remote: created machine $machine_id"
   LEERIE_MACHINE_ID="$machine_id"
   export LEERIE_MACHINE_ID
 

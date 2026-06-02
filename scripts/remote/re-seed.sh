@@ -42,16 +42,16 @@ _RESEED_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # --- re_seed -------------------------------------------------------------
 re_seed() {
   if [ -z "${LEERIE_RUN_ID:-}" ]; then
-    echo "leerie: re_seed: LEERIE_RUN_ID is not set" >&2
+    remote_log "re_seed: LEERIE_RUN_ID is not set"
     return 1
   fi
   if [ -z "${USER_REPO:-}" ]; then
-    echo "leerie: re_seed: USER_REPO is not set" >&2
+    remote_log "re_seed: USER_REPO is not set"
     return 1
   fi
   local sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
   if [ ! -f "$sidecar" ]; then
-    echo "leerie: re_seed: no run.json at $sidecar" >&2
+    remote_log "re_seed: no run.json at $sidecar"
     return 1
   fi
   local mid
@@ -64,7 +64,7 @@ except Exception:
     pass
 " "$sidecar" 2>/dev/null || true)"
   if [ -z "$mid" ]; then
-    echo "leerie: re_seed: no fly_machine_id recorded in $sidecar" >&2
+    remote_log "re_seed: no fly_machine_id recorded in $sidecar"
     return 1
   fi
 
@@ -85,9 +85,9 @@ except Exception:
   case "$state" in
     started|starting) : ;;
     stopped)
-      echo "[leerie] remote: re-seed: starting paused machine $mid..." >&2
+      remote_log "remote: re-seed: starting paused machine $mid..."
       if ! flyctl machine start "$mid" --app "$fly_app" >/dev/null 2>&1; then
-        echo "leerie: re_seed: flyctl machine start failed for $mid" >&2
+        remote_log "re_seed: flyctl machine start failed for $mid"
         return 1
       fi
       if declare -f wait_for_started >/dev/null 2>&1; then
@@ -95,11 +95,11 @@ except Exception:
       fi
       ;;
     destroyed|"")
-      echo "leerie: re_seed: machine $mid is destroyed or missing — cannot re-seed" >&2
+      remote_log "re_seed: machine $mid is destroyed or missing — cannot re-seed"
       return 1
       ;;
     *)
-      echo "leerie: re_seed: machine $mid is in state '$state' — cannot re-seed" >&2
+      remote_log "re_seed: machine $mid is in state '$state' — cannot re-seed"
       return 1
       ;;
   esac
@@ -118,7 +118,7 @@ except Exception:
     remote_dirty="$(printf '%s\n' "$remote_dirty" \
                       | awk 'length($0) > 0 && substr($0,4) !~ /^\.leerie\// { print }')"
     if [ -n "$remote_dirty" ]; then
-      echo "leerie: re_seed: machine /work has uncommitted tracked changes:" >&2
+      remote_log "re_seed: machine /work has uncommitted tracked changes:"
       printf '%s\n' "$remote_dirty" | head -10 >&2
       echo "" >&2
       echo "  These edits would be clobbered by re-seed." >&2
@@ -130,7 +130,7 @@ except Exception:
 
   # --- Step 3: rsync the host dirty set -----------------------------------
   if ! declare -f seed_repo_dirty >/dev/null 2>&1; then
-    echo "leerie: re_seed: seed_repo_dirty not loaded — source seed-repo.sh first" >&2
+    remote_log "re_seed: seed_repo_dirty not loaded — source seed-repo.sh first"
     return 1
   fi
   seed_repo_dirty

@@ -40,6 +40,13 @@
 
 set -euo pipefail
 
+# remote_log helper. Sourced directly (not via lib.sh) so the standalone
+# test path in tests/test_fetch_branch_sh.py — which doesn't source lib.sh
+# — still gets the logger without pulling in the rest of lib.sh's surface.
+_FETCH_BRANCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+. "$_FETCH_BRANCH_DIR/_log.sh"
+
 FLY_APP="${LEERIE_FLY_APP:-leerie}"
 
 # ---------------------------------------------------------------------------
@@ -70,11 +77,11 @@ print(" ".join(shlex.quote(a) for a in sys.argv[1:]))
 fetch_branch() {
   local machine_id="${LEERIE_MACHINE_ID:-}"
   if [ -z "$machine_id" ]; then
-    echo "leerie: fetch_branch: LEERIE_MACHINE_ID is not set" >&2
+    remote_log "fetch_branch: LEERIE_MACHINE_ID is not set"
     return 1
   fi
   if [ -z "${USER_REPO:-}" ]; then
-    echo "leerie: fetch_branch: USER_REPO is not set" >&2
+    remote_log "fetch_branch: USER_REPO is not set"
     return 1
   fi
   # flyctl presence + auth via the shared helper from lib.sh. The launcher's
@@ -82,14 +89,14 @@ fetch_branch() {
   # braces for callers that source fetch-branch.sh standalone.
   if ! command -v require_flyctl >/dev/null 2>&1; then
     if ! command -v flyctl >/dev/null 2>&1; then
-      echo "leerie: fetch_branch: flyctl not found on PATH" >&2
+      remote_log "fetch_branch: flyctl not found on PATH"
       return 1
     fi
   else
     require_flyctl || return 1
   fi
 
-  echo "[leerie] remote: fetching completed run from machine $machine_id ..." >&2
+  remote_log "remote: fetching completed run from machine $machine_id ..."
 
   # --- Step 1: discover the completed run-id on the machine ----------------
   # The orchestrator writes .leerie/runs/<run-id>/run.json with finished_at
@@ -149,7 +156,7 @@ print(best[1])
 print(best[2])
 print(best[3])
 ' 2>"$_discover_err")" || {
-    echo "leerie: fetch_branch: failed to discover completed run on machine $machine_id" >&2
+    remote_log "fetch_branch: failed to discover completed run on machine $machine_id"
     echo "  Output: $discover_output" >&2
     echo "  Stderr: $(cat "$_discover_err")" >&2
     rm -f "$_discover_err"
@@ -159,7 +166,7 @@ print(best[3])
 
   # Check for ERROR prefix from the Python script
   if printf '%s' "$discover_output" | grep -q "^ERROR:"; then
-    echo "leerie: fetch_branch: $discover_output" >&2
+    remote_log "fetch_branch: $discover_output"
     return 1
   fi
 
@@ -169,12 +176,12 @@ print(best[3])
   run_no_push="$(printf '%s' "$discover_output" | sed -n '4p')"
 
   if [ -z "$run_id" ] || [ -z "$run_branch" ]; then
-    echo "leerie: fetch_branch: could not parse run-id or branch from machine output" >&2
+    remote_log "fetch_branch: could not parse run-id or branch from machine output"
     echo "  Output was: $discover_output" >&2
     return 1
   fi
 
-  echo "[leerie] remote: discovered run $run_id (branch: $run_branch)" >&2
+  remote_log "remote: discovered run $run_id (branch: $run_branch)"
   export LEERIE_REMOTE_RUN_ID="$run_id"
 
   # --- Step 2: stream the run branch via git bundle -------------------------
@@ -195,7 +202,7 @@ print(best[3])
     _branch_present="true"
   fi
   if [ "$_branch_present" = "false" ]; then
-    echo "[leerie] remote: run branch $run_branch not present on machine; skipping bundle" >&2
+    remote_log "remote: run branch $run_branch not present on machine; skipping bundle"
   else
     # Create a bundle on the machine containing the run branch and all
     # its ancestry, then pipe it to the host and fetch from it.  The host
@@ -210,26 +217,26 @@ print(best[3])
     # shellcheck disable=SC2064
     trap "rm -f '$host_bundle'" RETURN
 
-    echo "[leerie] remote: streaming git bundle for $run_branch ..." >&2
+    remote_log "remote: streaming git bundle for $run_branch ..."
     # git bundle create writes the bundle to stdout when given "-" as
     # the file. flyctl machine exec streams that stdout back to the host.
     if ! _fetch_machine_exec \
          git -C /work bundle create - "$run_branch" \
          > "$host_bundle" 2>/dev/null; then
-      echo "leerie: fetch_branch: failed to create git bundle on machine $machine_id" >&2
+      remote_log "fetch_branch: failed to create git bundle on machine $machine_id"
       rm -f "$host_bundle"
       return 1
     fi
 
     if [ ! -s "$host_bundle" ]; then
-      echo "leerie: fetch_branch: git bundle is empty — run branch may not exist on machine" >&2
+      remote_log "fetch_branch: git bundle is empty — run branch may not exist on machine"
       rm -f "$host_bundle"
       return 1
     fi
 
     # Verify the bundle is valid before attempting fetch.
     if ! git -C "$USER_REPO" bundle verify "$host_bundle" >/dev/null 2>&1; then
-      echo "leerie: fetch_branch: bundle verification failed — possible transfer corruption" >&2
+      remote_log "fetch_branch: bundle verification failed — possible transfer corruption"
       rm -f "$host_bundle"
       return 1
     fi
@@ -238,12 +245,12 @@ print(best[3])
     # `git fetch <bundle> <refspec>` creates the local branch.
     if ! git -C "$USER_REPO" fetch "$host_bundle" \
            "+$run_branch:$run_branch" 2>/dev/null; then
-      echo "leerie: fetch_branch: git fetch from bundle failed" >&2
+      remote_log "fetch_branch: git fetch from bundle failed"
       rm -f "$host_bundle"
       return 1
     fi
     rm -f "$host_bundle"
-    echo "[leerie] remote: run branch $run_branch fetched to host" >&2
+    remote_log "remote: run branch $run_branch fetched to host"
   fi
 
   # --- Step 3: stream the .leerie run state directory back -------------------
@@ -254,15 +261,15 @@ print(best[3])
   local host_leerie_runs="$USER_REPO/.leerie/runs"
   mkdir -p "$host_leerie_runs"
 
-  echo "[leerie] remote: streaming .leerie/runs/$run_id state directory ..." >&2
+  remote_log "remote: streaming .leerie/runs/$run_id state directory ..."
   if ! _fetch_machine_exec \
        tar -cC /work/.leerie/runs "$run_id" \
        | tar -xC "$host_leerie_runs" 2>/dev/null; then
-    echo "leerie: fetch_branch: failed to stream run state directory from machine $machine_id" >&2
+    remote_log "fetch_branch: failed to stream run state directory from machine $machine_id"
     return 1
   fi
 
-  echo "[leerie] remote: run state directory fetched to $host_leerie_runs/$run_id" >&2
+  remote_log "remote: run state directory fetched to $host_leerie_runs/$run_id"
 
   # The in-Fly orchestrator was launched with --no-push by the launcher
   # because the machine can't push (no GitHub SSH key by design). That
@@ -290,6 +297,6 @@ if data.get("no_push") is True:
 PY
   fi
 
-  echo "[leerie] remote: fetch complete — run $run_id ready for host-side finalize" >&2
+  remote_log "remote: fetch complete — run $run_id ready for host-side finalize"
   return 0
 }

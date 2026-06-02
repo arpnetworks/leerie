@@ -35,11 +35,11 @@ _RESUME_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 resume_machine() {
   local mid="${1:-}"
   if [ -z "$mid" ]; then
-    echo "resume_machine: machine id required" >&2
+    remote_log "resume_machine: machine id required"
     return 1
   fi
   local fly_app="${LEERIE_FLY_APP:-leerie}"
-  echo "[leerie] remote: resuming machine $mid (app=$fly_app)..." >&2
+  remote_log "remote: resuming machine $mid (app=$fly_app)..."
 
   if ! flyctl machine start "$mid" --app "$fly_app" >/dev/null 2>&1; then
     # The machine might already be running (idempotency on retry).
@@ -55,14 +55,14 @@ resume_machine() {
         : # already coming up; fall through to wait
         ;;
       destroyed|"")
-        echo "leerie: machine $mid does not exist or has been destroyed" >&2
+        remote_log "machine $mid does not exist or has been destroyed"
         echo "  The pause sidecar references a machine that is no longer recoverable." >&2
         echo "  Delete .leerie/runs/<run-id>/run.json paused_at fields, or destroy" >&2
         echo "  the run and start fresh: scripts/cleanup.sh --run-id <id> --branches" >&2
         return 1
         ;;
       *)
-        echo "leerie: machine $mid is in state '$state' — cannot resume" >&2
+        remote_log "machine $mid is in state '$state' — cannot resume"
         return 1
         ;;
     esac
@@ -97,6 +97,6 @@ resume_machine() {
     fi
   fi
 
-  echo "[leerie] remote: machine $mid resumed" >&2
+  remote_log "remote: machine $mid resumed"
   return 0
 }

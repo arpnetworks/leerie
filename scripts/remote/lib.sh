@@ -24,7 +24,7 @@ update_run_json() {
   local dir
   dir="$(dirname "$sidecar")"
   if [ ! -d "$dir" ]; then
-    echo "update_run_json: $dir does not exist" >&2
+    remote_log "update_run_json: $dir does not exist"
     return 1
   fi
   local tmp
@@ -57,7 +57,7 @@ with open(tmp, "w") as f:
 PY
   then
     rm -f "$tmp"
-    echo "update_run_json: python merge failed for $sidecar" >&2
+    remote_log "update_run_json: python merge failed for $sidecar"
     return 1
   fi
   mv "$tmp" "$sidecar"
@@ -69,6 +69,12 @@ PY
 iso_now() {
   python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"))'
 }
+
+# --- remote_log ----------------------------------------------------------
+# Defined in _log.sh so seed-auth.sh and fetch-branch.sh can pull in just
+# the logger (without the rest of lib.sh) for their standalone-test path.
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_log.sh"
 
 # --- fly_rsync_wrapper ---------------------------------------------------
 # Emit (to stdout) the absolute path of a single-use shell script that
@@ -161,12 +167,18 @@ WRAPPER
 # bash). It uses `tail -F` which all of those support.
 render_tail_wrapper() {
   cat <<'TAIL_SH'
+# NOTE: lines below run INSIDE the Fly Machine under /bin/sh
+# (busybox/dash, not bash). The host-side `remote_log` helper from
+# lib.sh is NOT in scope here, so the timestamp prefix is inlined.
+# Repo name is omitted (USER_REPO is a host-side path, not meaningful
+# in-machine; the parallel-runs disambiguation problem this tag solves
+# is a host-shell problem).
 # Run-id input: prefer the LEERIE_TAIL_RUN_ID env var (works under
 # `flyctl ssh console --command` which discards positional args), fall
 # back to $1 (works under `flyctl machine exec ... -- sh -c "..." -- id`).
 ID="${LEERIE_TAIL_RUN_ID:-$1}"
 if [ -z "$ID" ]; then
-  echo "[leerie] remote: render_tail_wrapper got empty run-id (LEERIE_TAIL_RUN_ID unset and \$1 empty)" >&2
+  echo "[leerie $(date +%H:%M:%S)] remote: render_tail_wrapper got empty run-id (LEERIE_TAIL_RUN_ID unset and \$1 empty)" >&2
   exit 2
 fi
 HANDOVER="/work/.leerie/launcher-${ID}.runid"
@@ -192,15 +204,15 @@ case "$ID" in
     kill "$TAIL_PID" 2>/dev/null || true
     wait "$TAIL_PID" 2>/dev/null || true
     if [ ! -f "$HANDOVER" ]; then
-      echo "[leerie] remote: bootstrap dir gone but no handover at $HANDOVER" >&2
+      echo "[leerie $(date +%H:%M:%S)] remote: bootstrap dir gone but no handover at $HANDOVER" >&2
       exit 2
     fi
     FINAL="$(head -1 "$HANDOVER" 2>/dev/null)"
     if [ -z "$FINAL" ]; then
-      echo "[leerie] remote: handover file empty at $HANDOVER" >&2
+      echo "[leerie $(date +%H:%M:%S)] remote: handover file empty at $HANDOVER" >&2
       exit 2
     fi
-    echo "[leerie] remote: run-id promoted to ${FINAL}" >&2
+    echo "[leerie $(date +%H:%M:%S)] remote: run-id promoted to ${FINAL}" >&2
     ID="$FINAL"
     LOG="/work/.leerie/runs/${ID}/orchestrator.log"
     ;;
@@ -229,7 +241,7 @@ kill "$TAIL_PID" 2>/dev/null || true
 wait "$TAIL_PID" 2>/dev/null || true
 
 echo "" >&2
-echo "[leerie] remote: orchestrator exited — syncing run branch + state to host..." >&2
+echo "[leerie $(date +%H:%M:%S)] remote: orchestrator exited — syncing run branch + state to host..." >&2
 
 # Auto-finalize hook: when the calling host sets AUTO_FINALIZE_TOKEN,
 # print it as the wrapper's last stderr line. The host-side caller
@@ -267,9 +279,9 @@ TAIL_SH
 require_flyctl() {
   if ! command -v flyctl >/dev/null 2>&1; then
     if [ "${LEERIE_NO_RUNTIME_INSTALL:-0}" = "1" ] || [ "${LEERIE_NONINTERACTIVE:-0}" = "1" ]; then
-      echo "leerie: flyctl not found on PATH." >&2
-      echo "  Install from https://fly.io/docs/flyctl/install/" >&2
-      echo "  or: brew install flyctl (macOS)" >&2
+      remote_log "flyctl not found on PATH."
+      remote_log "  Install from https://fly.io/docs/flyctl/install/"
+      remote_log "  or: brew install flyctl (macOS)"
       return 1
     fi
     if ! _require_flyctl_install; then
@@ -282,15 +294,15 @@ require_flyctl() {
       fi
     fi
     if ! command -v flyctl >/dev/null 2>&1; then
-      echo "leerie: flyctl install reported success but binary still not on PATH." >&2
-      echo "  Check $HOME/.fly/bin or restart your shell." >&2
+      remote_log "flyctl install reported success but binary still not on PATH."
+      remote_log "  Check $HOME/.fly/bin or restart your shell."
       return 1
     fi
   fi
   if ! flyctl auth status >/dev/null 2>&1; then
     if [ "${LEERIE_NONINTERACTIVE:-0}" = "1" ]; then
-      echo "leerie: flyctl is not authenticated." >&2
-      echo "  Run: flyctl auth login" >&2
+      remote_log "flyctl is not authenticated."
+      remote_log "  Run: flyctl auth login"
       return 1
     fi
     if ! _require_flyctl_login; then
@@ -333,19 +345,19 @@ require_fly_ssh() {
   # certainly Fly's (regular SSH key authentication doesn't put
   # certs in the agent; only Fly does for this user).
   if ssh-add -l 2>/dev/null | grep -qE "CERT\)"; then
-    echo "[leerie] remote: ssh-agent has cert(s); skipping issue step" >&2
+    remote_log "remote: ssh-agent has cert(s); skipping issue step"
     return 0
   fi
-  echo "[leerie] remote: issuing Fly SSH certificate (24h) for org=$fly_org" >&2
+  remote_log "remote: issuing Fly SSH certificate (24h) for org=$fly_org"
   if ! flyctl ssh issue --agent --hours 24 "$fly_org" >/dev/null 2>&1; then
     # Best-effort: if we have ANY ssh-add cert, hope it's a Fly one
     # and let the subsequent ssh console attempt either succeed or
     # surface the real error.
     if ssh-add -l >/dev/null 2>&1; then
-      echo "leerie: warning: flyctl ssh issue failed (possible Fly API outage); proceeding with existing agent state" >&2
+      remote_log "warning: flyctl ssh issue failed (possible Fly API outage); proceeding with existing agent state"
       return 0
     fi
-    echo "leerie: warning: flyctl ssh issue failed and no ssh-agent cert available; seed-auth may fail" >&2
+    remote_log "warning: flyctl ssh issue failed and no ssh-agent cert available; seed-auth may fail"
     return 1
   fi
   return 0
@@ -389,7 +401,7 @@ wait_for_fly_ssh_ready() {
       sleep 5
     fi
   done
-  echo "leerie: warning: machine $machine_id did not accept SSH within 60s" >&2
+  remote_log "warning: machine $machine_id did not accept SSH within 60s"
   return 1
 }
 
@@ -401,48 +413,48 @@ _require_flyctl_install() {
   echo "" >&2
   case "$os" in
     Darwin)
-      echo "[leerie] flyctl is not installed. Install via:" >&2
-      echo "         brew install flyctl" >&2
+      remote_log "flyctl is not installed. Install via:"
+      remote_log "         brew install flyctl"
       printf "       Run it now? [Y/n] " >&2
       local ans
       read -r ans
       case "${ans:-Y}" in
         [Yy]*|"") ;;
         *)
-          echo "leerie: aborted by user; install flyctl manually and re-run." >&2
+          remote_log "aborted by user; install flyctl manually and re-run."
           return 1
           ;;
       esac
       if ! command -v brew >/dev/null 2>&1; then
-        echo "leerie: brew not found. Install Homebrew first: https://brew.sh" >&2
+        remote_log "brew not found. Install Homebrew first: https://brew.sh"
         return 1
       fi
       if ! brew install flyctl; then
-        echo "leerie: brew install flyctl failed" >&2
+        remote_log "brew install flyctl failed"
         return 1
       fi
       ;;
     Linux)
-      echo "[leerie] flyctl is not installed. Install via:" >&2
-      echo "         curl -L https://fly.io/install.sh | sh" >&2
+      remote_log "flyctl is not installed. Install via:"
+      remote_log "         curl -L https://fly.io/install.sh | sh"
       printf "       Run it now? [Y/n] " >&2
       local ans
       read -r ans
       case "${ans:-Y}" in
         [Yy]*|"") ;;
         *)
-          echo "leerie: aborted by user; install flyctl manually and re-run." >&2
+          remote_log "aborted by user; install flyctl manually and re-run."
           return 1
           ;;
       esac
       if ! curl -L https://fly.io/install.sh | sh; then
-        echo "leerie: flyctl install script failed" >&2
+        remote_log "flyctl install script failed"
         return 1
       fi
       ;;
     *)
-      echo "leerie: don't know how to install flyctl on $os." >&2
-      echo "  Install manually from https://fly.io/docs/flyctl/install/" >&2
+      remote_log "don't know how to install flyctl on $os."
+      remote_log "  Install manually from https://fly.io/docs/flyctl/install/"
       return 1
       ;;
   esac
@@ -452,23 +464,23 @@ _require_flyctl_install() {
 # Internal: prompt + run flyctl auth login. Opens a browser.
 _require_flyctl_login() {
   echo "" >&2
-  echo "[leerie] flyctl is installed but not authenticated." >&2
+  remote_log "flyctl is installed but not authenticated."
   printf "       Run 'flyctl auth login' now (opens browser)? [Y/n] " >&2
   local ans
   read -r ans
   case "${ans:-Y}" in
     [Yy]*|"") ;;
     *)
-      echo "leerie: aborted by user; run 'flyctl auth login' manually and re-run." >&2
+      remote_log "aborted by user; run 'flyctl auth login' manually and re-run."
       return 1
       ;;
   esac
   if ! flyctl auth login; then
-    echo "leerie: flyctl auth login failed" >&2
+    remote_log "flyctl auth login failed"
     return 1
   fi
   if ! flyctl auth status >/dev/null 2>&1; then
-    echo "leerie: flyctl auth login reported success but auth status still fails." >&2
+    remote_log "flyctl auth login reported success but auth status still fails."
     return 1
   fi
   return 0

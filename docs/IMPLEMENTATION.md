@@ -427,8 +427,7 @@ handling) is identical.
 
 - `-i` + `-t` give the orchestrator a controlling TTY → its existing
   `log(...)` and stream-event summarizers write directly to the user's
-  terminal with no aggregation layer. No changes to `log()` or the
-  per-worker summary code.
+  terminal with no aggregation layer.
 - `--clarify` prompts use `input()` interactively — the user types
   answers at the host terminal, characters flow through the pty to
   Python inside the container.
@@ -2329,8 +2328,8 @@ Environment variables consumed by `provision.sh`:
 | `LEERIE_FLY_APP` | `leerie` | Fly.io app name |
 | `FLY_IMAGE_TAG` | `registry.fly.io/<app>:<version>` | Full image tag to launch (set by the launcher) |
 | `FLY_REGION` | `iad` | Fly.io region |
-| `FLY_VM_CPUS` | `4` | vCPU count for the machine |
-| `FLY_VM_MEMORY` | `8192` | Memory in MB for the machine |
+| `FLY_VM_CPUS` | `4` | vCPU count for the machine. Setting >8 auto-promotes to Fly's `performance` CPU class (much more expensive — ~14x per CPU-second). |
+| `FLY_VM_MEMORY` | `8192` | Memory in MB for the machine. Setting >16384 auto-promotes to Fly's `performance` CPU class. |
 | `LEERIE_MACHINE_START_TIMEOUT` | `120` | Seconds to wait for `state=started` |
 
 `FLY_IMAGE_TAG` is resolved by the launcher (`resolve_fly_image_tag()`)
@@ -2913,9 +2912,9 @@ Two surfaces address this together:
    `/work/.leerie/runs/<run-id>/orchestrator.pid` immediately after
    backgrounding. `leerie --attach --tail` watches this pid (via a small
    `while kill -0 $pid; do sleep 1; done` loop alongside the `tail -F`)
-   and, when the pid disappears, prints a one-line banner:
-   `[leerie] orchestrator exited cleanly — run "leerie --finalize <run-id>"
-   to push and open a PR`. The tail then exits.
+   and, when the pid disappears, prints a one-line banner like
+   `[leerie HH:MM:SS] remote: orchestrator exited — syncing run branch + state to host...`.
+   The tail then exits.
 2. **`leerie --finalize <run-id>`** — new launcher fast-path that runs the
    post-orchestrator block the launcher used to run inline: source
    `fetch-branch.sh`, call `fetch_branch`, source the host-side

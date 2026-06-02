@@ -51,6 +51,15 @@
 
 set -euo pipefail
 
+# remote_log helper. Sourced directly (not via lib.sh) so the standalone
+# test path in tests/test_seed_auth_sh.py — which doesn't source lib.sh —
+# still gets the logger without pulling in require_fly_ssh /
+# wait_for_fly_ssh_ready (the `command -v` guards below depend on those
+# being absent so the test path skips them against stub flyctl).
+_SEED_AUTH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck disable=SC1091
+. "$_SEED_AUTH_DIR/_log.sh"
+
 FLY_APP="${LEERIE_FLY_APP:-leerie}"
 
 # --- seed_auth -----------------------------------------------------------
@@ -62,15 +71,15 @@ FLY_APP="${LEERIE_FLY_APP:-leerie}"
 seed_auth() {
   local machine_id="${LEERIE_MACHINE_ID:-}"
   if [ -z "$machine_id" ]; then
-    echo "leerie: seed_auth: LEERIE_MACHINE_ID is not set — cannot seed" >&2
+    remote_log "seed_auth: LEERIE_MACHINE_ID is not set — cannot seed"
     return 1
   fi
   if [ -z "${STAGE:-}" ]; then
-    echo "leerie: seed_auth: STAGE is not set — launcher must assemble the scratch dir first" >&2
+    remote_log "seed_auth: STAGE is not set — launcher must assemble the scratch dir first"
     return 1
   fi
 
-  echo "[leerie] remote: seeding Claude config + git identity into machine $machine_id ..." >&2
+  remote_log "remote: seeding Claude config + git identity into machine $machine_id ..."
 
   # --- 1. Seed ~/.claude.json + ~/.claude/ via a single tar pipe ----------
   # The $STAGE dir already has:
@@ -94,14 +103,14 @@ seed_auth() {
   # that source seed-auth.sh standalone (e.g. tests).
   if command -v require_fly_ssh >/dev/null 2>&1; then
     if ! require_fly_ssh "$FLY_APP"; then
-      echo "leerie: seed_auth: Fly SSH setup failed; cannot seed config" >&2
+      remote_log "seed_auth: Fly SSH setup failed; cannot seed config"
       return 1
     fi
   fi
   # hallpass takes 5-30 s to come up after machine start; wait so the
   # tar-pipe below doesn't fail with "handshake failed: EOF".
   if command -v wait_for_fly_ssh_ready >/dev/null 2>&1; then
-    echo "[leerie] remote: waiting for hallpass (SSH) on $machine_id..." >&2
+    remote_log "remote: waiting for hallpass (SSH) on $machine_id..."
     wait_for_fly_ssh_ready "$FLY_APP" "$machine_id" || true
   fi
   # COPYFILE_DISABLE=1 tells macOS BSD tar to skip the per-file
@@ -139,7 +148,7 @@ seed_auth() {
     if [ "$attempt" -eq 1 ] \
        && grep -qE "tunnel unavailable|context deadline exceeded|i/o timeout" "$err_log"; then
       cat "$err_log" >&2
-      echo "[leerie] remote: tunnel unavailable; restarting flyctl agent and retrying once..." >&2
+      remote_log "remote: tunnel unavailable; restarting flyctl agent and retrying once..."
       flyctl agent restart >/dev/null 2>&1 || true
       sleep 2
       rm -f "$err_log"
@@ -150,10 +159,10 @@ seed_auth() {
     break
   done
   if [ "$tar_rc" -ne 0 ]; then
-    echo "leerie: seed_auth: failed to seed Claude config files into machine $machine_id" >&2
+    remote_log "seed_auth: failed to seed Claude config files into machine $machine_id"
     return 1
   fi
-  echo "[leerie] remote: Claude config seeded" >&2
+  remote_log "remote: Claude config seeded"
 
   # --- 2. Token fallback: if no credentials file was in $STAGE, write one --
   # On Linux (and on macOS when Keychain extraction fails) the launcher does
@@ -177,13 +186,13 @@ seed_auth() {
              --machine "$machine_id" \
              --pty=false \
              -C "sh -c 'cat > /home/leerie/.claude/.credentials.json && chmod 600 /home/leerie/.claude/.credentials.json && chown leerie: /home/leerie/.claude/.credentials.json'" 2>&1; then
-      echo "leerie: seed_auth: failed to write credentials JSON from CLAUDE_CODE_OAUTH_TOKEN" >&2
+      remote_log "seed_auth: failed to write credentials JSON from CLAUDE_CODE_OAUTH_TOKEN"
       return 1
     fi
-    echo "[leerie] remote: Claude credentials written from CLAUDE_CODE_OAUTH_TOKEN" >&2
+    remote_log "remote: Claude credentials written from CLAUDE_CODE_OAUTH_TOKEN"
   elif [ ! -s "$STAGE/.claude/.credentials.json" ] && \
        [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    echo "leerie: seed_auth: no credentials available — neither \$STAGE/.claude/.credentials.json" >&2
+    remote_log "seed_auth: no credentials available — neither \$STAGE/.claude/.credentials.json"
     echo "  nor \$CLAUDE_CODE_OAUTH_TOKEN is set. Workers will not be able to authenticate." >&2
     echo "  On macOS: grant the launcher Keychain access (the prompt that appears on first run)." >&2
     echo "  On Linux: export CLAUDE_CODE_OAUTH_TOKEN in your shell before running leerie." >&2
@@ -198,7 +207,7 @@ seed_auth() {
   git_email="$(git config user.email 2>/dev/null || true)"
 
   if [ -z "$git_name" ] || [ -z "$git_email" ]; then
-    echo "leerie: seed_auth: git user.name or user.email is not configured on the host." >&2
+    remote_log "seed_auth: git user.name or user.email is not configured on the host."
     echo "  Run: git config --global user.name \"Your Name\"" >&2
     echo "       git config --global user.email \"you@example.com\"" >&2
     return 1
@@ -218,11 +227,11 @@ seed_auth() {
               git config --file /home/leerie/.gitconfig user.name \"\$n\" && \
               git config --file /home/leerie/.gitconfig user.email \"\$e\" && \
               chown leerie: /home/leerie/.gitconfig'" >/dev/null 2>&1; then
-    echo "leerie: seed_auth: failed to set git identity on machine $machine_id" >&2
+    remote_log "seed_auth: failed to set git identity on machine $machine_id"
     return 1
   fi
 
-  echo "[leerie] remote: git identity set (${git_name} <${git_email}>)" >&2
+  remote_log "remote: git identity set (${git_name} <${git_email}>)"
 
   # Pre-warm the Claude CLI. The very first `claude --version` on a
   # cold Fly machine takes ~17 s (Node runtime warm-up, statsig
@@ -230,11 +239,11 @@ seed_auth() {
   # timeout. Running it once here as the leerie user makes the
   # orchestrator's subsequent call complete in <0.2 s. Failure
   # here is non-fatal — the orchestrator will still try.
-  echo "[leerie] remote: pre-warming Claude CLI..." >&2
+  remote_log "remote: pre-warming Claude CLI..."
   flyctl ssh console --app "$FLY_APP" --machine "$machine_id" --pty=false \
     -C "su leerie -c 'HOME=/home/leerie PATH=/usr/local/share/mise/installs/node/lts-current/bin:/usr/bin:/bin claude --version'" \
     >/dev/null 2>&1 || true
 
-  echo "[leerie] remote: seed_auth complete" >&2
+  remote_log "remote: seed_auth complete"
   return 0
 }

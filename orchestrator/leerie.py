@@ -1143,7 +1143,8 @@ def now() -> str:
 
 
 def log(msg: str) -> None:
-    print(f"[leerie {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+    repo = Path(os.environ.get("USER_REPO") or os.getcwd()).name or "?"
+    print(f"[leerie {datetime.now().strftime('%H:%M:%S')}] [{repo}] {msg}", flush=True)
 
 
 def die(msg: str, code: int = 1):
