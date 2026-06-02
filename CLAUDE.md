@@ -25,7 +25,7 @@ Runtime: containerd + nerdctl. On Linux, native. On macOS, via
 `docs/INSTALL.md` for per-OS install steps.
 
 Python is provisioned *inside the container* by the image (Python 3
-from Debian 12). The launcher itself is a portable bash script; it
+from Debian 13). The launcher itself is a portable bash script; it
 no longer needs `uv` or a host Python. See `docs/IMPLEMENTATION.md`
 §0 (install surface) and §0.5 (container shape).
 
@@ -95,8 +95,8 @@ orchestrator and not used anywhere in this repo.
 ## Mandatory requirements
 
 - **Worker outputs are JSON-schema-validated.** New worker types must
-  define a schema in `SCHEMAS` (leerie.py:76+) and pass it via
-  `--json-schema` in `claude_p()`.
+  define a schema in the `SCHEMAS` dict in `orchestrator/leerie.py` and
+  pass it via `--json-schema` in `claude_p()`.
 - **Caps are real Python counters in `DEFAULT_CAPS`**, not prompt
   instructions. Adding a new cap means adding a counter and a check, not
   asking a worker to bound itself.
@@ -270,6 +270,7 @@ Before marking a change complete:
       The `version` field is duplicated across the two manifests;
       `tests/test_version_flag.py` guards them from drifting.
 - [ ] `python3 -c 'import json; [json.loads(l) for l in open(".leerie/runs/<run>/calls.ndjson")]'`
-      — if the telemetry writer (`capture_llm_call`) was touched, confirm a
+      — if the telemetry writer (`_capture_call`) was touched, confirm a
       representative run produces a well-formed `calls.ndjson` (each line
-      valid JSON with at least `call_type`, `prompt`, and `response` keys).
+      valid JSON with at least `call_type`, `system_prompt`, and
+      `response_content` keys).

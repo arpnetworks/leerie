@@ -28,7 +28,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `.claude-plugin/plugin.json` | Existing plugin manifest (commands, skills, metadata). The `version` field is the single source of truth for `leerie --version`. |
 | `scripts/install.sh` | The `curl \| bash` shell installer. Preflight (git/claude/curl) → runtime preflight (colima on macOS, nerdctl+containerd on Linux) → clone → symlink → verify. Self-contained bash; deps: `bash`, `curl`, `git`. |
 | `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Fast paths for `--version` skip container startup. |
-| `Dockerfile` | Image recipe (Debian 12 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
+| `Dockerfile` | Image recipe (Debian 13 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. `cd /work`. If invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately), `exec sleep infinity` to keep the namespace alive. Otherwise `exec python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
 | `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-finalize-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, source `scripts/host-finalize.sh` and call `host_finalize <run-dir>` to push + open the PR with the host's auth; **only if push succeeds** does `destroy_machine` run; on push failure leave the machine RUNNING with a recovery banner pointing at `leerie --finalize <run-id>`; on sync failure same recovery pattern with `sync_failed_at` written to the sidecar), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: stop machine, write `paused_at`/`pause_reason` to the run sidecar). |
@@ -43,8 +43,8 @@ inside the container (DESIGN §6 / §0.5 below).
 
 ### Python runtime — provisioned inside the container
 
-Leerie requires Python 3.10+. The container image installs Debian 12's
-`python3` (currently 3.11), which satisfies the requirement. The host
+Leerie requires Python 3.10+. The container image installs Debian 13's
+`python3` (currently 3.13), which satisfies the requirement. The host
 needs no Python at all. The orchestrator's source is baked into the
 image at `/opt/leerie-image/` via the Dockerfile's `COPY` instructions.
 On local runs the launcher's bind mount (`-v $LEERIE_REPO:/opt/leerie-image:ro`)
@@ -176,7 +176,7 @@ subsequent runs < 3s.
 
 Base layers (top-down):
 
-- `debian:12-slim` — minimal, predictable, glibc-based.
+- `debian:13-slim` — minimal, predictable, glibc-based.
 - `apt-get install`: `ca-certificates`, `curl`, `git`, `openssh-client`,
   `python3`, `python3-pip`, `build-essential`. The build tools cover
   native-module comleerietion in `npm install` (sharp, bcrypt, esbuild
@@ -529,8 +529,8 @@ handling) is identical.
   `[ -t 0 ]` returns false; the launcher passes only `-i`, no pty
   allocated inside the container.
 - Inside the container, `sys.stdin.isatty()` returns False. The
-  orchestrator's `gather_answers` (`leerie.py:4416`) and mid-execution
-  clarification path (`leerie.py:4522`) both detect this and trigger
+  orchestrator's `gather_answers()` and the mid-execution
+  clarification path (`surface_clarification()`) both detect this and trigger
   the canonical no-TTY signal: write `.leerie/pending-questions.json`
   to disk and `sys.exit(EXIT_NEEDS_ANSWERS)` (= 10).
 - `.leerie/pending-questions.json` is visible on the host because
@@ -589,25 +589,41 @@ leerie/
 │                                   (min_machines_running=0). See §0.5.
 ├── orchestrator/leerie.py        the orchestrator — all control flow (chmod +x)
 ├── prompts/
+│   ├── _clarification_filter.md   shared include (codebase→research→ask filter)
+│   │                              inlined by classifier.md / implementer.md via
+│   │                              load_prompt's {{include: …}} expansion
 │   ├── classifier.md              Phase 1 worker system prompt
 │   ├── planner.md                 Phase 2 worker system prompt
 │   ├── reconciler.md              Phase 2½ worker — resolve cross-domain
 │   │                              capability-tag drift between planners
+│   ├── provision.md               §6½ LLM-fallback install-recipe worker
 │   ├── implementer.md             Phase 5 implementer worker system prompt
 │   ├── conformer.md               Phase 5 post-work conformance worker (DESIGN §9)
 │   ├── integrator.md              conflict-resolution worker system prompt
-│   └── judge.md                  LLM judge worker — 3-dimensional rubric for
+│   ├── pr_writer.md               Phase 6 PR title + body author worker
+│   ├── patch_generator.md         post-run self-heal worker — proposes minimal
+│   │                              system-prompt patches against failing call_types
+│   └── judge.md                   LLM judge worker — 3-dimensional rubric for
 │                                  reviewing captured call records
 ├── scripts/
 │   ├── setup-run.sh               create per-run branch + worktree (idempotent)
 │   ├── new-worktree.sh            create/reuse a per-subtask worktree (per-run scoped)
 │   ├── integrate.sh               merge a subtask branch into the per-run branch
 │   ├── finalize.sh                verify the run branch exists and is non-empty; ready for push
+│   ├── host-finalize.sh           host-side push + PR creation block; sourced by
+│   │                              the local-runtime post-run path in leerie,
+│   │                              decide_teardown's Fly clean-exit branch, and
+│   │                              `leerie --finalize <run-id>` (§7 Host-side finalize)
 │   ├── cleanup.sh                 remove worktrees / branches (default: scoped to one run)
 │   ├── container-entry.sh         container PID 1: `cd /work && exec python3 orchestrator/leerie.py`
 │   ├── install.sh                 one-command installer (curl | bash); preflight git/claude/curl +
 │   │                               runtime preflight (colima / nerdctl) + clones + symlinks
+│   ├── runtime-install.sh         per-OS auto-install of the container runtime (Colima on macOS;
+│   │                              containerd + nerdctl on Debian / Fedora / Arch). Sourced by
+│   │                              install.sh and the launcher.
 │   └── remote/
+│       ├── _log.sh                shared remote_log() helper (timestamped, repo-tagged
+│       │                          stderr) sourced by every other scripts/remote/*.sh file
 │       ├── build-push.sh          build and push a self-contained image for Fly.io Machines;
 │       │                           the baked /opt/leerie-image/ lets the image run without
 │       │                           a bind mount (§0.5 "Registry publish path")
@@ -796,7 +812,7 @@ Requirements: the `claude` CLI on `PATH` and logged in interactively (no API
 key — subscription auth); `git`; a git repository with `user.email` and
 `user.name` configured; a container runtime (colima on macOS, nerdctl +
 containerd on Linux — see `docs/INSTALL.md`). Python is provisioned inside
-the container by the image (Debian 12's `python3` 3.11); the host does not
+the container by the image (Debian 13's `python3` 3.13); the host does not
 need Python. The launcher's `--version` fast path returns without starting
 a container.
 
@@ -1161,7 +1177,7 @@ The `pr_writer` worker is invoked by passing its entire user prompt
 (task text, classification, subtask titles, full commit log, diff
 stat/dirstat, sampled diff, and the PR template body — all serialized
 as one JSON string) as a single argv element to `claude -p`. Linux
-`ARG_MAX` in the leerie container (Debian 12) defaults to ~128 KB; a
+`ARG_MAX` in the leerie container (Debian 13) defaults to ~128 KB; a
 degenerate run with thousands of commits, a huge template, or a
 sprawling diff would silently fail with `E2BIG`.
 
@@ -1386,7 +1402,7 @@ Each worker is one `claude -p` headless process. Flags used:
 | `-p` | non-interactive single-shot |
 | `--output-format stream-json --verbose` | streams one JSON event per stdout line as the worker runs; the final `result` event is the envelope (same shape as `--output-format json`'s single output — `cost`, `usage`, `terminal_reason`, `structured_output`). `_invoke` writes raw events to `.leerie/logs/<sid>.log` and emits per-event inline summaries gated by `state.json["verbosity"]` |
 | `--json-schema <inline>` | the payload schema; serialized inline as a JSON string — a file path is silently ignored (verified against Claude Code 2.1.143) |
-| `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/provision/implementer/integrator/conformer |
+| `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/provision/implementer/integrator/conformer, plus the post-run / finalize workers pr_writer, judge, and patch_generator |
 | `--allowedTools` | tool allowlist; two buckets — **inspect** (`INSPECT_TOOLS`: read set + allowlisted `Bash(ls:*)` / `Bash(find:*)` / `Bash(cat:*)` / … for cross-cwd read-only inspection, **no Write/Edit**) for classifier, planner, reconciler, and provision; **acting** (`ACT_TOOLS`: read set + Bash/Write/Edit) for implementer, integrator, and conformer. The acting bucket keeps Bash unrestricted because its workers run with `--dangerously-skip-permissions`; the inspect bucket uses `Bash(<verb>:*)` prefix patterns to pre-approve specific read-only verbs at the CLI level — no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
 | `--max-turns` | per-worker turn cap (values in §6) |
 | `--model` | model alias for this worker — `sonnet` / `opus` / `haiku`. Value comes from per-worker resolution (see §2 *Model selection*) |
@@ -2029,8 +2045,8 @@ of `orchestrate()` is skipped, so no re-fire check is needed.
 
 ### Worker registration
 
-`WORKER_TYPES` (`leerie.py:285`) gains `"provision"`. `SCHEMAS["provision"]`
-(`leerie.py:~76`) is the JSON schema for the LLM-fallback recipe:
+`WORKER_TYPES` gains `"provision"`. `SCHEMAS["provision"]` is the JSON
+schema for the LLM-fallback recipe:
 
 ```python
 {
@@ -2092,9 +2108,8 @@ on violation):
 ### Phase implementation (`phase_provision`)
 
 Insertion point in `orchestrate()`: inside the `else:` (fresh-run)
-branch, after the `_write_run_json(...)` block (currently
-leerie.py:5984) and before `gather_answers(st, supplied)` (currently
-leerie.py:5989). Step order:
+branch, after the `_write_run_json(...)` block and before
+`gather_answers(st, supplied)`. Step order:
 
 1. **Docs-only short-circuit.** If the categories from classify
    contain no code-touching category (only `documentation`, etc.),
@@ -2305,16 +2320,22 @@ The launcher's finalize block in `leerie` (bash) does, in order:
    same multi-line message as the old Python path (names run branch +
    working branch, captured stderr, exact retry command), update
    `run.json` with `push_error`, exit non-zero.
-4. **Compose PR body** via a bash heredoc that reads `state.json`
-   fields with `jq` — same deterministic body shape as the previous
-   Python `compose_pr_body` (task, category, source-of-truth, run
-   timestamps, wave + subtask + worker counts).
+4. **Compose PR title + body.** Primary path: read `pr_title` /
+   `pr_body` from `run.json` — these are written by the `pr_writer`
+   worker that `phase_finalize` invokes when `push_will_happen` is
+   true (see DESIGN §6 *Finalization* and §9 *Structured-output
+   schemas* `pr_writer` entry). Fallback path (pr_writer skipped or
+   crashed): a bash heredoc reads `state.json` fields with `jq` and
+   emits the deterministic body shape that `compose_pr_body` used to
+   produce (task, category, source-of-truth, run timestamps, wave +
+   subtask + worker counts). The launcher branches on whether
+   `pr_title_llm` / `pr_body_llm` are non-empty.
 5. **Open PR.** `gh pr create --base <working-branch> --head
-   leerie/runs/<run-id> --title leerie: <run-id> --body-file -` with the
-   composed body piped on stdin. On failure: log a warning with the
-   pushed-branch URL and the retry command; update `run.json` with
-   `pr_error`. **Non-fatal** — exit 0 (the run is complete; only the
-   PR is missing).
+   leerie/runs/<run-id> --title "leerie: <pr_title>" --body-file -`
+   with the composed body piped on stdin. On failure: log a warning
+   with the pushed-branch URL and the retry command; update
+   `run.json` with `pr_error`. **Non-fatal** — exit 0 (the run is
+   complete; only the PR is missing).
 
 **Local runtime only.** The inline finalize block above runs only when
 `LEERIE_RUNTIME != "fly"`. On Fly the run dir is not yet on the host
@@ -2335,7 +2356,7 @@ moved to the host where the auth state actually lives.
 env, `no_push = true` in `leerie.toml`. **Both the launcher (bash) and
 the in-container orchestrator (Python) resolve `no_push` from all three
 sources** so they agree on intent: the orchestrator's
-`resolve_no_push` (`orchestrator/leerie.py:2635`) and the launcher's
+`resolve_no_push()` and the launcher's
 inline TOML fallback (mirroring `_read_toml_key`'s flat grep — no
 `tomllib` dependency, since the launcher runs on the user's host where
 Python 3.9 is still common) both check CLI → env → TOML. Disagreement
@@ -2671,9 +2692,9 @@ clean terminal exits (rc=0/10/75: `_try_fetch_branch_for_teardown` runs
 machine RUNNING for user recovery), **detach** for SIGINT/SIGTERM,
 **pause** for other non-zero rc.
 
-Maps to `DESIGN.md`: §6 (container boundary / teardown / finalization),
-`remote-task-system.md` §"microVM = 1 Colima" (lines 163–206) and
-§"The hard problem is auth-crossing" (lines 232–253).
+Maps to `DESIGN.md` §6 (container boundary / teardown / finalization)
+and §6 *Remote execution* (the one-microVM-per-run model and the
+host-as-the-only-credential-holder contract).
 
 #### Repo seeding (`scripts/remote/seed-repo.sh`)
 
@@ -2683,8 +2704,8 @@ machine; the machine clones from the bundle on its local disk; the
 host then rsync's the small dirty/untracked delta to fill in
 uncommitted edits, untracked files, and forced-in `.claude/`. No
 in-machine `git clone` from origin — Fly machines deliberately receive
-no GitHub credentials (DESIGN §6 *Finalization* / `remote-task-system.md`
-lines 232–253: the host pushes via `leerie --finalize`, not the machine).
+no GitHub credentials (DESIGN §6 *Finalization*: the host pushes via
+`leerie --finalize`, not the machine).
 
 **Phase 1: bundle clone (`seed_repo_clone`).**
 
@@ -3425,7 +3446,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `.leerie/runs/` |
-| `call_type` | str | one of `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `provision`, `implementer`, `integrator`, `conformer` |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the seven `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `provision`, `implementer`, `integrator`, `conformer`) plus the three post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
@@ -3458,23 +3479,28 @@ Each `call_type` maps to exactly one system-prompt source. The table below
 is the complete, canonical mapping — no call_type is ever spawned without
 a system prompt, and no system prompt is shared between call types.
 
-| call_type      | Prompt source | Notes |
-|----------------|---------------|-------|
-| `classifier`   | `prompts/classifier.md` | read from disk by the orchestrator |
-| `planner`      | `prompts/planner.md` | read from disk |
-| `reconciler`   | `prompts/reconciler.md` | read from disk |
-| `implementer`  | `prompts/implementer.md` | read from disk |
-| `integrator`   | `prompts/integrator.md` | read from disk |
-| `conformer`    | `prompts/conformer.md` | read from disk |
+| call_type        | Prompt source | Notes |
+|------------------|---------------|-------|
+| `classifier`     | `prompts/classifier.md` | read from disk by the orchestrator |
+| `planner`        | `prompts/planner.md` | read from disk |
+| `reconciler`     | `prompts/reconciler.md` | read from disk |
+| `provision`      | `prompts/provision.md` | LLM fallback when the lockfile table misses (DESIGN §6½) |
+| `implementer`    | `prompts/implementer.md` | read from disk |
+| `integrator`     | `prompts/integrator.md` | read from disk |
+| `conformer`      | `prompts/conformer.md` | read from disk |
+| `pr_writer`      | `prompts/pr_writer.md` | invoked by `phase_finalize` when `push_will_happen` is true (DESIGN §6 *Finalization*) |
+| `judge`          | `prompts/judge.md` | post-run skill; not used by the main orchestrate loop |
+| `patch_generator`| `prompts/patch_generator.md` | post-run heal-loop worker |
 
 Every `call_type` resolves to a file under `prompts/`. The heal loop's
 patch-generator worker calls
 `resolve_prompt(call_type: str) -> tuple[str, str, str]` to load a
-worker's system prompt: given any member of `WORKER_TYPES`, it returns
-`(source_kind, content, location_hint)` where `source_kind` is `"file"`,
-`content` is the prompt body, and `location_hint` is the relative path
-`"prompts/<call_type>.md"`. Raises `ValueError` for an unknown
-`call_type`. (Earlier iterations of leerie also exposed a `validator`
+worker's system prompt: given any member of `WORKER_TYPES` (the
+self-heal target set is the seven main-loop workers, not the post-run
+workers), it returns `(source_kind, content, location_hint)` where
+`source_kind` is `"file"`, `content` is the prompt body, and
+`location_hint` is the relative path `"prompts/<call_type>.md"`.
+Raises `ValueError` for an unknown `call_type`. (Earlier iterations of leerie also exposed a `validator`
 call type whose prompt lived as a `VALIDATOR_SYSTEM` constant inside
 `leerie.py`; that worker was retired when the criteria file became
 informational, and `resolve_prompt` no longer carries a
@@ -3535,8 +3561,11 @@ enforcement functions:
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |
 
-Run with `pytest tests/` from the repo root. The suite completes in
-under two seconds end to end.
+Run with `pytest tests/` from the repo root. The full suite (~1700
+tests across the deterministic-enforcement, bash-harness, and remote
+lifecycle tiers) completes in roughly a minute end to end. The table
+above lists a representative subset; the live count under `tests/`
+is the authoritative inventory.
 
 **CI surface.** GitHub Actions runs three independent workflows on every
 pull request to `main` (and on pushes to `main`):

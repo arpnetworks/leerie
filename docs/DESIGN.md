@@ -957,9 +957,11 @@ machine's filesystem on its Fly volume; the orchestrator's own state is
 already in `.leerie/runs/<run-id>/run.json` on that volume, the run
 branch holds the committed work, and `flyctl machine start` brings the
 machine back from disk without losing anything. Memory state is not
-preserved — `remote-task-system.md` lines 89–99 explicitly retract the
-abstract "memory-state snapshot" requirement in favor of the
-run-branch-as-durable-record contract this section relies on.
+preserved across a pause — the contract this section relies on is
+that the run branch (the committed work) plus `.leerie/runs/<run-id>/`
+(the orchestrator's own state) are the only durable record of a run,
+and both already live on the machine's Fly volume by the time a pause
+fires.
 
 Six sidecar fields on `run.json` capture remote lifecycle state:
 
@@ -1082,14 +1084,15 @@ Local mode has no attach today — `leerie --attach` errors with
 "attach is remote-only" until a parallel `scripts/local/attach.sh`
 wrapping `nerdctl exec -it <name> bash` is added.
 
-**Mid-run re-seed (remote mode).** `remote-task-system.md` line 50
-specifies "a second rsync of current laptop state into the task,
-user-triggered." leerie realises this as two surfaces sharing one
-mechanism: an explicit `leerie --re-seed <run-id>` subcommand and an
-implicit auto-re-seed step inside `leerie --resume --run-id <id>
---runtime fly`. Both wake the machine if stopped, run a safety
-check, and call the same `seed_repo_dirty` helper used by the fresh-
-provision path.
+**Mid-run re-seed (remote mode).** Once a remote run has started, the
+host's working tree keeps evolving — the user lands new commits,
+saves uncommitted edits, pulls in a new submodule. The remote machine
+needs a user-triggered way to pick that up without destroying its
+volume. leerie realises this as two surfaces sharing one mechanism:
+an explicit `leerie --re-seed <run-id>` subcommand and an implicit
+auto-re-seed step inside `leerie --resume --run-id <id> --runtime fly`.
+Both wake the machine if stopped, run a safety check, and call the
+same `seed_repo_dirty` helper used by the fresh-provision path.
 
 Three operations, in order, mirroring the spec's intent ("current
 laptop state" = host commits plus host dirty edits):

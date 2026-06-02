@@ -376,10 +376,6 @@ surface:
 - [`docs/USAGE.md`](docs/USAGE.md) — worked end-to-end example
 - [`docs/INSTALL.md`](docs/INSTALL.md) — per-OS container runtime setup
   (Colima on macOS, containerd + nerdctl on Linux), Fly.io prerequisites
-- [`remote-task-system.md`](remote-task-system.md) — platform-agnostic
-  design of the remote (Fly.io) task-execution system: git-aware
-  host-to-machine seeding, machine lifecycle, PTY attach, pause-on-
-  failure, sync-before-destroy
 
 Policy and process:
 
@@ -419,7 +415,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 |------|------------|
 | `orchestrator/leerie.py` | The orchestrator — all phases, waves, caps, retries |
 | `leerie` | Executable bash launcher — runtime preflight + `nerdctl run` (or Fly Machine provisioning when `--runtime fly`) |
-| `Dockerfile` | Container image recipe — Debian 12 + Node + pnpm + `claude` CLI + baked orchestrator source. Built locally on first run, tagged `leerie:<VERSION>` |
+| `Dockerfile` | Container image recipe — Debian 13 + Node + pnpm + `claude` CLI + baked orchestrator source. Built locally on first run, tagged `leerie:<VERSION>` |
 | `fly.toml` | Fly.io Machine configuration — app name, region, vm sizing (4 cpu / 8 GB), `min_machines_running=0` (no warm pool) |
 | `prompts/classifier.md` | System prompt: classify task + surface intent questions |
 | `prompts/planner.md` | System prompt: decompose one category into a subtask plan |
@@ -430,6 +426,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `prompts/integrator.md` | System prompt: resolve merge conflicts behaviorally |
 | `prompts/judge.md` | System prompt: 3-dimensional accuracy rubric for the post-run judge skill |
 | `prompts/patch_generator.md` | System prompt: minimal prompt-patch proposal for the post-run self-heal loop |
+| `prompts/pr_writer.md` | System prompt: finalize-time PR title + body author (invoked by `phase_finalize` when the run will push) |
 | `prompts/_clarification_filter.md` | Shared include (codebase→research→ask filter) inlined by `classifier.md` and `implementer.md` via `load_prompt`'s `{{include: …}}` expansion |
 | `scripts/install.sh` | One-command `curl \| bash` installer (preflight → runtime preflight → clone → symlink → verify) |
 | `scripts/runtime-install.sh` | Per-OS auto-install of the container runtime (Colima on macOS; containerd + nerdctl on Debian / Fedora / Arch). Sourced by `install.sh` and the launcher |
@@ -438,7 +435,9 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `scripts/new-worktree.sh` | Create per-subtask branch + worktree off the run branch |
 | `scripts/integrate.sh` | Merge a subtask branch into the run branch |
 | `scripts/finalize.sh` | Verify the run branch is non-empty and ready to push. The working branch is never modified locally. The push + `gh pr create` step lives in the **host launcher** (bash + `jq`) and runs after `nerdctl run` exits cleanly, using the host's own auth state — see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Host-side finalize*. Skipped when `--no-push` is set. |
+| `scripts/host-finalize.sh` | Host-side push + PR creation block. Sourced by three call sites: the local-runtime post-run code path in the launcher, `decide_teardown` in `scripts/remote/provision.sh` (Fly clean-exit auto-finalize), and `leerie --finalize <run-id>` (recovery fast-path). Provides `host_finalize <run-dir>`; uses `pr_title` / `pr_body` from `run.json` when the `pr_writer` worker populated them, otherwise falls back to a deterministic body. |
 | `scripts/cleanup.sh` | Remove worktrees for one run (default `--run-id`) or all runs (`--all-runs`). State dir always preserved as audit. `--branches` also deletes the matching `leerie/runs/<id>` run branch *and* `leerie/subtasks/<id>/*` subtask branches. `--subtask-branches` deletes only the subtask branches and keeps `leerie/runs/<id>` (the post-finalize default — the run branch is the PR head). `--bootstrap` removes orphaned `_bootstrap-*` dirs (runs that died before classify completed). |
+| `scripts/remote/_log.sh` | Shared `remote_log()` helper — timestamped, repo-tagged stderr lines. Sourced by every other `scripts/remote/*.sh` file so all Fly-mode output is uniformly labeled. |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry (source baked in at `/opt/leerie-image/`). Default mode is Fly's remote builder (no host Docker daemon required); `--local-build` / `LEERIE_LOCAL_BUILD=1` opts into the legacy nerdctl/docker path. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §0.5 *Registry publish path*. |
 | `scripts/remote/provision.sh` | Fly Machine lifecycle helper (sourced by the launcher's `RUNTIME=fly` branch). Provides `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, and `decide_teardown()` (classifies `$LEERIE_REMOTE_EXIT_RC`; on clean exit runs `fetch_branch` BEFORE `destroy_machine` so no work is lost; on sync failure leaves the machine RUNNING with `sync_failed_at` written for user-driven recovery; on pause-worthy non-zero rc stops the machine). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Machine lifecycle*. |
 | `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, and `re-seed.sh`. Provides `update_run_json()` (atomic merge into the run sidecar) and `wait_for_started()` (poll Fly Machine status until ready). |
@@ -460,7 +459,6 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `docs/IMPLEMENTATION.md` | Current code-surface spec — functions, caps, schemas (mechanism) |
 | `docs/INSTALL.md` | Per-OS container runtime setup and the Fly.io runtime prerequisites |
 | `docs/USAGE.md` | End-to-end walkthrough of one Leerie run |
-| `remote-task-system.md` | Platform-agnostic design of the remote (Fly.io) task-execution system: seeding, lifecycle, PTY attach, pause-on-failure |
 
 ## Safety
 

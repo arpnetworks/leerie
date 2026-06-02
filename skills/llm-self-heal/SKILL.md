@@ -1,6 +1,6 @@
 ---
 name: llm-self-heal
-description: "Autonomous self-healing loop for leerie worker prompts that produced captured failures. For each call_type with failures, runs a measured n=N baseline (unpatched), then iterates: invoke slm-patch-generator subagent → apply proposed patch → replay patched arm → score → check convergence (SUCCESS/PLATEAUED/BUDGET_EXHAUSTED/TIMEOUT/REGRESSED). Writes a healing-<call_type>.md report per call_type with the best patch and the iteration history. Production prompts in prompts/ stay manual — the skill proposes patches with measured evidence."
+description: "Autonomous self-healing loop for leerie worker prompts that produced captured failures. For each call_type with failures, runs a measured n=N baseline (unpatched), then iterates: invoke patch-generator subagent → apply proposed patch → replay patched arm → score → check convergence (SUCCESS/PLATEAUED/BUDGET_EXHAUSTED/TIMEOUT/REGRESSED). Writes a healing-<call_type>.md report per call_type with the best patch and the iteration history. Production prompts in prompts/ stay manual — the skill proposes patches with measured evidence."
 argument-hint: "<run-id-or-ndjson-path> [--call-type <name>] [--max-iterations <N>] [--n-replays <N>] [--success-threshold <0..1>]"
 allowed-tools:
   - Read
@@ -18,7 +18,7 @@ produced failures in a judge-llm-batch run. The loop iterates:
 
 1. **Baseline** — run n=N unpatched replays per failing sample via
    `claude -p`, score each, establish noise floor.
-2. **Loop** — invoke the `slm-patch-generator` subagent to propose a
+2. **Loop** — invoke the `patch-generator` subagent to propose a
    minimal patch to the system prompt, apply the patch, replay the
    patched arm, score, check convergence.
 3. **Report** — write `<heal-dir>/<call_type>/healing-<call_type>.md`
@@ -98,7 +98,7 @@ Under `<heal-dir>/<call_type>/`:
 ```
 state.json           — loop state (history, best-so-far, baseline)
 iter-<N>/
-  patch-request.json   — inputs for the slm-patch-generator subagent
+  patch-request.json   — inputs for the patch-generator subagent
   patch-response.json  — subagent's structured output
   applied-patch.txt    — the patched system prompt text
   arm-results.json     — n-replay results per failing sample
@@ -172,7 +172,7 @@ For each failing sample (those with `pass=false` in the verdict file):
 3. **Invoke patch-generator subagent:**
    ```
    Agent({
-     subagent_type: "slm-patch-generator",
+     subagent_type: "patch-generator",
      description: "Propose patch for <call_type> iter-<N>",
      prompt: "<contents of patch-request.json formatted as delimited sections>"
    })
