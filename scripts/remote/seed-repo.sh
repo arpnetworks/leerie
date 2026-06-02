@@ -399,33 +399,272 @@ for line in sys.stdin.read().splitlines():
 }
 
 # ---------------------------------------------------------------------------
+# _seed_one_inspect_dir_clone <host> <remote>
+#
+# Bundle + machine-side-clone for a single git-repo inspect dir.
+# Adapts seed_repo_clone's bundle pipeline (parent bundle + per-
+# submodule bundles + machine-side `git clone`) but scoped to
+# /tmp/leerie-inspect-<base>.{bundle,subs/} and a per-dir target
+# instead of /work. <base> = basename($remote), e.g. "stackpulse".
+#
+# Why: shipping the working tree via plain rsync over flyctl ssh
+# fails for non-trivial repos (the v1 path: a 1.7 GB / 120k-file
+# tree like stackpulse with node_modules/.next/.pnpm-store hung
+# indefinitely). The bundle is committed-state-only — gitignored
+# build artifacts stay on the host where they belong. For a 1.7 GB
+# stackpulse working tree, the bundle is ~600 KB and ships in one
+# pipe (measured 2026-06-02).
+# ---------------------------------------------------------------------------
+_seed_one_inspect_dir_clone() {
+  local host="$1" remote="$2" base bundle_path subs_dir
+  base="$(basename "$remote")"
+  bundle_path="/tmp/leerie-inspect-${base}.bundle"
+  subs_dir="/tmp/leerie-inspect-${base}-subs"
+
+  remote_log "remote: bundling inspect-dir $host (parent + submodules) -> $remote ..."
+
+  # Reset per-dir staging on the machine: remove the target, the
+  # bundle file, and the subs dir if a prior partial attempt left
+  # them. mkdir the subs dir so submodule bundle pipes can land.
+  # Also mkdir -p the parent of $remote so we can land into it.
+  if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+         --pty=false -C "sh -c 'rm -rf ${remote} ${bundle_path} ${subs_dir} && mkdir -p $(dirname "${remote}") ${subs_dir}'" \
+         >/dev/null 2>&1; then
+    remote_log "seed_inspect_dirs: failed to reset staging for $remote"
+    return 1
+  fi
+
+  # 1. Bundle the parent and pipe it to /tmp/leerie-inspect-<base>.bundle.
+  #    `git bundle create - --all` packs every ref into one pack-format
+  #    binary stream on stdout. The `sh -c '...'` wrapper around `cat`
+  #    is load-bearing — bare `-C "cat > /tmp/..."` fails because flyctl
+  #    treats `>` as an arg to `cat` (`cat: invalid option`).
+  if ! git -C "$host" bundle create - --all 2>/dev/null \
+        | flyctl ssh console --quiet --app "$FLY_APP" \
+            --machine "$LEERIE_MACHINE_ID" --pty=false \
+            -C "sh -c 'cat > ${bundle_path}'" >/dev/null 2>&1; then
+    remote_log "seed_inspect_dirs: failed to pipe parent bundle for $host"
+    return 1
+  fi
+
+  # 2. Bundle each submodule recursively, pipe each into
+  #    <subs_dir>/<flattened-displaypath>.bundle. Displaypath-flattening
+  #    (`/` → `_`) matches the machine-side clone script below so both
+  #    sides agree on the filename for nested submodules.
+  if [ -f "$host/.gitmodules" ]; then
+    if ! (
+      cd "$host" && \
+      LEERIE_FLY_APP="$FLY_APP" \
+      LEERIE_MACHINE_ID="$LEERIE_MACHINE_ID" \
+      LEERIE_SUBS_DIR="$subs_dir" \
+      git submodule --quiet foreach --recursive '
+        bn="$(printf %s "$displaypath" | tr / _).bundle"
+        git bundle create - --all 2>/dev/null \
+          | flyctl ssh console --quiet --app "$LEERIE_FLY_APP" \
+              --machine "$LEERIE_MACHINE_ID" --pty=false \
+              -C "sh -c '\''cat > $LEERIE_SUBS_DIR/$bn'\''" >/dev/null 2>&1 \
+          || { echo "leerie: seed_inspect_dirs: failed to pipe submodule $displaypath bundle" >&2; exit 1; }
+      '
+    ); then
+      remote_log "seed_inspect_dirs: submodule bundling failed for $host"
+      return 1
+    fi
+  fi
+
+  # 3. Machine-side: clone the parent bundle into $remote, wire each
+  #    submodule's URL to its bundle file in .git/config (NOT
+  #    .gitmodules — never modify the committed file), then submodule
+  #    update --recursive. Finally chown -R leerie: $remote so the
+  #    orchestrator (which runs as leerie) and inspect-bucket workers
+  #    can read the tree. Clean up the staged bundle files.
+  #
+  #    protocol.file.allow=always is required for submodule update to
+  #    accept file://-style local paths — git 2.38+ blocks `file` by
+  #    default per CVE-2022-39253. We trust local paths because we
+  #    just put them there.
+  #
+  #    The clone script is sent over `sh -c '...'` via flyctl's -C.
+  #    We use envsubst-style replacement at host emit-time (sed) for
+  #    the three paths so the inner sh -c script doesn't need any
+  #    quoting acrobatics.
+  local clone_script
+  clone_script="$(cat <<'CLONE_SCRIPT'
+set -e
+git clone __BUNDLE_PATH__ __REMOTE__
+cd __REMOTE__
+if [ -f .gitmodules ]; then
+  git submodule init
+  git submodule status | awk "{print \$2}" | while read sm; do
+    bn=$(printf %s "$sm" | tr / _).bundle
+    if [ -f "__SUBS_DIR__/$bn" ]; then
+      git config "submodule.$sm.url" "__SUBS_DIR__/$bn"
+    fi
+  done
+  git -c protocol.file.allow=always submodule update --recursive
+fi
+chown -R leerie: __REMOTE__
+rm -rf __BUNDLE_PATH__ __SUBS_DIR__
+CLONE_SCRIPT
+)"
+  # Substitute the three paths. None of bundle_path / remote / subs_dir
+  # contains a `|` so it's a safe sed delimiter.
+  clone_script="${clone_script//__BUNDLE_PATH__/$bundle_path}"
+  clone_script="${clone_script//__REMOTE__/$remote}"
+  clone_script="${clone_script//__SUBS_DIR__/$subs_dir}"
+
+  if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+         --pty=false -C "sh -c '$clone_script'" >/dev/null 2>&1; then
+    remote_log "seed_inspect_dirs: machine-side clone failed for $remote"
+    return 1
+  fi
+
+  remote_log "remote: inspect-dir $remote seeded (bundle)"
+}
+
+# ---------------------------------------------------------------------------
+# _seed_one_inspect_dir_dirty <host> <remote>
+#
+# Rsync the dirty/untracked delta for a single git inspect dir into
+# $remote/ on the machine. Adapts seed_repo_dirty's porcelain-based
+# file-list logic, retargeted from /work to $remote and with the
+# .claude/ force-include step DROPPED — workers Read/Grep/Glob the
+# inspect dir but don't run inside it, so its .claude/ (if any) is
+# not load-bearing.
+#
+# Empty delta is fine and returns 0 (the bundle already shipped
+# committed state, and there's nothing dirty to layer on top).
+# ---------------------------------------------------------------------------
+_seed_one_inspect_dir_dirty() {
+  local host="$1" remote="$2"
+
+  local dirty_files
+  dirty_files="$(git -C "$host" status --porcelain 2>/dev/null \
+                  | awk '
+                      /^\?\? / {
+                        f = substr($0, 4)
+                        gsub(/\/$/, "", f)
+                        print f
+                        next
+                      }
+                      length($0) >= 2 && substr($0,2,1) != " " {
+                        f = substr($0, 4)
+                        if (index(f, " -> ")) {
+                          f = substr(f, index(f, " -> ") + 4)
+                        }
+                        gsub(/\/$/, "", f)
+                        print f
+                      }
+                  ')"
+
+  if [ -z "$dirty_files" ]; then
+    return 0
+  fi
+
+  local file_count
+  file_count="$(printf '%s\n' "$dirty_files" | grep -c -v '^$' || true)"
+  remote_log "remote: inspect-dir $remote — syncing $file_count dirty file(s)..."
+
+  local wrapper file_list rc=0
+  wrapper="$(fly_rsync_wrapper "$FLY_APP")"
+  file_list="$(mktemp -t leerie-inspect-dirty-list.XXXXXX)"
+
+  printf '%s\n' "$dirty_files" \
+    | python3 -c '
+import sys
+for line in sys.stdin.read().splitlines():
+    if not line:
+        continue
+    if line.startswith(".git/") or line == ".git":
+        continue
+    sys.stdout.buffer.write(line.encode() + b"\x00")
+' > "$file_list"
+
+  LEERIE_FLY_APP="$FLY_APP" rsync -a -H \
+    --from0 --files-from="$file_list" \
+    -e "$wrapper" \
+    "$host/" "$LEERIE_MACHINE_ID:$remote/" \
+    >/dev/null 2>&1
+  rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$file_list" "$wrapper"
+    remote_log "seed_inspect_dirs: dirty rsync failed for $host -> $remote (exit $rc)"
+    return 1
+  fi
+
+  # Re-chown to keep the dirty-rsync'd files leerie-owned. Broad-stroke
+  # like seed_repo_dirty:390.
+  if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+         --pty=false -C "chown -R leerie: $remote" >/dev/null 2>&1; then
+    rm -f "$file_list" "$wrapper"
+    remote_log "seed_inspect_dirs: chown -R leerie: $remote after dirty rsync failed"
+    return 1
+  fi
+
+  rm -f "$file_list" "$wrapper"
+}
+
+# ---------------------------------------------------------------------------
+# _seed_one_inspect_dir_rsync_fallback <host> <remote>
+#
+# Plain rsync for non-git inspect dirs (a docs folder, a scratch dir
+# with no .git/). This is what v1 did unconditionally; we keep it as
+# the non-git fallback only. The git path uses bundle+clone instead
+# (orders of magnitude faster on large trees).
+# ---------------------------------------------------------------------------
+_seed_one_inspect_dir_rsync_fallback() {
+  local host="$1" remote="$2"
+  remote_log "remote: rsync-seeding non-git inspect-dir $host -> $remote ..."
+
+  local wrapper rc=0
+  wrapper="$(fly_rsync_wrapper "$FLY_APP")"
+
+  LEERIE_FLY_APP="$FLY_APP" rsync -a -H \
+    -e "$wrapper" \
+    "$host/" "$LEERIE_MACHINE_ID:$remote/" \
+    >/dev/null 2>&1
+  rc=$?
+
+  if [ "$rc" -ne 0 ]; then
+    rm -f "$wrapper"
+    remote_log "seed_inspect_dirs: fallback rsync failed for $host -> $remote (exit $rc)"
+    return 1
+  fi
+
+  if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+         --pty=false -C "chown -R leerie: $remote" >/dev/null 2>&1; then
+    rm -f "$wrapper"
+    remote_log "seed_inspect_dirs: chown -R leerie: $remote (fallback) failed"
+    return 1
+  fi
+
+  rm -f "$wrapper"
+  remote_log "remote: inspect-dir $remote seeded (rsync)"
+}
+
+# ---------------------------------------------------------------------------
 # seed_inspect_dirs
 #
-# Transport host-side --inspect-dir paths to /inspect/<basename> on the
-# machine via rsync over `flyctl ssh console`. The launcher already
-# rewrote each --inspect-dir CLI flag to /inspect/<basename> for the
-# orchestrator's in-machine view (REWRITTEN_ARGS); this function makes
-# those paths actually exist on the machine's filesystem.
+# Transport host-side --inspect-dir paths to /inspect/<basename> on
+# the Fly machine. The launcher already rewrote each --inspect-dir
+# CLI flag to /inspect/<basename> for the in-machine orchestrator
+# (REWRITTEN_ARGS); this function makes those paths exist.
 #
 # Input: LEERIE_INSPECT_HOST_TARGETS env var, newline-separated records
 # of "<host-path>\t<remote-target>". The launcher serializes its
-# INSPECT_HOST_TARGETS bash array to this env var via
-# _serialize_inspect_host_targets before calling. Empty / unset means no
-# inspect dirs — no-op return 0.
+# INSPECT_HOST_TARGETS bash array via _serialize_inspect_host_targets.
+# Empty/unset means no inspect dirs — no-op return 0.
 #
-# Per-directory rsync (small N, typically 1–3). Per-dir is simpler than
-# a combined --files-from call: atomic per dir, clear error attribution,
-# fixed dest path. Reuses fly_rsync_wrapper (same helper seed_repo_dirty
-# uses).
+# Per inspect dir:
+#   - If $host is a git repo: probe the machine for /inspect/<base>/.git.
+#     If present (resume on an already-seeded run), just refresh the
+#     dirty delta. Otherwise full bundle-clone, then dirty rsync.
+#   - If $host is NOT a git repo (a docs folder, etc.): probe for
+#     dir-existence-and-non-empty. If present, skip; otherwise plain
+#     rsync (the v1 fallback).
 #
-# Why rsync (not a tar pipe): same reason seed_repo_dirty uses rsync —
-# macOS BSD `tar -c` flips filenames NFC → NFD during archive creation
-# (libarchive). rsync preserves filename bytes verbatim. Inspect dirs
-# commonly contain non-ASCII filenames.
-#
-# Each /inspect/<basename> is chowned leerie:leerie after rsync so the
-# orchestrator (running as leerie) and its workers can read it —
-# mirrors seed_repo_dirty's post-rsync chown of /work.
+# The bundle path is the same strategy seed_repo_clone uses for /work
+# — see _seed_one_inspect_dir_clone's header for the perf rationale.
 # ---------------------------------------------------------------------------
 seed_inspect_dirs() {
   _seed_repo_preflight || return 1
@@ -444,8 +683,8 @@ seed_inspect_dirs() {
     wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID" || true
   fi
 
-  # mkdir /inspect once + chown leerie:leerie so per-dir rsync lands
-  # under a leerie-owned parent.
+  # mkdir /inspect once + chown leerie: /inspect so per-dir clones/rsyncs
+  # land under a leerie-owned parent.
   if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
          --pty=false -C "sh -c 'mkdir -p /inspect && chown leerie: /inspect'" \
          >/dev/null 2>&1; then
@@ -453,25 +692,15 @@ seed_inspect_dirs() {
     return 1
   fi
 
-  local wrapper rc=0 record host remote
-  wrapper="$(fly_rsync_wrapper "$FLY_APP")"
-
+  local rc=0 record host remote
   while IFS= read -r record; do
     [ -z "$record" ] && continue
     host="${record%%$'\t'*}"
     remote="${record#*$'\t'}"
-    # Malformed record (no tab separator): bash parameter expansion
-    # returns the whole string unchanged when the pattern doesn't
-    # match. Log and skip rather than rsync to a bogus target.
     if [ -z "$host" ] || [ -z "$remote" ] || [ "$host" = "$record" ]; then
       remote_log "seed_inspect_dirs: malformed record (no tab separator): $record"
       continue
     fi
-    # Defensive: only ship targets under /inspect/. In-repo inspect
-    # dirs (launcher's skip-redundant-mount branch) rewrite to
-    # /work/<sub> and don't enter INSPECT_HOST_TARGETS — but if
-    # something slipped through, skip structurally rather than rsync
-    # over /work/.
     case "$remote" in
       /inspect/*) : ;;
       *)
@@ -479,26 +708,52 @@ seed_inspect_dirs() {
         continue
         ;;
     esac
-    remote_log "remote: seeding inspect-dir $host -> $remote"
-    # Trailing slashes: copy contents of $host *into* $remote/, don't
-    # create $remote/<basename-of-host>/ inside it.
-    if ! LEERIE_FLY_APP="$FLY_APP" rsync -a -H \
-            -e "$wrapper" \
-            "$host/" "$LEERIE_MACHINE_ID:$remote/" \
-            >/dev/null 2>&1; then
-      remote_log "seed_inspect_dirs: rsync failed for $host -> $remote"
-      rc=1
-      break
+
+    # Is the host path a git repo? Two probes — direct .git/ presence
+    # (covers the normal case) and `git rev-parse --git-dir` (covers
+    # worktrees / .git files).
+    local is_git=false
+    if [ -d "$host/.git" ] || git -C "$host" rev-parse --git-dir >/dev/null 2>&1; then
+      is_git=true
     fi
-    if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-           --pty=false -C "chown -R leerie: $remote" >/dev/null 2>&1; then
-      remote_log "seed_inspect_dirs: chown -R leerie: $remote failed"
-      rc=1
-      break
+
+    if $is_git; then
+      # Resume probe: if /inspect/<base>/.git already exists on the
+      # machine, the bundle was shipped on a prior run. Skip the
+      # expensive clone, just refresh the dirty delta.
+      if flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+           --pty=false -C "test -d $remote/.git" >/dev/null 2>&1; then
+        remote_log "remote: inspect-dir $remote already present; refreshing dirty delta only"
+        if ! _seed_one_inspect_dir_dirty "$host" "$remote"; then
+          rc=1
+          break
+        fi
+      else
+        if ! _seed_one_inspect_dir_clone "$host" "$remote"; then
+          rc=1
+          break
+        fi
+        if ! _seed_one_inspect_dir_dirty "$host" "$remote"; then
+          rc=1
+          break
+        fi
+      fi
+    else
+      # Non-git inspect dir. Probe dir-exists-and-non-empty; if so,
+      # assume a prior run shipped it and skip. Otherwise plain rsync.
+      if flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+           --pty=false -C "sh -c 'test -d $remote && [ -n \"\$(ls -A $remote 2>/dev/null)\" ]'" \
+           >/dev/null 2>&1; then
+        remote_log "remote: inspect-dir $remote already present (non-git); skipping"
+      else
+        if ! _seed_one_inspect_dir_rsync_fallback "$host" "$remote"; then
+          rc=1
+          break
+        fi
+      fi
     fi
   done <<< "$LEERIE_INSPECT_HOST_TARGETS"
 
-  rm -f "$wrapper"
   return $rc
 }
 

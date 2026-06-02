@@ -398,19 +398,50 @@ warns and skips the redundant mount.
 
 #### Remote runtime (Fly.io) transport
 
-Under `--runtime fly`, the launcher additionally rsyncs each
+Under `--runtime fly`, the launcher additionally ships each
 `--inspect-dir` host path to `/inspect/<basename>` on the Fly machine
 via `scripts/remote/seed-repo.sh:seed_inspect_dirs`. The rewritten
 `--inspect-dir /inspect/<basename>` CLI flag already carries the
 in-machine view to the orchestrator via `REWRITTEN_ARGS`; this step
 makes the path actually exist on the machine's filesystem.
 
-Transport: `rsync -a -H` over `flyctl ssh console` via
-`fly_rsync_wrapper` (the same helper `seed_repo_dirty` uses). One rsync
-per inspect dir — counts are small (typically 1–3) and per-dir keeps
-error attribution clear. After each rsync, `chown -R leerie:` runs on
-the target so workers (which run as `leerie`) can read it, mirroring
-`seed_repo_dirty`'s post-rsync chown of `/work`.
+Per inspect dir, transport is two-phase, mirroring the
+`seed_repo_clone` + `seed_repo_dirty` strategy used for `/work`:
+
+- **Git repos** — `git bundle create - --all` packs every reachable
+  object into one pack-format binary stream, piped via
+  `flyctl ssh console -C "sh -c 'cat > /tmp/leerie-inspect-<base>.bundle'"`.
+  Submodules are bundled the same way into
+  `/tmp/leerie-inspect-<base>-subs/`. The machine then `git clone`s
+  from the local bundle file into `/inspect/<base>` (with
+  `protocol.file.allow=always` for the submodule update;
+  CVE-2022-39253 mitigation). A second pass (`_seed_one_inspect_dir_dirty`)
+  rsyncs the uncommitted-edit delta on top via `fly_rsync_wrapper` so
+  workers see your in-flight changes for inspect dirs, the same way
+  they do for the main repo.
+- **Non-git directories** (docs folders, etc.) — fall back to plain
+  `rsync -a -H` via `fly_rsync_wrapper` (the v1 path; kept for the
+  no-`.git/` case).
+
+Why bundle for git repos: plain rsync over `flyctl ssh console` is
+unworkable for non-trivial trees. Empirically (2026-06-02), a
+~1.7 GB / 120k-file working tree (`~/src/enric/stackpulse` with
+`node_modules`, `.next`, `.pnpm-store`) hung indefinitely under v1's
+plain rsync. The same repo's bundle is ~600 KB and ships in one pipe
+in under a second. Gitignored build artifacts stay on the host; the
+inspect-bucket workers only need source.
+
+Resume probe: before the bundle phase, `seed_inspect_dirs` runs one
+`flyctl ssh console -C "test -d /inspect/<base>/.git"` per inspect
+dir. If the directory was already seeded on a prior run, the bundle
+is skipped and only the dirty delta refreshes — typical resume cost
+is a few seconds per inspect dir, not a few minutes. New inspect
+dirs added at `--resume` time take the full fresh path.
+
+Each `/inspect/<basename>` is chowned `leerie:leerie` after every
+transport phase so the orchestrator (which runs as `leerie`) and
+its workers can read the tree — same ownership-handover pattern
+`seed_repo_clone` / `seed_repo_dirty` use for `/work`.
 
 The launcher serializes its `INSPECT_HOST_TARGETS` bash array (parallel
 to `INSPECT_MOUNTS`, populated by `collect_inspect_path` for every
@@ -439,16 +470,17 @@ Read-only contract: inspect-bucket workers only `Read`/`Grep`/`Glob`
 inspect dirs (DESIGN §12). No rsync `--delete` or two-way sync is
 used.
 
-Inspect dirs are **not** `git clone`d on the machine because the
-machine deliberately holds no GitHub credentials (DESIGN §6
-*Finalization*). The transport treats each inspect dir as an opaque
-tree of files; even if the source is a git repo, only the working tree
-ships — workers read source files, not history.
+Inspect dirs are **not** `git clone`d *from origin* on the machine
+because the machine deliberately holds no GitHub credentials (DESIGN §6
+*Finalization*). The bundle approach above ships the host's local git
+state directly — no remote auth ever needed in-machine.
 
-Same rsync-vs-tar rationale as `seed_repo_dirty`: macOS BSD `tar -c`
+Same rsync-vs-tar rationale as `seed_repo_dirty` (applies to the
+fallback path and the dirty-delta phase): macOS BSD `tar -c`
 normalizes filenames NFC → NFD (libarchive); rsync preserves filename
-bytes verbatim. Inspect dirs frequently contain docs/PDFs with
-non-ASCII names.
+bytes verbatim. Bundles sidestep the problem entirely — filenames
+travel as pack-format binary objects, materialized natively by the
+receiving git.
 
 ### macOS-specific: Colima auto-share scope
 

@@ -1,24 +1,33 @@
 """Tests for seed_inspect_dirs in scripts/remote/seed-repo.sh.
 
 seed_inspect_dirs ships each --inspect-dir host path to /inspect/<basename>
-on the Fly machine via rsync over `flyctl ssh console`. It's called by the
-leerie launcher after seed_repo on fresh provision and after re_seed on
-resume. See docs/IMPLEMENTATION.md §0.5 "Remote runtime (Fly.io) transport".
+on the Fly machine. For git repos: `git bundle create - --all` + machine-side
+`git clone` + dirty rsync delta. For non-git dirs: plain rsync. See
+docs/IMPLEMENTATION.md §0.5 "Remote runtime (Fly.io) transport".
 
-These tests stub flyctl and exercise the bash function in isolation via
-subprocess. The stub recognizes:
+These tests stub flyctl and exercise the bash function via subprocess.
+The stub recognizes:
 
   1. `-C "true"`: wait_for_fly_ssh_ready probe → exit 0.
-  2. `-C "sh -c 'mkdir -p /inspect && chown leerie: /inspect'"`: the
-     one-shot inspect parent setup. Rewrite `/inspect` → DEST/inspect and
-     eval locally.
-  3. `rsync*` with a `<machine>:/inspect/<base>/` target: rewrite the
-     trailing `/inspect/` → `DEST/inspect/` and eval the rewritten
-     rsync locally so the protocol completes.
-  4. `chown -R leerie: /inspect/<base>`: exit 0 (no `leerie` user on
-     the test host).
-  5. Anything else: drain stdin and exit 0 (defensive — keeps unrelated
-     producers from SIGPIPE'ing).
+  2. `-C "sh -c 'mkdir -p /inspect && chown leerie: /inspect'"`: parent
+     setup. Rewrite /inspect → DEST/inspect and eval.
+  3. `-C "sh -c 'rm -rf /inspect/<base> ... mkdir -p ...'"`: per-dir
+     reset before bundle clone.
+  4. `-C "sh -c 'cat > /tmp/leerie-inspect-<base>.bundle'"`: capture
+     stdin to DEST/inspect-<base>.bundle.
+  5. `-C "sh -c 'cat > /tmp/leerie-inspect-<base>-subs/<sm>.bundle'"`:
+     capture stdin to DEST/inspect-<base>-subs/<sm>.bundle.
+  6. Machine-side clone script (`git clone /tmp/leerie-inspect-<base>.bundle
+     /inspect/<base>`): rewrite the absolute paths, strip the chown +
+     cleanup, and eval locally.
+  7. `-C "test -d /inspect/<base>/.git"` and `-C "sh -c 'test -d /inspect/<base>
+     && [ -n "$(ls -A ...)" ]'"`: resume probes. Map /inspect → DEST/inspect
+     and run the test; the test fixture pre-creates the path to simulate a
+     prior-seeded state.
+  8. `rsync*`: dirty rsync or non-git fallback. Rewrite trailing /inspect →
+     DEST/inspect and eval locally.
+  9. `chown -R leerie: /inspect/<base>`: exit 0 (no leerie user on test host).
+ 10. Anything else: drain stdin and exit 0.
 """
 from __future__ import annotations
 
@@ -44,20 +53,19 @@ def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProce
 
 def _make_stub_flyctl(stub_path: Path, exec_log: Path, dest_dir: Path,
                       fail_rsync: bool = False) -> None:
-    """Stub flyctl that handles the seed_inspect_dirs pattern and actually
-    executes rsync locally against `dest_dir/inspect/...`.
+    """Stub flyctl that handles seed_inspect_dirs's bundle + rsync flow
+    and actually executes the machine-side clone + rsync locally against
+    `dest_dir/inspect/...`.
 
-    fail_rsync=True makes every rsync invocation exit 1; used to assert
-    that seed_inspect_dirs aborts on the first failure and does not
-    attempt subsequent records.
+    fail_rsync=True makes every rsync invocation exit 1 (used to verify
+    abort-on-failure behavior).
     """
     dest = str(dest_dir.resolve())
     log_path = str(exec_log.resolve())
     rsync_fail_clause = "exit 1" if fail_rsync else """
-    # The driver rsync -e wrapper invokes flyctl with the receiver-side
+    # The driver rsync's -e wrapper invokes flyctl with the receiver-side
     # rsync command, e.g. `rsync --server ... /inspect/<base>/`. Rewrite
-    # the path so the receiver runs against DEST/inspect/<base>/ on the
-    # test host. Same pattern test_seed_repo_sh.py uses for /work.
+    # the path so the receiver runs against DEST/inspect/<base>/ locally.
     local_cmd="${remote_cmd// \\/inspect/ $DEST/inspect}"
     eval "$local_cmd"
     exit $?
@@ -82,11 +90,72 @@ if [ "$remote_cmd" = "true" ]; then
   exit 0
 fi
 
+_drain_to() {{
+  mkdir -p "$(dirname "$1")"
+  cat > "$1"
+}}
+
 case "$remote_cmd" in
-  *"mkdir -p /inspect"*)
-    # One-shot inspect parent setup. Rewrite /inspect → DEST/inspect.
+  *"mkdir -p /inspect &&"*)
+    # One-shot parent setup. Rewrite /inspect → DEST/inspect.
     local_cmd="${{remote_cmd//chown leerie: \\/inspect/true}}"
     local_cmd="${{local_cmd//\\/inspect/$DEST/inspect}}"
+    eval "$local_cmd"
+    exit $?
+    ;;
+  *"rm -rf /inspect/"*"mkdir -p"*)
+    # Per-dir reset before bundle clone. Rewrite /inspect → DEST/inspect
+    # and eval; this nukes the prior copy (if any) and re-creates the
+    # subs staging dir locally.
+    local_cmd="${{remote_cmd//\\/tmp\\/leerie-inspect-/$DEST/tmp-leerie-inspect-}}"
+    local_cmd="${{local_cmd//\\/inspect/$DEST/inspect}}"
+    eval "$local_cmd"
+    exit $?
+    ;;
+  *"cat > /tmp/leerie-inspect-"*"-subs/"*)
+    # Submodule bundle pipe. Extract <base>-subs/<bn> from the command.
+    bn_with_subs="${{remote_cmd##*cat > /tmp/leerie-inspect-}}"
+    # bn_with_subs is now like "stackpulse-subs/vendor_foo.bundle'"
+    bn_with_subs="${{bn_with_subs%\\'*}}"  # strip trailing quote
+    _drain_to "$DEST/tmp-leerie-inspect-$bn_with_subs"
+    exit 0
+    ;;
+  *"cat > /tmp/leerie-inspect-"*".bundle"*)
+    # Parent bundle pipe. Extract <base>.bundle.
+    bn="${{remote_cmd##*cat > /tmp/leerie-inspect-}}"
+    bn="${{bn%\\'*}}"  # strip trailing quote
+    _drain_to "$DEST/tmp-leerie-inspect-$bn"
+    exit 0
+    ;;
+  *"git clone /tmp/leerie-inspect-"*)
+    # Machine-side clone script for an inspect dir. Strip the chown
+    # (no leerie user on test host), strip the post-clone /tmp cleanup
+    # (so tests can inspect the captured bundles), then rewrite the
+    # absolute paths to point inside DEST.
+    local_cmd="$remote_cmd"
+    # Strip chown lines (any /inspect/<base> target). Match up to the
+    # newline so we don't gobble a trailing close-quote on the last line.
+    local_cmd="$(printf '%s\\n' "$local_cmd" | sed 's|chown -R leerie: /inspect/[^[:space:]]*|true|g')"
+    # Strip the post-clone rm cleanup. Same caveat: the rm line is the
+    # last line of the inner script (just before the closing `'`); a
+    # greedy [^ ]* match would gobble the closing quote. Use [^[:space:]'\\\\'][^[:space:]'\\\\']* — anything but space or quote.
+    local_cmd="$(printf '%s\\n' "$local_cmd" | sed "s|rm -rf /tmp/leerie-inspect-[^[:space:]']* /tmp/leerie-inspect-[^[:space:]']*|true|g")"
+    # Rewrite absolute paths: /tmp/leerie-inspect-* → DEST/tmp-leerie-inspect-*
+    # and /inspect → DEST/inspect.
+    local_cmd="${{local_cmd//\\/tmp\\/leerie-inspect-/$DEST/tmp-leerie-inspect-}}"
+    local_cmd="${{local_cmd//\\/inspect/$DEST/inspect}}"
+    eval "$local_cmd"
+    exit $?
+    ;;
+  "test -d /inspect/"*"/.git")
+    # Resume probe for git inspect dirs. Rewrite /inspect → DEST/inspect.
+    local_cmd="${{remote_cmd//\\/inspect/$DEST/inspect}}"
+    eval "$local_cmd"
+    exit $?
+    ;;
+  *"test -d /inspect/"*"ls -A /inspect/"*)
+    # Resume probe for non-git inspect dirs.
+    local_cmd="${{remote_cmd//\\/inspect/$DEST/inspect}}"
     eval "$local_cmd"
     exit $?
     ;;
@@ -94,7 +163,7 @@ case "$remote_cmd" in
     {rsync_fail_clause}
     ;;
   *"chown -R leerie: /inspect"*)
-    # Per-dir chown after rsync. No `leerie` user on the test host; swallow.
+    # Per-dir chown after rsync / clone. No leerie user on test host.
     exit 0
     ;;
   *)
@@ -109,19 +178,48 @@ esac
 
 def _make_stub_timeout(stub_dir: Path) -> None:
     """Same `timeout` stub as test_seed_repo_sh.py — macOS doesn't ship
-    GNU `timeout` in /usr/bin, and the tests pin PATH for determinism."""
+    GNU `timeout` in /usr/bin."""
     stub = stub_dir / "timeout"
     stub.write_text(
         """#!/usr/bin/env bash
 while [[ "$1" == --* ]]; do shift; done
-shift  # discard the seconds arg
+shift
 exec "$@"
 """
     )
     stub.chmod(0o755)
 
 
-def _make_host_inspect_dir(root: Path, name: str, files: dict[str, str]) -> Path:
+def _make_git_repo(root: Path, name: str, files: dict[str, str],
+                   dirty_files: dict[str, str] | None = None) -> Path:
+    """Create a real git repo at root/name with committed files + optional
+    uncommitted edits."""
+    repo = root / name
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "-C", str(repo), "init", "-q"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@t.com"],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"],
+                   check=True, capture_output=True)
+    for relpath, content in files.items():
+        f = repo / relpath
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(content)
+    subprocess.run(["git", "-C", str(repo), "add", "."],
+                   check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "init"],
+                   check=True, capture_output=True)
+    if dirty_files:
+        for relpath, content in dirty_files.items():
+            f = repo / relpath
+            f.parent.mkdir(parents=True, exist_ok=True)
+            f.write_text(content)
+    return repo
+
+
+def _make_plain_dir(root: Path, name: str, files: dict[str, str]) -> Path:
+    """Create a plain directory (no .git) at root/name."""
     d = root / name
     d.mkdir(parents=True, exist_ok=True)
     for relpath, content in files.items():
@@ -131,8 +229,13 @@ def _make_host_inspect_dir(root: Path, name: str, files: dict[str, str]) -> Path
     return d
 
 
+# ----------------------------------------------------------------------------
+# Basic guard tests
+# ----------------------------------------------------------------------------
+
+
 def test_seed_inspect_dirs_no_op_when_empty(tmp_path):
-    """Empty LEERIE_INSPECT_HOST_TARGETS → returns 0 and never calls flyctl."""
+    """Empty LEERIE_INSPECT_HOST_TARGETS → returns 0; no ssh-console / rsync."""
     exec_log = tmp_path / "exec_log.txt"
     fake_flyctl = tmp_path / "flyctl"
     _make_stub_flyctl(fake_flyctl, exec_log, tmp_path)
@@ -149,20 +252,12 @@ def test_seed_inspect_dirs_no_op_when_empty(tmp_path):
         },
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
-    # _seed_repo_preflight runs `flyctl auth status` even on the empty
-    # path; what must NOT happen is any ssh-console / rsync / mkdir
-    # invocation against the machine.
     log_text = exec_log.read_text() if exec_log.exists() else ""
-    assert "ssh console" not in log_text, (
-        f"empty inspect set should never call ssh console; got:\n{log_text}"
-    )
-    assert "rsync" not in log_text, (
-        f"empty inspect set should never invoke rsync; got:\n{log_text}"
-    )
+    assert "ssh console" not in log_text, log_text
+    assert "rsync" not in log_text, log_text
 
 
 def test_seed_inspect_dirs_fails_without_machine_id(tmp_path):
-    """seed_inspect_dirs returns 1 when LEERIE_MACHINE_ID is unset."""
     result = _run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
@@ -175,10 +270,103 @@ def test_seed_inspect_dirs_fails_without_machine_id(tmp_path):
     assert "LEERIE_MACHINE_ID" in result.stderr
 
 
-def test_seed_inspect_dirs_single_dir_lands(tmp_path):
-    """One inspect-dir record → file lands at DEST/inspect/<basename>/<file>."""
-    src = _make_host_inspect_dir(tmp_path / "hostroot", "beacon",
-                                 {"README.md": "hi beacon"})
+def test_seed_inspect_dirs_skips_malformed_record(tmp_path):
+    """Record without a tab separator → log + skip; no rsync."""
+    dest = tmp_path / "machine"
+    dest.mkdir()
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    _make_stub_flyctl(fake_flyctl, exec_log, dest)
+    _make_stub_timeout(tmp_path)
+
+    result = _run_bash(
+        f"source {SEED_SH}; seed_inspect_dirs",
+        env={
+            "LEERIE_MACHINE_ID": "test-machine-001",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(tmp_path),
+            "LEERIE_INSPECT_HOST_TARGETS": "/some/path-without-tab",
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    log = exec_log.read_text() if exec_log.exists() else ""
+    assert "rsync" not in log
+    assert "malformed record" in result.stderr
+
+
+def test_seed_inspect_dirs_skips_non_inspect_targets(tmp_path):
+    """Records whose remote target is NOT under /inspect/ are skipped."""
+    src = _make_plain_dir(tmp_path / "hostroot", "weird", {"x.txt": "x"})
+    dest = tmp_path / "machine"
+    dest.mkdir()
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    _make_stub_flyctl(fake_flyctl, exec_log, dest)
+    _make_stub_timeout(tmp_path)
+
+    record = f"{src}\t/work/sub"
+    result = _run_bash(
+        f"source {SEED_SH}; seed_inspect_dirs",
+        env={
+            "LEERIE_MACHINE_ID": "test-machine-001",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(tmp_path),
+            "LEERIE_INSPECT_HOST_TARGETS": record,
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    log = exec_log.read_text() if exec_log.exists() else ""
+    assert "rsync" not in log
+    assert "skipping non-/inspect target" in result.stderr
+
+
+def test_seed_inspect_dirs_creates_inspect_parent_first(tmp_path):
+    """`mkdir -p /inspect && chown leerie: /inspect` appears in the log
+    BEFORE any per-dir operation."""
+    src = _make_git_repo(tmp_path / "hostroot", "first", {"a.txt": "a"})
+    dest = tmp_path / "machine"
+    dest.mkdir()
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    _make_stub_flyctl(fake_flyctl, exec_log, dest)
+    _make_stub_timeout(tmp_path)
+
+    record = f"{src}\t/inspect/first"
+    result = _run_bash(
+        f"source {SEED_SH}; seed_inspect_dirs",
+        env={
+            "LEERIE_MACHINE_ID": "test-machine-001",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(tmp_path),
+            "LEERIE_INSPECT_HOST_TARGETS": record,
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    log = exec_log.read_text()
+    mkdir_pos = log.find("mkdir -p /inspect &&")
+    bundle_pos = log.find("cat > /tmp/leerie-inspect-")
+    rsync_pos = log.find("rsync")
+    assert mkdir_pos != -1, log
+    # The bundle pipe must come after the parent mkdir.
+    if bundle_pos != -1:
+        assert mkdir_pos < bundle_pos, log
+    if rsync_pos != -1:
+        assert mkdir_pos < rsync_pos, log
+
+
+# ----------------------------------------------------------------------------
+# Git-repo bundle-clone path
+# ----------------------------------------------------------------------------
+
+
+def test_seed_inspect_dirs_git_repo_uses_bundle_clone(tmp_path):
+    """A git-repo inspect dir is shipped via bundle + machine-side clone.
+    The committed file lands under DEST/inspect/<base>/."""
+    src = _make_git_repo(tmp_path / "hostroot", "beacon",
+                         {"src/api.ts": "export const x = 1\n"})
     dest = tmp_path / "machine"
     dest.mkdir()
     exec_log = tmp_path / "exec_log.txt"
@@ -198,17 +386,27 @@ def test_seed_inspect_dirs_single_dir_lands(tmp_path):
         },
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
-    landed = dest / "inspect" / "beacon" / "README.md"
-    assert landed.exists(), f"file did not land at {landed}; stderr={result.stderr}"
-    assert landed.read_text() == "hi beacon"
+    log = exec_log.read_text()
+    # Bundle pipe + machine-side clone must both appear.
+    assert "cat > /tmp/leerie-inspect-beacon.bundle" in log, log
+    assert "git clone /tmp/leerie-inspect-beacon.bundle /inspect/beacon" in log, log
+    # The clone landed.
+    landed = dest / "inspect" / "beacon" / "src" / "api.ts"
+    assert landed.exists(), f"committed file did not land at {landed}; log:\n{log}"
+    assert landed.read_text() == "export const x = 1\n"
+    # And it's a real git clone.
+    assert (dest / "inspect" / "beacon" / ".git").is_dir()
 
 
-def test_seed_inspect_dirs_multiple_dirs_each_lands_separately(tmp_path):
-    """Two inspect-dir records → both contents land at their distinct targets."""
-    src_a = _make_host_inspect_dir(tmp_path / "hostroot", "stackpulse",
-                                   {"src/api.ts": "export const x = 1"})
-    src_b = _make_host_inspect_dir(tmp_path / "hostroot", "navegando",
-                                   {"docs/intro.md": "navegando docs"})
+def test_seed_inspect_dirs_git_repo_includes_dirty_delta(tmp_path):
+    """After bundle-clone, the dirty/uncommitted delta is rsync'd on top —
+    workers see the host's in-flight edits."""
+    src = _make_git_repo(
+        tmp_path / "hostroot", "beacon",
+        files={"src/api.ts": "export const x = 1\n"},
+        dirty_files={"src/api.ts": "export const x = 2 // edited\n",
+                     "untracked.md": "new!"},
+    )
     dest = tmp_path / "machine"
     dest.mkdir()
     exec_log = tmp_path / "exec_log.txt"
@@ -216,7 +414,7 @@ def test_seed_inspect_dirs_multiple_dirs_each_lands_separately(tmp_path):
     _make_stub_flyctl(fake_flyctl, exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    record = f"{src_a}\t/inspect/stackpulse\n{src_b}\t/inspect/navegando"
+    record = f"{src}\t/inspect/beacon"
     result = _run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
@@ -228,24 +426,116 @@ def test_seed_inspect_dirs_multiple_dirs_each_lands_separately(tmp_path):
         },
     )
     assert result.returncode == 0, f"stderr: {result.stderr}"
-    assert (dest / "inspect" / "stackpulse" / "src" / "api.ts").read_text() == \
-        "export const x = 1"
-    assert (dest / "inspect" / "navegando" / "docs" / "intro.md").read_text() == \
-        "navegando docs"
+    # The dirty edit landed.
+    modified = dest / "inspect" / "beacon" / "src" / "api.ts"
+    assert modified.read_text() == "export const x = 2 // edited\n", (
+        f"dirty delta did not land; content: {modified.read_text()!r}"
+    )
+    # The untracked file also landed.
+    untracked = dest / "inspect" / "beacon" / "untracked.md"
+    assert untracked.exists() and untracked.read_text() == "new!"
 
 
-def test_seed_inspect_dirs_chowns_each_target(tmp_path):
-    """After each rsync, `chown -R leerie: /inspect/<base>` appears in the
-    exec log — same ownership-handover pattern seed_repo_dirty uses."""
-    src_a = _make_host_inspect_dir(tmp_path / "hostroot", "alpha",
-                                   {"a.txt": "a"})
-    src_b = _make_host_inspect_dir(tmp_path / "hostroot", "bravo",
-                                   {"b.txt": "b"})
+def test_seed_inspect_dirs_skips_bundle_on_resume(tmp_path):
+    """If /inspect/<base>/.git already exists on the machine, the bundle
+    phase is skipped — only the dirty delta refreshes."""
+    src = _make_git_repo(
+        tmp_path / "hostroot", "beacon",
+        files={"src/api.ts": "v1\n"},
+        dirty_files={"src/api.ts": "v2\n"},
+    )
+    dest = tmp_path / "machine"
+    dest.mkdir()
+    # Pre-create the marker: DEST/inspect/beacon/.git is what the resume
+    # probe checks for.
+    pre = dest / "inspect" / "beacon"
+    pre.mkdir(parents=True)
+    (pre / ".git").mkdir()
+
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    _make_stub_flyctl(fake_flyctl, exec_log, dest)
+    _make_stub_timeout(tmp_path)
+
+    record = f"{src}\t/inspect/beacon"
+    result = _run_bash(
+        f"source {SEED_SH}; seed_inspect_dirs",
+        env={
+            "LEERIE_MACHINE_ID": "test-machine-001",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(tmp_path),
+            "LEERIE_INSPECT_HOST_TARGETS": record,
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    log = exec_log.read_text()
+    # No bundle pipe — the resume probe short-circuited the clone.
+    assert "cat > /tmp/leerie-inspect-beacon.bundle" not in log, (
+        f"bundle should be skipped on resume; log:\n{log}"
+    )
+    assert "git clone /tmp/leerie-inspect-beacon.bundle" not in log, log
+    # But the rsync (dirty) still ran.
+    assert "rsync" in log, f"dirty rsync should still run on resume; log:\n{log}"
+    # And the resume marker shows in stderr.
+    assert "already present" in result.stderr
+
+
+def test_seed_inspect_dirs_clones_new_dir_added_at_resume(tmp_path):
+    """When two inspect dirs are passed and only one was previously seeded,
+    the new one goes the full bundle path and the old one only refreshes."""
+    src_a = _make_git_repo(tmp_path / "hostroot", "old",
+                           {"a.txt": "a"})
+    src_b = _make_git_repo(tmp_path / "hostroot", "new",
+                           {"b.txt": "b"})
+    dest = tmp_path / "machine"
+    dest.mkdir()
+    # Mark "old" as already seeded.
+    (dest / "inspect" / "old" / ".git").mkdir(parents=True)
+
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    _make_stub_flyctl(fake_flyctl, exec_log, dest)
+    _make_stub_timeout(tmp_path)
+
+    record = f"{src_a}\t/inspect/old\n{src_b}\t/inspect/new"
+    result = _run_bash(
+        f"source {SEED_SH}; seed_inspect_dirs",
+        env={
+            "LEERIE_MACHINE_ID": "test-machine-001",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(tmp_path),
+            "LEERIE_INSPECT_HOST_TARGETS": record,
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    log = exec_log.read_text()
+    # "new" must be bundle-cloned.
+    assert "cat > /tmp/leerie-inspect-new.bundle" in log, log
+    assert "git clone /tmp/leerie-inspect-new.bundle /inspect/new" in log, log
+    # "old" must NOT be bundle-cloned.
+    assert "cat > /tmp/leerie-inspect-old.bundle" not in log, log
+    assert "git clone /tmp/leerie-inspect-old.bundle" not in log, log
+    # The new dir landed.
+    assert (dest / "inspect" / "new" / "b.txt").exists()
+
+
+def test_seed_inspect_dirs_aborts_on_rsync_failure(tmp_path):
+    """A failed rsync (dirty or fallback) makes seed_inspect_dirs return 1
+    and stop — the second record is not attempted."""
+    src_a = _make_git_repo(
+        tmp_path / "hostroot", "alpha",
+        files={"a.txt": "v1"},
+        dirty_files={"a.txt": "v2"},
+    )
+    src_b = _make_git_repo(tmp_path / "hostroot", "bravo",
+                           {"b.txt": "b"})
     dest = tmp_path / "machine"
     dest.mkdir()
     exec_log = tmp_path / "exec_log.txt"
     fake_flyctl = tmp_path / "flyctl"
-    _make_stub_flyctl(fake_flyctl, exec_log, dest)
+    _make_stub_flyctl(fake_flyctl, exec_log, dest, fail_rsync=True)
     _make_stub_timeout(tmp_path)
 
     record = f"{src_a}\t/inspect/alpha\n{src_b}\t/inspect/bravo"
@@ -259,24 +549,58 @@ def test_seed_inspect_dirs_chowns_each_target(tmp_path):
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )
+    assert result.returncode != 0
+    log = exec_log.read_text()
+    # bravo's bundle must NOT appear — we bailed after alpha failed.
+    assert "cat > /tmp/leerie-inspect-bravo.bundle" not in log, (
+        f"bravo should not have been attempted; log:\n{log}"
+    )
+
+
+# ----------------------------------------------------------------------------
+# Non-git rsync fallback
+# ----------------------------------------------------------------------------
+
+
+def test_seed_inspect_dirs_non_git_dir_uses_plain_rsync(tmp_path):
+    """A non-git directory takes the rsync fallback path. No bundle pipe
+    appears in the log; the file lands via rsync."""
+    src = _make_plain_dir(tmp_path / "hostroot", "docs",
+                          {"README.md": "hi docs"})
+    dest = tmp_path / "machine"
+    dest.mkdir()
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    _make_stub_flyctl(fake_flyctl, exec_log, dest)
+    _make_stub_timeout(tmp_path)
+
+    record = f"{src}\t/inspect/docs"
+    result = _run_bash(
+        f"source {SEED_SH}; seed_inspect_dirs",
+        env={
+            "LEERIE_MACHINE_ID": "test-machine-001",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(tmp_path),
+            "LEERIE_INSPECT_HOST_TARGETS": record,
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
     assert result.returncode == 0, f"stderr: {result.stderr}"
     log = exec_log.read_text()
-    assert "chown -R leerie: /inspect/alpha" in log, (
-        f"missing alpha chown; log:\n{log}"
+    assert "cat > /tmp/leerie-inspect-" not in log, (
+        f"non-git dir should not bundle; log:\n{log}"
     )
-    assert "chown -R leerie: /inspect/bravo" in log, (
-        f"missing bravo chown; log:\n{log}"
-    )
+    assert "rsync" in log
+    assert (dest / "inspect" / "docs" / "README.md").read_text() == "hi docs"
 
 
-def test_seed_inspect_dirs_preserves_nfc_unicode_filenames(tmp_path):
-    """Inspect dirs commonly contain non-ASCII filenames (PDFs, docs).
-    rsync preserves filename bytes verbatim on the Linux receiver — no
-    NFC→NFD flip from a tar pipe. Regression-protects the rationale that
-    drove the seed_repo_dirty design (seed-repo.sh:22-38)."""
+def test_seed_inspect_dirs_non_git_preserves_nfc_unicode_filenames(tmp_path):
+    """rsync (fallback path) preserves filename bytes verbatim — non-ASCII
+    filenames survive the round trip. Regression for the rationale that
+    drove the rsync-vs-tar choice (seed-repo.sh:22-38)."""
     nfc_name = "Planón.pdf"  # 'ó' as single codepoint U+00F3 (NFC)
-    src = _make_host_inspect_dir(tmp_path / "hostroot", "docs",
-                                 {nfc_name: "binary-ish content"})
+    src = _make_plain_dir(tmp_path / "hostroot", "docs",
+                          {nfc_name: "binary-ish"})
     dest = tmp_path / "machine"
     dest.mkdir()
     exec_log = tmp_path / "exec_log.txt"
@@ -298,144 +622,6 @@ def test_seed_inspect_dirs_preserves_nfc_unicode_filenames(tmp_path):
     assert result.returncode == 0, f"stderr: {result.stderr}"
     landed_files = [p.name for p in (dest / "inspect" / "docs").iterdir()]
     assert nfc_name in landed_files, (
-        f"NFC filename {nfc_name!r} not preserved; landed files: "
+        f"NFC filename not preserved; landed: "
         f"{[name.encode('utf-8') for name in landed_files]}"
     )
-
-
-def test_seed_inspect_dirs_skips_non_inspect_targets(tmp_path):
-    """Records whose remote target is NOT under /inspect/ are skipped
-    structurally — belt-and-braces against an in-repo path slipping
-    through the launcher's redundant-mount-skip branch."""
-    src = _make_host_inspect_dir(tmp_path / "hostroot", "weird",
-                                 {"x.txt": "x"})
-    dest = tmp_path / "machine"
-    dest.mkdir()
-    exec_log = tmp_path / "exec_log.txt"
-    fake_flyctl = tmp_path / "flyctl"
-    _make_stub_flyctl(fake_flyctl, exec_log, dest)
-    _make_stub_timeout(tmp_path)
-
-    # Remote target points at /work/sub — must NOT be rsync'd.
-    record = f"{src}\t/work/sub"
-    result = _run_bash(
-        f"source {SEED_SH}; seed_inspect_dirs",
-        env={
-            "LEERIE_MACHINE_ID": "test-machine-001",
-            "LEERIE_FLY_APP": "leerie",
-            "USER_REPO": str(tmp_path),
-            "LEERIE_INSPECT_HOST_TARGETS": record,
-            "PATH": f"{tmp_path}:/usr/bin:/bin",
-        },
-    )
-    assert result.returncode == 0, f"stderr: {result.stderr}"
-    # mkdir /inspect should have happened, but no rsync for /work/sub
-    # should appear in the log.
-    log = exec_log.read_text()
-    assert "rsync" not in log, (
-        f"non-/inspect target should be skipped; rsync log line found:\n{log}"
-    )
-    assert "skipping non-/inspect target" in result.stderr
-
-
-def test_seed_inspect_dirs_creates_inspect_parent_first(tmp_path):
-    """The mkdir /inspect step appears in the log BEFORE any rsync — so
-    per-dir rsync lands under a leerie-owned parent."""
-    src = _make_host_inspect_dir(tmp_path / "hostroot", "first",
-                                 {"a.txt": "a"})
-    dest = tmp_path / "machine"
-    dest.mkdir()
-    exec_log = tmp_path / "exec_log.txt"
-    fake_flyctl = tmp_path / "flyctl"
-    _make_stub_flyctl(fake_flyctl, exec_log, dest)
-    _make_stub_timeout(tmp_path)
-
-    record = f"{src}\t/inspect/first"
-    result = _run_bash(
-        f"source {SEED_SH}; seed_inspect_dirs",
-        env={
-            "LEERIE_MACHINE_ID": "test-machine-001",
-            "LEERIE_FLY_APP": "leerie",
-            "USER_REPO": str(tmp_path),
-            "LEERIE_INSPECT_HOST_TARGETS": record,
-            "PATH": f"{tmp_path}:/usr/bin:/bin",
-        },
-    )
-    assert result.returncode == 0, f"stderr: {result.stderr}"
-    log = exec_log.read_text()
-    mkdir_pos = log.find("mkdir -p /inspect")
-    rsync_pos = log.find("rsync")
-    assert mkdir_pos != -1, f"missing mkdir /inspect step; log:\n{log}"
-    assert rsync_pos != -1, f"missing rsync step; log:\n{log}"
-    assert mkdir_pos < rsync_pos, (
-        f"mkdir /inspect must precede rsync; got positions "
-        f"mkdir={mkdir_pos}, rsync={rsync_pos}; log:\n{log}"
-    )
-
-
-def test_seed_inspect_dirs_aborts_on_rsync_failure(tmp_path):
-    """A failed rsync makes seed_inspect_dirs return 1 and stop — the
-    second record is NOT attempted. Mirrors seed_repo_dirty's fatal-on-
-    rsync-failure behavior."""
-    src_a = _make_host_inspect_dir(tmp_path / "hostroot", "alpha",
-                                   {"a.txt": "a"})
-    src_b = _make_host_inspect_dir(tmp_path / "hostroot", "bravo",
-                                   {"b.txt": "b"})
-    dest = tmp_path / "machine"
-    dest.mkdir()
-    exec_log = tmp_path / "exec_log.txt"
-    fake_flyctl = tmp_path / "flyctl"
-    _make_stub_flyctl(fake_flyctl, exec_log, dest, fail_rsync=True)
-    _make_stub_timeout(tmp_path)
-
-    record = f"{src_a}\t/inspect/alpha\n{src_b}\t/inspect/bravo"
-    result = _run_bash(
-        f"source {SEED_SH}; seed_inspect_dirs",
-        env={
-            "LEERIE_MACHINE_ID": "test-machine-001",
-            "LEERIE_FLY_APP": "leerie",
-            "USER_REPO": str(tmp_path),
-            "LEERIE_INSPECT_HOST_TARGETS": record,
-            "PATH": f"{tmp_path}:/usr/bin:/bin",
-        },
-    )
-    assert result.returncode != 0, (
-        f"expected nonzero exit on rsync failure; got 0\n"
-        f"stderr={result.stderr}\nlog={exec_log.read_text()}"
-    )
-    log = exec_log.read_text()
-    # bravo's chown must NOT appear — we should have bailed after alpha
-    # failed.
-    assert "chown -R leerie: /inspect/bravo" not in log, (
-        f"bravo should not have been attempted after alpha rsync failed; "
-        f"log:\n{log}"
-    )
-
-
-def test_seed_inspect_dirs_skips_malformed_record(tmp_path):
-    """A record without a tab separator is logged and skipped (not
-    rsync'd to an empty/bogus target). Belt-and-braces defense."""
-    dest = tmp_path / "machine"
-    dest.mkdir()
-    exec_log = tmp_path / "exec_log.txt"
-    fake_flyctl = tmp_path / "flyctl"
-    _make_stub_flyctl(fake_flyctl, exec_log, dest)
-    _make_stub_timeout(tmp_path)
-
-    record = "/some/path-without-tab-separator"  # no \t
-    result = _run_bash(
-        f"source {SEED_SH}; seed_inspect_dirs",
-        env={
-            "LEERIE_MACHINE_ID": "test-machine-001",
-            "LEERIE_FLY_APP": "leerie",
-            "USER_REPO": str(tmp_path),
-            "LEERIE_INSPECT_HOST_TARGETS": record,
-            "PATH": f"{tmp_path}:/usr/bin:/bin",
-        },
-    )
-    assert result.returncode == 0, f"stderr: {result.stderr}"
-    log = exec_log.read_text()
-    assert "rsync" not in log, (
-        f"malformed record should be skipped; rsync log line found:\n{log}"
-    )
-    assert "malformed record" in result.stderr
