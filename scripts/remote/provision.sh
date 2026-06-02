@@ -52,6 +52,16 @@ FLY_REGION="${FLY_REGION:-iad}"
 FLY_VM_CPUS="${FLY_VM_CPUS:-4}"
 FLY_VM_MEMORY="${FLY_VM_MEMORY:-8192}"
 
+# Fly's `shared` CPU class tops out at 8 CPUs / 16384 MB. Above either
+# ceiling, promote to `performance` CPUs (significantly more expensive —
+# ~14x per CPU-second — but the only way to exceed shared-cpu-8x).
+if [ "$FLY_VM_CPUS" -gt 8 ] || [ "$FLY_VM_MEMORY" -gt 16384 ]; then
+  FLY_VM_CPU_KIND="performance"
+  remote_log "remote: using performance CPUs (cpus=$FLY_VM_CPUS memory=${FLY_VM_MEMORY}MB exceeds shared-cpu-8x ceiling of 8/16384)"
+else
+  FLY_VM_CPU_KIND="shared"
+fi
+
 # Max seconds to wait for the machine to reach state "started".
 MACHINE_START_TIMEOUT="${LEERIE_MACHINE_START_TIMEOUT:-120}"
 
@@ -335,6 +345,7 @@ provision_machine() {
        --region "$FLY_REGION" \
        --vm-cpus "$FLY_VM_CPUS" \
        --vm-memory "$FLY_VM_MEMORY" \
+       --vm-cpu-kind "$FLY_VM_CPU_KIND" \
        --detach \
        2>&1)"; then
     # Extract the first whitespace-delimited token after "Machine ID:".
