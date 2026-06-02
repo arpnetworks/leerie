@@ -132,6 +132,16 @@ case "$remote_cmd" in
     eval "$local_cmd"
     exit $?
     ;;
+  rsync*)
+    # Rsync server invocation for the seed_repo_dirty delta phase.
+    # The driver rsync expects a real `rsync --server` on the other
+    # end of the protocol. Substitute the trailing `/work` → DEST/work
+    # so the receiver actually has a real dest directory; then eval
+    # the rewritten command locally so the two rsyncs can talk.
+    local_cmd="${{remote_cmd// \\/work/ $DEST/work}}"
+    eval "$local_cmd"
+    exit $?
+    ;;
   chown*)
     # Standalone chown calls (none expected post-bundle-rewrite, but
     # safe to swallow).
@@ -312,17 +322,26 @@ def test_seed_repo_pipes_bundle_via_ssh_console(tmp_path):
     assert "find /work -mindepth 1 -maxdepth 1" in log_text, (
         f"expected /work content-wipe step; got:\n{log_text}"
     )
-    # Parent bundle pipe.
-    assert "cat > /tmp/pila-seed.bundle" in log_text, (
-        f"expected parent bundle pipe; got:\n{log_text}"
+    # Parent bundle pipe. The `sh -c '...'` wrapper is load-bearing —
+    # bare `cat > /tmp/...` fails on flyctl's `-C` arg with
+    # `cat: invalid option -- 'c'`. Assert the exact wrapped form so
+    # a revert is caught by the test, not a live run.
+    assert "sh -c 'cat > /tmp/pila-seed.bundle'" in log_text, (
+        f"expected `sh -c 'cat > /tmp/pila-seed.bundle'` (the wrapper "
+        f"is load-bearing); got:\n{log_text}"
     )
     # Machine-side clone command.
     assert "git clone /tmp/pila-seed.bundle /work" in log_text, (
         f"expected machine-side clone from bundle; got:\n{log_text}"
     )
-    # No rsync (the old path).
-    assert "rsync" not in log_text, (
-        f"rsync should not appear in the new bundle-only path; got:\n{log_text}"
+    # protocol.file.allow=always is load-bearing for the submodule
+    # update — git 2.38+ blocks file:// transport per CVE-2022-39253.
+    # Assert the flag is in the clone script even if this fixture has
+    # no submodules (the gate stays around the submodule update block
+    # in seed-repo.sh).
+    assert "protocol.file.allow=always" in log_text, (
+        f"expected `protocol.file.allow=always` on the submodule update "
+        f"(CVE-2022-39253 mitigation); got:\n{log_text}"
     )
     # No tar -xC (the older tar-pipe path).
     assert "tar -xC /work" not in log_text, (
@@ -331,6 +350,113 @@ def test_seed_repo_pipes_bundle_via_ssh_console(tmp_path):
     # The bundle file actually landed.
     assert (dest / "seed.bundle").exists(), (
         f"parent bundle was not captured at {dest/'seed.bundle'}"
+    )
+
+
+def test_seed_repo_respects_gitignore_and_force_includes_claude(tmp_path):
+    """seed_repo's combined bundle+rsync payload obeys .gitignore
+    (skipping build artifacts and gitignored .claude/ entries from the
+    bundle), hard-skips .pila/, and hard-includes the repo-local
+    `.claude/` directory via the rsync delta even when .gitignore
+    excludes it. Restores test coverage that existed at HEAD~1 for the
+    tar-pipeline seed; the bundle-based seed must preserve the same
+    behavior so workers always get their hooks/agents/skills/commands.
+    """
+    repo = tmp_path / "myrepo"
+    repo.mkdir()
+    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "config", "user.name", "Test"],
+        check=True, capture_output=True,
+    )
+    # .gitignore excludes build artifacts AND .claude/ (the common case
+    # — most pila users have `.claude/` in their gitignore). We want
+    # .claude/ force-included DESPITE this.
+    (repo / ".gitignore").write_text("build/\n*.log\n.claude/\n")
+    # Tracked source file (committed → goes via the parent bundle).
+    (repo / "src.py").write_text("print('hi')")
+    # Untracked-not-ignored file (rides along via seed_repo_dirty rsync).
+    (repo / "untracked.txt").write_text("untracked")
+    # Gitignored build artifact (must NOT ride along — not in bundle,
+    # not in porcelain, not in force-included set).
+    (repo / "build").mkdir()
+    (repo / "build" / "out.bin").write_text("artifact")
+    # Gitignored log file (same — must NOT ride along).
+    (repo / "debug.log").write_text("noise")
+    # Host run state (must NOT ride along regardless).
+    (repo / ".pila" / "runs" / "old").mkdir(parents=True)
+    (repo / ".pila" / "runs" / "old" / "state.json").write_text("{}")
+    # Repo-local Claude settings (gitignored, but force-include via
+    # seed_repo_dirty's .claude/ walk).
+    (repo / ".claude" / "hooks").mkdir(parents=True)
+    (repo / ".claude" / "settings.local.json").write_text('{"x": 1}')
+    (repo / ".claude" / "hooks" / "pre-tool-use.sh").write_text("#!/bin/sh\n")
+    subprocess.run(
+        ["git", "-C", str(repo), "add", ".gitignore", "src.py"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"],
+        check=True, capture_output=True,
+    )
+
+    dest = tmp_path / "machine"
+    dest.mkdir()
+    exec_log = tmp_path / "exec_log.txt"
+    fake_flyctl = tmp_path / "flyctl"
+    _make_stub_flyctl(fake_flyctl, exec_log, dest)
+    _make_stub_timeout(tmp_path)
+
+    result = _run_bash(
+        f"source {SEED_SH}; seed_repo",
+        env={
+            "PILA_MACHINE_ID": "test-machine-gitaware",
+            "PILA_FLY_APP": "pila",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+
+    # Inspect dest/work — the union of the bundle clone + the dirty
+    # delta rsync.
+    work = dest / "work"
+    landed = {
+        str(p.relative_to(work))
+        for p in work.rglob("*")
+        if p.is_file()
+    }
+
+    # Tracked file rides along via the bundle.
+    assert "src.py" in landed, f"committed src.py missing; got: {landed}"
+    # Untracked-not-ignored rides along via the rsync delta.
+    assert "untracked.txt" in landed, (
+        f"untracked.txt missing from rsync delta; got: {landed}"
+    )
+    # Gitignored artifacts do NOT ride along.
+    assert "build/out.bin" not in landed, (
+        f"gitignored build artifact leaked into seed: {landed}"
+    )
+    assert "debug.log" not in landed, (
+        f"gitignored log file leaked into seed: {landed}"
+    )
+    # .pila/ never rides along regardless of .gitignore (defensive
+    # filter in the porcelain pipeline + .pila/ not enumerated in
+    # the .claude force-include walk).
+    assert not any(p.startswith(".pila/") for p in landed), (
+        f"host .pila/ leaked into seed: {landed}"
+    )
+    # .claude/ rides along EVEN THOUGH .gitignore lists it (the
+    # regression test — this MUST be force-included).
+    assert ".claude/settings.local.json" in landed, (
+        f".claude/ should be force-included; got: {landed}"
+    )
+    assert ".claude/hooks/pre-tool-use.sh" in landed, (
+        f".claude/hooks/* should be force-included; got: {landed}"
     )
 
 

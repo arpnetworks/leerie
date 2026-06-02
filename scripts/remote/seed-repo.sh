@@ -256,13 +256,20 @@ rm -rf /tmp/pila-seed.bundle /tmp/pila-subs
 # `scripts/remote/re-seed.sh` (Phase 4) when the user pauses a run,
 # edits files locally, and resumes.
 #
-# The dirty set is `git status --porcelain` of the host repo, filtered:
-#   - Modified-but-uncommitted tracked files
-#   - Untracked-not-ignored files
-#   - Defensive excludes for `.pila/runs/*/worktrees/*` (host-side
-#     worktree paths can't structurally appear today but the exclude
-#     prevents silent clobbering if the upstream behavior ever changes)
-#   - Defensive excludes for `.git/*` (same shape)
+# The file list, host-side, combines two sources:
+#
+#   (a) `git status --porcelain` output (modified-but-uncommitted
+#       tracked files + untracked-not-ignored files), filtered to drop
+#       defensive `.pila/runs/*/worktrees/*` and `.git/*` entries (the
+#       upstream behavior shouldn't surface these today, but the
+#       exclude prevents silent clobbering if it ever does).
+#
+#   (b) Every file under the repo-local `.claude/` directory, force-
+#       included even when `.gitignore` excludes it. Most repos list
+#       `.claude/` in their gitignore but workers need its hooks,
+#       agents, skills, commands, and settings to function. Bundles
+#       can't carry gitignored content (only committed state), so this
+#       step is where `.claude/` lands on the machine.
 #
 # Transport: rsync over `flyctl ssh console -C "rsync --server ..."`
 # via the `fly_rsync_wrapper` helper in lib.sh. rsync preserves
@@ -294,19 +301,32 @@ seed_repo_dirty() {
                       }
                   ')"
 
-  if [ -z "$dirty_files" ]; then
+  # The dirty set is git status output. But we ALSO need to ship the
+  # repo-local `.claude/` directory verbatim, even when it's gitignored
+  # (the common case — most repos list `.claude/` in their gitignore).
+  # Workers need its hooks/agents/skills/commands to function. The
+  # bundle-based seed_repo_clone can't carry it (gitignored content
+  # isn't in the bundle); this rsync step is where it lands.
+  local claude_files=""
+  if [ -d "$USER_REPO/.claude" ]; then
+    claude_files="$(cd "$USER_REPO" && find .claude -type f 2>/dev/null)"
+  fi
+
+  if [ -z "$dirty_files" ] && [ -z "$claude_files" ]; then
     echo "[pila] remote: seeding — working tree is clean; no delta to sync" >&2
     return 0
   fi
 
+  # Combined count for the user-facing message (dirty entries +
+  # .claude/ files). Count nonempty input lines from both sources.
   local file_count
-  file_count="$(printf '%s\n' "$dirty_files" | wc -l | tr -d ' ')"
-  echo "[pila] remote: seeding — syncing $file_count dirty file(s)/dir(s)..." >&2
+  file_count="$(printf '%s\n%s\n' "$dirty_files" "$claude_files" \
+                 | grep -c -v '^$' || true)"
+  echo "[pila] remote: seeding — syncing $file_count dirty / forced-include file(s)..." >&2
 
-  # rsync the dirty delta. Same NFC-preservation reason as
-  # seed_repo_clone — if a paused-and-edited file has non-ASCII chars
-  # in its name, host-side tar -c would normalize to NFD and the
-  # parent repo on the machine would flag dirty after the re-seed.
+  # rsync the dirty delta. rsync preserves filename bytes verbatim
+  # (NFC stays NFC on the Linux receiver), important for the same
+  # reason seed_repo_clone uses bundles instead of tar.
   #
   # Defensive: the dirty set comes from `git status --porcelain` which
   # operates on the parent repo. Excluding .pila/runs/*/worktrees/*
@@ -327,14 +347,24 @@ seed_repo_dirty() {
   file_list="$(mktemp -t pila-reseed-list.XXXXXX)"
   wrapper="$(fly_rsync_wrapper "$FLY_APP")"
 
-  # Build NUL-delimited file list, filtering out worktree + .git paths.
-  printf '%s\n' "$dirty_files" \
+  # Build NUL-delimited file list. Two sources concatenated:
+  #   (a) git porcelain dirty set, filtered (drop .git/, .pila/runs/
+  #       worktrees, blanks)
+  #   (b) repo-local .claude/ files (force-included even if gitignored)
+  # The python filter applies to both; .claude/* entries from (b)
+  # pass the filter trivially (no .git/ or worktree prefix).
+  printf '%s\n%s\n' "$dirty_files" "$claude_files" \
     | python3 -c '
 import sys
 for line in sys.stdin.read().splitlines():
     if not line:
         continue
+    # .git/ and .pila/ are coordination state, never transported here.
+    # .git/ → bundle path creates it natively on the machine.
+    # .pila/ → host-side run state; the machine writes its own.
     if line.startswith(".git/") or line == ".git":
+        continue
+    if line.startswith(".pila/") or line == ".pila":
         continue
     # Defensive: drop worktree paths if they ever surface.
     if "/.pila/runs/" in line and "/worktrees/" in line:
