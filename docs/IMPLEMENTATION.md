@@ -2596,8 +2596,11 @@ normalization decision ever happens.
 dirty set from `git status --porcelain` on the host:
 - Modified-but-uncommitted tracked files
 - Untracked-not-ignored files
-- Defensive excludes for `.pila/runs/*/worktrees/*` and `.git/*`
-- Forced-in `.claude/` (workers need it, often gitignored)
+- Defensive filter drops `.git/*`, `.pila/*`, and worktree paths
+  (`.pila/runs/*/worktrees/*`) before handing the list to rsync
+- Forced-in `.claude/` (workers need it, often gitignored) —
+  enumerated via `find .claude -type f` host-side and appended to
+  the dirty list before the defensive filter
 
 The dirty set is rsync'd over `flyctl ssh console -C "rsync --server
 ..."` via `fly_rsync_wrapper` (lib.sh). NFC byte preservation is
@@ -2800,12 +2803,15 @@ Three operations in `re_seed`, in order:
    of in-flight worker edits that haven't yet been committed to a
    per-subtask branch.
 3. **`seed_repo_dirty`.** Recompute the host's `git status
-   --porcelain` dirty set, tar it (with defensive `--exclude` flags
-   for `.pila/runs/*/worktrees/*` and `.git/*`), pipe via
-   `flyctl machine exec tar -C /work -xzf -`. The full-history
-   clone on the machine is preserved — re-seed must never re-clone,
-   because that would obliterate the run branch and per-subtask
-   branches.
+   --porcelain` dirty set, append every file under the repo-local
+   `.claude/` directory (force-included even when gitignored — workers
+   need its hooks/agents/skills/commands), filter the combined list
+   (drop `.git/*`, `.pila/*`, and `.pila/runs/*/worktrees/*` defensive
+   entries), then rsync the result to `/work` on the machine via
+   `fly_rsync_wrapper` from `lib.sh` (transports `rsync --server` over
+   `flyctl ssh console -C`). The full-history clone on the machine is
+   preserved — re-seed must never re-clone, because that would
+   obliterate the run branch and per-subtask branches.
 
 Launcher flag consumption:
 

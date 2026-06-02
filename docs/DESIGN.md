@@ -1079,10 +1079,18 @@ laptop state" = host commits plus host dirty edits):
 
 The dirty set is computed on the host where worktree paths
 (`.pila/runs/<run-id>/worktrees/...`) structurally cannot appear,
-because worktrees live only on the machine. A defensive
-filter excludes `.pila/runs/*/worktrees/*` and `.git/*` paths
+because worktrees live only on the machine. A defensive filter
+excludes `.git/*`, `.pila/*`, and `.pila/runs/*/worktrees/*` paths
 before handing the file list to rsync's `--files-from=-` — protects
-against a future change that lets host-side paths name worktree files.
+against a future change that lets host-side paths name worktree files
+or surfaces host-side `.pila/` run state to the machine.
+
+The repo-local `.claude/` directory is force-included in the dirty
+set even when `.gitignore` excludes it (the common case). Workers
+need the repo's hooks, agents, skills, commands, and settings to
+function — and bundles can't carry gitignored content. Architectural
+guarantee: every fresh seed and every mid-run re-seed delivers the
+host's current `.claude/` to the machine.
 
 Resume auto-re-seeds by default. `--no-re-seed` opts out for the
 rate-limit auto-resume case where no host edits happened. The

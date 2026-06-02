@@ -21,13 +21,15 @@
 #      (unless PILA_RE_SEED_FORCE=1) — prevents silent clobbering of
 #      in-flight worker edits that haven't yet been committed to a
 #      per-subtask branch.
-#   3. Run seed_repo_dirty — recompute the host's dirty set, tar it, pipe
-#      to the machine. The full-history clone is preserved (no re-clone).
+#   3. Run seed_repo_dirty — recompute the host's dirty set + force-include
+#      .claude/, rsync to /work on the machine via fly_rsync_wrapper.
+#      The full-history clone is preserved (no re-clone — that would
+#      obliterate the run branch and per-subtask branches).
 #
 # Environment variables (set by the launcher):
 #
 #   PILA_RUN_ID         — run id whose sidecar holds fly_machine_id
-#   USER_REPO           — host-side repo path (for git status + tar source)
+#   USER_REPO           — host-side repo path (for git status + rsync source)
 #   PILA_FLY_APP        — Fly.io app name (default: "pila")
 #   PILA_RE_SEED_FORCE  — set to "1" to bypass the dirty-machine safety check
 

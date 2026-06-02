@@ -114,9 +114,11 @@ case "$remote_cmd" in
     exit 0
     ;;
   *"git clone /tmp/pila-seed.bundle /work"*)
-    # The machine-side clone script. Rewrite absolute paths to point
-    # inside the test's DEST dir, then strip the chown (no pila user
-    # on the test host), then exec.
+    # The machine-side clone script. Three transforms before eval:
+    # strip the chown (no pila user on the test host), strip the
+    # post-clone /tmp/pila-* cleanup (so tests can still inspect the
+    # captured bundle files), then rewrite the absolute paths to point
+    # inside the test's DEST dir.
     #
     # Step 1: strip the `chown -R pila: /work` line BEFORE path
     # substitution, since the path substitution would rewrite /work
@@ -143,8 +145,10 @@ case "$remote_cmd" in
     exit $?
     ;;
   chown*)
-    # Standalone chown calls (none expected post-bundle-rewrite, but
-    # safe to swallow).
+    # Standalone chown calls. seed_repo_dirty issues
+    # `chown -R pila: /work` after the rsync delta lands; that lands
+    # here. (The clone-script's inline chown is handled in the
+    # rewrite case above.) No pila user on the test host — swallow.
     exit 0
     ;;
   *)
