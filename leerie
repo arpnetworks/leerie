@@ -938,6 +938,15 @@ fi
 INSPECT_MOUNTS=()
 REWRITTEN_ARGS=()
 INSPECT_NAMES=()
+# Parallel to INSPECT_MOUNTS: pairs of "<host-path>\t<remote-target>" used by
+# the remote (Fly) runtime to rsync each inspect dir to /inspect/<basename>
+# on the machine. The local runtime ignores this — it uses INSPECT_MOUNTS
+# directly. Populated only for inspect dirs OUTSIDE $USER_REPO; in-repo
+# inspect dirs (the skip-redundant-mount branch in collect_inspect_path)
+# arrive on the machine via seed_repo at /work/<subpath> and need no
+# separate transport. See docs/IMPLEMENTATION.md §0.5 "Remote runtime
+# (Fly.io) transport".
+INSPECT_HOST_TARGETS=()
 
 collect_inspect_path() {
   local host_path expanded resolved base mount_target user_repo_resolved
@@ -983,6 +992,24 @@ collect_inspect_path() {
   INSPECT_NAMES+=("$base")
   INSPECT_MOUNTS+=(-v "$resolved:$mount_target:ro")
   REWRITTEN_ARGS+=(--inspect-dir "$mount_target")
+  # Remote (Fly) runtime needs the host-path → /inspect/<basename> mapping to
+  # rsync each dir onto the machine. Tab separator is safe: POSIX paths
+  # cannot contain \t (they can contain `:` and ` `).
+  INSPECT_HOST_TARGETS+=("$resolved"$'\t'"$mount_target")
+}
+
+# Serialize INSPECT_HOST_TARGETS for the remote-runtime helper. Empty array
+# → empty env var → seed_inspect_dirs short-circuits. Newline-separated
+# records, each "<host>\t<remote>", matching the format seed_inspect_dirs
+# parses with `read -r`. See docs/IMPLEMENTATION.md §0.5 "Remote runtime
+# (Fly.io) transport".
+_serialize_inspect_host_targets() {
+  if [ "${#INSPECT_HOST_TARGETS[@]}" -eq 0 ]; then
+    LEERIE_INSPECT_HOST_TARGETS=""
+  else
+    LEERIE_INSPECT_HOST_TARGETS="$(printf '%s\n' "${INSPECT_HOST_TARGETS[@]}")"
+  fi
+  export LEERIE_INSPECT_HOST_TARGETS
 }
 
 # Pre-pass: LEERIE_INSPECT_DIRS env (colon-separated).
@@ -1577,6 +1604,23 @@ except Exception:
         remote_log "error: repo seeding failed for machine $LEERIE_MACHINE_ID"
         container_rc=1
         _seed_ok=false
+      fi
+      # Inspect dirs: rsync each --inspect-dir host path to
+      # /inspect/<basename> on the machine. Re-resolved on every run
+      # (including resume) so the user can add an inspect dir at
+      # --resume time and expect it to land. The orchestrator already
+      # has the rewritten --inspect-dir /inspect/<basename> flags in
+      # REWRITTEN_ARGS; this just makes the in-machine paths exist.
+      # See docs/IMPLEMENTATION.md §0.5 "Remote runtime (Fly.io)
+      # transport". A failure is fatal — workers cannot do their job
+      # with --add-dir flags pointing at non-existent paths.
+      if [ "$_seed_ok" = "true" ]; then
+        _serialize_inspect_host_targets
+        if ! seed_inspect_dirs; then
+          remote_log "error: inspect-dir seeding failed for machine $LEERIE_MACHINE_ID"
+          container_rc=1
+          _seed_ok=false
+        fi
       fi
       if [ "$_seed_ok" = "true" ]; then
         # Start the orchestrator detached on the Fly Machine. setsid makes

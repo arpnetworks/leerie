@@ -399,6 +399,110 @@ for line in sys.stdin.read().splitlines():
 }
 
 # ---------------------------------------------------------------------------
+# seed_inspect_dirs
+#
+# Transport host-side --inspect-dir paths to /inspect/<basename> on the
+# machine via rsync over `flyctl ssh console`. The launcher already
+# rewrote each --inspect-dir CLI flag to /inspect/<basename> for the
+# orchestrator's in-machine view (REWRITTEN_ARGS); this function makes
+# those paths actually exist on the machine's filesystem.
+#
+# Input: LEERIE_INSPECT_HOST_TARGETS env var, newline-separated records
+# of "<host-path>\t<remote-target>". The launcher serializes its
+# INSPECT_HOST_TARGETS bash array to this env var via
+# _serialize_inspect_host_targets before calling. Empty / unset means no
+# inspect dirs — no-op return 0.
+#
+# Per-directory rsync (small N, typically 1–3). Per-dir is simpler than
+# a combined --files-from call: atomic per dir, clear error attribution,
+# fixed dest path. Reuses fly_rsync_wrapper (same helper seed_repo_dirty
+# uses).
+#
+# Why rsync (not a tar pipe): same reason seed_repo_dirty uses rsync —
+# macOS BSD `tar -c` flips filenames NFC → NFD during archive creation
+# (libarchive). rsync preserves filename bytes verbatim. Inspect dirs
+# commonly contain non-ASCII filenames.
+#
+# Each /inspect/<basename> is chowned leerie:leerie after rsync so the
+# orchestrator (running as leerie) and its workers can read it —
+# mirrors seed_repo_dirty's post-rsync chown of /work.
+# ---------------------------------------------------------------------------
+seed_inspect_dirs() {
+  _seed_repo_preflight || return 1
+
+  if [ -z "${LEERIE_INSPECT_HOST_TARGETS:-}" ]; then
+    return 0
+  fi
+
+  if command -v require_fly_ssh >/dev/null 2>&1; then
+    if ! require_fly_ssh "$FLY_APP"; then
+      remote_log "seed_inspect_dirs: Fly SSH setup failed; cannot seed inspect dirs"
+      return 1
+    fi
+  fi
+  if command -v wait_for_fly_ssh_ready >/dev/null 2>&1; then
+    wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID" || true
+  fi
+
+  # mkdir /inspect once + chown leerie:leerie so per-dir rsync lands
+  # under a leerie-owned parent.
+  if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+         --pty=false -C "sh -c 'mkdir -p /inspect && chown leerie: /inspect'" \
+         >/dev/null 2>&1; then
+    remote_log "seed_inspect_dirs: failed to mkdir /inspect on machine $LEERIE_MACHINE_ID"
+    return 1
+  fi
+
+  local wrapper rc=0 record host remote
+  wrapper="$(fly_rsync_wrapper "$FLY_APP")"
+
+  while IFS= read -r record; do
+    [ -z "$record" ] && continue
+    host="${record%%$'\t'*}"
+    remote="${record#*$'\t'}"
+    # Malformed record (no tab separator): bash parameter expansion
+    # returns the whole string unchanged when the pattern doesn't
+    # match. Log and skip rather than rsync to a bogus target.
+    if [ -z "$host" ] || [ -z "$remote" ] || [ "$host" = "$record" ]; then
+      remote_log "seed_inspect_dirs: malformed record (no tab separator): $record"
+      continue
+    fi
+    # Defensive: only ship targets under /inspect/. In-repo inspect
+    # dirs (launcher's skip-redundant-mount branch) rewrite to
+    # /work/<sub> and don't enter INSPECT_HOST_TARGETS — but if
+    # something slipped through, skip structurally rather than rsync
+    # over /work/.
+    case "$remote" in
+      /inspect/*) : ;;
+      *)
+        remote_log "seed_inspect_dirs: skipping non-/inspect target: $remote"
+        continue
+        ;;
+    esac
+    remote_log "remote: seeding inspect-dir $host -> $remote"
+    # Trailing slashes: copy contents of $host *into* $remote/, don't
+    # create $remote/<basename-of-host>/ inside it.
+    if ! LEERIE_FLY_APP="$FLY_APP" rsync -a -H \
+            -e "$wrapper" \
+            "$host/" "$LEERIE_MACHINE_ID:$remote/" \
+            >/dev/null 2>&1; then
+      remote_log "seed_inspect_dirs: rsync failed for $host -> $remote"
+      rc=1
+      break
+    fi
+    if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+           --pty=false -C "chown -R leerie: $remote" >/dev/null 2>&1; then
+      remote_log "seed_inspect_dirs: chown -R leerie: $remote failed"
+      rc=1
+      break
+    fi
+  done <<< "$LEERIE_INSPECT_HOST_TARGETS"
+
+  rm -f "$wrapper"
+  return $rc
+}
+
+# ---------------------------------------------------------------------------
 # seed_repo
 #
 # Used on fresh provisions. Two phases:
@@ -410,6 +514,10 @@ for line in sys.stdin.read().splitlines():
 #
 # re-seed.sh still calls seed_repo_dirty directly when the user
 # pauses + edits + resumes.
+#
+# Inspect dirs (/inspect/<basename> contents) are transported by
+# seed_inspect_dirs, invoked by the launcher after seed_repo on fresh
+# provision and after re_seed on resume.
 # ---------------------------------------------------------------------------
 seed_repo() {
   seed_repo_clone || return 1

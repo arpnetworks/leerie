@@ -396,6 +396,60 @@ A host path *inside* `$USER_REPO` (already visible at `/work/<subpath>`)
 collides with the launcher's `/inspect/<basename>` target. The launcher
 warns and skips the redundant mount.
 
+#### Remote runtime (Fly.io) transport
+
+Under `--runtime fly`, the launcher additionally rsyncs each
+`--inspect-dir` host path to `/inspect/<basename>` on the Fly machine
+via `scripts/remote/seed-repo.sh:seed_inspect_dirs`. The rewritten
+`--inspect-dir /inspect/<basename>` CLI flag already carries the
+in-machine view to the orchestrator via `REWRITTEN_ARGS`; this step
+makes the path actually exist on the machine's filesystem.
+
+Transport: `rsync -a -H` over `flyctl ssh console` via
+`fly_rsync_wrapper` (the same helper `seed_repo_dirty` uses). One rsync
+per inspect dir — counts are small (typically 1–3) and per-dir keeps
+error attribution clear. After each rsync, `chown -R leerie:` runs on
+the target so workers (which run as `leerie`) can read it, mirroring
+`seed_repo_dirty`'s post-rsync chown of `/work`.
+
+The launcher serializes its `INSPECT_HOST_TARGETS` bash array (parallel
+to `INSPECT_MOUNTS`, populated by `collect_inspect_path` for every
+out-of-repo inspect dir) into the `LEERIE_INSPECT_HOST_TARGETS` env var
+before each call. In-repo inspect dirs (the skip-redundant-mount branch)
+are not appended to `INSPECT_HOST_TARGETS` — they arrive on the machine
+via `seed_repo` at `/work/<subpath>` and need no separate transport.
+
+Called at two points inside the `--runtime fly` block:
+
+1. **Fresh provision** — after `seed_repo` lands `/work`, before the
+   detached orchestrator launches.
+2. **Resume / re-seed** — after `re_seed` lands the dirty delta, on
+   every resume. This honors the documented property that inspect
+   dirs are re-resolved fresh on every run including `--resume`
+   (§2 *Inspect directories*); the user can add `--inspect-dir <path>`
+   at resume time and expect it to land on the machine.
+
+A failure of `seed_inspect_dirs` is fatal — the run aborts before the
+orchestrator launches, in the same class as `seed_repo` / `seed_auth`
+failures. Workers cannot do their job with `--add-dir` flags pointing
+at non-existent paths, so silent continuation would yield wrong
+classifier / planner output.
+
+Read-only contract: inspect-bucket workers only `Read`/`Grep`/`Glob`
+inspect dirs (DESIGN §12). No rsync `--delete` or two-way sync is
+used.
+
+Inspect dirs are **not** `git clone`d on the machine because the
+machine deliberately holds no GitHub credentials (DESIGN §6
+*Finalization*). The transport treats each inspect dir as an opaque
+tree of files; even if the source is a git repo, only the working tree
+ships — workers read source files, not history.
+
+Same rsync-vs-tar rationale as `seed_repo_dirty`: macOS BSD `tar -c`
+normalizes filenames NFC → NFD (libarchive); rsync preserves filename
+bytes verbatim. Inspect dirs frequently contain docs/PDFs with
+non-ASCII names.
+
 ### macOS-specific: Colima auto-share scope
 
 Colima auto-shares only paths under `/Users/$USER` into the VM by
