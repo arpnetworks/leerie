@@ -146,8 +146,15 @@ def test_destroy_machine_called_on_exit_trap(tmp_path):
     fake_flyctl.chmod(0o755)
 
     # Run in a subshell so the EXIT trap fires when it exits.
+    # Override _try_fetch_branch_for_teardown *after* sourcing provision.sh
+    # so decide_teardown takes the sync-success branch and reaches
+    # destroy_machine. The sync-failure branch (which leaves the machine
+    # running by design) is not what this test is verifying — see
+    # scripts/remote/provision.sh:176.
     result = _run_bash(
-        f"( source {PROVISION_SH}; provision_machine )",
+        f"( source {PROVISION_SH}; "
+        "_try_fetch_branch_for_teardown() { return 0; }; "
+        "provision_machine )",
         env={
             "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
             "PATH": f"{tmp_path}:/usr/bin:/bin",

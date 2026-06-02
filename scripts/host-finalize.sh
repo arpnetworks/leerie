@@ -126,7 +126,7 @@ host_finalize() {
     pr_body="$pr_body_llm"
   else
     # Deterministic fallback.
-    local or_na_helper task first_cat source_of_truth started_at finished_at
+    local task first_cat source_of_truth started_at finished_at
     local wave_count subtask_count worker_count working_branch_display
     or_na_helper() { [ -n "$1" ] && [ "$1" != "null" ] && printf '%s' "$1" || printf 'n/a'; }
     task="$(jq -r '.task // ""' "$state_json")"

@@ -136,7 +136,7 @@ def test_strip_leerie_prefix_removes_uppercase(leerie):
 
 def test_strip_leerie_prefix_removes_mixed_case(leerie):
     assert leerie._strip_leerie_prefix("Leerie: x") == "x"
-    assert leerie._strip_leerie_prefix("pILa: y") == "y"
+    assert leerie._strip_leerie_prefix("lEErIE: y") == "y"
 
 
 def test_strip_leerie_prefix_handles_extra_whitespace(leerie):

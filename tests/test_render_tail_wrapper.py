@@ -83,7 +83,7 @@ def test_final_id_tails_directly_until_pid_dies(tmp_path):
     script = _render(tmp_path)
     r = _run_wrapper(tmp_path, script, "feat-x-aaaaaa")
     assert r.returncode == 0, r.stderr
-    assert "leerie --finalize feat-x-aaaaaa" in r.stderr
+    assert "orchestrator exited" in r.stderr
 
 
 # --- bootstrap id branch (without rename — wrapper should fail with the
@@ -157,7 +157,7 @@ def test_bootstrap_id_resolves_via_handover(tmp_path):
         raise AssertionError(f"wrapper hung; stderr so far: {stderr!r}")
     assert proc.returncode == 0, stderr
     assert "promoted to feat-y-bbbbbb" in stderr
-    assert "leerie --finalize feat-y-bbbbbb" in stderr
+    assert "orchestrator exited" in stderr
 
 
 # --- auto-finalize token --------------------------------------------------
