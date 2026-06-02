@@ -2913,7 +2913,7 @@ Two surfaces address this together:
    backgrounding. `leerie --attach --tail` watches this pid (via a small
    `while kill -0 $pid; do sleep 1; done` loop alongside the `tail -F`)
    and, when the pid disappears, prints a one-line banner like
-   `[leerie HH:MM:SS] remote: orchestrator exited — syncing run branch + state to host...`.
+   `HH:MM:SS [leerie] remote: orchestrator exited — syncing run branch + state to host...`.
    The tail then exits.
 2. **`leerie --finalize <run-id>`** — new launcher fast-path that runs the
    post-orchestrator block the launcher used to run inline: source

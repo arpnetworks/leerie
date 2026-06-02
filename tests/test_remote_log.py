@@ -1,7 +1,8 @@
 """Tests for scripts/remote/_log.sh and lib.sh's remote_log helper.
 
-Asserts the [leerie HH:MM:SS] [<repo>] <msg> prefix shape — the user-
+Asserts the HH:MM:SS [leerie] [<repo>] <msg> prefix shape — the user-
 visible contract for telling parallel runs apart in interleaved stderr.
+Time first so a glance at the leftmost column gives a chronological scan.
 The helper lives in _log.sh; lib.sh sources it. Tests exercise both
 sourcing routes so the two can't drift silently.
 """
@@ -17,7 +18,7 @@ LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
 LIB_SH = REPO_ROOT / "scripts" / "remote" / "lib.sh"
 
 PREFIX_RE = re.compile(
-    r"^\[leerie \d{2}:\d{2}:\d{2}\] \[(?P<repo>[^\]]+)\] (?P<body>.*)$"
+    r"^\d{2}:\d{2}:\d{2} \[leerie\] \[(?P<repo>[^\]]+)\] (?P<body>.*)$"
 )
 
 

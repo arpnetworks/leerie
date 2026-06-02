@@ -38,6 +38,13 @@ done
 LEERIE_REPO="$(cd -P "$(dirname "$SRC")" && pwd)"
 USER_REPO="$(pwd -P)"
 
+# Bring remote_log into scope before any further stderr emit so every
+# leerie-tagged line carries the HH:MM:SS [leerie] [<repo>] prefix.
+# The line-29 emit above (symlink-loop fatal) stays bare because the
+# chase that resolves LEERIE_REPO hasn't completed at that point.
+# shellcheck disable=SC1091
+. "$LEERIE_REPO/scripts/remote/_log.sh"
+
 # Image tag = leerie:<version>. Version comes from plugin.json (single source of
 # truth — same one `leerie --version` reads). The launcher only needs the value
 # for tagging, so a minimal extractor avoids needing python/jq at this stage.
@@ -144,16 +151,16 @@ case "${1:-}" in
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --force) _re_seed_force=1; shift ;;
-        --*) echo "leerie: unknown --re-seed flag: $1" >&2; exit 1 ;;
+        --*) remote_log "unknown --re-seed flag: $1"; exit 1 ;;
         *)
           if [ -z "$_re_seed_run_id" ]; then _re_seed_run_id="$1"; shift
-          else echo "leerie: unexpected --re-seed arg: $1" >&2; exit 1
+          else remote_log "unexpected --re-seed arg: $1"; exit 1
           fi
           ;;
       esac
     done
     if [ -z "$_re_seed_run_id" ]; then
-      echo "leerie: --re-seed requires a <run-id>" >&2
+      remote_log "--re-seed requires a <run-id>"
       echo "  Usage: leerie --re-seed <run-id> [--force]" >&2
       exit 1
     fi
@@ -177,13 +184,13 @@ case "${1:-}" in
     export USER_REPO
     _stop_run_id="${1:-}"
     if [ -z "$_stop_run_id" ]; then
-      echo "leerie: --stop requires a <run-id>" >&2
+      remote_log "--stop requires a <run-id>"
       echo "  Usage: leerie --stop <run-id>" >&2
       exit 1
     fi
     _stop_run_dir="$USER_REPO/.leerie/runs/$_stop_run_id"
     if [ ! -d "$_stop_run_dir" ]; then
-      echo "leerie: --stop: no run dir at $_stop_run_dir" >&2
+      remote_log "--stop: no run dir at $_stop_run_dir"
       echo "  Check 'leerie --list' for active runs." >&2
       exit 1
     fi
@@ -200,7 +207,7 @@ case "${1:-}" in
     # run.json — matches scripts/remote/attach.sh's resolution order.
     LEERIE_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_stop_run_dir")"
     if [ -z "$LEERIE_MACHINE_ID" ]; then
-      echo "leerie: --stop: $_stop_run_id has no fly_machine_id (was it a local run?)" >&2
+      remote_log "--stop: $_stop_run_id has no fly_machine_id (was it a local run?)"
       exit 1
     fi
     export LEERIE_MACHINE_ID
@@ -208,13 +215,13 @@ case "${1:-}" in
     # update_run_json has a file to merge paused_at into.
     _ensure_run_json "$_stop_run_dir" || true
     _stop_sidecar="$_stop_run_dir/run.json"
-    echo "[leerie] --stop: pausing machine $LEERIE_MACHINE_ID (run $LEERIE_RUN_ID)" >&2
+    remote_log "--stop: pausing machine $LEERIE_MACHINE_ID (run $LEERIE_RUN_ID)"
     stop_machine
     update_run_json "$_stop_sidecar" \
       paused_at "$(iso_now)" \
       pause_reason "user-requested" \
       fly_machine_id "$LEERIE_MACHINE_ID" || true
-    echo "[leerie] --stop: paused. Resume via: leerie --resume --run-id $LEERIE_RUN_ID --runtime fly" >&2
+    remote_log "--stop: paused. Resume via: leerie --resume --run-id $LEERIE_RUN_ID --runtime fly"
     exit 0
     ;;
   --kill)
@@ -235,10 +242,10 @@ case "${1:-}" in
         --machine-id=*) _kill_machine_id="${1#--machine-id=}"; shift ;;
         --app) _kill_app="$2"; shift 2 ;;
         --app=*) _kill_app="${1#--app=}"; shift ;;
-        --*) echo "leerie: unknown --kill flag: $1" >&2; exit 1 ;;
+        --*) remote_log "unknown --kill flag: $1"; exit 1 ;;
         *)
           if [ -z "$_kill_run_id" ]; then _kill_run_id="$1"; shift
-          else echo "leerie: unexpected --kill arg: $1" >&2; exit 1
+          else remote_log "unexpected --kill arg: $1"; exit 1
           fi
           ;;
       esac
@@ -251,7 +258,7 @@ case "${1:-}" in
     if [ -n "$_kill_run_id" ]; then
       _kill_run_dir="$USER_REPO/.leerie/runs/$_kill_run_id"
       if [ ! -d "$_kill_run_dir" ] && [ -z "$_kill_machine_id" ]; then
-        echo "leerie: --kill: no run dir at $_kill_run_dir" >&2
+        remote_log "--kill: no run dir at $_kill_run_dir"
         echo "  Pass --machine-id <id> to destroy an orphan machine without a sidecar." >&2
         exit 1
       fi
@@ -262,7 +269,7 @@ case "${1:-}" in
       fi
     fi
     if [ -z "$_kill_machine_id" ]; then
-      echo "leerie: --kill: no fly_machine_id found." >&2
+      remote_log "--kill: no fly_machine_id found."
       echo "  Usage: leerie --kill <run-id> [--force]" >&2
       echo "  Orphan: leerie --kill --machine-id <id> [--app <app>]" >&2
       exit 1
@@ -282,7 +289,7 @@ case "${1:-}" in
         "$_kill_machine_id" "$_kill_prompt_target" "$_kill_prompt_label" >&2
       read -r _kill_confirm
       if [ "$_kill_confirm" != "$_kill_prompt_target" ]; then
-        echo "leerie: --kill: confirmation mismatch; aborted." >&2
+        remote_log "--kill: confirmation mismatch; aborted."
         exit 1
       fi
     fi
@@ -293,7 +300,7 @@ case "${1:-}" in
     require_flyctl || exit 1
     LEERIE_MACHINE_ID="$_kill_machine_id"
     export LEERIE_MACHINE_ID
-    echo "[leerie] --kill: destroying machine $LEERIE_MACHINE_ID" >&2
+    remote_log "--kill: destroying machine $LEERIE_MACHINE_ID"
     destroy_machine
     # Bootstrap run.json from fly-machine.json if needed (in-flight
     # kill before classify) so killed_at + fly_machine_id are recorded
@@ -312,7 +319,7 @@ case "${1:-}" in
           fly_machine_id "$_kill_machine_id" || true
       fi
     fi
-    echo "[leerie] --kill: destroyed. Run is no longer resumable." >&2
+    remote_log "--kill: destroyed. Run is no longer resumable."
     exit 0
     ;;
   --finalize)
@@ -326,13 +333,13 @@ case "${1:-}" in
     export USER_REPO
     _fin_run_id="${1:-}"
     if [ -z "$_fin_run_id" ]; then
-      echo "leerie: --finalize requires a <run-id>" >&2
+      remote_log "--finalize requires a <run-id>"
       echo "  Usage: leerie --finalize <run-id>" >&2
       exit 1
     fi
     _fin_run_dir="$USER_REPO/.leerie/runs/$_fin_run_id"
     if [ ! -d "$_fin_run_dir" ]; then
-      echo "leerie: --finalize: no run dir at $_fin_run_dir" >&2
+      remote_log "--finalize: no run dir at $_fin_run_dir"
       exit 1
     fi
     # Short-circuit if already finalized (only possible once run.json
@@ -348,7 +355,7 @@ except Exception:
     pass
 ' "$_fin_sidecar")"
       if [ -n "$_already" ]; then
-        echo "[leerie] --finalize: run $_fin_run_id is already pushed; nothing to do." >&2
+        remote_log "--finalize: run $_fin_run_id is already pushed; nothing to do."
         exit 0
       fi
     fi
@@ -387,7 +394,7 @@ except Exception:
     fi
 
     if [ "$_already_synced" = "true" ]; then
-      echo "[leerie] --finalize: run already synced to host; skipping fetch_branch" >&2
+      remote_log "--finalize: run already synced to host; skipping fetch_branch"
       _fetched_run_id="$_fin_run_id"
       _fetched_run_dir="$_fin_run_dir"
     else
@@ -402,13 +409,13 @@ except Exception:
       # run.json — matches scripts/remote/attach.sh's resolution order.
       LEERIE_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_fin_run_dir")"
       if [ -z "$LEERIE_MACHINE_ID" ]; then
-        echo "leerie: --finalize: $_fin_run_id has no fly_machine_id and is not already synced" >&2
+        remote_log "--finalize: $_fin_run_id has no fly_machine_id and is not already synced"
         exit 1
       fi
       export LEERIE_MACHINE_ID
-      echo "[leerie] --finalize: streaming completed run from machine $LEERIE_MACHINE_ID" >&2
+      remote_log "--finalize: streaming completed run from machine $LEERIE_MACHINE_ID"
       if ! fetch_branch; then
-        echo "leerie: error: fetch_branch failed" >&2
+        remote_log "error: fetch_branch failed"
         exit 1
       fi
       # fetch_branch sets LEERIE_REMOTE_RUN_ID to the discovered final run-id
@@ -417,7 +424,7 @@ except Exception:
       _fetched_run_id="${LEERIE_REMOTE_RUN_ID:-$_fin_run_id}"
       _fetched_run_dir="$USER_REPO/.leerie/runs/$_fetched_run_id"
       if [ ! -d "$_fetched_run_dir" ]; then
-        echo "leerie: error: fetch_branch succeeded but $_fetched_run_dir missing" >&2
+        remote_log "error: fetch_branch succeeded but $_fetched_run_dir missing"
         exit 1
       fi
     fi
@@ -463,7 +470,7 @@ except Exception:
         fi
       done
       if [ "$_host_intent" = "true" ]; then
-        echo "[leerie] finalize: host_no_push was set at launch — skipping push" >&2
+        remote_log "finalize: host_no_push was set at launch — skipping push"
         _FINALIZE_NO_PUSH=true
       fi
       # Clear the in-Fly orchestrator's mechanism-flag no_push so
@@ -540,14 +547,14 @@ See docs/INSTALL.md for rootless mode and other distros.
 EOF
       ;;
     *)
-      echo "leerie: unsupported OS: $OS (need macOS or Linux)" >&2
+      remote_log "unsupported OS: $OS (need macOS or Linux)"
       ;;
   esac
 }
 
 require() {
   command -v "$1" >/dev/null 2>&1 || {
-    echo "leerie: missing required command: $1" >&2
+    remote_log "missing required command: $1"
     print_install_hint
     exit 1
   }
@@ -670,7 +677,7 @@ if [ -f "$USER_REPO/leerie.toml" ]; then
     local|fly) RUNTIME="${toml_runtime}" ;;
     "")        : ;;
     *)
-      echo "leerie: leerie.toml: runtime=${toml_runtime} is not one of local|fly" >&2
+      remote_log "leerie.toml: runtime=${toml_runtime} is not one of local|fly"
       exit 1
       ;;
   esac
@@ -684,7 +691,7 @@ case "${LEERIE_RUNTIME:-}" in
   local|fly) RUNTIME="${LEERIE_RUNTIME}" ;;
   "")        : ;;
   *)
-    echo "leerie: LEERIE_RUNTIME=${LEERIE_RUNTIME} is not one of local|fly" >&2
+    remote_log "LEERIE_RUNTIME=${LEERIE_RUNTIME} is not one of local|fly"
     exit 1
     ;;
 esac
@@ -697,7 +704,7 @@ for arg in "$@"; do
     --runtime=local)    RUNTIME=local ;;
     --runtime=fly)      RUNTIME=fly ;;
     --runtime=*)
-      echo "leerie: --runtime=${arg#--runtime=} is not one of local|fly" >&2
+      remote_log "--runtime=${arg#--runtime=} is not one of local|fly"
       exit 1
       ;;
   esac
@@ -709,7 +716,7 @@ for arg in "$@"; do
     case "$arg" in
       local|fly) RUNTIME="$arg" ;;
       *)
-        echo "leerie: --runtime $arg is not one of local|fly" >&2
+        remote_log "--runtime $arg is not one of local|fly"
         exit 1
         ;;
     esac
@@ -746,18 +753,18 @@ case "$OS" in
     # hang. Mirror the pattern at line ~135 (nerdctl-shim install).
     if ! command -v colima >/dev/null 2>&1; then
       if [ "$NO_RUNTIME_INSTALL" = "true" ]; then
-        echo "leerie: Colima is missing (auto-install skipped via --no-runtime-install)." >&2
+        remote_log "Colima is missing (auto-install skipped via --no-runtime-install)."
         print_install_hint
         exit 1
       fi
       if [ -t 0 ]; then
-        echo "[leerie] Colima is missing — installing now (one-time; may prompt for sudo)..." >&2
+        remote_log "Colima is missing — installing now (one-time; may prompt for sudo)..."
         if ! runtime_install_macos; then
           print_install_hint
           exit 1
         fi
       else
-        echo "leerie: Colima is not installed and we have no terminal to" >&2
+        remote_log "Colima is not installed and we have no terminal to"
         echo "  prompt for sudo / brew install. Run leerie once from a" >&2
         echo "  terminal so the one-time install can complete:" >&2
         echo "    leerie --version" >&2
@@ -769,7 +776,7 @@ case "$OS" in
     # Don't auto-start Colima — if the user has an existing setup with
     # dockerd we'd clobber their preference. Give a clear hint instead.
     if ! colima status >/dev/null 2>&1; then
-      echo "leerie: Colima VM is not running." >&2
+      remote_log "Colima VM is not running."
       echo "  Start it with:  colima start --runtime containerd --mount-type virtiofs" >&2
       exit 1
     fi
@@ -780,20 +787,20 @@ case "$OS" in
     # with a clear hint instead of hanging.
     if ! command -v nerdctl >/dev/null 2>&1; then
       if [ -t 0 ]; then
-        echo "[leerie] installing host-side nerdctl shim (one-time; may prompt for sudo)..." >&2
+        remote_log "installing host-side nerdctl shim (one-time; may prompt for sudo)..."
         if ! colima nerdctl install >&2; then
-          echo "leerie: failed to install nerdctl shim — run 'colima nerdctl install' manually" >&2
+          remote_log "failed to install nerdctl shim — run 'colima nerdctl install' manually"
           exit 1
         fi
       else
-        echo "leerie: nerdctl shim is not installed and we have no terminal to run sudo." >&2
+        remote_log "nerdctl shim is not installed and we have no terminal to run sudo."
         echo "  Run this once from a terminal, then re-invoke /leerie:" >&2
         echo "    colima nerdctl install" >&2
         exit 1
       fi
     fi
     if ! nerdctl info >/dev/null 2>&1; then
-      echo "leerie: nerdctl cannot reach the container runtime." >&2
+      remote_log "nerdctl cannot reach the container runtime."
       echo "  Ensure Colima was started with --runtime containerd:" >&2
       echo "    colima stop && colima start --runtime containerd --mount-type virtiofs" >&2
       exit 1
@@ -806,7 +813,7 @@ case "$OS" in
       case "$1" in
         "$USER_HOME_PREFIX"|"$USER_HOME_PREFIX"/*) return 0 ;;
         *)
-          echo "leerie: warning — '$1' is outside $USER_HOME_PREFIX" >&2
+          remote_log "warning — '$1' is outside $USER_HOME_PREFIX"
           echo "  and may appear empty in the container. Add it to Colima's" >&2
           echo "  mount list: edit ~/.colima/default/colima.yaml's 'mounts:'" >&2
           echo "  section, then 'colima restart'." >&2
@@ -822,18 +829,18 @@ case "$OS" in
     # `sudo apt-get install` etc. would hang in plugin mode without TTY.
     if ! command -v nerdctl >/dev/null 2>&1; then
       if [ "$NO_RUNTIME_INSTALL" = "true" ]; then
-        echo "leerie: nerdctl is missing (auto-install skipped via --no-runtime-install)." >&2
+        remote_log "nerdctl is missing (auto-install skipped via --no-runtime-install)."
         print_install_hint
         exit 1
       fi
       if [ -t 0 ]; then
-        echo "[leerie] nerdctl is missing — installing containerd + nerdctl (one-time; may prompt for sudo)..." >&2
+        remote_log "nerdctl is missing — installing containerd + nerdctl (one-time; may prompt for sudo)..."
         if ! runtime_install_linux; then
           print_install_hint
           exit 1
         fi
       else
-        echo "leerie: nerdctl is not installed and we have no terminal to" >&2
+        remote_log "nerdctl is not installed and we have no terminal to"
         echo "  prompt for sudo. Run leerie once from a terminal so the" >&2
         echo "  one-time install can complete:" >&2
         echo "    leerie --version" >&2
@@ -841,14 +848,14 @@ case "$OS" in
       fi
     fi
     if ! nerdctl info >/dev/null 2>&1; then
-      echo "leerie: nerdctl cannot reach containerd." >&2
+      remote_log "nerdctl cannot reach containerd."
       echo "  Ensure containerd is running:  systemctl status containerd" >&2
       echo "  For rootless mode see docs/INSTALL.md." >&2
       exit 1
     fi
     ;;
   *)
-    echo "leerie: unsupported OS: $OS" >&2
+    remote_log "unsupported OS: $OS"
     print_install_hint
     exit 1
     ;;
@@ -876,7 +883,7 @@ esac
 
 # 1. cwd is a git repo (orchestrator's old check at leerie.py:7652).
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "leerie: error: not inside a git repository" >&2
+  remote_log "error: not inside a git repository"
   exit 1
 fi
 
@@ -889,7 +896,7 @@ fi
 #    catching anything the post-push failure path doesn't handle.
 if [ "$NO_PUSH" = "false" ]; then
   if ! git remote get-url origin >/dev/null 2>&1; then
-    echo "leerie: error: this repository has no \`origin\` remote — finalize cannot" >&2
+    remote_log "error: this repository has no \`origin\` remote — finalize cannot"
     echo "  push without one. Add one with \`git remote add origin <url>\` or pass" >&2
     echo "  \`--no-push\`." >&2
     exit 1
@@ -900,7 +907,7 @@ fi
 #    state.json. Hard-fail on macOS (brew install jq) and Linux (distro
 #    package manager); we use jq for the body composition + state writes.
 if [ "$NO_PUSH" = "false" ] && ! command -v jq >/dev/null 2>&1; then
-  echo "leerie: error: \`jq\` not found on PATH." >&2
+  remote_log "error: \`jq\` not found on PATH."
   case "$OS" in
     Darwin) echo "  Install with: brew install jq" >&2 ;;
     Linux)  echo "  Install with your distro package manager (apt install jq / dnf install jq / pacman -S jq)." >&2 ;;
@@ -911,7 +918,7 @@ fi
 
 # --- build image if not present (one-time, ~60-120s) --------------------
 if ! nerdctl image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
-  echo "[leerie] building container image (one-time; ~60-120s)..." >&2
+  remote_log "building container image (one-time; ~60-120s)..."
   nerdctl build \
     --build-arg HOST_UID="$(id -u)" \
     --build-arg HOST_GID="$(id -g)" \
@@ -942,7 +949,7 @@ collect_inspect_path() {
     *)     expanded="$host_path" ;;
   esac
   resolved="$(cd -P "$expanded" 2>/dev/null && pwd)" || {
-    echo "leerie: --inspect-dir path not found: $host_path" >&2
+    remote_log "--inspect-dir path not found: $host_path"
     exit 1
   }
   # If the path is inside $USER_REPO it's already visible at /work/<sub>,
@@ -955,7 +962,7 @@ collect_inspect_path() {
       # SC2295). Paths typically lack glob metachars, but the cost of
       # defensiveness is one quote-pair.
       local rel="${resolved#"$user_repo_resolved"}"
-      echo "leerie: --inspect-dir '$host_path' is inside the repo; skipping redundant mount" >&2
+      remote_log "--inspect-dir '$host_path' is inside the repo; skipping redundant mount"
       REWRITTEN_ARGS+=(--inspect-dir "/work${rel}")
       return 0
       ;;
@@ -1062,11 +1069,11 @@ done
 AUTH_MOUNTS=()
 
 if [ ! -d "$HOME/.claude" ]; then
-  echo "leerie: $HOME/.claude not found — run \`claude\` at least once first" >&2
+  remote_log "$HOME/.claude not found — run \`claude\` at least once first"
   exit 1
 fi
 if [ ! -f "$HOME/.claude.json" ]; then
-  echo "leerie: $HOME/.claude.json not found — run \`claude\` at least once first" >&2
+  remote_log "$HOME/.claude.json not found — run \`claude\` at least once first"
   exit 1
 fi
 
@@ -1161,7 +1168,7 @@ if [ "$OS" = "Darwin" ]; then
     if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
       AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
     else
-      echo "leerie: note — could not extract Claude credentials from Keychain." >&2
+      remote_log "note — could not extract Claude credentials from Keychain."
       echo "  Export CLAUDE_CODE_OAUTH_TOKEN in your shell, or grant the launcher" >&2
       echo "  Keychain access (the prompt that pops up the first time)." >&2
     fi
@@ -1323,7 +1330,7 @@ ensure_image() {
   fi
   local build_push="$LEERIE_REPO/scripts/remote/build-push.sh"
   if [ ! -x "$build_push" ]; then
-    echo "leerie: error: $build_push not found or not executable" >&2
+    remote_log "error: $build_push not found or not executable"
     return 1
   fi
   local fly_app="${LEERIE_FLY_APP:-leerie}"
@@ -1341,9 +1348,9 @@ try:
 except Exception:
     sys.exit(1)
 ' "$fly_app"; then
-    echo "[leerie] remote: Fly app '$fly_app' does not exist — creating it" >&2
+    remote_log "remote: Fly app '$fly_app' does not exist — creating it"
     if ! flyctl apps create "$fly_app" 2>&1; then
-      echo "leerie: error: flyctl apps create $fly_app failed" >&2
+      remote_log "error: flyctl apps create $fly_app failed"
       echo "  Create it manually: flyctl apps create $fly_app" >&2
       return 1
     fi
@@ -1357,9 +1364,9 @@ except Exception:
     build_args+=(--local-build)
   fi
 
-  echo "[leerie] remote: ensuring image $tag is published (cache miss)" >&2
+  remote_log "remote: ensuring image $tag is published (cache miss)"
   if ! "$build_push" "${build_args[@]}"; then
-    echo "leerie: error: build-push.sh failed; remote run cannot proceed" >&2
+    remote_log "error: build-push.sh failed; remote run cannot proceed"
     return 1
   fi
   mkdir -p "$cache_dir"
@@ -1384,7 +1391,7 @@ if [ "$RUNTIME" = "fly" ]; then
   # skip .leerie/. No in-machine `git clone` (the machine deliberately has no
   # GitHub credentials). Orchestration inside the machine follows after both
   # seedings succeed.
-  echo "[leerie] remote: starting Fly.io machine (--runtime fly / LEERIE_RUNTIME=fly / leerie.toml runtime=fly)" >&2
+  remote_log "remote: starting Fly.io machine (--runtime fly / LEERIE_RUNTIME=fly / leerie.toml runtime=fly)"
 
   # Preflight: ensure flyctl is on PATH and authenticated. require_flyctl
   # in lib.sh handles auto-install on first --runtime fly use (parallels
@@ -1433,19 +1440,19 @@ if [ "$RUNTIME" = "fly" ]; then
   SEED_SCRIPT="$LEERIE_REPO/scripts/remote/seed-repo.sh"
   FETCH_SCRIPT="$LEERIE_REPO/scripts/remote/fetch-branch.sh"
   if [ ! -f "$PROVISION_SCRIPT" ]; then
-    echo "leerie: error: $PROVISION_SCRIPT not found" >&2
+    remote_log "error: $PROVISION_SCRIPT not found"
     container_rc=1
   elif [ ! -f "$RESUME_SCRIPT" ]; then
-    echo "leerie: error: $RESUME_SCRIPT not found" >&2
+    remote_log "error: $RESUME_SCRIPT not found"
     container_rc=1
   elif [ ! -f "$SEED_AUTH_SCRIPT" ]; then
-    echo "leerie: error: $SEED_AUTH_SCRIPT not found" >&2
+    remote_log "error: $SEED_AUTH_SCRIPT not found"
     container_rc=1
   elif [ ! -f "$SEED_SCRIPT" ]; then
-    echo "leerie: error: $SEED_SCRIPT not found" >&2
+    remote_log "error: $SEED_SCRIPT not found"
     container_rc=1
   elif [ ! -f "$FETCH_SCRIPT" ]; then
-    echo "leerie: error: $FETCH_SCRIPT not found" >&2
+    remote_log "error: $FETCH_SCRIPT not found"
     container_rc=1
   else
     # shellcheck disable=SC1090
@@ -1509,7 +1516,7 @@ except Exception:
                      -C "cat /work/.leerie/launcher-${_bootstrap_pid}.runid" \
                      2>/dev/null | head -1 | tr -d '[:space:]' || true)"
       if [ -n "$_final_id" ] && [ "$_final_id" != "$_bootstrap_pid" ]; then
-        echo "[leerie] remote: bootstrap id ${_bootstrap_pid} promoted to ${_final_id} on machine — rewriting LEERIE_RUN_ID" >&2
+        remote_log "remote: bootstrap id ${_bootstrap_pid} promoted to ${_final_id} on machine — rewriting LEERIE_RUN_ID"
         # Migrate host-side run dir if needed.
         _host_boot_dir="$USER_REPO/.leerie/runs/${_bootstrap_pid}"
         _host_final_dir="$USER_REPO/.leerie/runs/${_final_id}"
@@ -1544,7 +1551,7 @@ except Exception:
       export USER_REPO
       _seed_ok=true
       if ! seed_auth; then
-        echo "leerie: error: seed_auth failed — aborting remote run" >&2
+        remote_log "error: seed_auth failed — aborting remote run"
         container_rc=1
         _seed_ok=false
       elif [ "$_resumed" = "true" ]; then
@@ -1555,13 +1562,13 @@ except Exception:
           . "$LEERIE_REPO/scripts/remote/re-seed.sh"
           [ "$RE_SEED_FORCE" = "true" ] && export LEERIE_RE_SEED_FORCE=1
           if ! re_seed; then
-            echo "leerie: error: re_seed failed — aborting remote run" >&2
+            remote_log "error: re_seed failed — aborting remote run"
             container_rc=1
             _seed_ok=false
           fi
         fi
       elif ! seed_repo; then
-        echo "leerie: error: repo seeding failed for machine $LEERIE_MACHINE_ID" >&2
+        remote_log "error: repo seeding failed for machine $LEERIE_MACHINE_ID"
         container_rc=1
         _seed_ok=false
       fi
@@ -1574,7 +1581,7 @@ except Exception:
         # REWRITTEN_ARGS, so the path is known before the orchestrator
         # produces any output. DESIGN §6 *Detached orchestrator (remote
         # mode)*.
-        echo "[leerie] remote: machine $LEERIE_MACHINE_ID seeded — starting orchestrator (detached)" >&2
+        remote_log "remote: machine $LEERIE_MACHINE_ID seeded — starting orchestrator (detached)"
 
         # Detached-launch wrapper. Uses a python3 heredoc instead of
         # `sh -c "...setsid nohup..."` for three reasons:
@@ -1660,7 +1667,7 @@ PY
              | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
                  --pty=false -C "python3 -"
         then
-          echo "leerie: error: failed to start detached orchestrator on machine $LEERIE_MACHINE_ID" >&2
+          remote_log "error: failed to start detached orchestrator on machine $LEERIE_MACHINE_ID"
           container_rc=1
         else
           # Phase 3: promote the PID-keyed attach pointer to a run-keyed
@@ -1682,7 +1689,7 @@ PY
           # writes the final run-id to /work/.leerie/launcher-<bootstrap>.runid;
           # the wrapper script reads that, re-tails the new path, and on
           # orchestrator-pid exit prints a finalize hint and ends.
-          echo "[leerie] remote: tailing orchestrator log (Ctrl-C to detach — orchestrator keeps running)" >&2
+          remote_log "remote: tailing orchestrator log (Ctrl-C to detach — orchestrator keeps running)"
 
           # The remote tail wrapper is shared with `leerie --attach --tail`
           # via render_tail_wrapper in scripts/remote/lib.sh (already

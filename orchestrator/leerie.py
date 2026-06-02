@@ -1144,7 +1144,7 @@ def now() -> str:
 
 def log(msg: str) -> None:
     repo = Path(os.environ.get("USER_REPO") or os.getcwd()).name or "?"
-    print(f"[leerie {datetime.now().strftime('%H:%M:%S')}] [{repo}] {msg}", flush=True)
+    print(f"{datetime.now().strftime('%H:%M:%S')} [leerie] [{repo}] {msg}", flush=True)
 
 
 def die(msg: str, code: int = 1):
@@ -5035,7 +5035,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     # Inline summary (verbosity-gated). Multi-line
                     # summaries (multi-block events, multi-line text)
                     # are emitted one log() call per line so each
-                    # line gets its own [leerie HH:MM:SS] prefix —
+                    # line gets its own HH:MM:SS [leerie] prefix —
                     # otherwise the timestamp only renders on line 1
                     # and lines 2+ visually disconnect from the
                     # orchestrator's timestamped log stream.

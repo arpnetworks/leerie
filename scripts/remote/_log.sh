@@ -5,10 +5,10 @@
 # doesn't go through lib.sh, and which want this helper without the rest
 # of lib.sh's surface in scope).
 #
-# Format: [leerie HH:MM:SS] [<repo>] <msg>
+# Format: HH:MM:SS [leerie] [<repo>] <msg>
 # Repo derives from $USER_REPO (basename); falls back to "?" if unset.
 remote_log() {
   local _repo
   _repo="$(basename "${USER_REPO:-?}")"
-  printf '[leerie %s] [%s] %s\n' "$(date +%H:%M:%S)" "$_repo" "$*" >&2
+  printf '%s [leerie] [%s] %s\n' "$(date +%H:%M:%S)" "$_repo" "$*" >&2
 }

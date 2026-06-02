@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -284,7 +285,7 @@ def test_multi_line_summary_each_line_has_timestamp(leerie, leerie_dir,
                                                      monkeypatch, capsys):
     """A multi-line summary (multi-line text block, or multiple
     tool_use blocks in one event) must produce one log() call per
-    line so each line gets its own [leerie HH:MM:SS] prefix.
+    line so each line gets its own HH:MM:SS [leerie] prefix.
 
     Earlier behavior returned a \\n-joined string and called log()
     once, which prepended the timestamp only to the first line —
@@ -307,7 +308,8 @@ def test_multi_line_summary_each_line_has_timestamp(leerie, leerie_dir,
         verbosity="stream"))
     out = capsys.readouterr().out
     # Each text line is on its own output line, each prefixed with
-    # the [leerie HH:MM:SS] timestamp.
+    # the HH:MM:SS [leerie] timestamp.
+    line_prefix_re = re.compile(r"^\s*\d{2}:\d{2}:\d{2} \[leerie\]")
     paragraphs = ["first paragraph", "second paragraph", "third paragraph"]
     for para in paragraphs:
         # Find the line containing this paragraph and assert it has
@@ -315,8 +317,8 @@ def test_multi_line_summary_each_line_has_timestamp(leerie, leerie_dir,
         matching = [l for l in out.split("\n") if para in l]
         assert matching, f"missing line for {para!r}; got: {out!r}"
         for l in matching:
-            assert l.lstrip().startswith("[leerie "), (
-                f"line {l!r} lacks [leerie HH:MM:SS] prefix — the "
+            assert line_prefix_re.match(l), (
+                f"line {l!r} lacks HH:MM:SS [leerie] prefix — the "
                 "log() call per line guarantee broke")
 
 

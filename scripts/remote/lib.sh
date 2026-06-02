@@ -178,7 +178,7 @@ render_tail_wrapper() {
 # back to $1 (works under `flyctl machine exec ... -- sh -c "..." -- id`).
 ID="${LEERIE_TAIL_RUN_ID:-$1}"
 if [ -z "$ID" ]; then
-  echo "[leerie $(date +%H:%M:%S)] remote: render_tail_wrapper got empty run-id (LEERIE_TAIL_RUN_ID unset and \$1 empty)" >&2
+  echo "$(date +%H:%M:%S) [leerie] remote: render_tail_wrapper got empty run-id (LEERIE_TAIL_RUN_ID unset and \$1 empty)" >&2
   exit 2
 fi
 HANDOVER="/work/.leerie/launcher-${ID}.runid"
@@ -204,15 +204,15 @@ case "$ID" in
     kill "$TAIL_PID" 2>/dev/null || true
     wait "$TAIL_PID" 2>/dev/null || true
     if [ ! -f "$HANDOVER" ]; then
-      echo "[leerie $(date +%H:%M:%S)] remote: bootstrap dir gone but no handover at $HANDOVER" >&2
+      echo "$(date +%H:%M:%S) [leerie] remote: bootstrap dir gone but no handover at $HANDOVER" >&2
       exit 2
     fi
     FINAL="$(head -1 "$HANDOVER" 2>/dev/null)"
     if [ -z "$FINAL" ]; then
-      echo "[leerie $(date +%H:%M:%S)] remote: handover file empty at $HANDOVER" >&2
+      echo "$(date +%H:%M:%S) [leerie] remote: handover file empty at $HANDOVER" >&2
       exit 2
     fi
-    echo "[leerie $(date +%H:%M:%S)] remote: run-id promoted to ${FINAL}" >&2
+    echo "$(date +%H:%M:%S) [leerie] remote: run-id promoted to ${FINAL}" >&2
     ID="$FINAL"
     LOG="/work/.leerie/runs/${ID}/orchestrator.log"
     ;;
@@ -241,7 +241,7 @@ kill "$TAIL_PID" 2>/dev/null || true
 wait "$TAIL_PID" 2>/dev/null || true
 
 echo "" >&2
-echo "[leerie $(date +%H:%M:%S)] remote: orchestrator exited — syncing run branch + state to host..." >&2
+echo "$(date +%H:%M:%S) [leerie] remote: orchestrator exited — syncing run branch + state to host..." >&2
 
 # Auto-finalize hook: when the calling host sets AUTO_FINALIZE_TOKEN,
 # print it as the wrapper's last stderr line. The host-side caller
