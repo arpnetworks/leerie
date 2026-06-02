@@ -312,52 +312,81 @@ require_flyctl() {
   return 0
 }
 
-# --- require_fly_ssh ------------------------------------------------------
-# Ensure the host's SSH agent has a Fly-issued certificate for SSH-based
-# file transfer via `flyctl ssh console -C "..." < tar`. Certs expire after
-# 24 hours; if missing/expired the SSH attempts hang or error. Leerie uses
-# SSH for seeding repo+auth into the machine because flyctl removed
-# `--stdin` from `machine exec` and the alternative argv-based payload
-# transfer hits ARG_MAX on macOS for typical Claude config (~640 MB).
+# --- _leerie_fly_agent_ensure --------------------------------------------
+# Spawn (or reuse) a leerie-owned ssh-agent at a predictable socket and
+# point SSH_AUTH_SOCK at it. The user's main ssh-agent is never touched.
 #
-# Idempotent: a successful `flyctl ssh console --pty=false -C true
-# --machine <non-existent>` against the target app proves the cert is
-# valid (returns "no started VMs" with rc=1 but doesn't hang).
+# Why: `flyctl ssh issue --agent` appends a 24h cert to whichever agent
+# SSH_AUTH_SOCK points at, and never deletes prior certs. If aimed at the
+# user's main agent, repeated leerie runs accumulate dozens of certs,
+# which OpenSSH then offers to every ssh destination (including
+# github.com). After ~5 failed auth attempts per connection, GitHub
+# rate-limits the account. A private agent contains the blast radius.
 #
-# This is best-effort: if `flyctl ssh issue` fails (e.g. user is on a
-# restricted org), seed-auth will surface the original SSH error.
-require_fly_ssh() {
-  local fly_app="${1:-$LEERIE_FLY_APP}"
-  local fly_org="${LEERIE_FLY_ORG:-personal}"
-  # Probe: a quick ssh attempt against a non-existent machine. Fly's
-  # error is "no started VMs" which means auth succeeded; any other
-  # error (hangs, "could not connect to WireGuard", etc.) means we
-  # need to issue a fresh cert.
-  if echo | timeout 8 flyctl ssh console --app "$fly_app" \
-       --machine "probe-nonexistent" --pty=false -C "true" 2>&1 \
-     | grep -qE "no started VMs|app.*not.*found"; then
+# Lifecycle: persistent across runs so the 24h cert is reused (re-issuing
+# every invocation defeats the lifetime and is what caused the original
+# accumulation). Never auto-killed. Reboot wipes the socket inode → next
+# run lazy-spawns fresh.
+_leerie_fly_agent_ensure() {
+  local agent_dir sock lockdir i
+  agent_dir="${XDG_CACHE_HOME:-$HOME/.cache}/leerie/agent"
+  sock="$agent_dir/ssh-agent.sock"
+  lockdir="$agent_dir/.spawn.lock"
+  install -d -m 700 "$agent_dir"
+  # Serialize spawn-or-reuse across parallel leerie invocations using
+  # mkdir-as-mutex (portable; macOS has no `flock` binary). Spin up to
+  # ~10s waiting for a concurrent spawn to finish; then proceed even if
+  # we couldn't acquire (the worst case is two ssh-agent procs racing,
+  # one wins the bind and the other exits — benign).
+  i=0
+  while ! mkdir "$lockdir" 2>/dev/null; do
+    i=$((i+1))
+    if [ "$i" -ge 50 ]; then
+      break
+    fi
+    sleep 0.2
+  done
+  # NOTE: We don't use `trap '...' RETURN` for lockdir cleanup because
+  # bash RETURN traps persist in the caller's scope (they fire on every
+  # subsequent function return up the call chain). Instead, we rmdir
+  # explicitly at each return path below.
+  if [ -S "$sock" ] && SSH_AUTH_SOCK="$sock" ssh-add -l \
+       >/dev/null 2>&1; then
+    export SSH_AUTH_SOCK="$sock"
+    rmdir "$lockdir" 2>/dev/null || true
     return 0
   fi
-  # If the agent ALREADY has an SSH cert, the probe might have failed
-  # for an unrelated reason (transient WireGuard hiccup, Fly API 500
-  # during the cert-issuance outage we observed 2026-06-01). Skip
-  # the `flyctl ssh issue` step — the existing cert is almost
-  # certainly Fly's (regular SSH key authentication doesn't put
-  # certs in the agent; only Fly does for this user).
-  if ssh-add -l 2>/dev/null | grep -qE "CERT\)"; then
-    remote_log "remote: ssh-agent has cert(s); skipping issue step"
+  rm -f "$sock"
+  ssh-agent -a "$sock" >/dev/null 2>&1
+  export SSH_AUTH_SOCK="$sock"
+  rmdir "$lockdir" 2>/dev/null || true
+}
+
+# --- require_fly_ssh ------------------------------------------------------
+# Ensure the leerie-private ssh-agent has a Fly-issued certificate for
+# SSH-based file transfer via `flyctl ssh console -C "..." < tar`. Certs
+# expire after 24 hours; if missing/expired the SSH attempts hang or
+# error. Leerie uses SSH for seeding because flyctl removed `--stdin`
+# from `machine exec` and the alternative argv-based payload transfer
+# hits ARG_MAX on macOS for typical Claude config (~640 MB).
+#
+# The Fly-API probe that earlier versions used was removed: it was
+# racy under WireGuard latency and unreliable, causing the function to
+# fall through to issuance even when a valid cert already existed. With
+# a private agent we trust local state: any ED25519-CERT in the agent
+# is leerie's own.
+#
+# Best-effort: if `flyctl ssh issue` fails (e.g. user is on a restricted
+# org), seed-auth will surface the original SSH error.
+require_fly_ssh() {
+  local fly_org="${LEERIE_FLY_ORG:-personal}"
+  _leerie_fly_agent_ensure
+  if ssh-add -l 2>/dev/null | grep -qE 'CERT\)'; then
     return 0
   fi
   remote_log "remote: issuing Fly SSH certificate (24h) for org=$fly_org"
   if ! flyctl ssh issue --agent --hours 24 "$fly_org" >/dev/null 2>&1; then
-    # Best-effort: if we have ANY ssh-add cert, hope it's a Fly one
-    # and let the subsequent ssh console attempt either succeed or
-    # surface the real error.
-    if ssh-add -l >/dev/null 2>&1; then
-      remote_log "warning: flyctl ssh issue failed (possible Fly API outage); proceeding with existing agent state"
-      return 0
-    fi
-    remote_log "warning: flyctl ssh issue failed and no ssh-agent cert available; seed-auth may fail"
+    remote_log "warning: flyctl ssh issue failed; seed-auth may fail"
     return 1
   fi
   return 0

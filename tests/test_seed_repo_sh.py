@@ -10,23 +10,21 @@ The seed mechanism uses `git bundle` over `flyctl ssh console -C "sh
 these classes of invocation (substring matchers, so the `sh -c '...'`
 wrapper is handled transparently):
 
-  1. `--machine probe-nonexistent`: require_fly_ssh's cert-validity
-     probe — emit "no started VMs" on stderr so the helper short-circuits.
-  2. `-C "true"`: wait_for_fly_ssh_ready's readiness probe — exit 0.
-  3. `-C "sh -c '...find /work...'"`: the /work content-wipe step.
+  1. `-C "true"`: wait_for_fly_ssh_ready's readiness probe — exit 0.
+  2. `-C "sh -c '...find /work...'"`: the /work content-wipe step.
      Just exit 0 (we'll let the machine-side clone create the dir).
-  4. `-C "sh -c 'cat > /tmp/leerie-seed.bundle'"`: capture stdin to
+  3. `-C "sh -c 'cat > /tmp/leerie-seed.bundle'"`: capture stdin to
      <dest_dir>/seed.bundle (the parent bundle pipe).
-  5. `-C "sh -c 'cat > /tmp/leerie-subs/<name>.bundle'"`: capture stdin
+  4. `-C "sh -c 'cat > /tmp/leerie-subs/<name>.bundle'"`: capture stdin
      to <dest_dir>/subs/<name>.bundle (a submodule bundle pipe).
-  6. `-C "sh -c '<clone-script>'"`: the machine-side clone command.
+  5. `-C "sh -c '<clone-script>'"`: the machine-side clone command.
      Rewrite the absolute paths in the script (`/tmp/leerie-seed.bundle`,
      `/tmp/leerie-subs`, `/work`) to point at the test's <dest_dir>, then
      exec the script. The resulting clone tree is what tests inspect.
      The script contains `git -c protocol.file.allow=always submodule
      update --recursive`, which the stub passes through unchanged so
      the local git invocation accepts the file://-style bundle URLs.
-  7. Anything else: log and exit 0.
+  6. Anything else: log and exit 0.
 """
 from __future__ import annotations
 
@@ -68,22 +66,14 @@ echo "flyctl $*" >> {exec_log}
 
 DEST={dest!r}
 
-# Parse args: pull -C "<cmd>" and --machine <id> out of argv.
+# Parse args: pull -C "<cmd>" out of argv.
 remote_cmd=""
-machine=""
 while [ $# -gt 0 ]; do
   case "$1" in
     -C) remote_cmd="$2"; shift 2 ;;
-    --machine) machine="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
-
-# require_fly_ssh probe.
-if [ "$machine" = "probe-nonexistent" ]; then
-  echo "Error: no started VMs" >&2
-  exit 1
-fi
 
 # wait_for_fly_ssh_ready probe.
 if [ "$remote_cmd" = "true" ]; then
@@ -166,9 +156,9 @@ esac
 def _make_stub_timeout(stub_dir: Path) -> None:
     """Stub `timeout` for hosts where coreutils isn't on /usr/bin.
 
-    lib.sh's require_fly_ssh and wait_for_fly_ssh_ready both wrap flyctl
-    in `timeout <secs>` so a stuck WireGuard handshake doesn't hang the
-    seed forever. macOS doesn't ship `timeout` in /usr/bin (it's in
+    lib.sh's wait_for_fly_ssh_ready wraps flyctl in `timeout <secs>`
+    so a stuck WireGuard handshake doesn't hang the seed forever.
+    macOS doesn't ship `timeout` in /usr/bin (it's in
     coreutils via Homebrew). Tests pin PATH to a controlled set so they
     don't depend on the host's Homebrew layout; this stub provides
     `timeout` semantics (run the child, propagate rc, ignore the time

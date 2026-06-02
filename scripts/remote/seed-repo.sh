@@ -137,7 +137,7 @@ seed_repo_clone() {
   # Both helpers are no-ops when called against an already-warm
   # machine, so the cost is one fast probe.
   if command -v require_fly_ssh >/dev/null 2>&1; then
-    if ! require_fly_ssh "$FLY_APP"; then
+    if ! require_fly_ssh; then
       remote_log "seed_repo: Fly SSH setup failed; cannot seed repo"
       return 1
     fi
@@ -333,7 +333,7 @@ seed_repo_dirty() {
   # and .git/* structurally protects against any future change that
   # lets those paths surface in the porcelain output.
   if command -v require_fly_ssh >/dev/null 2>&1; then
-    if ! require_fly_ssh "$FLY_APP"; then
+    if ! require_fly_ssh; then
       remote_log "seed_repo: Fly SSH setup failed; cannot transfer delta"
       return 1
     fi

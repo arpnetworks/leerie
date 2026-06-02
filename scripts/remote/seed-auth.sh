@@ -96,13 +96,13 @@ seed_auth() {
   # `flyctl ssh console -C` instead: it forwards host stdin to the
   # remote command and supports arbitrarily large payloads (we
   # routinely transfer ~640 MB of Claude plugins/agents). Requires
-  # an active Fly SSH cert in the host's ssh-agent — require_fly_ssh
-  # ensures that.
+  # an active Fly SSH cert in the leerie-private ssh-agent —
+  # require_fly_ssh ensures that.
   # require_fly_ssh lives in lib.sh (sourced by provision.sh, which the
   # launcher sources before seed-auth.sh). Defensive check for callers
   # that source seed-auth.sh standalone (e.g. tests).
   if command -v require_fly_ssh >/dev/null 2>&1; then
-    if ! require_fly_ssh "$FLY_APP"; then
+    if ! require_fly_ssh; then
       remote_log "seed_auth: Fly SSH setup failed; cannot seed config"
       return 1
     fi

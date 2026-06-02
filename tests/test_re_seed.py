@@ -62,8 +62,8 @@ def _stub_flyctl(tmp_path: Path, *, remote_status: str = "started",
     with tmp_path/machine-work, and the rewritten command is exec'd
     locally so the rsync protocol actually completes successfully.
 
-    Also writes a `timeout` stub into tmp_path. lib.sh's require_fly_ssh
-    and wait_for_fly_ssh_ready wrap flyctl in `timeout <secs>` and macOS
+    Also writes a `timeout` stub into tmp_path. lib.sh's
+    wait_for_fly_ssh_ready wraps flyctl in `timeout <secs>` and macOS
     doesn't ship `timeout` in /usr/bin. The stub skips the time cap and
     exec's the real (stubbed) child.
     """
@@ -89,22 +89,14 @@ def _stub_flyctl(tmp_path: Path, *, remote_status: str = "started",
         '  "machine destroy") echo "destroyed" > "$STATE_FILE"; exit 0 ;;\n'
         '  "ssh issue") exit 0 ;;\n'
         '  "ssh console")\n'
-        # Parse -C "<cmd>" and --machine "<id>" from the remaining args.
+        # Parse -C "<cmd>" from the remaining args.
         '    cmd=""\n'
-        '    machine=""\n'
         '    while [ $# -gt 0 ]; do\n'
         '      case "$1" in\n'
         '        -C) cmd="$2"; shift 2 ;;\n'
-        '        --machine) machine="$2"; shift 2 ;;\n'
         '        *) shift ;;\n'
         '      esac\n'
         '    done\n'
-        # require_fly_ssh probe: machine is "probe-nonexistent". Emit
-        # the magic string require_fly_ssh greps for and exit nonzero.
-        '    if [ "$machine" = "probe-nonexistent" ]; then\n'
-        '      echo "Error: no started VMs" >&2\n'
-        '      exit 1\n'
-        '    fi\n'
         '    case "$cmd" in\n'
         f'      *"git -C /work status"*) printf "%s" "{remote_dirty}"; exit 0 ;;\n'
         '      "true") exit 0 ;;\n'
@@ -146,8 +138,8 @@ def _stub_flyctl(tmp_path: Path, *, remote_status: str = "started",
     )
     fake.chmod(0o755)
 
-    # Stub `timeout` so require_fly_ssh / wait_for_fly_ssh_ready work on
-    # macOS hosts where /usr/bin doesn't include it. Tests pin PATH to
+    # Stub `timeout` so wait_for_fly_ssh_ready works on macOS hosts
+    # where /usr/bin doesn't include it. Tests pin PATH to
     # tmp_path:/usr/bin:/bin which excludes Homebrew.
     timeout_stub = tmp_path / "timeout"
     timeout_stub.write_text(

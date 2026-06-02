@@ -2347,6 +2347,34 @@ local-runtime auto-install in `scripts/install.sh:200-208` and respects
 hint-and-exit-1). By the time `provision_machine` runs, `flyctl` is
 guaranteed to be on PATH and authenticated.
 
+#### Private ssh-agent isolation (`_leerie_fly_agent_ensure`)
+
+Before any `flyctl ssh ...` call can run, the launcher's `RUNTIME=fly`
+branch invokes `_leerie_fly_agent_ensure` (in `scripts/remote/lib.sh`)
+to spawn — or reuse — a leerie-owned ssh-agent at
+`${XDG_CACHE_HOME:-$HOME/.cache}/leerie/agent/ssh-agent.sock` and
+export `SSH_AUTH_SOCK` to point at it for the rest of the process
+tree. The user's main ssh-agent is never touched.
+
+This isolation matters because `flyctl ssh issue --agent` is
+**additive** — it appends a fresh 24h cert to the agent and never
+deletes prior certs. With multiple `require_fly_ssh` callers per
+leerie run (seed-auth + two seed-repo paths), aiming flyctl at the
+user's main agent accumulates dozens of certs, which OpenSSH then
+offers to every ssh destination (including `github.com`). After
+~5 failed auth attempts per connection, GitHub rate-limits the
+account. Containing all Fly certs in a private agent reachable only
+by leerie's process tree eliminates the failure mode.
+
+The private agent is persistent (lazy-spawned, never auto-killed)
+so the 24h cert is fully reused across leerie runs — re-issuing on
+every invocation was what produced the original accumulation. Reboot
+wipes the socket inode; the next run lazy-spawns fresh. Parallel
+leerie invocations serialize on `~/.cache/leerie/agent/.spawn.lock`
+via `mkdir`-as-mutex (portable across darwin/linux without the
+non-stdlib `flock` binary that macOS lacks); only the first spawn
+wins, the rest see a live socket and reuse it.
+
 #### Worker auth + config seeding (`scripts/remote/seed-auth.sh`)
 
 After `provision_machine()` returns successfully, the launcher sources
@@ -2361,13 +2389,12 @@ as a single string AND forwards host stdin.)
 
 `seed_auth()` performs four steps:
 
-1. **Hallpass readiness probe.** Call `require_fly_ssh` (skip
-   `flyctl ssh issue` when the ssh-agent already has any Fly cert —
-   detected via `ssh-add -l | grep CERT`; survives Fly cert-API
-   outages) and `wait_for_fly_ssh_ready` (poll `flyctl ssh console
-   --pty=false -C true` against the target machine until success;
-   hallpass takes 5-30 s to come up after `flyctl machine start`
-   reports "started").
+1. **Hallpass readiness probe.** Call `require_fly_ssh` (ensures the
+   leerie-private ssh-agent — see above — holds a valid Fly cert,
+   issuing only if no cert exists) and `wait_for_fly_ssh_ready` (poll
+   `flyctl ssh console --pty=false -C true` against the target
+   machine until success; hallpass takes 5-30 s to come up after
+   `flyctl machine start` reports "started").
 
 2. **Tar-pipe delivery of `$STAGE` to /home/leerie.** `tar -cC $STAGE`
    (excluding `.gitconfig`, `.gitconfig.local`, `.gitignore`,

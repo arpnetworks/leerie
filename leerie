@@ -1401,6 +1401,12 @@ if [ "$RUNTIME" = "fly" ]; then
   # and before any other remote script is sourced.
   # shellcheck disable=SC1091
   . "$LEERIE_REPO/scripts/remote/lib.sh"
+  # Spawn (or reuse) the leerie-private ssh-agent at
+  # ~/.cache/leerie/agent/ssh-agent.sock and set SSH_AUTH_SOCK for the
+  # rest of this process tree. Must run BEFORE any flyctl ssh call so
+  # Fly-issued certs never land in the user's main agent (which would
+  # cause OpenSSH to offer them to github.com and trigger rate-limits).
+  _leerie_fly_agent_ensure
   if ! require_flyctl; then
     exit 1
   fi
