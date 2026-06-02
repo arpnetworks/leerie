@@ -31,15 +31,15 @@ inside the container (DESIGN §6 / §0.5 below).
 | `Dockerfile` | Image recipe (Debian 12 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. `cd /work`. If invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately), `exec sleep infinity` to keep the namespace alive. Otherwise `exec python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
-| `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, then `destroy_machine`; on sync failure, leave machine RUNNING with `sync_failed_at` written to the sidecar and a multi-line WARNING listing recovery commands), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: stop machine, write `paused_at`/`pause_reason` to the run sidecar). |
+| `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-finalize-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, source `scripts/host-finalize.sh` and call `host_finalize <run-dir>` to push + open the PR with the host's auth; **only if push succeeds** does `destroy_machine` run; on push failure leave the machine RUNNING with a recovery banner pointing at `leerie --finalize <run-id>`; on sync failure same recovery pattern with `sync_failed_at` written to the sidecar), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: stop machine, write `paused_at`/`pause_reason` to the run sidecar). |
 | `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `attach.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `update_run_json()` (atomic merge of fields into `.leerie/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), and `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated). Replaces four duplicated detection blocks across the remote scripts. |
 | `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch when `paused_at` is set in the run sidecar). Exports `resume_machine()`: reads `fly_machine_id` from the sidecar, runs `flyctl machine start`, waits for `started`, and clears `paused_at`/`pause_reason` from the sidecar. The launcher then runs the orchestrator inside the resumed machine with `--resume --run-id <id>`. |
 | `scripts/remote/attach.sh` | PTY-attach helper (invoked via `leerie --attach`). Resolves the Fly Machine ID for a given run (or the only active record under `.leerie/remote/`) and `exec`s `flyctl ssh console` to open a real PTY into the machine over Fly's WireGuard mesh. `--tail` mode replaces the bare-shell command with `tail -F /work/.leerie/runs/<run-id>/orchestrator.log` — the canonical way to reattach to a detached run after Ctrl-C or laptop disconnect. No sshd in the image, no key management: hallpass is platform-injected by Fly. |
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Exports `re_seed()`: reads `fly_machine_id` from the run sidecar, wakes the machine via `flyctl machine start` if stopped, runs a safety check that refuses re-seed when machine-side `/work` has uncommitted tracked changes (unless `LEERIE_RE_SEED_FORCE=1`), then calls `seed_repo_dirty` from `seed-repo.sh`. Invoked by the launcher's `--re-seed <run-id>` fast-path and by the auto-re-seed step in the `--resume <run-id> --runtime fly` flow. |
 | `scripts/remote/seed-auth.sh` | Seeds Claude config + git identity into the provisioned Fly Machine. Tar-pipes the host's `$STAGE` (Keychain-extracted OAuth credentials + projects-stripped `~/.claude.json` + `.claude/` subdirs, with `.claude/local` skipped — ~408 MB host npm install duplicated by the Dockerfile's globally-installed claude binary) to `/home/leerie/` via `flyctl ssh console -C "tar -xC /home/leerie"`. Writes git identity to `/home/leerie/.gitconfig` (not `--global`, which would land in `/root/.gitconfig` under the ssh-console session's default root user). Pre-warms `claude --version` once as the leerie user so the orchestrator's preflight call hits warm caches (the FIRST claude invocation on a cold Fly machine takes ~17 s — Node + statsig cold start — and would otherwise exceed the orchestrator's preflight timeout). |
 | `scripts/remote/seed-repo.sh` | Two-phase bundle + delta repo seeding helper (sourced by the `leerie` launcher after `provision_machine()` succeeds). Exports `seed_repo_clone` (wipe `/work` contents but preserve the inode; create `git bundle` for the parent and each submodule; pipe each bundle via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"` — `sh -c` is required because bare `cat > ...` fails on flyctl's `-C`; have the machine `git clone` from the parent bundle, wire submodule URLs to their per-submodule bundles, run `git -c protocol.file.allow=always submodule update --recursive` — `protocol.file.allow` is required by git 2.38+ for file://-style submodule URLs per CVE-2022-39253 — then chown to leerie; clean up the bundle tmpfiles), `seed_repo_dirty` (rsync the dirty/untracked delta plus force-included `.claude/`, used by both fresh-seed delta and the Phase 4 `re-seed.sh` flow), and the wrapper `seed_repo`. Bundles sidestep macOS BSD tar's NFC→NFD filename normalization, which corrupted submodule working trees containing non-ASCII filenames on the Linux receiver. No in-machine `git clone` from origin — Fly machines deliberately receive no GitHub credentials. |
-| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.leerie/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry (stderr is captured to a tmpfile, NOT merged via `2>&1`, because `flyctl ssh console`'s "Connecting to ..." stderr would shift parsed-line indices and corrupt the discovered branch name); (2) probes whether the run branch actually exists on the machine via `git rev-parse --verify refs/heads/<branch>` — only then bundles. A missing branch is the cleared-but-empty terminal-state case (DESIGN §6); the `no_push` flag on `run.json` is NOT used as a proxy because it's a mechanism flag the launcher forces (the in-Fly orchestrator can't push), not a user-intent flag; (3) tars `.leerie/runs/<run-id>/` from the machine and extracts it on the host; (4) strips the mechanism-flag `no_push=true` from the host-side `run.json` after extraction, so `host_finalize` doesn't conflate it with user intent (which is recorded separately in `fly-machine.json` as `host_no_push`). |
-| `scripts/host-finalize.sh` | Host-side push + PR creation block, sourced by both the normal post-run code path in `leerie` and the `leerie --finalize <run-id>` fast-path. Exports `host_finalize <run-dir>`: honors `run.json.no_push` (skip), short-circuits when `pushed_at` is already set (idempotent), runs `git push -u origin <run-branch>` (with `--no-verify` if `NO_VERIFY_PUSH=true`), then `gh pr create` (using `pr_title`/`pr_body` from `run.json` if the pr_writer worker populated them, otherwise the deterministic fallback). PR-creation failure is non-fatal (push already succeeded). Replaces ~140 lines of inline launcher code with a single function call so the two callers stay in sync. |
+| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.leerie/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry (stderr is captured to a tmpfile, NOT merged via `2>&1`, because `flyctl ssh console`'s "Connecting to ..." stderr would shift parsed-line indices and corrupt the discovered branch name); (2) probes whether the run branch actually exists on the machine via `git rev-parse --verify refs/heads/<branch>` — only then bundles. A missing branch is the cleared-but-empty terminal-state case (DESIGN §6); the `no_push` flag on `run.json` is NOT used as a proxy because it's a mechanism flag the launcher forces (the in-Fly orchestrator can't push), not a user-intent flag; (3) tars `.leerie/runs/<run-id>/` from the machine and extracts it on the host; (4) **defense-in-depth**: strips a stray mechanism-flag `no_push=true` from the host-side `run.json` after extraction. This was load-bearing when the orchestrator wrote the mechanism flag; after the `--host-no-push` intent split landed, `phase_finalize` writes **intent** to `run.json.no_push`, so the stripper is now a defensive no-op for old-image runs in flight and can be removed in a follow-up release. |
+| `scripts/host-finalize.sh` | Host-side push + PR creation block, sourced by three call sites: the local-runtime post-run code path in `leerie`, `decide_teardown` in `scripts/remote/provision.sh` (Fly clean-exit auto-finalize), and the `leerie --finalize <run-id>` recovery fast-path. Exports `host_finalize <run-dir>`: honors `run.json.no_push` (skip — this is the **intent** flag, written by the orchestrator's `phase_finalize` from `push_will_happen(no_push, host_no_push)`, not the launcher-forced mechanism flag), short-circuits when `pushed_at` is already set (idempotent), runs `git push -u origin <run-branch>` (with `--no-verify` if `NO_VERIFY_PUSH=true`), then `gh pr create` (using `pr_title`/`pr_body` from `run.json` if the pr_writer worker populated them, otherwise the deterministic fallback). PR-creation failure is non-fatal (push already succeeded). Replaces ~140 lines of inline launcher code with a single function call so the three callers stay in sync. |
 
 ### Python runtime — provisioned inside the container
 
@@ -2316,6 +2316,13 @@ The launcher's finalize block in `leerie` (bash) does, in order:
    `pr_error`. **Non-fatal** — exit 0 (the run is complete; only the
    PR is missing).
 
+**Local runtime only.** The inline finalize block above runs only when
+`LEERIE_RUNTIME != "fly"`. On Fly the run dir is not yet on the host
+when this block would otherwise execute (it's on the Fly Machine and
+gets streamed back inside the EXIT trap `decide_teardown` that fires
+*later*). The Fly path runs the same `host_finalize` function from a
+different call site — see *Remote execution mode* below.
+
 **Preflight (`leerie` bash, before `nerdctl run`):** the launcher
 checks `git rev-parse --is-inside-work-tree`, `shutil.which gh`,
 `gh auth status`, and `git remote get-url origin` BEFORE spinning up
@@ -2325,9 +2332,19 @@ escape hatch. The orchestrator no longer runs these checks; they
 moved to the host where the auth state actually lives.
 
 `--no-push` skips the entire push + PR step. CLI flag, `LEERIE_NO_PUSH`
-env, `no_push = true` in `leerie.toml`. `--no-verify` is CLI-only and
-only affects the push step (worker `git commit`s inside worktrees
-still run all hooks).
+env, `no_push = true` in `leerie.toml`. **Both the launcher (bash) and
+the in-container orchestrator (Python) resolve `no_push` from all three
+sources** so they agree on intent: the orchestrator's
+`resolve_no_push` (`orchestrator/leerie.py:2635`) and the launcher's
+inline TOML fallback (mirroring `_read_toml_key`'s flat grep — no
+`tomllib` dependency, since the launcher runs on the user's host where
+Python 3.9 is still common) both check CLI → env → TOML. Disagreement
+on a TOML-only opt-out would make the Fly auto-finalize path push
+against user intent (the launcher seeds `fly-machine.json.host_no_push`
+and the `--host-no-push` argv; the orchestrator gates `pr_writer` and
+writes `run.json.no_push`). `--no-verify` is CLI-only and only
+affects the push step (worker `git commit`s inside worktrees still
+run all hooks).
 
 ### Remote execution mode
 
@@ -2588,7 +2605,8 @@ pid_path = run_dir + "/orchestrator.pid"
 with open(log_path, "ab") as log_f:
     p = subprocess.Popen(
         ["python3", "/opt/leerie-image/orchestrator/leerie.py",
-         "--no-push", *orch_args],
+         "--no-push", *orch_args],   # --host-no-push is in orch_args
+                                     # (appended by the launcher; see below)
         stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
         start_new_session=True,    # bash setsid equivalent; portable
         cwd="/work",                # avoid stale-cwd ENOENT cascades
@@ -2613,14 +2631,36 @@ printf '%s' "$_tail_invocation" \
 ```
 
 `--no-push` is always injected so the remote orchestrator's
-`phase_finalize` does not attempt a push itself — push is always the
-host launcher's responsibility, run via `leerie --finalize <run-id>` after
-reattach (see *Detached run finalization* below). The orchestrator
-writes `no_push=true` to its run.json as a mechanism flag; that's the
-launcher-forced value, NOT the user's intent — see *Run branch
-stream-back* below for how the user's actual `--no-push` preference is
-recorded separately in `fly-machine.json.host_no_push` and consulted by
-`leerie --finalize`.
+`phase_finalize` does not attempt a push itself — the Fly Machine has
+no GitHub auth and cannot push regardless of user intent. Push is the
+host's responsibility, run inline by `decide_teardown` after
+stream-back (see *Run branch stream-back* below) or — as a recovery
+path — via `leerie --finalize <run-id>` after reattach.
+
+**Intent vs mechanism.** The orchestrator must distinguish "the user
+launched with `--no-push`" (intent) from "I am running on a Fly
+Machine and physically cannot push" (mechanism). Both arrive as flags
+on the orchestrator's argv:
+
+- `--no-push` — the mechanism flag the launcher always passes on Fly.
+- `--host-no-push true|false` — the intent flag the launcher
+  *additionally* appends on Fly. The value is the launcher's resolved
+  `$NO_PUSH` at machine-creation time (host_no_push in
+  `fly-machine.json`).
+
+`phase_finalize` gates `pr_writer` and the value it writes to
+`run.json.no_push` on `push_will_happen(no_push, host_no_push)`:
+
+```python
+def push_will_happen(no_push: bool, host_no_push: bool | None) -> bool:
+    if host_no_push is None:            # local runtime — no Fly Machine
+        return not no_push
+    return not host_no_push             # Fly — intent wins over mechanism
+```
+
+Without this split, `pr_writer` would be silently skipped on every
+Fly run (because the mechanism flag silences it) and the LLM-written
+PR body would always be replaced by the deterministic fallback.
 
 When the tail's ssh-console session ends (the orchestrator wrote its
 final log line and exited, or the user pressed Ctrl-C, or the laptop
@@ -3135,7 +3175,7 @@ discovery without parsing the full `state.json`):
 | `killed_at` | ISO-8601 str \| null | when the remote run was explicitly destroyed by `leerie --kill <run-id>`. The Fly Machine has been destroyed and the run is no longer resumable. Null for any other terminal state. |
 | `sync_failed_at` | ISO-8601 str \| null | when the clean-exit branch of `decide_teardown` ran `fetch_branch` and it failed. The orchestrator finished cleanly on the machine, but the run branch + state directory could not be pulled back to the host. The machine is LEFT RUNNING (not stopped) so the user can recover manually via `leerie --finalize` (retry sync + push), `leerie --attach` (inspect), or `leerie --kill` (destroy only after work is safely on host). Orthogonal to `paused_at`/`pushed_at`/`killed_at` — the machine is neither paused nor destroyed. Mutex-checked against `pushed_at` (a successfully pushed run can't be sync-failed) and `killed_at` (a destroyed machine can't be sync-failed). Requires `fly_machine_id` to be set (the running machine needs a pointer). |
 | `sync_fail_reason` | str \| null | short tag accompanying `sync_failed_at` (currently always `sync-failed-on-clean-exit`). Null when `sync_failed_at` is null. |
-| `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped (`--no-push`), or had not yet run; the launcher uses its deterministic fallback in that case. |
+| `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped because the user opted out of pushing (`push_will_happen(no_push, host_no_push)` is False — local `--no-push` or Fly `host_no_push=true`), or had not yet run; `host_finalize` uses its deterministic fallback in that case. |
 | `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
 

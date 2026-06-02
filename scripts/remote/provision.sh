@@ -185,10 +185,91 @@ decide_teardown() {
       # when they've recovered the work.
       if _try_fetch_branch_for_teardown; then
         remote_log "remote: run branch + state synced to host"
-        if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
-          remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR"
+        # Auto-finalize: now that the run dir is on the host (and the
+        # orchestrator wrote run.json.no_push as **intent**, not the
+        # mechanism flag — see DESIGN §6), push + PR happen here so
+        # the user doesn't need a second command. The local-runtime
+        # path runs the same host_finalize inline; this is the Fly
+        # parity call site.
+        #
+        # Ctrl-C semantics (documented per the Ctrl-C audit in the
+        # implementation plan): bash masks the originating signal for
+        # the duration of this handler, so re-entrancy is not
+        # possible. SIGINT during `git push` → push fails → trap
+        # leaves machine running (recovery). SIGINT during `gh pr
+        # create` → push already succeeded → trap destroys machine;
+        # the user can `gh pr create` manually using the URL hint
+        # host_finalize already printed. Matches `leerie --finalize`'s
+        # existing behavior — work is preserved on origin.
+        local run_dir=""
+        if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ] && [ -n "${USER_REPO:-}" ]; then
+          run_dir="$USER_REPO/.leerie/runs/$LEERIE_REMOTE_RUN_ID"
         fi
-        destroy_machine
+        # Skip auto-finalize when the run exited cleanly (rc=0|10|75)
+        # but didn't reach phase_finalize — most commonly
+        # EXIT_NEEDS_ANSWERS=10 (orchestrator wrote
+        # pending-questions.json and exited 10 so the user can answer
+        # clarification questions and re-run with --answers). The run
+        # isn't failed; it's waiting. Calling host_finalize on a
+        # not-yet-finalized run would print a misleading "push FAILED"
+        # banner because host_finalize requires run.json.finished_at +
+        # branch fields. Fall through to the existing manual-hint
+        # path: destroy the machine (work is on host either way) and
+        # tell the user to re-run with --answers, after which
+        # `leerie --finalize <run-id>` is available.
+        local _run_finished_at=""
+        if [ -n "$run_dir" ] && [ -f "$run_dir/run.json" ]; then
+          _run_finished_at="$(jq -r '.finished_at // ""' "$run_dir/run.json" 2>/dev/null || true)"
+        fi
+        if [ -n "$run_dir" ] && [ -d "$run_dir" ] && [ -z "$_run_finished_at" ]; then
+          remote_log "remote: run did not reach finalize (likely waiting for clarification); skipping auto-finalize"
+          if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
+            remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR after the run completes"
+          fi
+          destroy_machine
+        elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
+          local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
+          if [ -f "$_leerie_dir/scripts/host-finalize.sh" ]; then
+            # shellcheck disable=SC1091
+            . "$_leerie_dir/scripts/host-finalize.sh"
+            remote_log "auto-finalize: pushing + opening PR"
+            if host_finalize "$run_dir"; then
+              # Push succeeded (PR-creation failure is non-fatal — the
+              # work is on origin; pr_error is in run.json).
+              destroy_machine
+            else
+              # Push failed; host_finalize wrote push_error to run.json.
+              # Mirror the sync-failure pattern below: keep the machine
+              # running so the user can retry from the host. Surface a
+              # banner with the recovery command.
+              echo "" >&2
+              echo "================================================================" >&2
+              remote_log "WARNING — auto-finalize push FAILED."
+              echo "  The run synced to host cleanly but git push failed." >&2
+              echo "  Branch + state are on host; retry the push from here:" >&2
+              echo "" >&2
+              echo "    leerie --finalize ${LEERIE_REMOTE_RUN_ID}" >&2
+              echo "" >&2
+              echo "  Machine is being LEFT RUNNING. When recovered, destroy:" >&2
+              echo "    leerie --kill ${LEERIE_REMOTE_RUN_ID}" >&2
+              echo "  Machine: $mid (still running on Fly)" >&2
+              echo "================================================================" >&2
+              # Intentionally NO destroy_machine.
+            fi
+          else
+            # Defensive: host-finalize.sh missing. Fall back to the old
+            # behavior (print the hint, destroy). Work is on host.
+            remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR"
+            destroy_machine
+          fi
+        else
+          # Defensive: sync said success but the expected run dir
+          # isn't where we look for it. Fall back to the manual hint.
+          if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
+            remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR"
+          fi
+          destroy_machine
+        fi
       else
         local sync_reason="sync-failed-on-clean-exit"
         local sidecar=""

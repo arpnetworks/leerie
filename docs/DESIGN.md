@@ -525,11 +525,17 @@ user didn't already see in the worker logs.
 **Remote runs** (Fly.io `--runtime fly`) face the same auth boundary from
 the other direction: the run branch and `.leerie/runs/<run-id>/` state live
 on the Fly Machine's filesystem, not on the host. The launcher resolves
-this with a **stream-back** step before the host-side finalize runs:
+this with a **stream-back** step before the host-side finalize runs.
+
+The orchestration is structured as a clean-exit EXIT trap
+(`decide_teardown` in `scripts/remote/provision.sh`) so the sync and
+the destroy stay on the same atomic path — sync gates destroy, and
+push + PR sit between them on the host:
 
 1. The orchestrator inside the Machine writes `finished_at` to `run.json`
    and exits 0, exactly as in local mode.
-2. The launcher calls `scripts/remote/fetch-branch.sh`, which:
+2. The launcher's `decide_teardown` trap fires. On a clean rc
+   (`0 | 10 | 75`) it calls `scripts/remote/fetch-branch.sh`, which:
    - discovers the completed run-id by scanning `.leerie/runs/*/run.json` on
      the Machine for a `finished_at`-bearing, unpushed entry;
    - creates a `git bundle` of `leerie/runs/<run-id>` on the Machine and
@@ -537,15 +543,38 @@ this with a **stream-back** step before the host-side finalize runs:
      host's local repo;
    - tars `.leerie/runs/<run-id>/` on the Machine and extracts it under
      `$USER_REPO/.leerie/runs/` on the host.
-3. The existing host-side finalize block (push + `gh pr create`) then runs
-   unchanged with the host's own auth — it finds `run.json` (now on the
-   host) and the run branch (now in the host repo) just as it would after a
-   local run.
+3. With the run dir now on the host, the trap sources
+   `scripts/host-finalize.sh` and calls `host_finalize` directly — push
+   + `gh pr create` happen inline, with the host's own auth, before
+   the trap proceeds.
+4. **Only if push succeeds does the trap destroy the machine.** Push
+   failure leaves the machine running and prints a recovery banner
+   pointing at `leerie --finalize <run-id>`; this mirrors the
+   sync-failure recovery path (work is preserved; the user destroys
+   manually via `leerie --kill <run-id>` when satisfied).
 
-The orchestrator inside the Machine is always invoked with `--no-push` so
-it never attempts a push itself; push is always the launcher's job. The
-stream-back step is the remote equivalent of the bind-mount: it makes the
-same state visible on the host so the same finalize code path runs.
+The local-runtime path runs the same `host_finalize` block inline in
+the launcher (no trap is needed; the launcher and the pusher are the
+same process). Both paths share `scripts/host-finalize.sh`; the
+recovery command `leerie --finalize <run-id>` also sources it. Three
+call sites, one finalize implementation.
+
+**`no_push`: intent vs mechanism.** The orchestrator inside the Machine
+is *always* invoked with `--no-push` because the Fly Machine has no
+GitHub auth — it cannot push regardless of user intent. This is a
+**mechanism flag**, not the user's preference. The user's actual
+launch-time intent is a separate signal: it lives in
+`fly-machine.json.host_no_push` on the host (set by `provision.sh` at
+machine creation) and is propagated *into* the Machine via a hidden
+`--host-no-push true|false` argv flag that the launcher appends to
+the orchestrator invocation. The orchestrator gates `pr_writer` and
+the `run.json.no_push` it writes on **intent**
+(`push_will_happen(no_push, host_no_push)` in `orchestrator/leerie.py`),
+not on the mechanism flag. The host's `host_finalize` reads the
+intent value from `run.json.no_push` and skips push if the user opted
+out at launch. This split is load-bearing: without it, `pr_writer`
+never runs on Fly (the mechanism flag silences it) and the LLM-written
+PR body is replaced by the deterministic fallback.
 
 The run branch is pushed to `origin` and a pull request is opened
 via `gh pr create` against the working branch (the branch

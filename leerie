@@ -880,6 +880,66 @@ done
 case "${LEERIE_NO_PUSH:-}" in
   1|true|TRUE|yes|YES) NO_PUSH=true ;;
 esac
+# Match the orchestrator's resolve_no_push order: CLI → env → leerie.toml.
+# The launcher and the in-Fly orchestrator are now both authoritative
+# consumers of this intent — the launcher seeds fly-machine.json.
+# host_no_push and the --host-no-push argv flag, the orchestrator gates
+# pr_writer and writes run.json.no_push. Disagreement on a TOML-only
+# opt-out would make the Fly auto-finalize path push against user
+# intent. Pattern mirrors orchestrator/leerie.py:2279 `_read_toml_key`
+# (flat `key = value` grep) — keeps the launcher free of a tomllib
+# dependency that would force a host-side Python 3.11+ bump.
+if [ "$NO_PUSH" = "false" ] && [ -f "$USER_REPO/leerie.toml" ]; then
+  # `|| true` swallows grep's exit 1 when the key is absent (set -e
+  # would otherwise abort the whole launcher). Sed normalizes the
+  # value: strip surrounding whitespace and matched double or single
+  # quotes, mirroring orchestrator/leerie.py:_read_toml_key.
+  _toml_no_push="$( { grep -E '^[[:space:]]*no_push[[:space:]]*=' \
+                          "$USER_REPO/leerie.toml" 2>/dev/null \
+                      || true; } \
+                    | head -1 \
+                    | sed -E 's/^[[:space:]]*no_push[[:space:]]*=[[:space:]]*//;
+                              s/[[:space:]]*$//;
+                              s/^"(.*)"$/\1/;
+                              s/^'"'"'(.*)'"'"'$/\1/')"
+  # Case-fold for matching so the launcher's truthy/falsy vocabulary
+  # is exactly the orchestrator's `_parse_bool_envtoml` (which uses
+  # `.lower()` then matches `1|true|yes|on` / `0|false|no|off`). The
+  # original value is kept for the error message so the user sees the
+  # exact spelling they wrote.
+  _toml_no_push_lc="$(printf '%s' "$_toml_no_push" \
+                      | tr '[:upper:]' '[:lower:]')"
+  case "$_toml_no_push_lc" in
+    1|true|yes|on)
+      NO_PUSH=true ;;
+    0|false|no|off|"")
+      : ;;  # explicit falsy / absent → leave NO_PUSH=false
+    *)
+      # Unrecognized value — die with the same error shape the
+      # orchestrator surfaces from _resolve_bool_pref. Silent fall-
+      # through would be the worse failure mode (a typo'd opt-out
+      # silently becomes "push", which surprises the user). Both
+      # layers should agree on what's a valid boolean.
+      echo "leerie: error: $USER_REPO/leerie.toml: no_push='$_toml_no_push' is not a boolean" >&2
+      echo "  (expected one of: 1, 0, true, false, yes, no, on, off — case-insensitive)" >&2
+      exit 1 ;;
+  esac
+  unset _toml_no_push _toml_no_push_lc
+fi
+
+# Parse --no-verify and export NO_VERIFY_PUSH here, BEFORE
+# provision_machine registers the EXIT trap. The trap's clean-exit
+# branch calls host_finalize, which reads NO_VERIFY_PUSH; exporting it
+# late (after the trap fires) would make `--no-verify` silently
+# inoperative on the Fly path. CLI-only (no env/TOML mirror — matches
+# CLAUDE.md's explicit-user-request principle for hook-skipping).
+NO_VERIFY_PUSH=false
+for arg in "$@"; do
+  if [ "$arg" = "--no-verify" ]; then
+    NO_VERIFY_PUSH=true
+  fi
+done
+export NO_VERIFY_PUSH
 
 # 1. cwd is a git repo (orchestrator's old check at leerie.py:7652).
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
@@ -1455,6 +1515,20 @@ if [ "$RUNTIME" = "fly" ]; then
     REWRITTEN_ARGS+=("--run-id" "$LEERIE_RUN_ID")
   fi
 
+  # Communicate the host's launch-time push intent to the in-Fly
+  # orchestrator (DESIGN §6 *Finalization*, intent vs mechanism). The
+  # orchestrator-side --no-push the in-Machine launcher injects is the
+  # mechanism flag (Fly can't reach origin); --host-no-push is the
+  # user's intent. The orchestrator gates pr_writer + the
+  # run.json.no_push it writes on intent, not mechanism. Local-runtime
+  # nerdctl invocation does NOT pass this — host_no_push stays None
+  # there and push_will_happen() falls back to (not no_push).
+  if [ "$NO_PUSH" = "true" ]; then
+    REWRITTEN_ARGS+=("--host-no-push" "true")
+  else
+    REWRITTEN_ARGS+=("--host-no-push" "false")
+  fi
+
   FLY_IMAGE_TAG="$(resolve_fly_image_tag)"
   export FLY_IMAGE_TAG
 
@@ -1855,6 +1929,16 @@ fi
 # the HOST so the host's working auth state (gh token, ssh-agent,
 # Keychain) is what authenticates — no in-container forwarding required.
 #
+# **Local runtime only.** On the Fly path the run dir is NOT yet on the
+# host when we reach this block — the stream-back happens inside
+# `decide_teardown` (an EXIT trap in scripts/remote/provision.sh) that
+# fires *after* this code returns. If we let this block run on Fly it
+# always finds nothing (LATEST_RUN_DIR is empty, exits 0), then the
+# trap syncs and destroys the machine without ever pushing. So: on
+# Fly, finalize happens inside `decide_teardown` (it sources the same
+# scripts/host-finalize.sh and calls host_finalize directly). On
+# local, finalize happens here.
+#
 # Skip if:
 #   - container exited non-zero (run failed; nothing to push)
 #   - --no-push set (the user explicitly opted out)
@@ -1864,48 +1948,48 @@ if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
   exit "$container_rc"
 fi
 
-# Locate the most-recent run dir under .leerie/runs/ that has a run.json
-# with finished_at set. The orchestrator writes run.json at finalize.
-# `find` + sort isn't portable with -printf; iterate and pick newest.
-LATEST_RUN_DIR=""
-LATEST_RUN_MTIME=0
-if [ -d "$USER_REPO/.leerie/runs" ]; then
-  for run_json in "$USER_REPO"/.leerie/runs/*/run.json; do
-    [ -f "$run_json" ] || continue
-    # finished_at must be present and non-null.
-    if [ "$(jq -r '.finished_at // ""' "$run_json")" = "" ]; then
-      continue
-    fi
-    # pushed_at must be absent or null — otherwise this run was already
-    # pushed (e.g. on a previous launcher invocation).
-    if [ "$(jq -r '.pushed_at // ""' "$run_json")" != "" ]; then
-      continue
-    fi
-    # Use mtime of run.json as the recency proxy.
-    mtime="$(stat -f %m "$run_json" 2>/dev/null || stat -c %Y "$run_json" 2>/dev/null || echo 0)"
-    if [ "$mtime" -gt "$LATEST_RUN_MTIME" ]; then
-      LATEST_RUN_MTIME=$mtime
-      LATEST_RUN_DIR="$(dirname "$run_json")"
-    fi
-  done
-fi
-
-if [ -z "$LATEST_RUN_DIR" ]; then
-  # No run finished this invocation — nothing to push.
-  exit 0
-fi
-
-# Detect --no-verify from $@ (CLI-only; not an env var).
-NO_VERIFY_PUSH=false
-for arg in "$@"; do
-  if [ "$arg" = "--no-verify" ]; then
-    NO_VERIFY_PUSH=true
+if [ "$RUNTIME" != "fly" ]; then
+  # Locate the most-recent run dir under .leerie/runs/ that has a run.json
+  # with finished_at set. The orchestrator writes run.json at finalize.
+  # `find` + sort isn't portable with -printf; iterate and pick newest.
+  LATEST_RUN_DIR=""
+  LATEST_RUN_MTIME=0
+  if [ -d "$USER_REPO/.leerie/runs" ]; then
+    for run_json in "$USER_REPO"/.leerie/runs/*/run.json; do
+      [ -f "$run_json" ] || continue
+      # finished_at must be present and non-null.
+      if [ "$(jq -r '.finished_at // ""' "$run_json")" = "" ]; then
+        continue
+      fi
+      # pushed_at must be absent or null — otherwise this run was already
+      # pushed (e.g. on a previous launcher invocation).
+      if [ "$(jq -r '.pushed_at // ""' "$run_json")" != "" ]; then
+        continue
+      fi
+      # Use mtime of run.json as the recency proxy.
+      mtime="$(stat -f %m "$run_json" 2>/dev/null || stat -c %Y "$run_json" 2>/dev/null || echo 0)"
+      if [ "$mtime" -gt "$LATEST_RUN_MTIME" ]; then
+        LATEST_RUN_MTIME=$mtime
+        LATEST_RUN_DIR="$(dirname "$run_json")"
+      fi
+    done
   fi
-done
-export NO_VERIFY_PUSH
 
-# Push + PR creation are shared with the `leerie --finalize <run-id>`
-# fast-path; both source scripts/host-finalize.sh and call host_finalize.
-# shellcheck disable=SC1091
-. "$LEERIE_REPO/scripts/host-finalize.sh"
-host_finalize "$LATEST_RUN_DIR" || exit $?
+  if [ -z "$LATEST_RUN_DIR" ]; then
+    # No run finished this invocation — nothing to push.
+    exit 0
+  fi
+
+  # NO_VERIFY_PUSH was parsed + exported up at the top of the script
+  # (before provision_machine registers its EXIT trap), so the Fly clean-
+  # exit auto-finalize sees it. It's still in scope here for the local-
+  # runtime path.
+
+  # Push + PR creation are shared with the `leerie --finalize <run-id>`
+  # fast-path; both source scripts/host-finalize.sh and call host_finalize.
+  # shellcheck disable=SC1091
+  . "$LEERIE_REPO/scripts/host-finalize.sh"
+  host_finalize "$LATEST_RUN_DIR" || exit $?
+fi
+# Fly path: decide_teardown's EXIT trap will source host-finalize.sh and
+# call host_finalize after fetch_branch. Nothing else to do here.

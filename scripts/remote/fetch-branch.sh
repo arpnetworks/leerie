@@ -271,14 +271,18 @@ print(best[3])
 
   remote_log "remote: run state directory fetched to $host_leerie_runs/$run_id"
 
-  # The in-Fly orchestrator was launched with --no-push by the launcher
-  # because the machine can't push (no GitHub SSH key by design). That
-  # forced no_push=true into run.json on the machine — a mechanism
-  # flag, NOT a user-intent flag. Strip it from the host-side run.json
-  # so host_finalize doesn't conflate it with the user's actual
-  # no-push preference. The user's true intent is recorded in
-  # fly-machine.json's `host_no_push` (set at launch time by
-  # provision.sh) and consulted by the launcher's --finalize handler.
+  # DEFENSE-IN-DEPTH: strip a stray mechanism-flag no_push=true from
+  # the host-side run.json. The in-Fly orchestrator gets --no-push
+  # (because the Fly Machine has no GitHub auth) AND --host-no-push
+  # carrying the user's actual launch-time intent; phase_finalize
+  # writes **intent** (`not push_will_happen(...)`) to
+  # run.json.no_push, so this stripper is a no-op for orchestrators
+  # built against the intent-vs-mechanism split. Kept here for one
+  # release as defense against:
+  #   - in-flight runs started against an older image where the
+  #     orchestrator still wrote the mechanism flag;
+  #   - a future regression that reintroduces the conflation.
+  # Safe to remove once no in-flight pre-split runs remain.
   local _host_run_json="$host_leerie_runs/$run_id/run.json"
   if [ -f "$_host_run_json" ]; then
     python3 - "$_host_run_json" <<'PY' || true
