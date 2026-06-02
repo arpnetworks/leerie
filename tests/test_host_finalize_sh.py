@@ -157,6 +157,43 @@ def test_records_pushed_at_on_success(tmp_path):
     assert after.get("pr_error") is None
 
 
+def test_skips_when_run_branch_absent_locally(tmp_path):
+    """Defense-in-depth: when run.json names a branch that does NOT
+    exist locally (the cleared-but-empty terminal-state case from
+    DESIGN §8 — no setup-run.sh ran), host_finalize logs "absent
+    locally" and returns 0 without attempting git push.
+
+    Without this guard, the launcher would try to push a non-existent
+    branch and fail with `src refspec ... does not match any`. The
+    guard backstops fetch-branch.sh's conditional stripper and the
+    --finalize stripper in `leerie`."""
+    run_dir = _make_run(tmp_path, "noop-run-aaaaaa", run_json={
+        "branch": "leerie/runs/noop-run-aaaaaa",
+        "working_branch": "main",
+        "finished_at": "2026-05-29T16:00:00+00:00",
+    })
+    # git stub: `rev-parse --verify` returns 1 (branch absent); any
+    # other invocation passes. This is the shape `git -C <repo>
+    # rev-parse --verify refs/heads/<branch>` sees on a local repo
+    # that never had the branch checked out.
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  exit 1
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 0, r.stderr
+    assert "absent locally" in r.stderr
+    assert "treating as no-op" in r.stderr
+    # Sidecar untouched: no push_error, no pushed_at, no pr_*.
+    after = json.loads((run_dir / "run.json").read_text())
+    assert after.get("pushed_at") is None
+    assert after.get("push_error") is None
+    assert after.get("pr_url") is None
+    assert after.get("pr_error") is None
+
+
 def test_pr_failure_is_non_fatal(tmp_path):
     """gh pr create fails → pr_error set, return 0 (push already succeeded)."""
     run_dir = _make_run(

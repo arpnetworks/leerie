@@ -272,20 +272,26 @@ print(best[3])
   remote_log "remote: run state directory fetched to $host_leerie_runs/$run_id"
 
   # DEFENSE-IN-DEPTH: strip a stray mechanism-flag no_push=true from
-  # the host-side run.json. The in-Fly orchestrator gets --no-push
-  # (because the Fly Machine has no GitHub auth) AND --host-no-push
-  # carrying the user's actual launch-time intent; phase_finalize
-  # writes **intent** (`not push_will_happen(...)`) to
-  # run.json.no_push, so this stripper is a no-op for orchestrators
-  # built against the intent-vs-mechanism split. Kept here for one
-  # release as defense against:
-  #   - in-flight runs started against an older image where the
-  #     orchestrator still wrote the mechanism flag;
-  #   - a future regression that reintroduces the conflation.
-  # Safe to remove once no in-flight pre-split runs remain.
-  local _host_run_json="$host_leerie_runs/$run_id/run.json"
-  if [ -f "$_host_run_json" ]; then
-    python3 - "$_host_run_json" <<'PY' || true
+  # the host-side run.json **only when a run branch was actually
+  # fetched**. The in-Fly orchestrator gets --no-push (because the Fly
+  # Machine has no GitHub auth) AND --host-no-push carrying the user's
+  # actual launch-time intent; phase_finalize writes **intent**
+  # (`not push_will_happen(...)`) to run.json.no_push, so this stripper
+  # is a no-op for orchestrators built against the intent-vs-mechanism
+  # split. It is retained as defense against in-flight runs started
+  # against an older image where the orchestrator still wrote the
+  # mechanism flag and a branch *did* materialize.
+  #
+  # Conditional on $_branch_present: when no branch was fetched (the
+  # cleared-but-empty terminal-state case — DESIGN §8), the orchestrator's
+  # `_finish_no_work_run` deliberately writes `no_push=true` as **intent**
+  # ("nothing to push — no branch exists"). Stripping it here would
+  # disarm host_finalize's no_push gate and cause it to attempt
+  # `git push` on a non-existent branch.
+  if [ "$_branch_present" = "true" ]; then
+    local _host_run_json="$host_leerie_runs/$run_id/run.json"
+    if [ -f "$_host_run_json" ]; then
+      python3 - "$_host_run_json" <<'PY' || true
 import json, os, sys
 path = sys.argv[1]
 try:
@@ -299,6 +305,7 @@ if data.get("no_push") is True:
     open(tmp, "a").write("\n")
     os.replace(tmp, path)
 PY
+    fi
   fi
 
   remote_log "remote: fetch complete — run $run_id ready for host-side finalize"

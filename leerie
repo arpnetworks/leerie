@@ -367,6 +367,16 @@ except Exception:
     # finished_at, state.json exists, the run branch is local, and
     # the machine is gone. Skip fetch_branch and go straight to
     # host_finalize.
+    #
+    # Two flavors of "already synced":
+    #   (a) Normal run: finished_at set, state.json present, AND the
+    #       run branch exists locally (auto-sync's git bundle landed).
+    #   (b) No-work run (DESIGN §8): finished_at set, state.json
+    #       present, run.json.no_push=true, and the run branch was
+    #       NEVER materialized (so it cannot exist locally). The
+    #       auto-sync tarred .leerie/runs/<id>/ back but skipped the
+    #       bundle (fetch-branch.sh:204–205). host_finalize will
+    #       short-circuit on no_push=true.
     _already_synced="false"
     if [ -f "$_fin_run_dir/run.json" ] && [ -f "$_fin_run_dir/state.json" ]; then
       _has_finished="$(python3 -c '
@@ -386,8 +396,21 @@ try:
 except Exception:
     pass
 ' "$_fin_run_dir/run.json")"
+        _run_no_push="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print("true" if d.get("no_push") is True else "")
+except Exception:
+    pass
+' "$_fin_run_dir/run.json")"
         if [ -n "$_run_branch" ] && \
            git -C "$USER_REPO" rev-parse --verify "refs/heads/$_run_branch" >/dev/null 2>&1; then
+          # Flavor (a): branch present locally.
+          _already_synced="true"
+        elif [ "$_run_no_push" = "true" ]; then
+          # Flavor (b): no-work terminal state — finished_at + intent
+          # no_push=true and no branch was ever produced.
           _already_synced="true"
         fi
       fi
@@ -475,9 +498,26 @@ except Exception:
       fi
       # Clear the in-Fly orchestrator's mechanism-flag no_push so
       # host_finalize doesn't conflate it with user intent.
+      #
+      # Conditional on a run branch being present locally: when no
+      # branch was materialized (the cleared-but-empty terminal-state
+      # case — DESIGN §8), `_finish_no_work_run` deliberately writes
+      # no_push=true as **intent** ("nothing to push — no branch
+      # exists"). Stripping it here would disarm host_finalize's
+      # no_push gate and cause it to attempt git push on a
+      # non-existent branch.
       if [ "$_FINALIZE_NO_PUSH" = "false" ]; then
         _fetched_run_json="$_fetched_run_dir/run.json"
-        if [ -f "$_fetched_run_json" ]; then
+        _fetched_run_branch="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("branch") or "")
+except Exception:
+    pass
+' "$_fetched_run_json" 2>/dev/null || true)"
+        if [ -f "$_fetched_run_json" ] && [ -n "$_fetched_run_branch" ] && \
+           git -C "$USER_REPO" rev-parse --verify "refs/heads/$_fetched_run_branch" >/dev/null 2>&1; then
           python3 - "$_fetched_run_json" <<'PY'
 import json, os, sys
 path = sys.argv[1]

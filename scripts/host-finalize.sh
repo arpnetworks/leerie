@@ -88,6 +88,19 @@ host_finalize() {
     return 1
   fi
 
+  # Defense-in-depth: a run branch named in run.json that does not
+  # exist locally cannot be pushed. This shape is legitimate for the
+  # cleared-but-empty terminal state (DESIGN §8 — no setup-run.sh
+  # ran, so no branch was created). Treat it as a no-op rather than
+  # attempting a `git push` that will fail with `src refspec ... does
+  # not match any`. Upstream callers (fetch-branch.sh's stripper and
+  # the --finalize stripper in `leerie`) already preserve no_push=true
+  # for this case; this guard backstops them.
+  if ! git -C "$USER_REPO" rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
+    echo "[leerie] finalize: run branch $run_branch absent locally; treating as no-op" >&2
+    return 0
+  fi
+
   # --- step 1: push -----------------------------------------------------
   local push_args=(git -C "$USER_REPO" push -u origin "$run_branch")
   [ "${NO_VERIFY_PUSH:-false}" = "true" ] && push_args+=(--no-verify)

@@ -38,8 +38,8 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Exports `re_seed()`: reads `fly_machine_id` from the run sidecar, wakes the machine via `flyctl machine start` if stopped, runs a safety check that refuses re-seed when machine-side `/work` has uncommitted tracked changes (unless `LEERIE_RE_SEED_FORCE=1`), then calls `seed_repo_dirty` from `seed-repo.sh`. Invoked by the launcher's `--re-seed <run-id>` fast-path and by the auto-re-seed step in the `--resume <run-id> --runtime fly` flow. |
 | `scripts/remote/seed-auth.sh` | Seeds Claude config + git identity into the provisioned Fly Machine. Tar-pipes the host's `$STAGE` (Keychain-extracted OAuth credentials + projects-stripped `~/.claude.json` + `.claude/` subdirs, with `.claude/local` skipped — ~408 MB host npm install duplicated by the Dockerfile's globally-installed claude binary) to `/home/leerie/` via `flyctl ssh console -C "tar -xC /home/leerie"`. Writes git identity to `/home/leerie/.gitconfig` (not `--global`, which would land in `/root/.gitconfig` under the ssh-console session's default root user). Pre-warms `claude --version` once as the leerie user so the orchestrator's preflight call hits warm caches (the FIRST claude invocation on a cold Fly machine takes ~17 s — Node + statsig cold start — and would otherwise exceed the orchestrator's preflight timeout). |
 | `scripts/remote/seed-repo.sh` | Two-phase bundle + delta repo seeding helper (sourced by the `leerie` launcher after `provision_machine()` succeeds). Exports `seed_repo_clone` (wipe `/work` contents but preserve the inode; create `git bundle` for the parent and each submodule; pipe each bundle via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"` — `sh -c` is required because bare `cat > ...` fails on flyctl's `-C`; have the machine `git clone` from the parent bundle, wire submodule URLs to their per-submodule bundles, run `git -c protocol.file.allow=always submodule update --recursive` — `protocol.file.allow` is required by git 2.38+ for file://-style submodule URLs per CVE-2022-39253 — then chown to leerie; clean up the bundle tmpfiles), `seed_repo_dirty` (rsync the dirty/untracked delta plus force-included `.claude/`, used by both fresh-seed delta and the Phase 4 `re-seed.sh` flow), and the wrapper `seed_repo`. Bundles sidestep macOS BSD tar's NFC→NFD filename normalization, which corrupted submodule working trees containing non-ASCII filenames on the Linux receiver. No in-machine `git clone` from origin — Fly machines deliberately receive no GitHub credentials. |
-| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.leerie/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry (stderr is captured to a tmpfile, NOT merged via `2>&1`, because `flyctl ssh console`'s "Connecting to ..." stderr would shift parsed-line indices and corrupt the discovered branch name); (2) probes whether the run branch actually exists on the machine via `git rev-parse --verify refs/heads/<branch>` — only then bundles. A missing branch is the cleared-but-empty terminal-state case (DESIGN §6); the `no_push` flag on `run.json` is NOT used as a proxy because it's a mechanism flag the launcher forces (the in-Fly orchestrator can't push), not a user-intent flag; (3) tars `.leerie/runs/<run-id>/` from the machine and extracts it on the host; (4) **defense-in-depth**: strips a stray mechanism-flag `no_push=true` from the host-side `run.json` after extraction. This was load-bearing when the orchestrator wrote the mechanism flag; after the `--host-no-push` intent split landed, `phase_finalize` writes **intent** to `run.json.no_push`, so the stripper is now a defensive no-op for old-image runs in flight and can be removed in a follow-up release. |
-| `scripts/host-finalize.sh` | Host-side push + PR creation block, sourced by three call sites: the local-runtime post-run code path in `leerie`, `decide_teardown` in `scripts/remote/provision.sh` (Fly clean-exit auto-finalize), and the `leerie --finalize <run-id>` recovery fast-path. Exports `host_finalize <run-dir>`: honors `run.json.no_push` (skip — this is the **intent** flag, written by the orchestrator's `phase_finalize` from `push_will_happen(no_push, host_no_push)`, not the launcher-forced mechanism flag), short-circuits when `pushed_at` is already set (idempotent), runs `git push -u origin <run-branch>` (with `--no-verify` if `NO_VERIFY_PUSH=true`), then `gh pr create` (using `pr_title`/`pr_body` from `run.json` if the pr_writer worker populated them, otherwise the deterministic fallback). PR-creation failure is non-fatal (push already succeeded). Replaces ~140 lines of inline launcher code with a single function call so the three callers stay in sync. |
+| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.leerie/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry (stderr is captured to a tmpfile, NOT merged via `2>&1`, because `flyctl ssh console`'s "Connecting to ..." stderr would shift parsed-line indices and corrupt the discovered branch name); (2) probes whether the run branch actually exists on the machine via `git rev-parse --verify refs/heads/<branch>` — only then bundles. A missing branch is the cleared-but-empty terminal-state case (DESIGN §6); the `no_push` flag on `run.json` is NOT used as a proxy because it's a mechanism flag the launcher forces (the in-Fly orchestrator can't push), not a user-intent flag; (3) tars `.leerie/runs/<run-id>/` from the machine and extracts it on the host; (4) **defense-in-depth, conditional on branch presence**: when a run branch *was* fetched, strips a stray mechanism-flag `no_push=true` from the host-side `run.json` (defense against in-flight old-image runs that wrote the mechanism flag before the `--host-no-push` intent split). When no branch was fetched (the cleared-but-empty terminal-state case — DESIGN §8), preserves `_finish_no_work_run`'s `no_push=true` intent so `host_finalize` short-circuits cleanly instead of attempting a `git push` against a non-existent ref. |
+| `scripts/host-finalize.sh` | Host-side push + PR creation block, sourced by three call sites: the local-runtime post-run code path in `leerie`, `decide_teardown` in `scripts/remote/provision.sh` (Fly clean-exit auto-finalize), and the `leerie --finalize <run-id>` recovery fast-path. Exports `host_finalize <run-dir>`: honors `run.json.no_push` (skip — this is the **intent** flag, written by the orchestrator's `phase_finalize` from `push_will_happen(no_push, host_no_push)`, not the launcher-forced mechanism flag), short-circuits when `pushed_at` is already set (idempotent), **defense-in-depth**: when the run branch named in `run.json` does not exist locally (`git rev-parse --verify refs/heads/<branch>` fails — the cleared-but-empty terminal-state case where no `setup-run.sh` ran), logs "run branch absent locally; treating as no-op" and returns 0 rather than attempting a push that would error with `src refspec ... does not match any`, runs `git push -u origin <run-branch>` (with `--no-verify` if `NO_VERIFY_PUSH=true`), then `gh pr create` (using `pr_title`/`pr_body` from `run.json` if the pr_writer worker populated them, otherwise the deterministic fallback). PR-creation failure is non-fatal (push already succeeded). Replaces ~140 lines of inline launcher code with a single function call so the three callers stay in sync. |
 
 ### Python runtime — provisioned inside the container
 
@@ -2807,8 +2807,15 @@ Runs in two contexts:
   left RUNNING with `sync_failed_at` written to the sidecar.
 - **`leerie --finalize`** (user-driven recovery / re-attempt). The
   launcher's `--finalize` handler also detects "already synced to
-  host" state and short-circuits past `fetch_branch` entirely (run
-  branch is local, state.json exists, finished_at present).
+  host" state and short-circuits past `fetch_branch` entirely. Two
+  flavors qualify: (a) **normal run** — `finished_at` set, state.json
+  present, AND the run branch exists locally (auto-sync's `git
+  bundle` step landed); (b) **no-work run (DESIGN §8)** —
+  `finished_at` set, state.json present, `run.json.no_push=true`, and
+  the run branch was NEVER materialized (so it cannot exist locally).
+  In flavor (b), `host_finalize`'s `no_push` gate short-circuits
+  the push cleanly; its rev-parse defense-in-depth guard backstops
+  the case where `no_push` was lost upstream.
 
 The mechanism is the same in both contexts:
 
@@ -2854,13 +2861,24 @@ The mechanism is the same in both contexts:
    are present on the host exactly as they would be after a
    local run.
 
-5. **Strip mechanism `no_push` from synced run.json** — after
-   the tar extracts, if the host-side run.json has
-   `no_push=true`, remove the field. This was the in-Fly
-   orchestrator's mechanism flag; the user's intent is stored
-   elsewhere (see `fly-machine.json.host_no_push`). Leaving the
-   mechanism flag in place would make `host_finalize` skip the
-   push even when the user wants it.
+5. **Strip mechanism `no_push` from synced run.json — conditional
+   on branch presence.** After the tar extracts, if a run branch
+   was actually fetched in step 3 AND the host-side run.json has
+   `no_push=true`, remove the field. This is defense against
+   in-flight old-image runs that wrote the mechanism flag; the
+   user's intent is stored elsewhere (see
+   `fly-machine.json.host_no_push`).
+
+   When step 2's branch probe returned absent (the cleared-but-empty
+   terminal-state case — DESIGN §8), the stripper is **skipped**.
+   `_finish_no_work_run` deliberately writes `no_push=true` to
+   `run.json` as **intent** ("nothing to push — no branch exists"),
+   and `host_finalize`'s `no_push` gate reads that intent to
+   short-circuit cleanly (the rev-parse defense-in-depth guard is
+   a backstop for the same case). Stripping `no_push` here would
+   disarm the gate; host_finalize would fall through to the
+   rev-parse guard and still return cleanly, but the on-disk
+   run.json would no longer reflect the orchestrator's intent.
 
 The script is **sourced** (not exec'd) by the launcher and exports
 `LEERIE_REMOTE_RUN_ID` on success (the discovered run-id, in case the caller

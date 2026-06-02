@@ -374,6 +374,75 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
     )
     assert (host_run_dir / "run.json").exists()
     assert (host_run_dir / "state.json").exists()
+    # CRITICAL: the defense-in-depth stripper at fetch-branch.sh:291 is
+    # conditional on $_branch_present="true". Since the branch was
+    # absent on the machine here, the stripper MUST be skipped and
+    # the in-Fly orchestrator's `no_push=true` intent (written by
+    # `_finish_no_work_run` per DESIGN §8) MUST be preserved on the
+    # host-side run.json. Stripping it would disarm host_finalize's
+    # no_push gate and the launcher would attempt `git push` against
+    # a non-existent branch.
+    host_rj = json.loads((host_run_dir / "run.json").read_text())
+    assert host_rj.get("no_push") is True, (
+        "fetch-branch.sh must preserve no_push=true on the host-side "
+        "run.json when no run branch was materialized (the "
+        "cleared-but-empty terminal state). The stripper at "
+        "fetch-branch.sh:291 must remain conditional on "
+        "$_branch_present=\"true\"."
+    )
+
+
+def test_fetch_branch_strips_no_push_when_branch_present(tmp_path):
+    """Positive control for Fix A's conditional stripper.
+
+    When a run branch *was* fetched (the `--branch_present="true"`
+    arm), the defense-in-depth stripper at fetch-branch.sh:291 must
+    still fire and remove `no_push=true` from the host-side run.json.
+    This protects against in-flight runs started against an older
+    image where the in-Fly orchestrator wrote the mechanism flag
+    instead of the post-split intent flag. Without this, an old-image
+    run that the user *wanted* pushed would be skipped by
+    host_finalize's no_push gate."""
+    repo = _make_git_repo(tmp_path)
+    run_id = "feat-stripper-test-abc123"
+    run_branch = f"leerie/runs/{run_id}"
+    subprocess.run(
+        ["git", "-C", str(repo), "branch", run_branch],
+        check=True, capture_output=True,
+    )
+
+    machine_runs = tmp_path / "machine_runs"
+    run_dir = machine_runs / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "finished_at": "2026-01-01T00:00:00Z",
+        # Stray mechanism flag — old-image shape we want stripped.
+        "no_push": True,
+        "branch": run_branch,
+        "working_branch": "main",
+    }))
+    (run_dir / "state.json").write_text("{}")
+
+    _make_fake_flyctl(tmp_path, machine_runs, repo)
+
+    result = _run_bash(
+        f"source {FETCH_SH}; fetch_branch",
+        env={
+            "LEERIE_MACHINE_ID": "test-machine",
+            "LEERIE_FLY_APP": "leerie",
+            "USER_REPO": str(repo),
+            "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
+        },
+    )
+    assert result.returncode == 0, f"stderr:\n{result.stderr}"
+
+    host_run_dir = repo / ".leerie" / "runs" / run_id
+    host_rj = json.loads((host_run_dir / "run.json").read_text())
+    assert "no_push" not in host_rj, (
+        "fetch-branch.sh's stripper must remove no_push=true on the "
+        "branch-present path so host_finalize will push. Found: "
+        f"{host_rj}"
+    )
 
 
 def test_fetch_branch_picks_normal_run_over_no_push(tmp_path):
