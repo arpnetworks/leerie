@@ -1,7 +1,7 @@
 """Tests for provision.sh's `flyctl machine run` output parsing.
 
 `flyctl machine run` does NOT accept `--json` (verified in real
-flyctl as of May 2026). Pila parses the human-readable text output
+flyctl as of May 2026). Leerie parses the human-readable text output
 for the `Machine ID: <id>` line via awk. This test exercises the awk
 parser in isolation against several output shapes flyctl has produced.
 
@@ -45,11 +45,11 @@ def _parse(text: str) -> str:
 def test_parser_extracts_id_from_typical_output():
     """The shape flyctl produces in normal interactive mode."""
     out = """\
-Searching for image 'registry.fly.io/pila:0.2.1' remotely...
+Searching for image 'registry.fly.io/leerie:0.2.1' remotely...
 image found: img_lrjxpggly9d5p7n6
-Image: registry.fly.io/pila:0.2.1@sha256:abc
+Image: registry.fly.io/leerie:0.2.1@sha256:abc
 
-Success! A Machine has been successfully launched in app pila
+Success! A Machine has been successfully launched in app leerie
  Machine ID: e8204deb7e4578
  Instance ID: 01KT0NDTAN7FPZ0GQDVN6XT8TB
  State: created

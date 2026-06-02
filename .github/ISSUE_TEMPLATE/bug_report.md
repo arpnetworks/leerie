@@ -1,12 +1,12 @@
 ---
 name: Bug report
-about: Report a defect in Pila
+about: Report a defect in Leerie
 labels: bug
 ---
 
 ## What happened
 
-<!-- One or two sentences. What did Pila do that it shouldn't have? -->
+<!-- One or two sentences. What did Leerie do that it shouldn't have? -->
 
 ## What you expected
 
@@ -16,9 +16,9 @@ labels: bug
 
 - **Task you ran:**
   ```
-  <the exact `pila "..."` invocation, or the slash-command form>
+  <the exact `leerie "..."` invocation, or the slash-command form>
   ```
-- **Repo state:** branch, roughly how dirty, any non-default `pila.toml`
+- **Repo state:** branch, roughly how dirty, any non-default `leerie.toml`
 - **Other relevant flags:** `--source-of-truth`, `--model` / `--model-<worker>`, `--max-workers`, `--max-parallel`, `--clarify`, etc.
 
 ## Environment
@@ -27,13 +27,13 @@ labels: bug
 - Container runtime:
   - macOS: `colima version` (one line)
   - Linux: `nerdctl --version` and `containerd --version`
-- Image tag: `nerdctl images pila --format '{{.Repository}}:{{.Tag}}'`
+- Image tag: `nerdctl images leerie --format '{{.Repository}}:{{.Tag}}'`
 - `claude --version` (on the host — `gh` and `~/.claude/` auth state live there):
-- Pila commit: `git -C ~/.pila rev-parse HEAD` (or wherever you cloned it)
+- Leerie commit: `git -C ~/.leerie rev-parse HEAD` (or wherever you cloned it)
 
 ## Relevant state
 
-Paste the relevant fields from `.pila/state.json` (redact anything
+Paste the relevant fields from `.leerie/state.json` (redact anything
 sensitive — task descriptions can contain repo-internal context). The full
 schema is in [`docs/IMPLEMENTATION.md`](../../docs/IMPLEMENTATION.md) §8 if
 you want to know what each field means.
@@ -44,8 +44,8 @@ you want to know what each field means.
 
 ## Which layer is the defect in?
 
-Pila separates theory (`docs/DESIGN.md`), mechanism
-(`docs/IMPLEMENTATION.md`), and code (`orchestrator/pila.py`). Knowing
+Leerie separates theory (`docs/DESIGN.md`), mechanism
+(`docs/IMPLEMENTATION.md`), and code (`orchestrator/leerie.py`). Knowing
 which layer the bug lives in helps triage. (Quiet reinforcement of the
 three-layer rule — see [`CLAUDE.md`](../../CLAUDE.md).)
 

@@ -73,7 +73,7 @@ def _make_flyctl_stub(tmp_path: Path, *, behavior: str) -> Path:
 def test_update_run_json_creates_fields(tmp_path: Path):
     """update_run_json merges new fields into an existing sidecar."""
     sidecar = tmp_path / "run.json"
-    sidecar.write_text(json.dumps({"run_id": "test-001", "branch": "pila/runs/test-001"}))
+    sidecar.write_text(json.dumps({"run_id": "test-001", "branch": "leerie/runs/test-001"}))
     result = _run_bash(
         f"source {LIB_SH}; update_run_json {sidecar} fly_machine_id mach-abc paused_at 2026-05-29T16:00:00+00:00",
     )
@@ -82,7 +82,7 @@ def test_update_run_json_creates_fields(tmp_path: Path):
     assert data["fly_machine_id"] == "mach-abc"
     assert data["paused_at"] == "2026-05-29T16:00:00+00:00"
     assert data["run_id"] == "test-001"  # preserved
-    assert data["branch"] == "pila/runs/test-001"  # preserved
+    assert data["branch"] == "leerie/runs/test-001"  # preserved
 
 
 def test_update_run_json_empty_value_clears_to_null(tmp_path: Path):
@@ -119,9 +119,9 @@ def test_iso_now_returns_iso8601(tmp_path: Path):
 # --- provision.sh: stop_machine -------------------------------------------
 
 def test_stop_machine_noop_when_no_machine_id(tmp_path: Path):
-    """stop_machine returns 0 when PILA_MACHINE_ID is empty (idempotency)."""
+    """stop_machine returns 0 when LEERIE_MACHINE_ID is empty (idempotency)."""
     result = _run_bash(
-        f"source {PROVISION_SH}; PILA_MACHINE_ID=''; stop_machine; echo ok",
+        f"source {PROVISION_SH}; LEERIE_MACHINE_ID=''; stop_machine; echo ok",
     )
     assert result.returncode == 0
     assert "ok" in result.stdout
@@ -132,7 +132,7 @@ def test_stop_machine_calls_flyctl_stop(tmp_path: Path):
     _make_flyctl_stub(tmp_path, behavior="happy")
     log = tmp_path / "flyctl.log"
     result = _run_bash(
-        f"source {PROVISION_SH}; PILA_MACHINE_ID=mach-xyz; stop_machine",
+        f"source {PROVISION_SH}; LEERIE_MACHINE_ID=mach-xyz; stop_machine",
         env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
     )
     assert result.returncode == 0, result.stderr
@@ -148,12 +148,12 @@ def _decide_teardown_with_rc(
     run_id: str = "test-run-001",
     fetch_branch_succeeds: bool = True,
 ) -> tuple[subprocess.CompletedProcess, Path]:
-    """Run decide_teardown with PILA_REMOTE_EXIT_RC=$rc.
+    """Run decide_teardown with LEERIE_REMOTE_EXIT_RC=$rc.
 
     Sets up:
       - stub flyctl that records argv
-      - USER_REPO with a .pila/runs/$run_id/run.json sidecar
-      - PILA_MACHINE_ID=mach-test
+      - USER_REPO with a .leerie/runs/$run_id/run.json sidecar
+      - LEERIE_MACHINE_ID=mach-test
       - On clean-exit branches (rc=0/10/75) decide_teardown calls
         `_try_fetch_branch_for_teardown` BEFORE destroy_machine.
         We override that helper to return either 0 (success — the
@@ -166,10 +166,10 @@ def _decide_teardown_with_rc(
     """
     _make_flyctl_stub(tmp_path, behavior="happy")
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / run_id
+    run_dir = user_repo / ".leerie" / "runs" / run_id
     run_dir.mkdir(parents=True)
     sidecar = run_dir / "run.json"
-    sidecar.write_text(json.dumps({"run_id": run_id, "branch": f"pila/runs/{run_id}"}))
+    sidecar.write_text(json.dumps({"run_id": run_id, "branch": f"leerie/runs/{run_id}"}))
     fetch_rc = "0" if fetch_branch_succeeds else "1"
     script = (
         f"source {PROVISION_SH}; "
@@ -179,7 +179,7 @@ def _decide_teardown_with_rc(
         # decide_teardown dispositions, not fetch_branch internals
         # (those are covered in test_fetch_branch_sh.py).
         f"_try_fetch_branch_for_teardown() {{ return {fetch_rc}; }}; "
-        f"PILA_MACHINE_ID=mach-test; "
+        f"LEERIE_MACHINE_ID=mach-test; "
         f"decide_teardown"
     )
     result = _run_bash(
@@ -187,8 +187,8 @@ def _decide_teardown_with_rc(
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
             "USER_REPO": str(user_repo),
-            "PILA_RUN_ID": run_id,
-            "PILA_REMOTE_EXIT_RC": rc,
+            "LEERIE_RUN_ID": run_id,
+            "LEERIE_REMOTE_EXIT_RC": rc,
         },
     )
     return result, sidecar
@@ -229,8 +229,8 @@ def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
     orchestrator exit, if the sync step that pulls the run branch +
     state back to the host can't succeed, the machine must NOT be
     destroyed — the user's paid LLM work is still on it. The user
-    sees a multi-line WARNING and recovers via `pila --finalize`,
-    `pila --attach`, or finally `pila --kill` once work is safe."""
+    sees a multi-line WARNING and recovers via `leerie --finalize`,
+    `leerie --attach`, or finally `leerie --kill` once work is safe."""
     result, sidecar = _decide_teardown_with_rc(
         tmp_path, "0", run_id="my-run", fetch_branch_succeeds=False,
     )
@@ -240,16 +240,16 @@ def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
     # whole point is to leave it running so the user can recover.
     assert "machine destroy" not in invocations
     assert "machine stop" not in invocations
-    # Sidecar must record the failure for `pila --list` to surface.
+    # Sidecar must record the failure for `leerie --list` to surface.
     data = json.loads(sidecar.read_text())
     assert data.get("sync_failed_at") is not None
     assert data.get("sync_fail_reason") == "sync-failed-on-clean-exit"
     assert data.get("fly_machine_id") == "mach-test"
     # Recovery guidance must be printed.
     assert "sync from machine to host FAILED" in result.stderr
-    assert "pila --finalize my-run" in result.stderr
-    assert "pila --attach my-run" in result.stderr
-    assert "pila --kill my-run" in result.stderr
+    assert "leerie --finalize my-run" in result.stderr
+    assert "leerie --attach my-run" in result.stderr
+    assert "leerie --kill my-run" in result.stderr
 
 
 def test_decide_teardown_rc130_detaches(tmp_path: Path):
@@ -272,9 +272,9 @@ def test_decide_teardown_rc130_detaches(tmp_path: Path):
     assert data.get("killed_at") is None
     # Detach hints must appear in stderr.
     assert "detached from run my-run-abc" in result.stderr
-    assert "pila --attach my-run-abc --tail" in result.stderr
-    assert "pila --stop my-run-abc" in result.stderr
-    assert "pila --kill my-run-abc" in result.stderr
+    assert "leerie --attach my-run-abc --tail" in result.stderr
+    assert "leerie --stop my-run-abc" in result.stderr
+    assert "leerie --kill my-run-abc" in result.stderr
 
 
 def test_decide_teardown_rc143_detaches(tmp_path: Path):
@@ -315,25 +315,25 @@ def test_decide_teardown_rc2_pauses(tmp_path: Path):
 def test_decide_teardown_prints_resume_command(tmp_path: Path):
     """The pause notification includes the resume command verbatim."""
     result, _ = _decide_teardown_with_rc(tmp_path, "1", run_id="my-run-abc")
-    assert "pila --resume --run-id my-run-abc --runtime fly" in result.stderr
+    assert "leerie --resume --run-id my-run-abc --runtime fly" in result.stderr
 
 
 def test_decide_teardown_pause_reason_overridable(tmp_path: Path):
-    """PILA_PAUSE_REASON env var overrides the default 'worker-error' tag."""
+    """LEERIE_PAUSE_REASON env var overrides the default 'worker-error' tag."""
     _make_flyctl_stub(tmp_path, behavior="happy")
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "test-001"
+    run_dir = user_repo / ".leerie" / "runs" / "test-001"
     run_dir.mkdir(parents=True)
     sidecar = run_dir / "run.json"
     sidecar.write_text(json.dumps({"run_id": "test-001"}))
     result = _run_bash(
-        f"source {PROVISION_SH}; PILA_MACHINE_ID=mach-test; decide_teardown",
+        f"source {PROVISION_SH}; LEERIE_MACHINE_ID=mach-test; decide_teardown",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
             "USER_REPO": str(user_repo),
-            "PILA_RUN_ID": "test-001",
-            "PILA_REMOTE_EXIT_RC": "1",
-            "PILA_PAUSE_REASON": "finalize-failed",
+            "LEERIE_RUN_ID": "test-001",
+            "LEERIE_REMOTE_EXIT_RC": "1",
+            "LEERIE_PAUSE_REASON": "finalize-failed",
         },
     )
     assert result.returncode == 0
@@ -342,26 +342,26 @@ def test_decide_teardown_pause_reason_overridable(tmp_path: Path):
 
 
 def test_decide_teardown_pause_notify_cmd_invoked(tmp_path: Path):
-    """PILA_PAUSE_NOTIFY_CMD is eval'd on pause for outbound notifications."""
+    """LEERIE_PAUSE_NOTIFY_CMD is eval'd on pause for outbound notifications."""
     _make_flyctl_stub(tmp_path, behavior="happy")
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "test-001"
+    run_dir = user_repo / ".leerie" / "runs" / "test-001"
     run_dir.mkdir(parents=True)
     sidecar = run_dir / "run.json"
     sidecar.write_text(json.dumps({"run_id": "test-001"}))
     notify_marker = tmp_path / "notify-fired"
     result = _run_bash(
-        f"source {PROVISION_SH}; PILA_MACHINE_ID=mach-test; decide_teardown",
+        f"source {PROVISION_SH}; LEERIE_MACHINE_ID=mach-test; decide_teardown",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
             "USER_REPO": str(user_repo),
-            "PILA_RUN_ID": "test-001",
-            "PILA_REMOTE_EXIT_RC": "1",
-            "PILA_PAUSE_NOTIFY_CMD": f"touch {notify_marker}",
+            "LEERIE_RUN_ID": "test-001",
+            "LEERIE_REMOTE_EXIT_RC": "1",
+            "LEERIE_PAUSE_NOTIFY_CMD": f"touch {notify_marker}",
         },
     )
     assert result.returncode == 0
-    assert notify_marker.exists(), "PILA_PAUSE_NOTIFY_CMD was not eval'd on pause"
+    assert notify_marker.exists(), "LEERIE_PAUSE_NOTIFY_CMD was not eval'd on pause"
 
 
 # --- resume-machine.sh ----------------------------------------------------
@@ -379,7 +379,7 @@ def test_resume_machine_calls_start_and_clears_paused_at(tmp_path: Path):
     """resume_machine starts the machine, waits for started, clears paused_at."""
     _make_flyctl_stub(tmp_path, behavior="happy")
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "test-001"
+    run_dir = user_repo / ".leerie" / "runs" / "test-001"
     run_dir.mkdir(parents=True)
     sidecar = run_dir / "run.json"
     sidecar.write_text(json.dumps({
@@ -394,7 +394,7 @@ def test_resume_machine_calls_start_and_clears_paused_at(tmp_path: Path):
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
             "USER_REPO": str(user_repo),
-            "PILA_RUN_ID": "test-001",
+            "LEERIE_RUN_ID": "test-001",
         },
     )
     assert result.returncode == 0, result.stderr
@@ -436,13 +436,13 @@ def test_launcher_resume_command_format_matches_decide_teardown():
     """Coupling: the resume command printed by decide_teardown must match
     the shape consumed by the launcher's --resume + --run-id parsing.
 
-    decide_teardown prints: pila --resume --run-id <id> --runtime fly
-    The launcher parses --run-id from $@ (see PILA_RUN_ID extraction).
+    decide_teardown prints: leerie --resume --run-id <id> --runtime fly
+    The launcher parses --run-id from $@ (see LEERIE_RUN_ID extraction).
     Both halves must use the same flag shape.
     """
-    launcher = (REPO_ROOT / "pila").read_text()
+    launcher = (REPO_ROOT / "leerie").read_text()
     provision = PROVISION_SH.read_text()
-    assert "pila --resume --run-id $PILA_RUN_ID --runtime fly" in provision, (
+    assert "leerie --resume --run-id $LEERIE_RUN_ID --runtime fly" in provision, (
         "decide_teardown's resume hint string drifted"
     )
     assert '--run-id' in launcher, "launcher no longer extracts --run-id"

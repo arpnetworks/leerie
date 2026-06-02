@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# install.sh — one-command installer for Pila.
+# install.sh — one-command installer for Leerie.
 #
-#   curl -fsSL https://raw.githubusercontent.com/enricai/pila/main/scripts/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
 #
 # What this does, in order:
 #   1. Verifies `git`, `claude`, and `curl` are on PATH.
@@ -11,14 +11,14 @@
 #      - Debian:   `apt-get install containerd` + pinned nerdctl binary + `systemctl enable --now containerd`
 #      - Fedora:   `dnf install containerd` + pinned nerdctl binary + `systemctl enable --now containerd`
 #      - Arch:     `pacman -S containerd nerdctl` + `systemctl enable --now containerd`
-#      Pass --no-runtime-install (or PILA_NO_RUNTIME_INSTALL=1) to skip
+#      Pass --no-runtime-install (or LEERIE_NO_RUNTIME_INSTALL=1) to skip
 #      auto-install — the installer falls back to a hint and exits 1.
 #      Unknown distros always fall back to the hint.
-#   3. Clones (or fast-forwards) enricai/pila into $PILA_HOME (default ~/.pila).
-#   4. Symlinks $PILA_HOME/pila into ~/.local/bin/pila.
-#   5. Verifies the install with `pila --version`.
+#   3. Clones (or fast-forwards) enricai/leerie into $LEERIE_HOME (default ~/.leerie).
+#   4. Symlinks $LEERIE_HOME/leerie into ~/.local/bin/leerie.
+#   5. Verifies the install with `leerie --version`.
 #
-# Pila runs entirely inside a container (DESIGN §6 / IMPLEMENTATION §0.5),
+# Leerie runs entirely inside a container (DESIGN §6 / IMPLEMENTATION §0.5),
 # so Python is provisioned by the image at runtime — the host doesn't need
 # Python or `uv` anymore. The launcher's --version fast path returns
 # without spinning up a container.
@@ -27,37 +27,37 @@
 #   --dry-run                Print actions without executing.
 #   --no-runtime-install     Skip auto-install of the container runtime;
 #                            print the manual hint and exit 1 if missing.
-#   --prefix DIR             Install Pila under DIR (default: $PILA_HOME or ~/.pila).
+#   --prefix DIR             Install Leerie under DIR (default: $LEERIE_HOME or ~/.leerie).
 #   --bin-dir DIR            Symlink dir (default: ~/.local/bin).
 #   --ref REF                Git ref to install (default: main).
 #   --help                   Show this message and exit.
 #
 # Env vars:
-#   PILA_HOME                 Install directory (default ~/.pila). --prefix overrides.
-#   PILA_BIN_DIR              Symlink directory (default ~/.local/bin). --bin-dir overrides.
-#   PILA_REPO_URL             Repo URL to clone (default https://github.com/enricai/pila.git).
-#   PILA_NO_RUNTIME_INSTALL   Same as --no-runtime-install when truthy ("1", "true", "yes").
+#   LEERIE_HOME                 Install directory (default ~/.leerie). --prefix overrides.
+#   LEERIE_BIN_DIR              Symlink directory (default ~/.local/bin). --bin-dir overrides.
+#   LEERIE_REPO_URL             Repo URL to clone (default https://github.com/enricai/leerie.git).
+#   LEERIE_NO_RUNTIME_INSTALL   Same as --no-runtime-install when truthy ("1", "true", "yes").
 set -euo pipefail
 
 # --- defaults ------------------------------------------------------------
 
 # Guard against an unset HOME (some CI containers, broken cron envs, minimal
-# Docker images). Without this, $HOME/.pila expands to /.pila and the
+# Docker images). Without this, $HOME/.leerie expands to /.leerie and the
 # install silently tries to write under the root filesystem.
-: "${HOME:?HOME is unset; cannot compute install prefix. Set HOME (or PILA_HOME + PILA_BIN_DIR) and retry.}"
+: "${HOME:?HOME is unset; cannot compute install prefix. Set HOME (or LEERIE_HOME + LEERIE_BIN_DIR) and retry.}"
 
-DEFAULT_REPO_URL="https://github.com/enricai/pila.git"
+DEFAULT_REPO_URL="https://github.com/enricai/leerie.git"
 DEFAULT_REF="main"
 
-PREFIX="${PILA_HOME:-$HOME/.pila}"
-BIN_DIR="${PILA_BIN_DIR:-$HOME/.local/bin}"
-REPO_URL="${PILA_REPO_URL:-$DEFAULT_REPO_URL}"
+PREFIX="${LEERIE_HOME:-$HOME/.leerie}"
+BIN_DIR="${LEERIE_BIN_DIR:-$HOME/.local/bin}"
+REPO_URL="${LEERIE_REPO_URL:-$DEFAULT_REPO_URL}"
 REF="$DEFAULT_REF"
 DRY_RUN=false
 
 # Truthy detector: "1" / "true" / "yes" → true; anything else → false.
-# Used to interpret PILA_NO_RUNTIME_INSTALL.
-case "${PILA_NO_RUNTIME_INSTALL:-}" in
+# Used to interpret LEERIE_NO_RUNTIME_INSTALL.
+case "${LEERIE_NO_RUNTIME_INSTALL:-}" in
   1|true|TRUE|yes|YES) NO_RUNTIME_INSTALL=true ;;
   *)                   NO_RUNTIME_INSTALL=false ;;
 esac
@@ -71,9 +71,9 @@ NERDCTL_VERSION=2.3.1
 
 usage() {
   cat <<'EOF'
-install.sh — one-command installer for Pila.
+install.sh — one-command installer for Leerie.
 
-  curl -fsSL https://raw.githubusercontent.com/enricai/pila/main/scripts/install.sh | bash
+  curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
 
 What this does, in order:
   1. Verifies `git`, `claude`, and `curl` are on PATH.
@@ -81,23 +81,23 @@ What this does, in order:
      (Colima on macOS via brew; containerd + pinned nerdctl on
      Debian/Fedora/Arch via the distro package manager). Pass
      --no-runtime-install to skip auto-install (fall back to hint + exit 1).
-  3. Clones (or fast-forwards) enricai/pila into $PILA_HOME (default ~/.pila).
-  4. Symlinks $PILA_HOME/pila into ~/.local/bin/pila.
-  5. Verifies the install with `pila --version`.
+  3. Clones (or fast-forwards) enricai/leerie into $LEERIE_HOME (default ~/.leerie).
+  4. Symlinks $LEERIE_HOME/leerie into ~/.local/bin/leerie.
+  5. Verifies the install with `leerie --version`.
 
 Flags:
   --dry-run                Print actions without executing.
   --no-runtime-install     Skip auto-install of the container runtime.
-  --prefix DIR             Install Pila under DIR (default: $PILA_HOME or ~/.pila).
+  --prefix DIR             Install Leerie under DIR (default: $LEERIE_HOME or ~/.leerie).
   --bin-dir DIR            Symlink dir (default: ~/.local/bin).
   --ref REF                Git ref to install (default: main).
   --help                   Show this message and exit.
 
 Env vars:
-  PILA_HOME                 Install directory (default ~/.pila). --prefix overrides.
-  PILA_BIN_DIR              Symlink directory (default ~/.local/bin). --bin-dir overrides.
-  PILA_REPO_URL             Repo URL to clone (default https://github.com/enricai/pila.git).
-  PILA_NO_RUNTIME_INSTALL   Same as --no-runtime-install when truthy ("1", "true", "yes").
+  LEERIE_HOME                 Install directory (default ~/.leerie). --prefix overrides.
+  LEERIE_BIN_DIR              Symlink directory (default ~/.local/bin). --bin-dir overrides.
+  LEERIE_REPO_URL             Repo URL to clone (default https://github.com/enricai/leerie.git).
+  LEERIE_NO_RUNTIME_INSTALL   Same as --no-runtime-install when truthy ("1", "true", "yes").
 EOF
 }
 
@@ -133,7 +133,7 @@ remediate_git() {
 
 remediate_claude() {
   err "claude CLI is missing. Install Claude Code from https://claude.ai/code"
-  err "Pila shells out to \`claude -p\` for every unit of LLM work; there is no fallback."
+  err "Leerie shells out to \`claude -p\` for every unit of LLM work; there is no fallback."
 }
 
 remediate_curl() {
@@ -200,7 +200,7 @@ fi
 # --- 2. runtime: install if missing AND start ---------------------------
 # Auto-install Colima on macOS (via brew) and containerd + a pinned nerdctl
 # on Linux (via the distro package manager + an upstream binary). Pass
-# --no-runtime-install (or PILA_NO_RUNTIME_INSTALL=1) to skip auto-install
+# --no-runtime-install (or LEERIE_NO_RUNTIME_INSTALL=1) to skip auto-install
 # and fall back to a printed hint + exit 1 — preserves the pre-auto-install
 # behavior for CI, dotfiles managers, and users who track their own
 # package installs. Unknown distros always fall back to the hint regardless.
@@ -213,7 +213,7 @@ case "$(uname -s)" in
       if [ "$NO_RUNTIME_INSTALL" = "true" ]; then
         err "colima is missing. Install with: brew install colima"
         # Same auto-sizing rationale as the install path: suggest the
-        # half-of-host sizing so the user doesn't OOM under pila's
+        # half-of-host sizing so the user doesn't OOM under leerie's
         # parallel-worker workload (Colima's 2-cpu / 2-GB default is
         # not enough). Also add the swap-provision YAML block to
         # ~/.colima/default/colima.yaml — see docs/INSTALL.md "Memory
@@ -224,7 +224,7 @@ case "$(uname -s)" in
         err "  then colima stop && colima start)."
         err "(Do NOT 'brew install nerdctl' on macOS — the formula requires Linux."
         err " Colima provides nerdctl inside its VM and installs a host-side shim;"
-        err " pila auto-runs 'colima nerdctl install' on first launch if needed.)"
+        err " leerie auto-runs 'colima nerdctl install' on first launch if needed.)"
         runtime_ok=false
       else
         runtime_install_macos || runtime_ok=false
@@ -242,7 +242,7 @@ case "$(uname -s)" in
     elif [ "$DRY_RUN" = "false" ]; then
       # Already installed AND running — leave it alone, but hint if the
       # existing sizing is below the auto-recommendation or the config
-      # is missing pila's swap provisioning.
+      # is missing leerie's swap provisioning.
       _runtime_check_colima_sizing
       _runtime_check_colima_swap
     fi
@@ -276,7 +276,7 @@ fi
 # --- 3. clone or update --------------------------------------------------
 
 if [ -d "$PREFIX/.git" ]; then
-  log "updating existing Pila checkout at $PREFIX"
+  log "updating existing Leerie checkout at $PREFIX"
   run git -C "$PREFIX" fetch origin
   run git -C "$PREFIX" checkout "$REF"
   run git -C "$PREFIX" pull --ff-only origin "$REF"
@@ -291,13 +291,13 @@ fi
 
 # --- 4. symlink launcher into bin dir ------------------------------------
 
-log "symlinking $PREFIX/pila into $BIN_DIR/pila"
+log "symlinking $PREFIX/leerie into $BIN_DIR/leerie"
 run mkdir -p "$BIN_DIR"
-LAUNCHER="$PREFIX/pila"
-LINK="$BIN_DIR/pila"
+LAUNCHER="$PREFIX/leerie"
+LINK="$BIN_DIR/leerie"
 # Clobber any pre-existing file/symlink at $LINK so re-runs are idempotent.
-# $BIN_DIR/pila is a path this installer owns by virtue of installing
-# Pila; if a user wants a custom file there, --bin-dir is the escape hatch.
+# $BIN_DIR/leerie is a path this installer owns by virtue of installing
+# Leerie; if a user wants a custom file there, --bin-dir is the escape hatch.
 if [ -L "$LINK" ] || [ -f "$LINK" ]; then
   run rm -f "$LINK"
 fi
@@ -328,12 +328,12 @@ esac
 
 log "verifying install"
 if [ "$DRY_RUN" = "false" ]; then
-  # Run the launcher we just symlinked, not whatever `pila` already
+  # Run the launcher we just symlinked, not whatever `leerie` already
   # exists on PATH — proves *this* install works end-to-end.
   if "$LINK" --version; then
-    log "done. Run \`pila \"your task\"\` from any git repository to start."
+    log "done. Run \`leerie \"your task\"\` from any git repository to start."
   else
-    err "pila --version failed. The install completed but the binary is not runnable."
+    err "leerie --version failed. The install completed but the binary is not runnable."
     exit 1
   fi
 else

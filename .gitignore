@@ -15,10 +15,10 @@ venv/
 *.swp
 *.swo
 
-# Pila run artifacts — created per-run in target repos, never tracked.
-.pila/
-# Top-level log when the CLI is teed (`./pila "..." | tee pila.log`).
-pila.log
+# Leerie run artifacts — created per-run in target repos, never tracked.
+.leerie/
+# Top-level log when the CLI is teed (`./leerie "..." | tee leerie.log`).
+leerie.log
 
 # Local Claude Code settings / cache — per-machine, never tracked.
 .claude/

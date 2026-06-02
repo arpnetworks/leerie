@@ -2,17 +2,17 @@
 # integrate.sh <subtask-id> <run-id> — merge a completed subtask branch
 # into the run branch.
 #
-# Run from the repo root. Merges pila/subtasks/<run-id>/<id> into
-# pila/runs/<run-id> inside the run-branch worktree at
-# .pila/runs/<run-id>/worktrees/staging. Exit 0 on a clean merge;
+# Run from the repo root. Merges leerie/subtasks/<run-id>/<id> into
+# leerie/runs/<run-id> inside the run-branch worktree at
+# .leerie/runs/<run-id>/worktrees/staging. Exit 0 on a clean merge;
 # non-zero if the merge conflicts, leaving the worktree mid-merge for
-# the pila-integrator to resolve.
+# the leerie-integrator to resolve.
 set -euo pipefail
 
 ID="${1:?usage: integrate.sh <subtask-id> <run-id>}"
 RUN_ID="${2:?usage: integrate.sh <subtask-id> <run-id>}"
-STAGING=".pila/runs/${RUN_ID}/worktrees/staging"
-BRANCH="pila/subtasks/${RUN_ID}/${ID}"
+STAGING=".leerie/runs/${RUN_ID}/worktrees/staging"
+BRANCH="leerie/subtasks/${RUN_ID}/${ID}"
 
 if [ ! -d "$STAGING" ]; then
   echo "error: run-branch worktree missing — run setup-run.sh ${RUN_ID} first" >&2
@@ -25,7 +25,7 @@ fi
 
 cd "$STAGING"
 
-if git merge --no-ff -m "pila: integrate ${ID}" "$BRANCH"; then
+if git merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
   echo "integrated: ${ID}"
   exit 0
 else

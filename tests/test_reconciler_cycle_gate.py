@@ -4,7 +4,7 @@ validation, and the three new cycle-breaking apply-step ops
 (`dropped_requires` / `dependency_edges` / `merged_subtasks`).
 
 The corpus is grounded in the two captured failures from
-`~/src/enric/summarizer/.pila/runs/` (run 1: `feat-008 ↔ feat-009`
+`~/src/enric/summarizer/.leerie/runs/` (run 1: `feat-008 ↔ feat-009`
 mixed-edge SCC; run 2: `config-005 ↔ feat-001` two-rename SCC) plus
 synthetic triangles, 4-cycles, and connector cycles to exercise the
 gate's diagnostic shape under topologies we haven't observed yet.
@@ -48,10 +48,10 @@ def _plan(domain: str, *subtasks) -> dict:
     return {"domain": domain, "status": "ready", "subtasks": list(subtasks)}
 
 
-def _build_graph(pila, subtasks_dict):
+def _build_graph(leerie, subtasks_dict):
     """Build (preds, providers, edge_sources, succ) the way the gate
     does, so tests can call Tarjan directly."""
-    preds, providers, edge_sources = pila._build_predecessor_graph(
+    preds, providers, edge_sources = leerie._build_predecessor_graph(
         subtasks_dict)
     succ = {sid: set() for sid in subtasks_dict}
     for tgt, src_set in preds.items():
@@ -156,19 +156,19 @@ def _run1_reconciler_output() -> dict:
 # Test 1: Run-2 case — both edges from renames, gate fires
 # ===========================================================================
 
-def test_gate_fires_on_run2_two_rename_cycle(pila):
+def test_gate_fires_on_run2_two_rename_cycle(leerie):
     """Tarjan returns the 2-node SCC; diagnostic names both subtasks
     and attributes each edge to its rename."""
     plans = _run2_post_reconcile_plans()
     output = _run2_reconciler_output()
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
 
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == [["config-005", "feat-001"]], (
         "expected one 2-node SCC sorted lex: ['config-005', 'feat-001']")
 
-    diag = pila._format_cycle_diagnostic(
+    diag = leerie._format_cycle_diagnostic(
         sccs, succ, edge_sources, output, by_id)
     assert "config-005" in diag and "feat-001" in diag
     # Both edges are attributed to renames (not planner-declared).
@@ -181,7 +181,7 @@ def test_gate_fires_on_run2_two_rename_cycle(pila):
 # Test 2: Run-1 case — mixed depends_on + rename, gate fires
 # ===========================================================================
 
-def test_gate_fires_on_run1_mixed_edge_cycle(pila):
+def test_gate_fires_on_run1_mixed_edge_cycle(leerie):
     """Run 1: feat-009 -> feat-008 via planner depends_on; feat-008 ->
     feat-009 via renamed requires. Diagnostic names each edge's source
     separately (depends_on vs. rename)."""
@@ -189,11 +189,11 @@ def test_gate_fires_on_run1_mixed_edge_cycle(pila):
     output = _run1_reconciler_output()
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
 
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == [["feat-008", "feat-009"]]
 
-    diag = pila._format_cycle_diagnostic(
+    diag = leerie._format_cycle_diagnostic(
         sccs, succ, edge_sources, output, by_id)
     # Both source labels appear.
     assert "depends_on" in diag
@@ -206,15 +206,15 @@ def test_gate_fires_on_run1_mixed_edge_cycle(pila):
 # Test 3: 3-node triangle via mixed edges
 # ===========================================================================
 
-def test_gate_fires_on_3node_triangle(pila):
+def test_gate_fires_on_3node_triangle(leerie):
     """A->B->C->A cycle via requires-tag matches."""
     a = _subtask("feat-a", provides=["a"], requires=["c"])
     b = _subtask("feat-b", provides=["b"], requires=["a"])
     c = _subtask("feat-c", provides=["c"], requires=["b"])
     by_id = {s["id"]: s for s in (a, b, c)}
 
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert len(sccs) == 1
     assert sorted(sccs[0]) == ["feat-a", "feat-b", "feat-c"]
 
@@ -223,15 +223,15 @@ def test_gate_fires_on_3node_triangle(pila):
 # Test 4: 4-node cycle A->B->C->D->A via mixed depends_on / requires
 # ===========================================================================
 
-def test_gate_fires_on_4node_cycle_mixed_edges(pila):
+def test_gate_fires_on_4node_cycle_mixed_edges(leerie):
     a = _subtask("a", provides=["a-cap"], depends_on=["d"])
     b = _subtask("b", provides=["b-cap"], requires=["a-cap"])
     c = _subtask("c", provides=["c-cap"], depends_on=["b"])
     d = _subtask("d", provides=["d-cap"], requires=["c-cap"])
     by_id = {s["id"]: s for s in (a, b, c, d)}
 
-    _preds, _provs, _es, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, _es, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert len(sccs) == 1
     assert sorted(sccs[0]) == ["a", "b", "c", "d"]
 
@@ -240,7 +240,7 @@ def test_gate_fires_on_4node_cycle_mixed_edges(pila):
 # Test 5: Cycle involving a reconciler-added connector
 # ===========================================================================
 
-def test_gate_fires_on_connector_cycle(pila):
+def test_gate_fires_on_connector_cycle(leerie):
     """A reconciler-added connector closes a loop; edge attribution
     names the connector by id."""
     feat_001 = _subtask("feat-001",
@@ -257,11 +257,11 @@ def test_gate_fires_on_connector_cycle(pila):
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
 
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == [["feat-001", "recon-001"]]
 
-    diag = pila._format_cycle_diagnostic(
+    diag = leerie._format_cycle_diagnostic(
         sccs, succ, edge_sources, output, by_id)
     assert "added_subtask: recon-001" in diag
 
@@ -270,7 +270,7 @@ def test_gate_fires_on_connector_cycle(pila):
 # Test 6: dropped_requires resolves the run-2 cycle
 # ===========================================================================
 
-def test_dropped_requires_resolves_run2(pila):
+def test_dropped_requires_resolves_run2(leerie):
     """Apply step removes the named requires entry; the graph becomes
     acyclic; Kahn's produces valid waves."""
     plans = _run2_post_reconcile_plans()
@@ -284,7 +284,7 @@ def test_dropped_requires_resolves_run2(pila):
         }],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
 
     # The dropped requires entry is gone.
     config_005 = next(s for plan in plans for s in plan["subtasks"]
@@ -294,8 +294,8 @@ def test_dropped_requires_resolves_run2(pila):
 
     # Graph is acyclic now.
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
-    _preds, _provs, _es, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, _es, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == []
 
 
@@ -303,7 +303,7 @@ def test_dropped_requires_resolves_run2(pila):
 # Test 7: dependency_edges resolves an asymmetric case
 # ===========================================================================
 
-def test_dependency_edges_appends_dedup_and_breaks_cycle(pila):
+def test_dependency_edges_appends_dedup_and_breaks_cycle(leerie):
     """Apply step appends to depends_on (dedup) so the explicit
     ordering is recorded; the existing graph stays consistent."""
     # Two subtasks with no current cycle.
@@ -320,14 +320,14 @@ def test_dependency_edges_appends_dedup_and_breaks_cycle(pila):
         ],
         "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
     b_after = next(s for plan in plans for s in plan["subtasks"]
                    if s["id"] == "b")
     assert b_after["depends_on"] == ["a"], (
         "duplicate dependency_edges must be deduped on append")
 
 
-def test_dependency_edges_die_on_missing_id(pila):
+def test_dependency_edges_die_on_missing_id(leerie):
     a = _subtask("a", provides=["a-cap"])
     plans = [_plan("feat", a)]
     output = {
@@ -339,14 +339,14 @@ def test_dependency_edges_die_on_missing_id(pila):
         "merged_subtasks": [], "unresolvable": [],
     }
     with pytest.raises(SystemExit):
-        pila._apply_reconciler_output(plans, output)
+        leerie._apply_reconciler_output(plans, output)
 
 
 # ===========================================================================
 # Test 8: merged_subtasks resolves the run-2 cycle
 # ===========================================================================
 
-def test_merged_subtasks_resolves_run2(pila):
+def test_merged_subtasks_resolves_run2(leerie):
     """Apply step folds config-005 into feat-001, unioning fields,
     dropping self-references, stamping _merged_from, rewriting
     downstream depends_on. Graph becomes acyclic."""
@@ -366,7 +366,7 @@ def test_merged_subtasks_resolves_run2(pila):
         }],
         "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
 
     # `from` (config-005) is removed.
     all_ids = {s["id"] for plan in plans for s in plan["subtasks"]}
@@ -402,8 +402,8 @@ def test_merged_subtasks_resolves_run2(pila):
 
     # Graph is acyclic.
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
-    _preds, _provs, _es, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, _es, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == []
 
 
@@ -411,7 +411,7 @@ def test_merged_subtasks_resolves_run2(pila):
 # Test 9: merged_subtasks fail-loud on missing id
 # ===========================================================================
 
-def test_merged_subtasks_die_on_missing_id(pila):
+def test_merged_subtasks_die_on_missing_id(leerie):
     a = _subtask("a", provides=["a"])
     plans = [_plan("feat", a)]
     output = {
@@ -423,10 +423,10 @@ def test_merged_subtasks_die_on_missing_id(pila):
         "unresolvable": [],
     }
     with pytest.raises(SystemExit):
-        pila._apply_reconciler_output(plans, output)
+        leerie._apply_reconciler_output(plans, output)
 
 
-def test_merged_subtasks_die_on_self_merge(pila):
+def test_merged_subtasks_die_on_self_merge(leerie):
     a = _subtask("a", provides=["a"])
     plans = [_plan("feat", a)]
     output = {
@@ -438,20 +438,20 @@ def test_merged_subtasks_die_on_self_merge(pila):
         "unresolvable": [],
     }
     with pytest.raises(SystemExit):
-        pila._apply_reconciler_output(plans, output)
+        leerie._apply_reconciler_output(plans, output)
 
 
 # ===========================================================================
 # Test 10: Acyclic plan: gate silent
 # ===========================================================================
 
-def test_gate_silent_on_acyclic_plan(pila):
+def test_gate_silent_on_acyclic_plan(leerie):
     a = _subtask("a", provides=["a"])
     b = _subtask("b", provides=["b"], requires=["a"])
     c = _subtask("c", provides=["c"], requires=["b"], depends_on=["a"])
     by_id = {s["id"]: s for s in (a, b, c)}
-    _preds, _provs, _es, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, _es, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == []
 
 
@@ -461,7 +461,7 @@ def test_gate_silent_on_acyclic_plan(pila):
 
 # Tiny synthetic stand-ins for the five successful-run plans surveyed in
 # the cross-repo canvass. We don't ship the full captured plans here
-# (they're large and live in user .pila/runs/ directories) — these
+# (they're large and live in user .leerie/runs/ directories) — these
 # scaffolds mirror the structural shape (n subtasks, m capability
 # matches, no cycles) so the gate's silent-on-acyclic property is
 # pinned in the test corpus.
@@ -486,7 +486,7 @@ def test_gate_silent_on_acyclic_plan(pila):
         ("bugfix-002", ["b2"], ["b1"], []),
         ("feat-001", ["f1"], ["b2"], []),
     ]),
-    ("pila-feat-please-read-2domains", [
+    ("leerie-feat-please-read-2domains", [
         ("feat-001", ["f1"], [], []),
         ("feat-002", ["f2"], ["f1"], []),
         ("config-001", [], ["f2"], []),
@@ -496,15 +496,15 @@ def test_gate_silent_on_acyclic_plan(pila):
         ("test-001", [], ["b1"], []),
     ]),
 ])
-def test_gate_silent_on_successful_run_shapes(pila, name, subtasks):
+def test_gate_silent_on_successful_run_shapes(leerie, name, subtasks):
     """The gate must NOT fire on any of the five successful-run shapes
     surveyed in the cross-repo canvass. False-positive regression
     guard. (Synthetic stand-ins; the real captured plans pass the same
-    check when reconstructed from .pila/runs/.)"""
+    check when reconstructed from .leerie/runs/.)"""
     by_id = {sid: _subtask(sid, provides=p, requires=r, depends_on=d)
              for (sid, p, r, d) in subtasks}
-    _preds, _provs, _es, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, _es, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == [], f"{name}: gate fired on a known-acyclic shape"
 
 
@@ -512,15 +512,15 @@ def test_gate_silent_on_successful_run_shapes(pila, name, subtasks):
 # Test 12: Retry-prompt builder produces expected structure
 # ===========================================================================
 
-def test_retry_prompt_builder_contains_required_sections(pila):
+def test_retry_prompt_builder_contains_required_sections(leerie):
     """The retry prompt names the SCC, the edges, the structural
     signals, the recommendation, and the must-include set."""
     plans = _run2_post_reconcile_plans()
     output = _run2_reconciler_output()
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
 
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
 
     # Pre-providers map: at this point, both subtasks still have their
     # ORIGINAL requires; pre-providers is just provides → [sid]. (In
@@ -531,10 +531,10 @@ def test_retry_prompt_builder_contains_required_sections(pila):
         "app-runtime-deps": ["config-005"],
         "app-build-scripts": ["config-005"],
     }
-    recs = [pila._recommend_cycle_resolution(
+    recs = [leerie._recommend_cycle_resolution(
         scc, succ, edge_sources, by_id, output, pre_providers)
         for scc in sccs]
-    prompt = pila._build_cycle_retry_prompt(
+    prompt = leerie._build_cycle_retry_prompt(
         sccs, succ, edge_sources, output, by_id, recs,
         "ORIGINAL USER PROMPT")
 
@@ -565,7 +565,7 @@ def test_retry_prompt_builder_contains_required_sections(pila):
 # Test 13: Mutation reversion is clean (deep-copy round trip)
 # ===========================================================================
 
-def test_mutation_reversion_via_deep_copy_is_clean(pila):
+def test_mutation_reversion_via_deep_copy_is_clean(leerie):
     """Deep-copy snapshot before apply; revert by restoring from the
     snapshot. Post-revert state must equal the original."""
     plans = _run2_post_reconcile_plans()
@@ -579,7 +579,7 @@ def test_mutation_reversion_via_deep_copy_is_clean(pila):
         }],
         "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
     # Confirm we actually mutated something.
     all_ids = {s["id"] for plan in plans for s in plan["subtasks"]}
     assert "config-005" not in all_ids
@@ -595,15 +595,15 @@ def test_mutation_reversion_via_deep_copy_is_clean(pila):
 # Test 14: Recommendation heuristic on both captured cycles
 # ===========================================================================
 
-def test_recommendation_correct_on_run2_cycle(pila):
+def test_recommendation_correct_on_run2_cycle(leerie):
     """Run 2's cycle has shared package.json; heuristic case 2 fires.
     feat-001 has the shorter SCS, so it becomes `into`."""
     plans = _run2_post_reconcile_plans()
     output = _run2_reconciler_output()
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
-    rec = pila._recommend_cycle_resolution(
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
+    rec = leerie._recommend_cycle_resolution(
         sccs[0], succ, edge_sources, by_id, output,
         pre_providers={
             "backend-http-server": ["feat-001"],
@@ -615,7 +615,7 @@ def test_recommendation_correct_on_run2_cycle(pila):
     assert rec["rationale"] == "case-2: shared-files merge"
 
 
-def test_recommendation_correct_on_run1_cycle(pila):
+def test_recommendation_correct_on_run1_cycle(leerie):
     """Run 1's cycle has planner-declared feat-009 -> feat-008; case 1
     fires; drop the rename closing the reverse direction.
 
@@ -628,9 +628,9 @@ def test_recommendation_correct_on_run1_cycle(pila):
     plans = _run1_post_reconcile_plans()
     output = _run1_reconciler_output()
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
-    rec = pila._recommend_cycle_resolution(
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
+    rec = leerie._recommend_cycle_resolution(
         sccs[0], succ, edge_sources, by_id, output,
         pre_providers={"prisma-data-access-ready": ["feat-009"]})
     assert rec["op"] == "dropped_requires"
@@ -647,13 +647,13 @@ def test_recommendation_correct_on_run1_cycle(pila):
 # Test 15: Must-include validation fail-loud
 # ===========================================================================
 
-def test_must_include_validation_flags_unaddressed_cycle(pila):
+def test_must_include_validation_flags_unaddressed_cycle(leerie):
     """If the revised output doesn't include any op addressing a named
     cycle, _validate_must_include returns it as unaddressed."""
     plans = _run2_post_reconcile_plans()
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
 
     # An "empty" revised output (no cycle-breaking ops at all).
     empty_output = {
@@ -661,15 +661,15 @@ def test_must_include_validation_flags_unaddressed_cycle(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = pila._validate_must_include(empty_output, sccs)
+    unaddressed = leerie._validate_must_include(empty_output, sccs)
     assert unaddressed == ["config-005 <-> feat-001"]
 
 
-def test_must_include_validation_passes_when_drop_addresses_cycle(pila):
+def test_must_include_validation_passes_when_drop_addresses_cycle(leerie):
     plans = _run2_post_reconcile_plans()
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
 
     output = {
         "renames": [], "added_provides": [], "added_subtasks": [],
@@ -679,15 +679,15 @@ def test_must_include_validation_passes_when_drop_addresses_cycle(pila):
         ],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = pila._validate_must_include(output, sccs)
+    unaddressed = leerie._validate_must_include(output, sccs)
     assert unaddressed == []
 
 
-def test_must_include_validation_passes_when_merge_addresses_cycle(pila):
+def test_must_include_validation_passes_when_merge_addresses_cycle(leerie):
     plans = _run2_post_reconcile_plans()
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
 
     output = {
         "renames": [], "added_provides": [], "added_subtasks": [],
@@ -697,7 +697,7 @@ def test_must_include_validation_passes_when_merge_addresses_cycle(pila):
         ],
         "unresolvable": [],
     }
-    unaddressed = pila._validate_must_include(output, sccs)
+    unaddressed = leerie._validate_must_include(output, sccs)
     assert unaddressed == []
 
 
@@ -705,7 +705,7 @@ def test_must_include_validation_passes_when_merge_addresses_cycle(pila):
 # Test 16: Post-retry cycle detection (revised output introduces new cycle)
 # ===========================================================================
 
-def test_post_retry_detects_newly_introduced_cycle(pila):
+def test_post_retry_detects_newly_introduced_cycle(leerie):
     """If the revised output resolves the named cycle but introduces a
     new one elsewhere, the post-retry Tarjan fires with the new SCC."""
     # Start with run 2's cycle. Imagine the model "resolves" it by
@@ -732,10 +732,10 @@ def test_post_retry_detects_newly_introduced_cycle(pila):
         ],
         "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
     by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
-    _preds, _provs, _es, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, _es, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     # Original cycle is gone, but a new one exists.
     assert sccs == [["config-005", "feat-x"]]
 
@@ -744,7 +744,7 @@ def test_post_retry_detects_newly_introduced_cycle(pila):
 # Test 17: No-recommendation case falls back to speculative-rename drop
 # ===========================================================================
 
-def test_recommendation_case3_speculative_rename(pila):
+def test_recommendation_case3_speculative_rename(leerie):
     """SCC with no shared files and no planner depends_on. Case 3 fires:
     drop the rename whose original tag had no pre-reconcile producer."""
     # Create a 2-rename cycle where the renames don't share files.
@@ -770,9 +770,9 @@ def test_recommendation_case3_speculative_rename(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
-    rec = pila._recommend_cycle_resolution(
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
+    rec = leerie._recommend_cycle_resolution(
         sccs[0], succ, edge_sources, by_id, output,
         pre_providers={"a-real": ["a"], "b-real": ["b"]})
     assert rec["op"] == "dropped_requires"
@@ -783,14 +783,14 @@ def test_recommendation_case3_speculative_rename(pila):
 # Test 18: Tarjan deterministic ordering
 # ===========================================================================
 
-def test_tarjan_returns_sorted_sccs(pila):
+def test_tarjan_returns_sorted_sccs(leerie):
     """Both the inner SCC node list AND the order of SCCs returned must
     be deterministic so diagnostic messages don't churn between runs."""
     a = _subtask("z", provides=["z"], requires=["a"])
     b = _subtask("a", provides=["a"], requires=["z"])
     by_id = {s["id"]: s for s in (a, b)}
-    _preds, _provs, _es, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, _es, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     # Inner list sorted lex.
     assert sccs == [["a", "z"]]
 
@@ -800,7 +800,7 @@ def test_tarjan_returns_sorted_sccs(pila):
 # same tag
 # ===========================================================================
 
-def test_dropped_requires_preserves_external_extent(pila):
+def test_dropped_requires_preserves_external_extent(leerie):
     """The apply step's `dropped_requires` op must only remove
     `extent: in_plan` entries. If a subtask carries both an in_plan and
     an external entry for the same tag string (rare but possible — the
@@ -823,7 +823,7 @@ def test_dropped_requires_preserves_external_extent(pila):
         }],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
     feat_a = next(s for plan in plans for s in plan["subtasks"]
                   if s["id"] == "feat-a")
     extents = sorted(r["extent"] for r in feat_a["requires"])
@@ -838,7 +838,7 @@ def test_dropped_requires_preserves_external_extent(pila):
 # Test 20: merged_subtasks chain carries _merged_from forward
 # ===========================================================================
 
-def test_merged_subtasks_chain_carries_merged_from(pila):
+def test_merged_subtasks_chain_carries_merged_from(leerie):
     """Three subtasks A, B, C. Merge A into B, then B into C. C must
     carry both ids in `_merged_from` so a downstream consumer can
     trace the full ancestry of the merged unit."""
@@ -856,7 +856,7 @@ def test_merged_subtasks_chain_carries_merged_from(pila):
         ],
         "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
     surviving = [s for plan in plans for s in plan["subtasks"]]
     assert len(surviving) == 1
     assert surviving[0]["id"] == "c"
@@ -871,7 +871,7 @@ def test_merged_subtasks_chain_carries_merged_from(pila):
 # Test 21: merged_subtasks override fields take precedence
 # ===========================================================================
 
-def test_merged_subtasks_override_fields(pila):
+def test_merged_subtasks_override_fields(leerie):
     """When the merge op includes optional `title`, `intent`, and
     `success_criteria_seed`, the surviving subtask must carry the
     overrides verbatim (not the concatenation default for SCS, not the
@@ -893,7 +893,7 @@ def test_merged_subtasks_override_fields(pila):
         }],
         "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
     a_after = next(s for plan in plans for s in plan["subtasks"]
                    if s["id"] == "a")
     assert a_after["title"] == "merged unit title"
@@ -907,7 +907,7 @@ def test_merged_subtasks_override_fields(pila):
 # Test 22: merged_subtasks requires-cleanup preserves external entries
 # ===========================================================================
 
-def test_merged_subtasks_requires_cleanup_preserves_external(pila):
+def test_merged_subtasks_requires_cleanup_preserves_external(leerie):
     """When the merged unit provides tag X and an absorbed side had a
     requires entry for X, the cleanup must only drop the entry if its
     `extent: in_plan`. An `extent: external` entry for the same tag
@@ -928,7 +928,7 @@ def test_merged_subtasks_requires_cleanup_preserves_external(pila):
             "into": "a", "from": "b", "reason": "..."}],
         "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
     a_after = next(s for plan in plans for s in plan["subtasks"]
                    if s["id"] == "a")
     # The merged unit provides "x" but the external requires entry for
@@ -945,7 +945,7 @@ def test_merged_subtasks_requires_cleanup_preserves_external(pila):
 # Test 23: dependency_edges fail-loud on self-loop
 # ===========================================================================
 
-def test_dependency_edges_die_on_self_loop(pila):
+def test_dependency_edges_die_on_self_loop(leerie):
     """`dependency_edges: [{from: 'a', to: 'a', ...}]` is a malformed
     op (a subtask cannot depend on itself). Apply step must die at
     apply time — symmetric with `merged_subtasks`'s into==from check —
@@ -962,7 +962,7 @@ def test_dependency_edges_die_on_self_loop(pila):
         "merged_subtasks": [], "unresolvable": [],
     }
     with pytest.raises(SystemExit):
-        pila._apply_reconciler_output(plans, output)
+        leerie._apply_reconciler_output(plans, output)
 
 
 # ===========================================================================
@@ -970,7 +970,7 @@ def test_dependency_edges_die_on_self_loop(pila):
 # always-returns-something guarantee
 # ===========================================================================
 
-def test_recommendation_case4_lexicographic_tiebreaker(pila):
+def test_recommendation_case4_lexicographic_tiebreaker(leerie):
     """When none of cases 1-3 apply — no planner-declared depends_on in
     the SCC, no shared files_likely_touched, and every rename's `from`
     tag had a producer in pre_providers (so case 3's speculative-rename
@@ -1009,8 +1009,8 @@ def test_recommendation_case4_lexicographic_tiebreaker(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    _preds, _provs, edge_sources, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, edge_sources, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == [["subtask-a", "subtask-b"]]
 
     # Both rename `from` tags claim pre-producers, so case 3 abstains
@@ -1021,7 +1021,7 @@ def test_recommendation_case4_lexicographic_tiebreaker(pila):
         "a-canonical": ["subtask-a"],
         "b-canonical": ["subtask-b"],
     }
-    rec = pila._recommend_cycle_resolution(
+    rec = leerie._recommend_cycle_resolution(
         sccs[0], succ, edge_sources, by_id, output, pre_providers)
     assert rec["op"] == "dropped_requires"
     assert rec["rationale"] == "case-4: lexicographic tiebreaker"
@@ -1045,7 +1045,7 @@ def test_recommendation_case4_lexicographic_tiebreaker(pila):
 # Test 25: _format_recommendation dropped_requires branch direct unit
 # ===========================================================================
 
-def test_format_recommendation_dropped_requires(pila):
+def test_format_recommendation_dropped_requires(leerie):
     """Direct unit test pins the rendered shape for a dropped_requires
     recommendation. The integration tests only render the merged_subtasks
     branch (via the run-2 fixture in
@@ -1059,7 +1059,7 @@ def test_format_recommendation_dropped_requires(pila):
         "reason": "Single-quoted 'reason' with a newline\nand a backslash\\",
         "rationale": "case-3: speculative-rename drop",
     }
-    rendered = pila._format_recommendation(rec)
+    rendered = leerie._format_recommendation(rec)
     # repr() escapes the embedded quotes and newline so the line stays
     # a valid Python-call literal.
     assert rendered.startswith(
@@ -1077,7 +1077,7 @@ def test_format_recommendation_dropped_requires(pila):
 # Test 26: _format_recommendation merged_subtasks branch direct unit
 # ===========================================================================
 
-def test_format_recommendation_merged_subtasks(pila):
+def test_format_recommendation_merged_subtasks(leerie):
     """Direct unit test for the merged_subtasks render branch."""
     rec = {
         "op": "merged_subtasks",
@@ -1086,7 +1086,7 @@ def test_format_recommendation_merged_subtasks(pila):
         "reason": "Both edit package.json",
         "rationale": "case-2: shared-files merge",
     }
-    rendered = pila._format_recommendation(rec)
+    rendered = leerie._format_recommendation(rec)
     assert rendered.startswith(
         "merged_subtasks(into='feat-001', from='config-005', reason=")
     assert rendered.endswith(")")
@@ -1097,7 +1097,7 @@ def test_format_recommendation_merged_subtasks(pila):
 # Test 27: _matches_recommendation marks the recommended option
 # ===========================================================================
 
-def test_matches_recommendation_marks_correct_option(pila):
+def test_matches_recommendation_marks_correct_option(leerie):
     """For each of the two reachable recommendation ops, an option
     string that starts with the recommendation's prefix returns True;
     a non-matching option returns False. Without this test, a bug that
@@ -1108,22 +1108,22 @@ def test_matches_recommendation_marks_correct_option(pila):
                 "reason": "r", "rationale": "case-1: planner-edge keeper"}
     matching = "dropped_requires(sid='a', tag='x', ...)"
     not_matching = "dropped_requires(sid='b', tag='x', ...)"
-    assert pila._matches_recommendation(matching, rec_drop) is True
-    assert pila._matches_recommendation(not_matching, rec_drop) is False
+    assert leerie._matches_recommendation(matching, rec_drop) is True
+    assert leerie._matches_recommendation(not_matching, rec_drop) is False
     # merged_subtasks
     rec_merge = {"op": "merged_subtasks", "into": "a", "from": "b",
                  "reason": "r", "rationale": "case-2: shared-files merge"}
     matching = "merged_subtasks(into='a', from='b', ...)"
     not_matching = "merged_subtasks(into='b', from='a', ...)"
-    assert pila._matches_recommendation(matching, rec_merge) is True
-    assert pila._matches_recommendation(not_matching, rec_merge) is False
+    assert leerie._matches_recommendation(matching, rec_merge) is True
+    assert leerie._matches_recommendation(not_matching, rec_merge) is False
 
 
 # ===========================================================================
 # Test 28: _validate_must_include rejects ops targeting non-SCC sids
 # ===========================================================================
 
-def test_must_include_rejects_op_on_non_scc_sid(pila):
+def test_must_include_rejects_op_on_non_scc_sid(leerie):
     """The validator credits an op against a cycle only when the op
     targets an SCC member. An op on an unrelated subtask should NOT
     satisfy any cycle's must-include set — without this negative test,
@@ -1134,8 +1134,8 @@ def test_must_include_rejects_op_on_non_scc_sid(pila):
     b = _subtask("b", provides=["b-cap"], requires=["a-cap"])
     c = _subtask("c", provides=["c-cap"])
     by_id = {s["id"]: s for s in (a, b, c)}
-    _preds, _provs, _es, succ = _build_graph(pila, by_id)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    _preds, _provs, _es, succ = _build_graph(leerie, by_id)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == [["a", "b"]], "fixture: SCC is exactly {a, b}"
 
     # Op targets C, not A or B → must NOT credit the cycle.
@@ -1146,7 +1146,7 @@ def test_must_include_rejects_op_on_non_scc_sid(pila):
         ],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = pila._validate_must_include(output, sccs)
+    unaddressed = leerie._validate_must_include(output, sccs)
     assert unaddressed == ["a <-> b"], (
         "a dropped_requires on a non-SCC sid must NOT satisfy the cycle's "
         "must-include set; validator should report the cycle as unaddressed")
@@ -1159,27 +1159,27 @@ def test_must_include_rejects_op_on_non_scc_sid(pila):
 # without renaming the original consumer's tag.
 # ===========================================================================
 
-def test_tag_jaccard_known_pairs(pila):
+def test_tag_jaccard_known_pairs(leerie):
     """Pin the similarity function on the captured-failure pair + edge
     cases. The 0.500 result on the 075210 pair is load-bearing for the
     case-1 heuristic firing."""
     # Captured run 075210: shared {stacks, authored} of {cdk, stacks,
     # authored, infra} → 2/4 = 0.5.
-    assert pila._tag_jaccard(
+    assert leerie._tag_jaccard(
         "cdk-stacks-authored", "infra-stacks-authored") == 0.5
     # Identical tags → 1.0.
-    assert pila._tag_jaccard("foo-bar", "foo-bar") == 1.0
+    assert leerie._tag_jaccard("foo-bar", "foo-bar") == 1.0
     # Disjoint → 0.0.
-    assert pila._tag_jaccard("foo-bar", "baz-qux") == 0.0
+    assert leerie._tag_jaccard("foo-bar", "baz-qux") == 0.0
     # Both empty → 0.0 (not div-by-zero).
-    assert pila._tag_jaccard("", "") == 0.0
+    assert leerie._tag_jaccard("", "") == 0.0
     # One empty → 0.0.
-    assert pila._tag_jaccard("foo", "") == 0.0
+    assert leerie._tag_jaccard("foo", "") == 0.0
     # Single-token tags with overlap.
-    assert pila._tag_jaccard("foo", "foo-bar") == 0.5
+    assert leerie._tag_jaccard("foo", "foo-bar") == 0.5
 
 
-def test_recommend_unresolved_resolution_075210_case(pila):
+def test_recommend_unresolved_resolution_075210_case(leerie):
     """The captured failure: deps-008 requires 'cdk-stacks-authored';
     config-011 (added by reconciler) provides 'infra-stacks-authored'.
     Heuristic case-1 must fire and recommend the missing rename. This
@@ -1190,7 +1190,7 @@ def test_recommend_unresolved_resolution_075210_case(pila):
         "prisma-deps-present": ["deps-001"],
         "node-engine-bumped": ["deps-007"],
     }
-    rec = pila._recommend_unresolved_resolution(
+    rec = leerie._recommend_unresolved_resolution(
         "deps-008", "cdk-stacks-authored", providers, {})
     assert rec is not None
     assert rec["op"] == "rename"
@@ -1200,7 +1200,7 @@ def test_recommend_unresolved_resolution_075210_case(pila):
     assert rec["rationale"] == "case-1: unique-strong-similarity"
 
 
-def test_recommend_unresolved_resolution_self_loop_guard(pila):
+def test_recommend_unresolved_resolution_self_loop_guard(leerie):
     """Self-loop guard: if the top-similar candidate is provided by the
     consumer's OWN sid, skip it. Caught the historical deps-011
     'supabase-client-imports-removed' case where Jaccard would rank
@@ -1210,13 +1210,13 @@ def test_recommend_unresolved_resolution_self_loop_guard(pila):
         "supabase-client-dep-removed": ["deps-011"],  # SELF — must skip
         "node-engine-bumped": ["deps-007"],
     }
-    rec = pila._recommend_unresolved_resolution(
+    rec = leerie._recommend_unresolved_resolution(
         "deps-011", "supabase-client-imports-removed", providers, {})
     # Self-match skipped; nothing else has j >= 0.5; abstain.
     assert rec is None
 
 
-def test_recommend_unresolved_resolution_no_match(pila):
+def test_recommend_unresolved_resolution_no_match(leerie):
     """No candidate has j >= 0.5 → return None, model decides unaided.
     Historical scan showed ~88% of post-mutation unresolved entries hit
     this branch — the heuristic abstains gracefully."""
@@ -1224,12 +1224,12 @@ def test_recommend_unresolved_resolution_no_match(pila):
         "totally-unrelated-thing": ["sub-a"],
         "another-unrelated": ["sub-b"],
     }
-    rec = pila._recommend_unresolved_resolution(
+    rec = leerie._recommend_unresolved_resolution(
         "consumer", "something-completely-different", providers, {})
     assert rec is None
 
 
-def test_recommend_unresolved_resolution_multi_strong_abstains(pila):
+def test_recommend_unresolved_resolution_multi_strong_abstains(leerie):
     """Multiple candidates with j >= 0.5 and none >= 0.7 → abstain
     (model picks unaided). Avoids confidently picking between two
     near-equal candidates."""
@@ -1239,14 +1239,14 @@ def test_recommend_unresolved_resolution_multi_strong_abstains(pila):
         "cdk-aws-stacks-deployed": ["sub-y"],     # j with target = 0.6
         "unrelated": ["sub-z"],
     }
-    rec = pila._recommend_unresolved_resolution(
+    rec = leerie._recommend_unresolved_resolution(
         "consumer", "cdk-aws-stacks-authored", providers, {})
     # Neither hits the j>=0.7 very-high threshold; case-1 needs unique
     # top match so it also doesn't fire. Abstain.
     assert rec is None
 
 
-def test_validate_unresolved_must_include_accepts_rename(pila):
+def test_validate_unresolved_must_include_accepts_rename(leerie):
     """A rename on the unresolved (sid, tag) addresses the entry."""
     unresolved = [{"domain": "deps", "sid": "deps-008",
                    "tag": "cdk-stacks-authored"}]
@@ -1257,10 +1257,10 @@ def test_validate_unresolved_must_include_accepts_rename(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    assert pila._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
-def test_validate_unresolved_must_include_accepts_added_provides(pila):
+def test_validate_unresolved_must_include_accepts_added_provides(leerie):
     """An added_provides covering the unresolved tag (on any sid)
     addresses the entry."""
     unresolved = [{"domain": "deps", "sid": "deps-008",
@@ -1271,10 +1271,10 @@ def test_validate_unresolved_must_include_accepts_added_provides(pila):
         "added_subtasks": [], "dropped_requires": [],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    assert pila._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
-def test_validate_unresolved_must_include_accepts_added_subtask_with_provides(pila):
+def test_validate_unresolved_must_include_accepts_added_subtask_with_provides(leerie):
     """An added_subtask whose `provides` includes the unresolved tag
     addresses the entry."""
     unresolved = [{"domain": "deps", "sid": "deps-008",
@@ -1286,10 +1286,10 @@ def test_validate_unresolved_must_include_accepts_added_subtask_with_provides(pi
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    assert pila._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
-def test_validate_unresolved_must_include_accepts_unresolvable(pila):
+def test_validate_unresolved_must_include_accepts_unresolvable(leerie):
     """An `unresolvable` on the same (sid, tag) addresses the entry —
     surfaces a clean die() instead of failing must-include validation."""
     unresolved = [{"domain": "deps", "sid": "deps-008",
@@ -1301,10 +1301,10 @@ def test_validate_unresolved_must_include_accepts_unresolvable(pila):
         "unresolvable": [{"sid": "deps-008", "tag": "cdk-stacks-authored",
                           "reason": "no real producer in this plan"}],
     }
-    assert pila._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
-def test_validate_unresolved_must_include_accepts_dropped_requires(pila):
+def test_validate_unresolved_must_include_accepts_dropped_requires(leerie):
     """A dropped_requires on the unresolved (sid, tag) addresses the
     entry — the consumer's requires entry was over-specified (aggregate
     or coarser synonym of its own provides) and the cleanest resolution
@@ -1320,10 +1320,10 @@ def test_validate_unresolved_must_include_accepts_dropped_requires(pila):
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    assert pila._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
-def test_validate_unresolved_must_include_dropped_requires_pre_revert_tag(pila):
+def test_validate_unresolved_must_include_dropped_requires_pre_revert_tag(leerie):
     """When attempt 1 renamed the consumer's tag, attempt 2's
     dropped_requires may target the PRE-revert tag (what the consumer's
     requires entry actually holds after the unresolved-retry's revert).
@@ -1346,15 +1346,15 @@ def test_validate_unresolved_must_include_dropped_requires_pre_revert_tag(pila):
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    assert pila._validate_unresolved_must_include(
+    assert leerie._validate_unresolved_must_include(
         output, unresolved, attempt_1_output) == []
 
 
-def test_validate_unresolved_must_include_dropped_requires_post_mutation_tag(pila):
+def test_validate_unresolved_must_include_dropped_requires_post_mutation_tag(leerie):
     """Symmetric to the pre-revert case: attempt 2 may also target the
     POST-mutation tag (a literal-minded model reading the unresolved
     header verbatim). The validator must accept that form too — without
-    it, pila would reject its own model's reasonable output."""
+    it, leerie would reject its own model's reasonable output."""
     attempt_1_output = {
         "renames": [{"sid": "config-006", "from": "foo-finalized",
                      "to": "foo-keys-finalized"}],
@@ -1370,11 +1370,11 @@ def test_validate_unresolved_must_include_dropped_requires_post_mutation_tag(pil
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    assert pila._validate_unresolved_must_include(
+    assert leerie._validate_unresolved_must_include(
         output, unresolved, attempt_1_output) == []
 
 
-def test_apply_reconciler_output_dropped_requires_strict_match_attempt_1(pila):
+def test_apply_reconciler_output_dropped_requires_strict_match_attempt_1(leerie):
     """Attempt-1 apply (no attempt_1_renames passed) does strict tag
     equality — preserves prior behavior. Documents the contract: the
     dual-tag fallback only fires in retry mode."""
@@ -1392,12 +1392,12 @@ def test_apply_reconciler_output_dropped_requires_strict_match_attempt_1(pila):
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
     sub = plans[0]["subtasks"][0]
     assert sub["requires"] == []
 
 
-def test_apply_reconciler_output_dropped_requires_dual_tag_in_retry(pila):
+def test_apply_reconciler_output_dropped_requires_dual_tag_in_retry(leerie):
     """In retry mode, the apply step accepts EITHER the post-mutation
     tag or the pre-revert tag — symmetric to the validator's dual-tag
     acceptance. The scenario: attempt 1 renamed the consumer's
@@ -1424,7 +1424,7 @@ def test_apply_reconciler_output_dropped_requires_dual_tag_in_retry(pila):
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(
+    leerie._apply_reconciler_output(
         plans, output2, attempt_1_renames=attempt_1_renames)
     sub = plans[0]["subtasks"][0]
     assert sub["requires"] == [], (
@@ -1432,7 +1432,7 @@ def test_apply_reconciler_output_dropped_requires_dual_tag_in_retry(pila):
         "attempt 2 targets the post-mutation form (dual-tag symmetry)")
 
 
-def test_apply_reconciler_output_dropped_requires_pre_revert_in_retry(pila):
+def test_apply_reconciler_output_dropped_requires_pre_revert_in_retry(leerie):
     """Symmetric to the prior test: attempt 2 emits dropped_requires
     targeting the PRE-revert tag (what the consumer's requires actually
     holds). Strict equality works in this case; the dual-tag fallback
@@ -1453,13 +1453,13 @@ def test_apply_reconciler_output_dropped_requires_pre_revert_in_retry(pila):
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(
+    leerie._apply_reconciler_output(
         plans, output2, attempt_1_renames=attempt_1_renames)
     sub = plans[0]["subtasks"][0]
     assert sub["requires"] == []
 
 
-def test_apply_reconciler_output_dropped_requires_no_rename_for_target_sid(pila):
+def test_apply_reconciler_output_dropped_requires_no_rename_for_target_sid(leerie):
     """Retry mode where `attempt_1_renames` is non-empty but does NOT
     cover the dropped_requires target sid (attempt 1 renamed OTHER
     subtasks; this consumer's tag was untouched). The dual-tag map
@@ -1495,7 +1495,7 @@ def test_apply_reconciler_output_dropped_requires_no_rename_for_target_sid(pila)
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(
+    leerie._apply_reconciler_output(
         plans, output2, attempt_1_renames=attempt_1_renames)
     config_006 = plans[0]["subtasks"][0]
     config_009 = plans[0]["subtasks"][1]
@@ -1521,7 +1521,7 @@ def test_apply_reconciler_output_dropped_requires_no_rename_for_target_sid(pila)
                               "reason": "spurious"}],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(
+    leerie._apply_reconciler_output(
         plans2, output_bad, attempt_1_renames=attempt_1_renames)
     assert plans2[0]["subtasks"][0]["requires"] == [
         {"tag": "foo-keys-finalized", "extent": "in_plan"}], (
@@ -1530,7 +1530,7 @@ def test_apply_reconciler_output_dropped_requires_no_rename_for_target_sid(pila)
         "remove an unrelated entry")
 
 
-def test_validate_unresolved_must_include_rejects_unrelated_op(pila):
+def test_validate_unresolved_must_include_rejects_unrelated_op(leerie):
     """A rename on a DIFFERENT sid+tag does NOT address an unresolved
     entry. Without this negative test, a regression that caused the
     validator to always return [] would not be caught."""
@@ -1543,11 +1543,11 @@ def test_validate_unresolved_must_include_rejects_unrelated_op(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = pila._validate_unresolved_must_include(output, unresolved)
+    unaddressed = leerie._validate_unresolved_must_include(output, unresolved)
     assert unaddressed == ["deps/deps-008 requires 'cdk-stacks-authored'"]
 
 
-def test_build_unresolved_retry_prompt_contains_required_sections(pila):
+def test_build_unresolved_retry_prompt_contains_required_sections(leerie):
     """The retry prompt must surface the unresolved tags, top-3
     similarity ranking, the recommendation (if computed), the
     must-include set, and the original user prompt at the end."""
@@ -1557,10 +1557,10 @@ def test_build_unresolved_retry_prompt_contains_required_sections(pila):
         "infra-stacks-authored": ["config-011"],
         "prisma-deps-present": ["deps-001"],
     }
-    rec = pila._recommend_unresolved_resolution(
+    rec = leerie._recommend_unresolved_resolution(
         "deps-008", "cdk-stacks-authored", providers, {})
     recs = {("deps-008", "cdk-stacks-authored"): rec}
-    prompt = pila._build_unresolved_retry_prompt(
+    prompt = leerie._build_unresolved_retry_prompt(
         unresolved, providers, recs, {}, "ORIGINAL USER PROMPT")
 
     # Required sections.
@@ -1590,7 +1590,7 @@ def test_build_unresolved_retry_prompt_contains_required_sections(pila):
     assert "rename(sid='deps-008', from='cdk-stacks-authored', " in prompt
 
 
-def test_build_unresolved_retry_prompt_uses_pre_revert_tag_in_example(pila):
+def test_build_unresolved_retry_prompt_uses_pre_revert_tag_in_example(leerie):
     """When attempt 1 renamed the consumer's tag to the now-unresolved
     target, the must-include `renames:` example must use the original
     pre-revert tag as `from` — not the post-mutation tag. After the
@@ -1618,7 +1618,7 @@ def test_build_unresolved_retry_prompt_uses_pre_revert_tag_in_example(pila):
     unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
     providers = {"barely-related-tag": ["producer"]}
     recs = {("consumer", "bar"): None}  # exercises the no-recommendation path
-    prompt = pila._build_unresolved_retry_prompt(
+    prompt = leerie._build_unresolved_retry_prompt(
         unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
 
     # The must-include example MUST use the pre-revert tag
@@ -1640,7 +1640,7 @@ def test_build_unresolved_retry_prompt_uses_pre_revert_tag_in_example(pila):
 # pytest, not only by live PR-review runs.
 # ===========================================================================
 
-def _minimal_state_for_retry(pila, tmp_path):
+def _minimal_state_for_retry(leerie, tmp_path):
     """Stub State with just enough plumbing for phase_reconcile +
     _spawn_reconciler to call bump_workers + st.save without crashing.
 
@@ -1648,17 +1648,17 @@ def _minimal_state_for_retry(pila, tmp_path):
     inline — keeping this test file independent of others (no cross-file
     test imports). Acceptable to duplicate ~5 lines of setup pattern
     rather than introduce a fixture coupling."""
-    pila_root = tmp_path / ".pila"
+    leerie_root = tmp_path / ".leerie"
     run_id = "test-unresolved-retry-aaa111"
-    (pila_root / "runs" / run_id).mkdir(parents=True)
-    st = pila.State(pila_root, run_id)
+    (leerie_root / "runs" / run_id).mkdir(parents=True)
+    st = leerie.State(leerie_root, run_id)
     st.data = {"task": "test", "worker_count": 0}
     st.save()
     return st
 
 
 def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
-    pila, monkeypatch, tmp_path
+    leerie, monkeypatch, tmp_path
 ):
     """End-to-end integration of the unresolved-tags retry loop.
 
@@ -1756,15 +1756,15 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
             return attempt_1_output
         return attempt_2_output
 
-    monkeypatch.setattr(pila, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    st = _minimal_state_for_retry(pila, tmp_path)
+    st = _minimal_state_for_retry(leerie, tmp_path)
     # Caps need the keys phase_reconcile + bump_workers touch.
-    caps = dict(pila.DEFAULT_CAPS)
+    caps = dict(leerie.DEFAULT_CAPS)
     models = {"reconciler": "opus"}
     efforts = {"reconciler": "high"}
 
-    result = asyncio.run(pila.phase_reconcile(
+    result = asyncio.run(leerie.phase_reconcile(
         plans, "migrate to AWS", st, caps, models, efforts))
 
     # 1. phase_reconcile returned (didn't die).
@@ -1784,7 +1784,7 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
     assert "HINT" in retry_prompt  # heuristic computed a recommendation
 
     # 4. Final plan has zero unresolved requires.
-    final_unresolved = pila._compute_unresolved_requires(result)
+    final_unresolved = leerie._compute_unresolved_requires(result)
     assert final_unresolved == [], (
         f"phase_reconcile should converge with zero unresolved entries; "
         f"got {final_unresolved}")
@@ -1808,11 +1808,11 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
 # ===========================================================================
 
 def test_unresolved_retry_dies_after_attempt_2(
-    pila, monkeypatch, tmp_path
+    leerie, monkeypatch, tmp_path
 ):
     """The model returns the same broken output twice (doesn't fix the
     unresolved tag, doesn't emit `unresolvable`, doesn't address the
-    named entry). Pila's must-include validator must fire on attempt 2
+    named entry). Leerie's must-include validator must fire on attempt 2
     and `die()` cleanly with the structured report.
 
     Without this test, a regression in the validator's `die()` wiring
@@ -1873,16 +1873,16 @@ def test_unresolved_retry_dies_after_attempt_2(
         # Return the SAME broken output on both calls.
         return broken_output
 
-    monkeypatch.setattr(pila, "claude_p", fake_claude_p)
-    st = _minimal_state_for_retry(pila, tmp_path)
-    caps = dict(pila.DEFAULT_CAPS)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
     models = {"reconciler": "opus"}
     efforts = {"reconciler": "high"}
 
     # phase_reconcile must die. `die()` calls sys.exit(); pytest catches
     # SystemExit.
     with pytest.raises(SystemExit) as exc_info:
-        asyncio.run(pila.phase_reconcile(
+        asyncio.run(leerie.phase_reconcile(
             plans, "migrate to AWS", st, caps, models, efforts))
 
     # Confirm the retry actually fired (2 calls) — the die came AFTER
@@ -1905,7 +1905,7 @@ def test_unresolved_retry_dies_after_attempt_2(
 # ===========================================================================
 
 def test_cycle_retry_loop_integration_with_stubbed_reconciler(
-    pila, monkeypatch, tmp_path
+    leerie, monkeypatch, tmp_path
 ):
     """End-to-end integration of the cycle-resolution retry loop.
 
@@ -1976,14 +1976,14 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    # Attempt 2: model emits the rename + drop pila's recommendation
-    # suggests. Pila's recommendation targets the ORIGINAL pre-rename
+    # Attempt 2: model emits the rename + drop leerie's recommendation
+    # suggests. Leerie's recommendation targets the ORIGINAL pre-rename
     # tag — which matches the consumer's requires entry after the
     # retry's revert restores the pre-mutation state. The apply step's
     # drop loop matches on entry tag, so dropping the original tag
     # executes correctly; dropping the post-rename tag would silently
     # no-op (no matching entry post-revert) and the cycle would
-    # persist. Fixture mirrors what pila actually recommends:
+    # persist. Fixture mirrors what leerie actually recommends:
     # - keep the feat-001 rename (resolves feat-001's requires to
     #   config-005's `app-runtime-deps`).
     # - drop config-005's ORIGINAL `app-server-framework-present`
@@ -2017,13 +2017,13 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
             return attempt_1_output
         return attempt_2_output
 
-    monkeypatch.setattr(pila, "claude_p", fake_claude_p)
-    st = _minimal_state_for_retry(pila, tmp_path)
-    caps = dict(pila.DEFAULT_CAPS)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
     models = {"reconciler": "opus"}
     efforts = {"reconciler": "high"}
 
-    result = asyncio.run(pila.phase_reconcile(
+    result = asyncio.run(leerie.phase_reconcile(
         plans, "migrate to AWS", st, caps, models, efforts))
 
     # 1. phase_reconcile returned (no die).
@@ -2048,12 +2048,12 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
     # 4. Final plan is acyclic — rebuild the graph from the post-retry
     #    state and run Tarjan.
     by_id = {s["id"]: s for plan in result for s in plan.get("subtasks", [])}
-    _preds, _provs, _es = pila._build_predecessor_graph(by_id)
+    _preds, _provs, _es = leerie._build_predecessor_graph(by_id)
     succ: dict[str, set[str]] = {sid: set() for sid in by_id}
     for tgt, src_set in _preds.items():
         for src in src_set:
             succ[src].add(tgt)
-    sccs = pila._tarjan_sccs(set(by_id), succ)
+    sccs = leerie._tarjan_sccs(set(by_id), succ)
     assert sccs == [], (
         f"final plan should be acyclic; Tarjan found SCCs: {sccs}")
 
@@ -2077,11 +2077,11 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
 # ===========================================================================
 
 def test_cycle_retry_dies_after_attempt_2(
-    pila, monkeypatch, tmp_path
+    leerie, monkeypatch, tmp_path
 ):
     """The model returns cycle-closing renames on attempt 1, then on
     attempt 2 returns an output that doesn't address the named cycle
-    (e.g., a dropped_requires on a subtask NOT in the SCC). Pila's
+    (e.g., a dropped_requires on a subtask NOT in the SCC). Leerie's
     must-include validator must fire on attempt 2 and `die()` cleanly.
 
     Without this test, a regression in the validator's die wiring for
@@ -2133,7 +2133,7 @@ def test_cycle_retry_dies_after_attempt_2(
     }
     # Attempt 2: model "fixes" the cycle by dropping a requires on a
     # subtask NOT in the SCC. This DOES address some requires but
-    # doesn't address the cycle pila named. The must-include validator
+    # doesn't address the cycle leerie named. The must-include validator
     # must reject and die.
     attempt_2_output = {
         "renames": [], "added_provides": [], "added_subtasks": [],
@@ -2157,14 +2157,14 @@ def test_cycle_retry_dies_after_attempt_2(
             return attempt_1_output
         return attempt_2_output
 
-    monkeypatch.setattr(pila, "claude_p", fake_claude_p)
-    st = _minimal_state_for_retry(pila, tmp_path)
-    caps = dict(pila.DEFAULT_CAPS)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
     models = {"reconciler": "opus"}
     efforts = {"reconciler": "high"}
 
     with pytest.raises(SystemExit) as exc_info:
-        asyncio.run(pila.phase_reconcile(
+        asyncio.run(leerie.phase_reconcile(
             plans, "migrate to AWS", st, caps, models, efforts))
 
     # 2 claude_p calls happened (retry fired before die).
@@ -2188,7 +2188,7 @@ def test_cycle_retry_dies_after_attempt_2(
 # it verbatim produces a rename the apply step actually executes.
 # ===========================================================================
 
-def test_recommend_unresolved_resolution_with_attempt_1_rename(pila):
+def test_recommend_unresolved_resolution_with_attempt_1_rename(leerie):
     """Attempt 1 renamed the consumer's tag (foo → bar) but `bar` has
     no producer, so the unresolved entry is (consumer, bar). Post-
     revert, consumer's requires entry has `foo`. The recommendation
@@ -2209,7 +2209,7 @@ def test_recommend_unresolved_resolution_with_attempt_1_rename(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    rec = pila._recommend_unresolved_resolution(
+    rec = leerie._recommend_unresolved_resolution(
         "consumer", "bar", providers, attempt_1_output)
     # Recommendation must use the pre-revert tag (`foo-original`), not
     # the post-rename tag (`bar`). Without this, model copying verbatim
@@ -2228,7 +2228,7 @@ def test_recommend_unresolved_resolution_with_attempt_1_rename(pila):
     assert rec["to"] == "bar-canonical"
 
 
-def test_recommend_unresolved_resolution_no_rename_in_attempt_1(pila):
+def test_recommend_unresolved_resolution_no_rename_in_attempt_1(leerie):
     """If attempt-1's renames don't touch the consumer's tag (the
     common case — captured 075210 fixture), the recommendation falls
     through to using the unresolved tag as-is for `from`. Pin that
@@ -2240,7 +2240,7 @@ def test_recommend_unresolved_resolution_no_rename_in_attempt_1(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    rec = pila._recommend_unresolved_resolution(
+    rec = leerie._recommend_unresolved_resolution(
         "consumer", "bar", providers, attempt_1_output)
     assert rec is not None
     assert rec["from"] == "bar", (
@@ -2249,13 +2249,13 @@ def test_recommend_unresolved_resolution_no_rename_in_attempt_1(pila):
         f"{rec['from']!r}")
 
 
-def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(pila):
+def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(leerie):
     """The validator must accept a rename whose `from` is the
     consumer's pre-revert tag (looked up via attempt-1's output) — not
-    just the post-mutation tag. This matches what pila's own
+    just the post-mutation tag. This matches what leerie's own
     recommendation produces.
 
-    Without this, pila would reject its own recommendation as not
+    Without this, leerie would reject its own recommendation as not
     addressing the unresolved entry."""
     unresolved = [{"domain": "feat", "sid": "consumer",
                    "tag": "bar"}]  # post-mutation tag (unresolved set)
@@ -2268,7 +2268,7 @@ def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    # Attempt-2 emits the pila-recommended rename: from the PRE-revert
+    # Attempt-2 emits the leerie-recommended rename: from the PRE-revert
     # tag (foo-original), not the post-mutation tag (bar).
     attempt_2_output = {
         "renames": [
@@ -2279,7 +2279,7 @@ def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = pila._validate_unresolved_must_include(
+    unaddressed = leerie._validate_unresolved_must_include(
         attempt_2_output, unresolved, attempt_1_output)
     assert unaddressed == [], (
         "validator must accept a rename whose `from` matches the "
@@ -2287,7 +2287,7 @@ def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(pila):
         f"got {unaddressed}")
 
 
-def test_validate_unresolved_must_include_accepts_added_provides_pre_revert_tag(pila):
+def test_validate_unresolved_must_include_accepts_added_provides_pre_revert_tag(leerie):
     """The validator must accept an added_provides covering the
     consumer's PRE-revert tag, not just the post-mutation tag.
 
@@ -2314,14 +2314,14 @@ def test_validate_unresolved_must_include_accepts_added_provides_pre_revert_tag(
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = pila._validate_unresolved_must_include(
+    unaddressed = leerie._validate_unresolved_must_include(
         attempt_2_output, unresolved, attempt_1_output)
     assert unaddressed == [], (
         "validator must accept added_provides covering the pre-revert "
         f"tag; got {unaddressed}")
 
 
-def test_validate_unresolved_must_include_accepts_added_subtask_pre_revert_tag(pila):
+def test_validate_unresolved_must_include_accepts_added_subtask_pre_revert_tag(leerie):
     """The validator must accept an added_subtask whose `provides`
     includes the consumer's PRE-revert tag."""
     unresolved = [{"domain": "feat", "sid": "consumer",
@@ -2341,14 +2341,14 @@ def test_validate_unresolved_must_include_accepts_added_subtask_pre_revert_tag(p
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = pila._validate_unresolved_must_include(
+    unaddressed = leerie._validate_unresolved_must_include(
         attempt_2_output, unresolved, attempt_1_output)
     assert unaddressed == [], (
         "validator must accept added_subtasks whose provides covers "
         f"the pre-revert tag; got {unaddressed}")
 
 
-def test_build_unresolved_retry_prompt_added_ops_examples_use_pre_revert_tag(pila):
+def test_build_unresolved_retry_prompt_added_ops_examples_use_pre_revert_tag(leerie):
     """The must-include `added_provides:` and `added_subtasks:`
     examples must reference the PRE-revert tag, not the post-mutation
     tag. A model copying the example verbatim with the post-mutation
@@ -2367,7 +2367,7 @@ def test_build_unresolved_retry_prompt_added_ops_examples_use_pre_revert_tag(pil
     unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
     providers = {"barely-related-tag": ["producer"]}
     recs = {("consumer", "bar"): None}
-    prompt = pila._build_unresolved_retry_prompt(
+    prompt = leerie._build_unresolved_retry_prompt(
         unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
 
     # added_provides example uses pre-revert tag (foo-original), not
@@ -2383,7 +2383,7 @@ def test_build_unresolved_retry_prompt_added_ops_examples_use_pre_revert_tag(pil
         "added_subtasks example must NOT reference the post-mutation tag")
 
 
-def test_build_unresolved_retry_prompt_includes_revert_note_when_tags_differ(pila):
+def test_build_unresolved_retry_prompt_includes_revert_note_when_tags_differ(leerie):
     """When attempt 1 renamed the consumer's tag, the per-entry NOTE
     must explain the revert semantic so a literal-minded model doesn't
     override the must-include examples with the post-mutation form."""
@@ -2397,7 +2397,7 @@ def test_build_unresolved_retry_prompt_includes_revert_note_when_tags_differ(pil
     unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
     providers = {"barely-related-tag": ["producer"]}
     recs = {("consumer", "bar"): None}
-    prompt = pila._build_unresolved_retry_prompt(
+    prompt = leerie._build_unresolved_retry_prompt(
         unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
 
     assert "NOTE:" in prompt, "revert note must be present when tags differ"
@@ -2409,7 +2409,7 @@ def test_build_unresolved_retry_prompt_includes_revert_note_when_tags_differ(pil
         "note must explicitly warn against the post-mutation form")
 
 
-def test_build_unresolved_retry_prompt_omits_revert_note_when_tags_match(pila):
+def test_build_unresolved_retry_prompt_omits_revert_note_when_tags_match(leerie):
     """When no attempt-1 rename touched the consumer (pre_revert_tag
     == tag), the revert note is irrelevant noise and must be omitted."""
     output = {
@@ -2421,10 +2421,10 @@ def test_build_unresolved_retry_prompt_omits_revert_note_when_tags_match(pila):
     unresolved = [{"domain": "deps", "sid": "deps-008",
                    "tag": "cdk-stacks-authored"}]
     providers = {"infra-stacks-authored": ["config-011"]}
-    rec = pila._recommend_unresolved_resolution(
+    rec = leerie._recommend_unresolved_resolution(
         "deps-008", "cdk-stacks-authored", providers, output)
     recs = {("deps-008", "cdk-stacks-authored"): rec}
-    prompt = pila._build_unresolved_retry_prompt(
+    prompt = leerie._build_unresolved_retry_prompt(
         unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
 
     assert "NOTE:" not in prompt, (
@@ -2437,7 +2437,7 @@ def test_build_unresolved_retry_prompt_omits_revert_note_when_tags_match(pila):
 # resolution action; grounded in the captured summarizer deps-004 failure).
 # ===========================================================================
 
-def test_conditional_drops_removes_subtask_and_prunes_depends_on(pila):
+def test_conditional_drops_removes_subtask_and_prunes_depends_on(leerie):
     """The core happy path: a planner-emitted subtask with an unresolvable
     in_plan precondition gets dropped, and any downstream subtask that
     listed it in `depends_on` has the reference pruned. Pins the apply-
@@ -2456,7 +2456,7 @@ def test_conditional_drops_removes_subtask_and_prunes_depends_on(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, out)
+    leerie._apply_reconciler_output(plans, out)
     sids = {s["id"] for s in plans[0]["subtasks"]}
     assert sids == {"feat-005", "feat-006"}, "dropped sid must be gone"
     feat_005 = next(s for s in plans[0]["subtasks"] if s["id"] == "feat-005")
@@ -2467,7 +2467,7 @@ def test_conditional_drops_removes_subtask_and_prunes_depends_on(pila):
         "depends_on references to OTHER sids must be preserved")
 
 
-def test_conditional_drops_silent_noop_on_unknown_sid(pila):
+def test_conditional_drops_silent_noop_on_unknown_sid(leerie):
     """Defensive: a conditional_drop on a sid that doesn't exist is a
     silent no-op (mirrors `renames` and `dropped_requires`). The
     reconciler is told only existing sids; this is belt-and-suspenders."""
@@ -2481,12 +2481,12 @@ def test_conditional_drops_silent_noop_on_unknown_sid(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, out)
+    leerie._apply_reconciler_output(plans, out)
     sids = {s["id"] for s in plans[0]["subtasks"]}
     assert sids == {"feat-001"}, "unknown sid is a no-op, not a crash"
 
 
-def test_conditional_drops_dies_on_reconciler_added_subtask(pila):
+def test_conditional_drops_dies_on_reconciler_added_subtask(leerie):
     """Restricted to planner-authored consumers. If the reconciler tries
     to drop a subtask it itself added, die() — that's a logic error
     (a reconciler-added subtask has no planner prose to convert into a
@@ -2506,10 +2506,10 @@ def test_conditional_drops_dies_on_reconciler_added_subtask(pila):
         "merged_subtasks": [], "unresolvable": [],
     }
     with pytest.raises(SystemExit):
-        pila._apply_reconciler_output(plans, out)
+        leerie._apply_reconciler_output(plans, out)
 
 
-def test_conditional_drops_replays_summarizer_deps004_shape(pila):
+def test_conditional_drops_replays_summarizer_deps004_shape(leerie):
     """Reconstruct the captured summarizer deps-004 plan shape (the
     motivating failure for this op) and verify the apply step resolves
     it cleanly: deps-004 drops out, the unresolved-requires recompute
@@ -2524,7 +2524,7 @@ def test_conditional_drops_replays_summarizer_deps004_shape(pila):
         _subtask("deps-005", provides=["supabase-dependency-removed"]),
     )]
     # Before: deps-004 has an unresolved in_plan requires.
-    pre_unresolved = pila._compute_unresolved_requires(plans)
+    pre_unresolved = leerie._compute_unresolved_requires(plans)
     pre_tags = {(u["sid"], u["tag"]) for u in pre_unresolved}
     assert ("deps-004", "email-provider-is-ses") in pre_tags, (
         "test setup precondition: deps-004 should be unresolved before drop")
@@ -2540,18 +2540,18 @@ def test_conditional_drops_replays_summarizer_deps004_shape(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, out)
+    leerie._apply_reconciler_output(plans, out)
     sids = {s["id"] for s in plans[0]["subtasks"]}
     assert sids == {"deps-001", "deps-002", "deps-003", "deps-005"}, (
         "deps-004 dropped; siblings untouched")
     # After: no unresolved entries (the only one belonged to the dropped sid).
-    post_unresolved = pila._compute_unresolved_requires(plans)
+    post_unresolved = leerie._compute_unresolved_requires(plans)
     assert post_unresolved == [], (
         "after conditional_drops, the unresolved set must be empty — "
         "the drop resolved the only outstanding requires entry")
 
 
-def test_validate_unresolved_must_include_accepts_conditional_drop(pila):
+def test_validate_unresolved_must_include_accepts_conditional_drop(leerie):
     """A conditional_drop on the consumer sid addresses the unresolved
     entry (mirrors the apply step: the consumer is gone, so the unmet
     requires is moot). Validator must accept the drop as a valid
@@ -2565,10 +2565,10 @@ def test_validate_unresolved_must_include_accepts_conditional_drop(pila):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    assert pila._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
-def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(pila):
+def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(leerie):
     """A conditional_drop targeting a different sid than the unresolved
     consumer does NOT address the named entry. Validator must flag the
     unresolved entry as unaddressed."""
@@ -2581,13 +2581,13 @@ def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = pila._validate_unresolved_must_include(output, unresolved)
+    unaddressed = leerie._validate_unresolved_must_include(output, unresolved)
     assert len(unaddressed) == 1
     assert "deps-004" in unaddressed[0]
     assert "email-provider-is-ses" in unaddressed[0]
 
 
-def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(pila):
+def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(leerie):
     """When the model emits BOTH `unresolvable` and `conditional_drops`
     in the same output, `_check_unresolvable` must die first — model
     indecision is treated as an abort, not as silently apply one and
@@ -2604,7 +2604,7 @@ def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(pila
     `phase_reconcile`: `unresolved` is the input set bound at closure
     time."""
     # Synthesize the closure-bound `unresolved` and `_check_unresolvable`
-    # body inline (mirrors pila.py phase_reconcile).
+    # body inline (mirrors leerie.py phase_reconcile).
     unresolved = [{"sid": "deps-004", "tag": "email-provider-is-ses",
                    "domain": "deps"}]
 
@@ -2612,8 +2612,8 @@ def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(pila
         u = out.get("unresolvable", []) or []
         if not u:
             return
-        # Match real die() behavior (raises SystemExit via pila.die()).
-        pila.die("test-die: unresolvable non-empty")
+        # Match real die() behavior (raises SystemExit via leerie.die()).
+        leerie.die("test-die: unresolvable non-empty")
 
     output = {
         "renames": [], "added_provides": [], "added_subtasks": [],
@@ -2629,7 +2629,7 @@ def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(pila
         _check_unresolvable(output)
 
 
-def test_record_conditional_drops_wholesale_replaces_across_attempts(pila):
+def test_record_conditional_drops_wholesale_replaces_across_attempts(leerie):
     """The audit-write helper for conditional_drops must wholesale-
     replace `st.data["conditional_drops"]` on every call (not
     per-sid overwrite), mirroring how `external_preconditions` is
@@ -2658,7 +2658,7 @@ def test_record_conditional_drops_wholesale_replaces_across_attempts(pila):
     ]
 
     # Inline mirror of _record_conditional_drops (production lives at
-    # pila.py: phase_reconcile's _record_conditional_drops closure).
+    # leerie.py: phase_reconcile's _record_conditional_drops closure).
     # If the production helper drifts from this shape, this test will
     # silently pass on a stale contract — but the coupling is tight
     # enough that the drift will surface in an adjacent test.

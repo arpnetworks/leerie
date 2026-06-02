@@ -17,12 +17,12 @@ except ImportError:
     HAS_JSONSCHEMA = False
 
 
-def _validate(pila, instance: dict) -> None:
+def _validate(leerie, instance: dict) -> None:
     """Validate using jsonschema when available; otherwise fall back to
     structural assertions that mirror what the schema declares. Tests
     must pass in both modes so CI without jsonschema installed still
     catches regressions."""
-    schema = pila.SCHEMAS["pr_writer"]
+    schema = leerie.SCHEMAS["pr_writer"]
     if HAS_JSONSCHEMA:
         jsonschema.validate(instance, schema)
         return
@@ -41,58 +41,58 @@ def _validate(pila, instance: dict) -> None:
             instance["used_template"], str)
 
 
-def test_pr_writer_schema_required_fields(pila):
-    schema = pila.SCHEMAS["pr_writer"]
+def test_pr_writer_schema_required_fields(leerie):
+    schema = leerie.SCHEMAS["pr_writer"]
     assert set(schema["required"]) == {"title", "body", "used_template"}
 
 
-def test_pr_writer_schema_accepts_valid_no_template(pila):
-    _validate(pila, {
+def test_pr_writer_schema_accepts_valid_no_template(leerie):
+    _validate(leerie, {
         "title": "Fix Dynamo pagination returning duplicate items",
         "body": "## Summary\n\nFixes a bug.\n",
         "used_template": None,
     })
 
 
-def test_pr_writer_schema_accepts_valid_with_template(pila):
-    _validate(pila, {
+def test_pr_writer_schema_accepts_valid_with_template(leerie):
+    _validate(leerie, {
         "title": "Migrate Reddit ingest from polling to SNS",
         "body": "## Description\n\n<filled template content>\n",
         "used_template": ".github/pull_request_template.md",
     })
 
 
-def test_pr_writer_schema_rejects_empty_title(pila):
+def test_pr_writer_schema_rejects_empty_title(leerie):
     if not HAS_JSONSCHEMA:
         pytest.skip("jsonschema not available; minLength check requires it")
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             {"title": "", "body": "x", "used_template": None},
-            pila.SCHEMAS["pr_writer"],
+            leerie.SCHEMAS["pr_writer"],
         )
 
 
-def test_pr_writer_schema_rejects_empty_body(pila):
+def test_pr_writer_schema_rejects_empty_body(leerie):
     if not HAS_JSONSCHEMA:
         pytest.skip("jsonschema not available; minLength check requires it")
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             {"title": "ok", "body": "", "used_template": None},
-            pila.SCHEMAS["pr_writer"],
+            leerie.SCHEMAS["pr_writer"],
         )
 
 
-def test_pr_writer_schema_rejects_too_long_title(pila):
+def test_pr_writer_schema_rejects_too_long_title(leerie):
     if not HAS_JSONSCHEMA:
         pytest.skip("jsonschema not available; maxLength check requires it")
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             {"title": "x" * 201, "body": "ok", "used_template": None},
-            pila.SCHEMAS["pr_writer"],
+            leerie.SCHEMAS["pr_writer"],
         )
 
 
-def test_pr_writer_schema_rejects_missing_used_template(pila):
+def test_pr_writer_schema_rejects_missing_used_template(leerie):
     if not HAS_JSONSCHEMA:
         pytest.skip("jsonschema not available; required check requires it")
     # used_template is required even when null — guards against the
@@ -100,82 +100,82 @@ def test_pr_writer_schema_rejects_missing_used_template(pila):
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
             {"title": "ok", "body": "ok"},
-            pila.SCHEMAS["pr_writer"],
+            leerie.SCHEMAS["pr_writer"],
         )
 
 
-def test_pr_writer_schema_is_json_serializable(pila):
+def test_pr_writer_schema_is_json_serializable(leerie):
     # The schema is passed to `claude -p` as --json-schema <inline-json>;
     # any non-serializable surface would blow up at runtime, not import.
-    json.dumps(pila.SCHEMAS["pr_writer"])
+    json.dumps(leerie.SCHEMAS["pr_writer"])
 
 
-def test_pr_writer_in_allowed_schema_keys(pila):
+def test_pr_writer_in_allowed_schema_keys(leerie):
     """claude_p() rejects unknown schema_key values — the allowlist must
     contain pr_writer or the _compose_pr_via_llm call would die."""
-    src = (pila.__file__ and open(pila.__file__).read()) or ""
+    src = (leerie.__file__ and open(leerie.__file__).read()) or ""
     # The allowlist is constructed inside claude_p; presence of the
     # literal in the source is the most stable check.
     assert '"pr_writer"' in src
 
 
-# --- _strip_pila_prefix --------------------------------------------------
+# --- _strip_leerie_prefix --------------------------------------------------
 # DESIGN §12 *prompts are advisory, code enforces*. The pr_writer prompt
-# tells the worker not to emit a `pila:` prefix; the launcher
-# unconditionally prepends `pila: `. Without code-side enforcement, a
-# single drift produces `pila: pila: …` on every PR until the prompt is
-# patched. _strip_pila_prefix is the code half of the guarantee.
+# tells the worker not to emit a `leerie:` prefix; the launcher
+# unconditionally prepends `leerie: `. Without code-side enforcement, a
+# single drift produces `leerie: leerie: …` on every PR until the prompt is
+# patched. _strip_leerie_prefix is the code half of the guarantee.
 
-def test_strip_pila_prefix_removes_lowercase(pila):
-    assert pila._strip_pila_prefix("pila: Fix Dynamo paging") == "Fix Dynamo paging"
-
-
-def test_strip_pila_prefix_removes_uppercase(pila):
-    assert pila._strip_pila_prefix("PILA: Fix Dynamo paging") == "Fix Dynamo paging"
+def test_strip_leerie_prefix_removes_lowercase(leerie):
+    assert leerie._strip_leerie_prefix("leerie: Fix Dynamo paging") == "Fix Dynamo paging"
 
 
-def test_strip_pila_prefix_removes_mixed_case(pila):
-    assert pila._strip_pila_prefix("Pila: x") == "x"
-    assert pila._strip_pila_prefix("pILa: y") == "y"
+def test_strip_leerie_prefix_removes_uppercase(leerie):
+    assert leerie._strip_leerie_prefix("LEERIE: Fix Dynamo paging") == "Fix Dynamo paging"
 
 
-def test_strip_pila_prefix_handles_extra_whitespace(pila):
-    assert pila._strip_pila_prefix("pila:   leading spaces") == "leading spaces"
-    assert pila._strip_pila_prefix("pila:\tFix bug") == "Fix bug"
-    assert pila._strip_pila_prefix("pila:no space") == "no space"
+def test_strip_leerie_prefix_removes_mixed_case(leerie):
+    assert leerie._strip_leerie_prefix("Leerie: x") == "x"
+    assert leerie._strip_leerie_prefix("pILa: y") == "y"
 
 
-def test_strip_pila_prefix_no_op_when_absent(pila):
-    assert pila._strip_pila_prefix("Fix the bug") == "Fix the bug"
+def test_strip_leerie_prefix_handles_extra_whitespace(leerie):
+    assert leerie._strip_leerie_prefix("leerie:   leading spaces") == "leading spaces"
+    assert leerie._strip_leerie_prefix("leerie:\tFix bug") == "Fix bug"
+    assert leerie._strip_leerie_prefix("leerie:no space") == "no space"
 
 
-def test_strip_pila_prefix_does_not_false_positive_on_pilates(pila):
-    """Anchor must be `pila:` exactly — not `pila` followed by anything.
-    A title like "pilates is great" must pass through unchanged."""
-    assert pila._strip_pila_prefix("pilates is great") == "pilates is great"
-    assert pila._strip_pila_prefix("pila is a word") == "pila is a word"
-    assert pila._strip_pila_prefix("Pilatesify") == "Pilatesify"
+def test_strip_leerie_prefix_no_op_when_absent(leerie):
+    assert leerie._strip_leerie_prefix("Fix the bug") == "Fix the bug"
 
 
-def test_strip_pila_prefix_only_strips_leading_match(pila):
-    """A mid-string `pila:` is part of the user's title (e.g. a quote)
+def test_strip_leerie_prefix_does_not_false_positive_on_leerietes(leerie):
+    """Anchor must be `leerie:` exactly — not `leerie` followed by anything.
+    A title like "leerietes is great" must pass through unchanged."""
+    assert leerie._strip_leerie_prefix("leerietes is great") == "leerietes is great"
+    assert leerie._strip_leerie_prefix("leerie is a word") == "leerie is a word"
+    assert leerie._strip_leerie_prefix("Leerietesify") == "Leerietesify"
+
+
+def test_strip_leerie_prefix_only_strips_leading_match(leerie):
+    """A mid-string `leerie:` is part of the user's title (e.g. a quote)
     and must not be stripped."""
-    assert pila._strip_pila_prefix("Add pila: marker to commits") == \
-        "Add pila: marker to commits"
+    assert leerie._strip_leerie_prefix("Add leerie: marker to commits") == \
+        "Add leerie: marker to commits"
 
 
-def test_strip_pila_prefix_strips_only_once(pila):
-    """A worker emitting `pila: pila: x` — the exact bug this guard
+def test_strip_leerie_prefix_strips_only_once(leerie):
+    """A worker emitting `leerie: leerie: x` — the exact bug this guard
     defends against — gets one prefix stripped; the second pass would
     happen on a re-invocation, not in a single call. This documents
-    the intent: the launcher will still add ONE `pila: ` on top."""
-    out = pila._strip_pila_prefix("pila: pila: x")
-    # One strip leaves "pila: x"; the launcher's unconditional prepend
-    # then produces "pila: pila: x" — still wrong, but the same wrong
+    the intent: the launcher will still add ONE `leerie: ` on top."""
+    out = leerie._strip_leerie_prefix("leerie: leerie: x")
+    # One strip leaves "leerie: x"; the launcher's unconditional prepend
+    # then produces "leerie: leerie: x" — still wrong, but the same wrong
     # as the original bug. Document the limit: a single strip handles
     # the realistic drift case.
-    assert out == "pila: x"
+    assert out == "leerie: x"
 
 
-def test_strip_pila_prefix_empty_string(pila):
-    assert pila._strip_pila_prefix("") == ""
+def test_strip_leerie_prefix_empty_string(leerie):
+    assert leerie._strip_leerie_prefix("") == ""

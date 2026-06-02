@@ -1,4 +1,4 @@
-"""Tests for Phase 4: mid-run re-rsync (`pila --re-seed` + auto-on-resume).
+"""Tests for Phase 4: mid-run re-rsync (`leerie --re-seed` + auto-on-resume).
 
 Covers:
   - scripts/remote/seed-repo.sh refactor (seed_repo_clone / seed_repo_dirty / seed_repo)
@@ -20,7 +20,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_REPO_SH = REPO_ROOT / "scripts" / "remote" / "seed-repo.sh"
 RE_SEED_SH = REPO_ROOT / "scripts" / "remote" / "re-seed.sh"
 PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
-LAUNCHER = REPO_ROOT / "pila"
+LAUNCHER = REPO_ROOT / "leerie"
 
 
 def _run_bash(script: str, env: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
@@ -195,7 +195,7 @@ def test_re_seed_requires_run_id(tmp_path: Path):
         env={"USER_REPO": str(tmp_path)},
     )
     assert result.returncode != 0
-    assert "PILA_RUN_ID" in result.stderr
+    assert "LEERIE_RUN_ID" in result.stderr
 
 
 def test_re_seed_requires_sidecar(tmp_path: Path):
@@ -206,7 +206,7 @@ def test_re_seed_requires_sidecar(tmp_path: Path):
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(user_repo),
-            "PILA_RUN_ID": "nonexistent",
+            "LEERIE_RUN_ID": "nonexistent",
         },
     )
     assert result.returncode != 0
@@ -216,14 +216,14 @@ def test_re_seed_requires_sidecar(tmp_path: Path):
 def test_re_seed_requires_fly_machine_id(tmp_path: Path):
     """re_seed errors when the sidecar exists but has no fly_machine_id."""
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "my-run"
+    run_dir = user_repo / ".leerie" / "runs" / "my-run"
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({"run_id": "my-run"}))
     result = _run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(user_repo),
-            "PILA_RUN_ID": "my-run",
+            "LEERIE_RUN_ID": "my-run",
         },
     )
     assert result.returncode != 0
@@ -239,7 +239,7 @@ def test_re_seed_starts_stopped_machine_and_calls_dirty(tmp_path: Path):
     # Add an uncommitted edit so seed_repo_dirty has something to send.
     (repo / "edit.txt").write_text("new file\n")
 
-    run_dir = repo / ".pila" / "runs" / "my-run"
+    run_dir = repo / ".leerie" / "runs" / "my-run"
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "run_id": "my-run",
@@ -252,9 +252,9 @@ def test_re_seed_starts_stopped_machine_and_calls_dirty(tmp_path: Path):
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
-            "PILA_RUN_ID": "my-run",
+            "LEERIE_RUN_ID": "my-run",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
-            "PILA_MACHINE_START_TIMEOUT": "5",
+            "LEERIE_MACHINE_START_TIMEOUT": "5",
         },
     )
     assert result.returncode == 0, result.stderr
@@ -271,7 +271,7 @@ def test_re_seed_skips_start_when_machine_already_started(tmp_path: Path):
     """re_seed doesn't try to start a machine that's already 'started'."""
     repo = tmp_path / "user-repo"
     _make_git_repo(repo)
-    run_dir = repo / ".pila" / "runs" / "my-run"
+    run_dir = repo / ".leerie" / "runs" / "my-run"
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "run_id": "my-run",
@@ -282,7 +282,7 @@ def test_re_seed_skips_start_when_machine_already_started(tmp_path: Path):
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
-            "PILA_RUN_ID": "my-run",
+            "LEERIE_RUN_ID": "my-run",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )
@@ -295,7 +295,7 @@ def test_re_seed_refuses_destroyed_machine(tmp_path: Path):
     """re_seed errors when the machine has been destroyed."""
     repo = tmp_path / "user-repo"
     _make_git_repo(repo)
-    run_dir = repo / ".pila" / "runs" / "my-run"
+    run_dir = repo / ".leerie" / "runs" / "my-run"
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "run_id": "my-run",
@@ -306,7 +306,7 @@ def test_re_seed_refuses_destroyed_machine(tmp_path: Path):
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
-            "PILA_RUN_ID": "my-run",
+            "LEERIE_RUN_ID": "my-run",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )
@@ -318,10 +318,10 @@ def test_re_seed_refuses_destroyed_machine(tmp_path: Path):
 
 def test_re_seed_refuses_when_machine_has_dirty_tracked_files(tmp_path: Path):
     """re_seed refuses (without --force) when /work on the machine has
-    uncommitted tracked changes that aren't under .pila/."""
+    uncommitted tracked changes that aren't under .leerie/."""
     repo = tmp_path / "user-repo"
     _make_git_repo(repo)
-    run_dir = repo / ".pila" / "runs" / "my-run"
+    run_dir = repo / ".leerie" / "runs" / "my-run"
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "run_id": "my-run",
@@ -334,7 +334,7 @@ def test_re_seed_refuses_when_machine_has_dirty_tracked_files(tmp_path: Path):
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
-            "PILA_RUN_ID": "my-run",
+            "LEERIE_RUN_ID": "my-run",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )
@@ -344,24 +344,24 @@ def test_re_seed_refuses_when_machine_has_dirty_tracked_files(tmp_path: Path):
     assert "--force" in result.stderr
 
 
-def test_re_seed_ignores_pila_dirty_paths(tmp_path: Path):
-    """Dirty paths under .pila/ are expected (worker state) and don't trip
+def test_re_seed_ignores_leerie_dirty_paths(tmp_path: Path):
+    """Dirty paths under .leerie/ are expected (worker state) and don't trip
     the safety check."""
     repo = tmp_path / "user-repo"
     _make_git_repo(repo)
-    run_dir = repo / ".pila" / "runs" / "my-run"
+    run_dir = repo / ".leerie" / "runs" / "my-run"
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "run_id": "my-run",
         "fly_machine_id": "mach-001",
     }))
     _stub_flyctl(tmp_path, remote_status="started",
-                 remote_dirty=" M .pila/runs/my-run/state.json\n M .pila/runs/my-run/logs/orch.log\n")
+                 remote_dirty=" M .leerie/runs/my-run/state.json\n M .leerie/runs/my-run/logs/orch.log\n")
     result = _run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
-            "PILA_RUN_ID": "my-run",
+            "LEERIE_RUN_ID": "my-run",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )
@@ -369,10 +369,10 @@ def test_re_seed_ignores_pila_dirty_paths(tmp_path: Path):
 
 
 def test_re_seed_force_bypasses_safety_check(tmp_path: Path):
-    """PILA_RE_SEED_FORCE=1 bypasses the dirty-state safety check."""
+    """LEERIE_RE_SEED_FORCE=1 bypasses the dirty-state safety check."""
     repo = tmp_path / "user-repo"
     _make_git_repo(repo)
-    run_dir = repo / ".pila" / "runs" / "my-run"
+    run_dir = repo / ".leerie" / "runs" / "my-run"
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "run_id": "my-run",
@@ -384,9 +384,9 @@ def test_re_seed_force_bypasses_safety_check(tmp_path: Path):
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
-            "PILA_RUN_ID": "my-run",
+            "LEERIE_RUN_ID": "my-run",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
-            "PILA_RE_SEED_FORCE": "1",
+            "LEERIE_RE_SEED_FORCE": "1",
         },
     )
     assert result.returncode == 0, result.stderr
@@ -415,7 +415,7 @@ def test_launcher_consumes_re_seed_flags():
 
 
 def test_launcher_re_seed_requires_run_id_arg():
-    """`pila --re-seed` without <run-id> errors with usage."""
+    """`leerie --re-seed` without <run-id> errors with usage."""
     result = _run_bash(
         f"{LAUNCHER} --re-seed",
     )

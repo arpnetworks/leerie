@@ -3,10 +3,10 @@
 # a provisioned Fly.io Machine.
 #
 # This is the remote equivalent of the `AUTH_MOUNTS` bind-mount block in the
-# local `nerdctl run` path (pila launcher lines 542–726). Instead of mounting
+# local `nerdctl run` path (leerie launcher lines 542–726). Instead of mounting
 # a $STAGE scratch dir, the same content is delivered over SSH via flyctl.
 #
-# Usage (invoked from the pila launcher's RUNTIME=fly branch after
+# Usage (invoked from the leerie launcher's RUNTIME=fly branch after
 # provision_machine() returns successfully):
 #
 #   source scripts/remote/seed-auth.sh
@@ -14,8 +14,8 @@
 #
 # Environment variables (must be set by the launcher before sourcing):
 #
-#   PILA_MACHINE_ID  — ID of the provisioned Fly Machine (set by provision.sh)
-#   PILA_FLY_APP     — Fly.io app name (default: "pila"; same as provision.sh)
+#   LEERIE_MACHINE_ID  — ID of the provisioned Fly Machine (set by provision.sh)
+#   LEERIE_FLY_APP     — Fly.io app name (default: "leerie"; same as provision.sh)
 #   STAGE            — host-side scratch dir already assembled by the launcher
 #                      containing .claude/, .claude.json, and optional .gitconfig
 #   HOME             — standard; used to read host git identity
@@ -41,36 +41,36 @@
 # Seeding mechanism:
 #   Files are delivered via `flyctl ssh console -C` with a tar pipe:
 #       tar -cC "$STAGE" . | flyctl ssh console --pty=false \
-#         -C "sh -c 'tar -xC /home/pila && chown -R pila: /home/pila'"
+#         -C "sh -c 'tar -xC /home/leerie && chown -R leerie: /home/leerie'"
 #   `ssh console -C` is the only flyctl transport that takes the command
 #   as a single string AND forwards host stdin (current flyctl dropped
 #   `--stdin` and the post-`--` argv form from `machine exec`). The
-#   trailing `chown -R pila:` is necessary because the ssh-console
+#   trailing `chown -R leerie:` is necessary because the ssh-console
 #   session lands as root by default; without it the orchestrator
-#   (running as pila) couldn't read its own credentials.
+#   (running as leerie) couldn't read its own credentials.
 
 set -euo pipefail
 
-FLY_APP="${PILA_FLY_APP:-pila}"
+FLY_APP="${LEERIE_FLY_APP:-leerie}"
 
 # --- seed_auth -----------------------------------------------------------
 # Seeds Claude config + git identity into the provisioned Fly Machine.
-# Requires: $PILA_MACHINE_ID (from provision.sh), $STAGE (from launcher),
+# Requires: $LEERIE_MACHINE_ID (from provision.sh), $STAGE (from launcher),
 #           $FLY_APP, $HOME, and either $STAGE/.claude/.credentials.json or
 #           $CLAUDE_CODE_OAUTH_TOKEN.
 # Returns: 0 on success; 1 on failure (caller should abort the run).
 seed_auth() {
-  local machine_id="${PILA_MACHINE_ID:-}"
+  local machine_id="${LEERIE_MACHINE_ID:-}"
   if [ -z "$machine_id" ]; then
-    echo "pila: seed_auth: PILA_MACHINE_ID is not set — cannot seed" >&2
+    echo "leerie: seed_auth: LEERIE_MACHINE_ID is not set — cannot seed" >&2
     return 1
   fi
   if [ -z "${STAGE:-}" ]; then
-    echo "pila: seed_auth: STAGE is not set — launcher must assemble the scratch dir first" >&2
+    echo "leerie: seed_auth: STAGE is not set — launcher must assemble the scratch dir first" >&2
     return 1
   fi
 
-  echo "[pila] remote: seeding Claude config + git identity into machine $machine_id ..." >&2
+  echo "[leerie] remote: seeding Claude config + git identity into machine $machine_id ..." >&2
 
   # --- 1. Seed ~/.claude.json + ~/.claude/ via a single tar pipe ----------
   # The $STAGE dir already has:
@@ -78,7 +78,7 @@ seed_auth() {
   #   .claude/               (bulk/history dirs excluded; settings.json.* stripped)
   #   .claude/.credentials.json  (if Keychain-extracted on macOS)
   # We pipe the whole $STAGE tree (limited to the claude files) as a tar
-  # stream into `tar -xC /home/pila` on the remote, preserving permissions.
+  # stream into `tar -xC /home/leerie` on the remote, preserving permissions.
   #
   # We explicitly exclude git/ssh/gnupg material — those are git-push auth
   # which lives on the host per DESIGN §6 *Finalization*. Workers only need
@@ -94,14 +94,14 @@ seed_auth() {
   # that source seed-auth.sh standalone (e.g. tests).
   if command -v require_fly_ssh >/dev/null 2>&1; then
     if ! require_fly_ssh "$FLY_APP"; then
-      echo "pila: seed_auth: Fly SSH setup failed; cannot seed config" >&2
+      echo "leerie: seed_auth: Fly SSH setup failed; cannot seed config" >&2
       return 1
     fi
   fi
   # hallpass takes 5-30 s to come up after machine start; wait so the
   # tar-pipe below doesn't fail with "handshake failed: EOF".
   if command -v wait_for_fly_ssh_ready >/dev/null 2>&1; then
-    echo "[pila] remote: waiting for hallpass (SSH) on $machine_id..." >&2
+    echo "[leerie] remote: waiting for hallpass (SSH) on $machine_id..." >&2
     wait_for_fly_ssh_ready "$FLY_APP" "$machine_id" || true
   fi
   # COPYFILE_DISABLE=1 tells macOS BSD tar to skip the per-file
@@ -130,7 +130,7 @@ seed_auth() {
              --app "$FLY_APP" \
              --machine "$machine_id" \
              --pty=false \
-             -C "sh -c 'tar -xC /home/pila && chown -R pila: /home/pila'" 2>"$err_log"
+             -C "sh -c 'tar -xC /home/leerie && chown -R leerie: /home/leerie'" 2>"$err_log"
     tar_rc=${PIPESTATUS[1]}
     if [ "$tar_rc" -eq 0 ]; then
       rm -f "$err_log"
@@ -139,7 +139,7 @@ seed_auth() {
     if [ "$attempt" -eq 1 ] \
        && grep -qE "tunnel unavailable|context deadline exceeded|i/o timeout" "$err_log"; then
       cat "$err_log" >&2
-      echo "[pila] remote: tunnel unavailable; restarting flyctl agent and retrying once..." >&2
+      echo "[leerie] remote: tunnel unavailable; restarting flyctl agent and retrying once..." >&2
       flyctl agent restart >/dev/null 2>&1 || true
       sleep 2
       rm -f "$err_log"
@@ -150,10 +150,10 @@ seed_auth() {
     break
   done
   if [ "$tar_rc" -ne 0 ]; then
-    echo "pila: seed_auth: failed to seed Claude config files into machine $machine_id" >&2
+    echo "leerie: seed_auth: failed to seed Claude config files into machine $machine_id" >&2
     return 1
   fi
-  echo "[pila] remote: Claude config seeded" >&2
+  echo "[leerie] remote: Claude config seeded" >&2
 
   # --- 2. Token fallback: if no credentials file was in $STAGE, write one --
   # On Linux (and on macOS when Keychain extraction fails) the launcher does
@@ -176,17 +176,17 @@ seed_auth() {
              --app "$FLY_APP" \
              --machine "$machine_id" \
              --pty=false \
-             -C "sh -c 'cat > /home/pila/.claude/.credentials.json && chmod 600 /home/pila/.claude/.credentials.json && chown pila: /home/pila/.claude/.credentials.json'" 2>&1; then
-      echo "pila: seed_auth: failed to write credentials JSON from CLAUDE_CODE_OAUTH_TOKEN" >&2
+             -C "sh -c 'cat > /home/leerie/.claude/.credentials.json && chmod 600 /home/leerie/.claude/.credentials.json && chown leerie: /home/leerie/.claude/.credentials.json'" 2>&1; then
+      echo "leerie: seed_auth: failed to write credentials JSON from CLAUDE_CODE_OAUTH_TOKEN" >&2
       return 1
     fi
-    echo "[pila] remote: Claude credentials written from CLAUDE_CODE_OAUTH_TOKEN" >&2
+    echo "[leerie] remote: Claude credentials written from CLAUDE_CODE_OAUTH_TOKEN" >&2
   elif [ ! -s "$STAGE/.claude/.credentials.json" ] && \
        [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    echo "pila: seed_auth: no credentials available — neither \$STAGE/.claude/.credentials.json" >&2
+    echo "leerie: seed_auth: no credentials available — neither \$STAGE/.claude/.credentials.json" >&2
     echo "  nor \$CLAUDE_CODE_OAUTH_TOKEN is set. Workers will not be able to authenticate." >&2
     echo "  On macOS: grant the launcher Keychain access (the prompt that appears on first run)." >&2
-    echo "  On Linux: export CLAUDE_CODE_OAUTH_TOKEN in your shell before running pila." >&2
+    echo "  On Linux: export CLAUDE_CODE_OAUTH_TOKEN in your shell before running leerie." >&2
     return 1
   fi
 
@@ -198,7 +198,7 @@ seed_auth() {
   git_email="$(git config user.email 2>/dev/null || true)"
 
   if [ -z "$git_name" ] || [ -z "$git_email" ]; then
-    echo "pila: seed_auth: git user.name or user.email is not configured on the host." >&2
+    echo "leerie: seed_auth: git user.name or user.email is not configured on the host." >&2
     echo "  Run: git config --global user.name \"Your Name\"" >&2
     echo "       git config --global user.email \"you@example.com\"" >&2
     return 1
@@ -207,34 +207,34 @@ seed_auth() {
   # Stream git identity over ssh-console's stdin so names with quotes
   # (O'Brien, "Smith, Jr.") can't break host-side quoting.
   #
-  # Write to /home/pila/.gitconfig directly (not --global, which would
+  # Write to /home/leerie/.gitconfig directly (not --global, which would
   # write to root's home since the ssh-console session lands as root)
-  # and chown afterwards. The orchestrator runs as the pila user and
-  # reads ~/.gitconfig from /home/pila.
+  # and chown afterwards. The orchestrator runs as the leerie user and
+  # reads ~/.gitconfig from /home/leerie.
   if ! printf '%s\n%s\n' "$git_name" "$git_email" \
        | flyctl ssh console --app "$FLY_APP" --machine "$machine_id" \
            --pty=false \
            -C "sh -c 'IFS= read -r n; IFS= read -r e; \
-              git config --file /home/pila/.gitconfig user.name \"\$n\" && \
-              git config --file /home/pila/.gitconfig user.email \"\$e\" && \
-              chown pila: /home/pila/.gitconfig'" >/dev/null 2>&1; then
-    echo "pila: seed_auth: failed to set git identity on machine $machine_id" >&2
+              git config --file /home/leerie/.gitconfig user.name \"\$n\" && \
+              git config --file /home/leerie/.gitconfig user.email \"\$e\" && \
+              chown leerie: /home/leerie/.gitconfig'" >/dev/null 2>&1; then
+    echo "leerie: seed_auth: failed to set git identity on machine $machine_id" >&2
     return 1
   fi
 
-  echo "[pila] remote: git identity set (${git_name} <${git_email}>)" >&2
+  echo "[leerie] remote: git identity set (${git_name} <${git_email}>)" >&2
 
   # Pre-warm the Claude CLI. The very first `claude --version` on a
   # cold Fly machine takes ~17 s (Node runtime warm-up, statsig
   # network call, etc); the orchestrator's preflight has a tight
-  # timeout. Running it once here as the pila user makes the
+  # timeout. Running it once here as the leerie user makes the
   # orchestrator's subsequent call complete in <0.2 s. Failure
   # here is non-fatal — the orchestrator will still try.
-  echo "[pila] remote: pre-warming Claude CLI..." >&2
+  echo "[leerie] remote: pre-warming Claude CLI..." >&2
   flyctl ssh console --app "$FLY_APP" --machine "$machine_id" --pty=false \
-    -C "su pila -c 'HOME=/home/pila PATH=/usr/local/share/mise/installs/node/lts-current/bin:/usr/bin:/bin claude --version'" \
+    -C "su leerie -c 'HOME=/home/leerie PATH=/usr/local/share/mise/installs/node/lts-current/bin:/usr/bin:/bin claude --version'" \
     >/dev/null 2>&1 || true
 
-  echo "[pila] remote: seed_auth complete" >&2
+  echo "[leerie] remote: seed_auth complete" >&2
   return 0
 }

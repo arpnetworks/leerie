@@ -4,10 +4,10 @@ the orchestrator's `os.environ` so downstream worker subprocesses
 
 Why this matters (DESIGN §6½):
 `phase_provision` synthesizes a mise override at
-`.pila/runs/<id>/mise-overrides.toml` when a polyglot repo needs a
+`.leerie/runs/<id>/mise-overrides.toml` when a polyglot repo needs a
 synthesized go pin (`go.mod` + idiomatic files, no `.go-version`).
 The override file is NOT in the worktree's tracked-file set (it lives
-under `.pila/`, which is git-ignored). So mise's discovery in the
+under `.leerie/`, which is git-ignored). So mise's discovery in the
 worktree wouldn't see the synth — and `mise exec -- go ...` invoked
 from a worker's Bash tool would fall through to system PATH, where
 Go isn't installed.
@@ -22,7 +22,7 @@ from __future__ import annotations
 import os
 
 
-def test_resume_reexports_override_env_when_set(pila, tmp_path, monkeypatch):
+def test_resume_reexports_override_env_when_set(leerie, tmp_path, monkeypatch):
     """On `--resume`, the orchestrator must re-export
     MISE_OVERRIDE_CONFIG_FILENAMES from persisted state so downstream
     implementer/conformer workers inherit it. Without this, mise's
@@ -40,7 +40,7 @@ def test_resume_reexports_override_env_when_set(pila, tmp_path, monkeypatch):
     assert os.environ.get("MISE_OVERRIDE_CONFIG_FILENAMES") == override_path
 
 
-def test_resume_does_not_export_override_when_none(pila, tmp_path, monkeypatch):
+def test_resume_does_not_export_override_when_none(leerie, tmp_path, monkeypatch):
     """When persisted state has no override_file (repo had no go.mod
     synth), nothing should be exported. mise's normal discovery walk
     handles the worker's deps."""
@@ -54,12 +54,12 @@ def test_resume_does_not_export_override_when_none(pila, tmp_path, monkeypatch):
     assert "MISE_OVERRIDE_CONFIG_FILENAMES" not in os.environ
 
 
-def test_replay_provision_function_was_removed(pila):
+def test_replay_provision_function_was_removed(leerie):
     """Regression guard: the per-worktree replay function was removed
     in favor of worker-driven install (DESIGN §6½). If a refactor
     re-introduces it, this test catches the design drift before code
     review."""
-    assert not hasattr(pila, "replay_provision_in_worktree"), (
+    assert not hasattr(leerie, "replay_provision_in_worktree"), (
         "replay_provision_in_worktree was deliberately removed; workers "
         "now run installs in their own worktrees per DESIGN §6½. If you "
         "need to re-introduce orchestrator-driven install, update "

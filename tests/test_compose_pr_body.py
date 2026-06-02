@@ -24,119 +24,119 @@ def _full_state() -> dict:
     }
 
 
-def test_compose_pr_body_deterministic(pila):
+def test_compose_pr_body_deterministic(leerie):
     """Same inputs → byte-identical output. Foundational property."""
     state = _full_state()
     rid = "feat-add-telemetry-and-self-heal-skills-a3f7c2"
-    a = pila.compose_pr_body(state, rid)
-    b = pila.compose_pr_body(state, rid)
+    a = leerie.compose_pr_body(state, rid)
+    b = leerie.compose_pr_body(state, rid)
     assert a == b
 
 
-def test_compose_pr_body_contains_all_sections(pila):
+def test_compose_pr_body_contains_all_sections(leerie):
     """The three top-level headings must all render so reviewers know
     what to expect."""
-    body = pila.compose_pr_body(_full_state(), "feat-foo-abc123")
+    body = leerie.compose_pr_body(_full_state(), "feat-foo-abc123")
     assert "## Task" in body
     assert "## Classification" in body
     assert "## Run summary" in body
 
 
-def test_compose_pr_body_renders_task_verbatim(pila):
+def test_compose_pr_body_renders_task_verbatim(leerie):
     """The task description appears as-is — important for review context."""
     state = _full_state()
-    body = pila.compose_pr_body(state, "feat-foo-abc123")
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
     assert state["task"] in body
 
 
-def test_compose_pr_body_uses_first_category(pila):
+def test_compose_pr_body_uses_first_category(leerie):
     """When multiple categories were assigned, the body shows the primary
     one (consistent with how `compute_run_id` derives the abbrev)."""
-    body = pila.compose_pr_body(_full_state(), "feat-foo-abc123")
+    body = leerie.compose_pr_body(_full_state(), "feat-foo-abc123")
     assert "feature-implementation" in body
 
 
-def test_compose_pr_body_renders_run_id(pila):
+def test_compose_pr_body_renders_run_id(leerie):
     """The run_id appears in the body for traceability — a reviewer can
-    grep their `.pila/runs/` for the directory."""
+    grep their `.leerie/runs/` for the directory."""
     rid = "feat-add-telemetry-and-self-heal-skills-a3f7c2"
-    body = pila.compose_pr_body(_full_state(), rid)
+    body = leerie.compose_pr_body(_full_state(), rid)
     assert rid in body
 
 
-def test_compose_pr_body_includes_wave_and_subtask_counts(pila):
+def test_compose_pr_body_includes_wave_and_subtask_counts(leerie):
     """`Waves: N, subtasks: M` — derived from `waves` list shape."""
-    body = pila.compose_pr_body(_full_state(), "feat-foo-abc123")
+    body = leerie.compose_pr_body(_full_state(), "feat-foo-abc123")
     # _full_state has 2 waves, 3 subtasks total.
     assert "Waves: 2" in body
     assert "subtasks: 3" in body
 
 
-def test_compose_pr_body_includes_worker_count(pila):
-    body = pila.compose_pr_body(_full_state(), "feat-foo-abc123")
+def test_compose_pr_body_includes_worker_count(leerie):
+    body = leerie.compose_pr_body(_full_state(), "feat-foo-abc123")
     assert "17" in body  # the worker_count
 
 
-def test_compose_pr_body_includes_working_branch(pila):
-    body = pila.compose_pr_body(_full_state(), "feat-foo-abc123")
+def test_compose_pr_body_includes_working_branch(leerie):
+    body = leerie.compose_pr_body(_full_state(), "feat-foo-abc123")
     assert "main" in body  # the working branch
 
 
-def test_compose_pr_body_includes_state_json_pointer(pila):
+def test_compose_pr_body_includes_state_json_pointer(leerie):
     """The body should point reviewers at the on-disk state.json for full
     detail beyond what the PR summary shows."""
     rid = "feat-foo-abc123"
-    body = pila.compose_pr_body(_full_state(), rid)
-    assert f".pila/runs/{rid}/state.json" in body
+    body = leerie.compose_pr_body(_full_state(), rid)
+    assert f".leerie/runs/{rid}/state.json" in body
 
 
 # --- missing / partial state handling --------------------------------------
 
-def test_compose_pr_body_missing_finished_at_renders_na(pila):
+def test_compose_pr_body_missing_finished_at_renders_na(leerie):
     """An unfinished run (no `finished_at`) should not render 'None' in
     the PR body — 'n/a' is the convention."""
     state = _full_state()
     del state["finished_at"]
-    body = pila.compose_pr_body(state, "feat-foo-abc123")
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
     assert "None" not in body
     assert "n/a" in body
 
 
-def test_compose_pr_body_missing_categories_renders_na(pila):
+def test_compose_pr_body_missing_categories_renders_na(leerie):
     """No categories at all → primary category renders as 'n/a'."""
     state = _full_state()
     del state["categories"]
-    body = pila.compose_pr_body(state, "feat-foo-abc123")
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
     assert "Category: n/a" in body
 
 
-def test_compose_pr_body_empty_categories_renders_na(pila):
+def test_compose_pr_body_empty_categories_renders_na(leerie):
     """Empty list → 'n/a' (not 'None' or a crash)."""
     state = _full_state()
     state["categories"] = []
-    body = pila.compose_pr_body(state, "feat-foo-abc123")
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
     assert "Category: n/a" in body
 
 
-def test_compose_pr_body_missing_answers_renders_na(pila):
+def test_compose_pr_body_missing_answers_renders_na(leerie):
     """No clarification was done → source-of-truth renders as 'n/a'."""
     state = _full_state()
     del state["answers"]
-    body = pila.compose_pr_body(state, "feat-foo-abc123")
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
     assert "Source of truth: n/a" in body
 
 
-def test_compose_pr_body_empty_state(pila):
+def test_compose_pr_body_empty_state(leerie):
     """Defensive: an empty state still renders without raising. The body
     will be mostly 'n/a' but every section header is still present."""
-    body = pila.compose_pr_body({}, "feat-foo-abc123")
+    body = leerie.compose_pr_body({}, "feat-foo-abc123")
     assert "## Task" in body
     assert "## Classification" in body
     assert "## Run summary" in body
     assert "None" not in body  # no literal 'None' leaked through
 
 
-def test_compose_pr_body_no_literal_none(pila):
+def test_compose_pr_body_no_literal_none(leerie):
     """Sweep guard: under no realistic state shape should the literal
     string 'None' appear in the body."""
     # Various partial states
@@ -149,5 +149,5 @@ def test_compose_pr_body_no_literal_none(pila):
         {"task": "x", "categories": [None]},
     ]
     for state in states:
-        body = pila.compose_pr_body(state, "feat-foo-abc123")
+        body = leerie.compose_pr_body(state, "feat-foo-abc123")
         assert "None" not in body, f"literal 'None' leaked for state={state}"

@@ -2,7 +2,7 @@
 # runtime-install.sh — container-runtime install helpers (DESIGN §6).
 #
 # Shared between scripts/install.sh (the one-command installer) and the
-# `pila` launcher (which auto-installs on first run when missing). The
+# `leerie` launcher (which auto-installs on first run when missing). The
 # logic was previously inlined in install.sh; extracting it lets the
 # launcher invoke the same code path without duplicating it.
 #
@@ -90,12 +90,12 @@ _runtime_nerdctl_arch() {
 # non-macOS (Colima is macOS-only — Linux runs containerd natively).
 #
 # Bounds rationale:
-#   CPU 2..8 — pila needs ≥2 cores for parallel workers; >8 is wasted
+#   CPU 2..8 — leerie needs ≥2 cores for parallel workers; >8 is wasted
 #     on dev workstations (the VM doesn't scale linearly past that).
-#   RAM 4..16 GB — the Colima default of 2 GB OOMs pila under concurrent
+#   RAM 4..16 GB — the Colima default of 2 GB OOMs leerie under concurrent
 #     `claude -p` workers (~300 MB each) plus toolchain processes;
 #     16 GB has ~60% headroom over the observed working-set of two
-#     parallel pila containers running ~8 implementers between them.
+#     parallel leerie containers running ~8 implementers between them.
 #
 # Caller is expected to expand the result with intentional word-
 # splitting: `colima start ... $size_flags`.
@@ -116,7 +116,7 @@ _runtime_colima_size_flags() {
 
 # Check the currently-configured Colima sizing against the auto-
 # recommendation. If the running VM is materially undersized for
-# parallel pila workloads, log a one-line hint with the exact resize
+# parallel leerie workloads, log a one-line hint with the exact resize
 # command. No-op on non-macOS or if config can't be read. Called only
 # when the launcher decides to leave an already-running VM alone.
 _runtime_check_colima_sizing() {
@@ -141,16 +141,16 @@ _runtime_check_colima_sizing() {
   if [ -n "$cur_cpu" ] && [ -n "$cur_mem" ] \
      && [ "$cur_cpu" -lt "$rec_cpu" ] && [ "$cur_mem" -lt "$rec_mem" ]; then
     _runtime_log "Colima is running with ${cur_cpu} cpu / ${cur_mem} GB."
-    _runtime_log "  Parallel pila runs benefit from ≥${rec_cpu} cpu / ${rec_mem} GB. To resize:"
+    _runtime_log "  Parallel leerie runs benefit from ≥${rec_cpu} cpu / ${rec_mem} GB. To resize:"
     _runtime_log "    colima stop && colima start --runtime containerd --mount-type virtiofs ${rec_flags}"
   fi
 }
 
-# Emit the canonical pila swap-provision YAML block. Single source of
+# Emit the canonical leerie swap-provision YAML block. Single source of
 # truth: both the fresh-install path (writes it into colima.yaml before
 # first start) and the already-running hint path (paste this into the
 # user's existing colima.yaml + restart) consume this function.
-# Sentinel markers (`pila:swap-provision-v1`) make the block idempotent
+# Sentinel markers (`leerie:swap-provision-v1`) make the block idempotent
 # across installer re-runs — grep for the marker and skip if present.
 #
 # The 4 GB swap is a safety net for transient memory spikes, not active
@@ -160,8 +160,8 @@ _runtime_check_colima_sizing() {
 # entries run on every boot.
 _runtime_colima_swap_yaml() {
   cat <<'YAML'
-# pila:swap-provision-v1 BEGIN
-# Auto-managed by pila's installer (scripts/runtime-install.sh).
+# leerie:swap-provision-v1 BEGIN
+# Auto-managed by leerie's installer (scripts/runtime-install.sh).
 # Adds 4 GB of swap at /var/swapfile and tunes vm.swappiness to 10
 # so the kernel uses swap only under real memory pressure (default
 # 60 is too eager for our safety-net use). Provision scripts run
@@ -181,11 +181,11 @@ provision:
         swapon "$SWAPFILE"
       fi
       sysctl -w vm.swappiness=10
-# pila:swap-provision-v1 END
+# leerie:swap-provision-v1 END
 YAML
 }
 
-# Ensure ~/.colima/default/colima.yaml carries pila's swap-provision
+# Ensure ~/.colima/default/colima.yaml carries leerie's swap-provision
 # block. Called by the macOS install path *before* the first
 # `colima start` so swap is live on the first boot.
 #
@@ -211,7 +211,7 @@ _runtime_install_colima_swap_yaml() {
   _runtime_colima_swap_yaml > "$cfg"
 }
 
-# Check whether the running Colima's config carries pila's swap
+# Check whether the running Colima's config carries leerie's swap
 # provisioning. If absent, log a one-line hint with the exact YAML
 # block to paste in and the restart command. No automatic mutation,
 # no automatic restart — running containers would die mid-flight.
@@ -222,11 +222,11 @@ _runtime_check_colima_swap() {
   local cfg
   cfg="$HOME/.colima/default/colima.yaml"
   [ -f "$cfg" ] || return 0
-  if grep -q "pila:swap-provision-v1" "$cfg" 2>/dev/null; then
+  if grep -q "leerie:swap-provision-v1" "$cfg" 2>/dev/null; then
     return 0   # already provisioned
   fi
-  _runtime_log "Colima is running without pila's swap provisioning."
-  _runtime_log "  Pila's parallel-implementer workload can OOM the VM under heavy"
+  _runtime_log "Colima is running without leerie's swap provisioning."
+  _runtime_log "  Leerie's parallel-implementer workload can OOM the VM under heavy"
   _runtime_log "  test/build load. To add 4 GB of swap (recommended), paste the"
   _runtime_log "  block below into ~/.colima/default/colima.yaml replacing any"
   _runtime_log "  existing 'provision:' line, then 'colima stop && colima start':"
@@ -260,7 +260,7 @@ runtime_install_macos() {
   fi
   if ! _runtime_have_runnable brew; then
     _runtime_err "Homebrew is needed to install Colima but isn't on PATH."
-    _runtime_err "Install Homebrew from https://brew.sh, then re-run pila."
+    _runtime_err "Install Homebrew from https://brew.sh, then re-run leerie."
     return 1
   fi
   _runtime_log "installing Colima via Homebrew"

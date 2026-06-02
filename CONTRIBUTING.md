@@ -1,6 +1,6 @@
-# Contributing to Pila
+# Contributing to Leerie
 
-Thanks for considering a contribution. Pila is small on purpose — a
+Thanks for considering a contribution. Leerie is small on purpose — a
 single-file Python orchestrator, stdlib-preferred on the Python side
 (runtime deps pinned in `requirements.txt` and listed in
 [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §0), with one dev
@@ -14,7 +14,7 @@ updated to match.
 ## Before you change anything: read the three-layer rule
 
 The repo separates *theory* (`docs/DESIGN.md`), *mechanism*
-(`docs/IMPLEMENTATION.md`), and *code* (`orchestrator/pila.py`), and
+(`docs/IMPLEMENTATION.md`), and *code* (`orchestrator/leerie.py`), and
 the layers are **top-down canonical**: each layer derives from and conforms
 to the one above it. Precedence when they disagree: **DESIGN > IMPLEMENTATION
 > code**. The lower layer is the defect.
@@ -27,18 +27,18 @@ opening a PR that touches more than a single layer.
 ## Development setup
 
 ```bash
-git clone https://github.com/enricai/pila.git
-cd pila
+git clone https://github.com/enricai/leerie.git
+cd leerie
 pip install pytest         # the only dev (host-side) dependency
-./pila --version           # smoke-check; uses the launcher's fast path —
+./leerie --version           # smoke-check; uses the launcher's fast path —
                            # does NOT require the container runtime, so
                            # it works on a fresh clone with no Colima.
 ```
 
-Running pila against a real task (`./pila "..."` rather than `--version`)
+Running leerie against a real task (`./leerie "..."` rather than `--version`)
 requires the container runtime to be installed and started — see
 [`docs/INSTALL.md`](docs/INSTALL.md). Iterating on
-`orchestrator/pila.py` and running `pytest tests/` is possible without
+`orchestrator/leerie.py` and running `pytest tests/` is possible without
 it; the test suite runs on the host Python.
 
 There is no `pyproject.toml`; contributors develop out of the checkout.
@@ -65,7 +65,7 @@ for any change:
       described there.
 - [ ] `docs/DESIGN.md` updated only if the architecture itself changed.
 - [ ] `pytest tests/` — all pass.
-- [ ] `python3 -c "import ast; ast.parse(open('orchestrator/pila.py').read())"`
+- [ ] `python3 -c "import ast; ast.parse(open('orchestrator/leerie.py').read())"`
       as a static check.
 - [ ] `grep -rn <removed-string> .` — confirm no stragglers if the change
       renamed or removed a string used elsewhere.

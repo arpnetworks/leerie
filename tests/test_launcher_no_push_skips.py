@@ -7,9 +7,9 @@ no-work case is the load-bearing one: no run branch was ever
 materialized, so attempting `git push` would error with "src refspec
 does not match any" and the launcher would write `push_error` to
 run.json — turning a successful no-op into a `push-failed` row in
-`pila --list`.
+`leerie --list`.
 
-The check lives entirely in the bash launcher (`pila`), so this test
+The check lives entirely in the bash launcher (`leerie`), so this test
 invokes a minimal bash harness that mirrors the exact block from the
 launcher's host-side finalize step. Analogous to
 `test_launcher_remote_knob.py` and `test_finalize_sh_behavior.py`.
@@ -22,7 +22,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Minimal bash harness mirroring the `pila:1207-1216` block. The
+# Minimal bash harness mirroring the `leerie:1207-1216` block. The
 # launcher reads run.json with jq; the harness does the same against
 # the run dir the test set up. Echoes "SKIPPED" + exits 0 on the
 # no_push path; echoes "PROCEED" + exits 0 when the check would fall
@@ -33,7 +33,7 @@ set -euo pipefail
 LATEST_RUN_DIR="$1"
 
 if [ "$(jq -r '.no_push // false' "$LATEST_RUN_DIR/run.json")" = "true" ]; then
-  echo "[pila] finalize: run.json has no_push=true; skipping push + PR"
+  echo "[leerie] finalize: run.json has no_push=true; skipping push + PR"
   exit 0
 fi
 
@@ -69,7 +69,7 @@ def test_no_push_true_skips_push(tmp_path):
         run_dir,
         finished_at="2026-05-31T20:00:00Z",
         no_push=True,
-        branch="pila/runs/bugfix-already-done-abc123",
+        branch="leerie/runs/bugfix-already-done-abc123",
         working_branch="main",
     )
     rc, output = _run(run_dir)
@@ -86,7 +86,7 @@ def test_no_push_false_proceeds_to_push(tmp_path):
         run_dir,
         finished_at="2026-05-31T20:00:00Z",
         no_push=False,
-        branch="pila/runs/feat-something-def456",
+        branch="leerie/runs/feat-something-def456",
         working_branch="main",
     )
     rc, output = _run(run_dir)
@@ -99,12 +99,12 @@ def test_no_push_absent_proceeds_to_push(tmp_path):
     """run.json without a no_push field at all → defaults to false
     via `jq -r '.no_push // false'`, falls through to the push step.
     Backwards-compat guard for run.json sidecars written by earlier
-    versions of pila that did not write the field."""
+    versions of leerie that did not write the field."""
     run_dir = tmp_path / "runs" / "legacy-run-no-field"
     _write_run_json(
         run_dir,
         finished_at="2026-05-31T20:00:00Z",
-        branch="pila/runs/legacy-run-no-field",
+        branch="leerie/runs/legacy-run-no-field",
         working_branch="main",
     )
     rc, output = _run(run_dir)
@@ -122,7 +122,7 @@ def test_no_push_null_proceeds_to_push(tmp_path):
         run_dir,
         finished_at="2026-05-31T20:00:00Z",
         no_push=None,
-        branch="pila/runs/nulled-no-push",
+        branch="leerie/runs/nulled-no-push",
         working_branch="main",
     )
     rc, output = _run(run_dir)
@@ -132,13 +132,13 @@ def test_no_push_null_proceeds_to_push(tmp_path):
 
 # ----- source-text coupling: the harness must match the real launcher ------
 
-def test_launcher_pila_contains_the_no_push_check():
+def test_launcher_leerie_contains_the_no_push_check():
     """Pin the host-finalize source so a refactor that removes or
     rewords the no_push check fails THIS test instead of silently
     breaking the no-work flow. Mirrors the pattern in
     test_finalize_sh_behavior.py and test_orchestrate_call_sites.py.
 
-    Note: the no_push check moved from `pila` (inline at finalize) into
+    Note: the no_push check moved from `leerie` (inline at finalize) into
     `scripts/host-finalize.sh` (the extracted host_finalize function)
     as part of Audit Drift 7. The pin now targets that file."""
     host_finalize = (REPO_ROOT / "scripts" / "host-finalize.sh").read_text()
@@ -148,7 +148,7 @@ def test_launcher_pila_contains_the_no_push_check():
         in host_finalize
     ), (
         "host_finalize must read `.no_push` from run.json and honor "
-        "true. Without it, a no-work pila run (DESIGN §8) tries to "
+        "true. Without it, a no-work leerie run (DESIGN §8) tries to "
         "push a non-existent branch and the launcher writes "
         "push_error to run.json."
     )

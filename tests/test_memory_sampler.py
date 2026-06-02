@@ -1,7 +1,7 @@
 """Tests for the orchestrator memory sampler.
 
 `_memory_sampler` is a background coroutine that writes one ndjson line
-per ~30s to `.pila/runs/<run-id>/memory.ndjson` while orchestrate() is
+per ~30s to `.leerie/runs/<run-id>/memory.ndjson` while orchestrate() is
 alive. Each line records RSS, current phase, worker count, open FDs,
 and thread count — the four axes we need to tell "natural heavy run"
 from "real orchestrator leak."
@@ -43,9 +43,9 @@ def _make_st(tmp_path: Path, phase: str = "phase 2: planning",
     )
 
 
-def test_collect_returns_expected_keys(pila, tmp_path):
+def test_collect_returns_expected_keys(leerie, tmp_path):
     st = _make_st(tmp_path)
-    sample = pila._collect_memory_sample(st)
+    sample = leerie._collect_memory_sample(st)
     assert set(sample.keys()) == {
         "ts", "rss_kb", "phase", "worker_count", "open_fds", "thread_count",
     }
@@ -60,24 +60,24 @@ def test_collect_returns_expected_keys(pila, tmp_path):
     assert sample["thread_count"] >= 1
 
 
-def test_collect_defaults_when_state_keys_missing(pila, tmp_path):
+def test_collect_defaults_when_state_keys_missing(leerie, tmp_path):
     """If `current_phase` / `worker_count` are absent the collector
     falls back to documented sentinels rather than KeyError-ing."""
     run_dir = tmp_path / "runs" / "bare"
     run_dir.mkdir(parents=True)
     st = SimpleNamespace(run_dir=run_dir, data={})
-    sample = pila._collect_memory_sample(st)
+    sample = leerie._collect_memory_sample(st)
     assert sample["phase"] == "<unknown>"
     assert sample["worker_count"] == 0
 
 
-def test_sampler_writes_ndjson_lines(pila, tmp_path):
+def test_sampler_writes_ndjson_lines(leerie, tmp_path):
     """Drive the sampler for two ticks at 50ms each. Expect at least
     two valid-JSON lines in memory.ndjson by the time we cancel."""
     st = _make_st(tmp_path)
 
     async def run() -> int:
-        task = asyncio.create_task(pila._memory_sampler(st, interval_sec=0.05))
+        task = asyncio.create_task(leerie._memory_sampler(st, interval_sec=0.05))
         await asyncio.sleep(0.18)  # ≥ 2 ticks (immediate + one sleep)
         task.cancel()
         try:
@@ -95,7 +95,7 @@ def test_sampler_writes_ndjson_lines(pila, tmp_path):
     assert n >= 2
 
 
-def test_cancel_writes_final_sample(pila, tmp_path):
+def test_cancel_writes_final_sample(leerie, tmp_path):
     """Cancelling the sampler triggers one final sample write before the
     CancelledError propagates, so we capture state at orchestrator
     exit."""
@@ -104,7 +104,7 @@ def test_cancel_writes_final_sample(pila, tmp_path):
     async def run() -> list[dict]:
         # interval long enough that only the initial sample fires before
         # cancellation; the cancel-path sample is the second line.
-        task = asyncio.create_task(pila._memory_sampler(st, interval_sec=5.0))
+        task = asyncio.create_task(leerie._memory_sampler(st, interval_sec=5.0))
         await asyncio.sleep(0.05)
         task.cancel()
         try:
@@ -122,7 +122,7 @@ def test_cancel_writes_final_sample(pila, tmp_path):
     assert samples[-1]["worker_count"] == 11
 
 
-def test_collector_exception_does_not_kill_sampler(pila, tmp_path,
+def test_collector_exception_does_not_kill_sampler(leerie, tmp_path,
                                                    monkeypatch):
     """If `_collect_memory_sample` raises, the sampler swallows it and
     keeps looping. The orchestrator must not be taken down by a
@@ -133,10 +133,10 @@ def test_collector_exception_does_not_kill_sampler(pila, tmp_path,
     def boom(_st):
         raise RuntimeError("synthetic collector failure")
 
-    monkeypatch.setattr(pila, "_collect_memory_sample", boom)
+    monkeypatch.setattr(leerie, "_collect_memory_sample", boom)
 
     async def run() -> None:
-        task = asyncio.create_task(pila._memory_sampler(st, interval_sec=0.02))
+        task = asyncio.create_task(leerie._memory_sampler(st, interval_sec=0.02))
         await asyncio.sleep(0.08)
         task.cancel()
         try:
@@ -152,7 +152,7 @@ def test_collector_exception_does_not_kill_sampler(pila, tmp_path,
     assert not (st.run_dir / "memory.ndjson").exists()
 
 
-def test_sampler_follows_run_dir_rename(pila, tmp_path):
+def test_sampler_follows_run_dir_rename(leerie, tmp_path):
     """Regression: the orchestrator atomically renames the run dir from
     `_bootstrap-<6hex>` to the final `<run-id>` at the end of phase 1
     (`State.rename_to` mutates `st.run_dir`). The sampler must re-resolve
@@ -175,7 +175,7 @@ def test_sampler_follows_run_dir_rename(pila, tmp_path):
 
     async def run() -> tuple[int, list[dict]]:
         task = asyncio.create_task(
-            pila._memory_sampler(st, interval_sec=0.03))
+            leerie._memory_sampler(st, interval_sec=0.03))
         # Pre-rename ticks: at least one sample lands in the bootstrap
         # dir while the captured path (if any) still resolves.
         await asyncio.sleep(0.08)

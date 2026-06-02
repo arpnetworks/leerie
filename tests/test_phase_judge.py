@@ -90,9 +90,9 @@ def _write_ndjson(path: Path, records: list[dict]) -> None:
             f.write(json.dumps(r) + "\n")
 
 
-def _make_state(pila, run_dir: Path):
+def _make_state(leerie, run_dir: Path):
     """Minimal State-alike for judge tests."""
-    st = pila.State.__new__(pila.State)
+    st = leerie.State.__new__(leerie.State)
     st.run_id = "test-run-judge"
     st.run_dir = run_dir
     st.path = run_dir / "state.json"
@@ -107,30 +107,30 @@ def _make_state(pila, run_dir: Path):
     return st
 
 
-def _patch_invoke(pila, monkeypatch, envelope=_JUDGE_ENVELOPE):
-    """Patch pila._invoke to return envelope without network I/O."""
-    async def fake_invoke(cmd, cwd, timeout, sid, pila_dir, verbosity,
+def _patch_invoke(leerie, monkeypatch, envelope=_JUDGE_ENVELOPE):
+    """Patch leerie._invoke to return envelope without network I/O."""
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
                           progress=None, **_kw):
         return envelope
 
-    monkeypatch.setattr(pila, "_invoke", fake_invoke)
+    monkeypatch.setattr(leerie, "_invoke", fake_invoke)
 
 
 # ---------------------------------------------------------------------------
 # Criterion 5: 3 verdicts written for 3-record NDJSON
 # ---------------------------------------------------------------------------
 
-def test_phase_judge_writes_three_verdict_files(pila, tmp_path, monkeypatch):
+def test_phase_judge_writes_three_verdict_files(leerie, tmp_path, monkeypatch):
     """phase_judge() with 3-record NDJSON writes 3 verdict files and an INDEX."""
     run_dir = tmp_path / "run"
     judge_dir = tmp_path / "judge-out"
-    st = _make_state(pila, run_dir)
+    st = _make_state(leerie, run_dir)
     records = _make_records(3)
     _write_ndjson(run_dir / "calls.ndjson", records)
-    _patch_invoke(pila, monkeypatch)
+    _patch_invoke(leerie, monkeypatch)
 
     result = asyncio.run(
-        pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert result["judged"] == 3, f"Expected 3, got {result['judged']}"
@@ -139,16 +139,16 @@ def test_phase_judge_writes_three_verdict_files(pila, tmp_path, monkeypatch):
         assert vf.exists(), f"Verdict file missing: {vf}"
 
 
-def test_phase_judge_index_lists_all_call_ids(pila, tmp_path, monkeypatch):
+def test_phase_judge_index_lists_all_call_ids(leerie, tmp_path, monkeypatch):
     """INDEX.json exists and lists all 3 judged call_ids."""
     run_dir = tmp_path / "run"
     judge_dir = tmp_path / "judge-out"
-    st = _make_state(pila, run_dir)
+    st = _make_state(leerie, run_dir)
     records = _make_records(3)
     _write_ndjson(run_dir / "calls.ndjson", records)
-    _patch_invoke(pila, monkeypatch)
+    _patch_invoke(leerie, monkeypatch)
 
-    asyncio.run(pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS))
+    asyncio.run(leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS))
 
     index_path = judge_dir / "INDEX.json"
     assert index_path.exists(), "INDEX.json not written"
@@ -162,16 +162,16 @@ def test_phase_judge_index_lists_all_call_ids(pila, tmp_path, monkeypatch):
 
 
 def test_phase_judge_verdicts_validate_against_judge_schema(
-        pila, tmp_path, monkeypatch):
+        leerie, tmp_path, monkeypatch):
     """Each verdict file has all required SCHEMAS['judge'] fields."""
     run_dir = tmp_path / "run"
     judge_dir = tmp_path / "judge-out"
-    st = _make_state(pila, run_dir)
+    st = _make_state(leerie, run_dir)
     records = _make_records(3)
     _write_ndjson(run_dir / "calls.ndjson", records)
-    _patch_invoke(pila, monkeypatch)
+    _patch_invoke(leerie, monkeypatch)
 
-    asyncio.run(pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS))
+    asyncio.run(leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS))
 
     required_fields = {"passed", "dimensions", "rationale", "suggested_fixes"}
     dim_fields = {"schema_ok", "factual_ok", "hallucination_ok"}
@@ -192,16 +192,16 @@ def test_phase_judge_verdicts_validate_against_judge_schema(
         assert isinstance(verdict["suggested_fixes"], list)
 
 
-def test_phase_judge_index_contains_passed_field(pila, tmp_path, monkeypatch):
+def test_phase_judge_index_contains_passed_field(leerie, tmp_path, monkeypatch):
     """Each INDEX.json entry has call_id, call_type, and passed fields."""
     run_dir = tmp_path / "run"
     judge_dir = tmp_path / "judge-out"
-    st = _make_state(pila, run_dir)
+    st = _make_state(leerie, run_dir)
     records = _make_records(3)
     _write_ndjson(run_dir / "calls.ndjson", records)
-    _patch_invoke(pila, monkeypatch)
+    _patch_invoke(leerie, monkeypatch)
 
-    asyncio.run(pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS))
+    asyncio.run(leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS))
 
     index = json.loads((judge_dir / "INDEX.json").read_text())
     for entry in index:
@@ -215,13 +215,13 @@ def test_phase_judge_index_contains_passed_field(pila, tmp_path, monkeypatch):
 # Criterion 6: max_parallel semaphore is honoured
 # ---------------------------------------------------------------------------
 
-def test_phase_judge_honours_max_parallel(pila, tmp_path, monkeypatch):
+def test_phase_judge_honours_max_parallel(leerie, tmp_path, monkeypatch):
     """Concurrent judge invocations never exceed caps['max_parallel']."""
     run_dir = tmp_path / "run"
     judge_dir = tmp_path / "judge-out"
     # Use a small cap so the test is meaningful
     caps = dict(_CAPS, max_parallel=2)
-    st = _make_state(pila, run_dir)
+    st = _make_state(leerie, run_dir)
 
     # Create more records than the cap
     records = _make_records(6)
@@ -230,7 +230,7 @@ def test_phase_judge_honours_max_parallel(pila, tmp_path, monkeypatch):
     concurrent_count = [0]
     peak_concurrent = [0]
 
-    async def fake_invoke(cmd, cwd, timeout, sid, pila_dir, verbosity,
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
                           progress=None, **_kw):
         concurrent_count[0] += 1
         if concurrent_count[0] > peak_concurrent[0]:
@@ -240,9 +240,9 @@ def test_phase_judge_honours_max_parallel(pila, tmp_path, monkeypatch):
         concurrent_count[0] -= 1
         return _JUDGE_ENVELOPE
 
-    monkeypatch.setattr(pila, "_invoke", fake_invoke)
+    monkeypatch.setattr(leerie, "_invoke", fake_invoke)
 
-    asyncio.run(pila.phase_judge(run_dir, judge_dir, caps, st, _MODELS, _EFFORTS))
+    asyncio.run(leerie.phase_judge(run_dir, judge_dir, caps, st, _MODELS, _EFFORTS))
 
     assert peak_concurrent[0] <= caps["max_parallel"], (
         f"Peak concurrent ({peak_concurrent[0]}) exceeded max_parallel "
@@ -253,11 +253,11 @@ def test_phase_judge_honours_max_parallel(pila, tmp_path, monkeypatch):
 # Filtering by judge_call_types
 # ---------------------------------------------------------------------------
 
-def test_phase_judge_filters_by_call_types(pila, tmp_path, monkeypatch):
+def test_phase_judge_filters_by_call_types(leerie, tmp_path, monkeypatch):
     """When judge_call_types is given, only matching records are judged."""
     run_dir = tmp_path / "run"
     judge_dir = tmp_path / "judge-out"
-    st = _make_state(pila, run_dir)
+    st = _make_state(leerie, run_dir)
 
     # 2 classifier + 1 planner records
     records = [
@@ -266,10 +266,10 @@ def test_phase_judge_filters_by_call_types(pila, tmp_path, monkeypatch):
         {**_make_records(1)[0], "call_id": "id-pln-1", "call_type": "planner"},
     ]
     _write_ndjson(run_dir / "calls.ndjson", records)
-    _patch_invoke(pila, monkeypatch)
+    _patch_invoke(leerie, monkeypatch)
 
     result = asyncio.run(
-        pila.phase_judge(
+        leerie.phase_judge(
             run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS,
             judge_call_types=["classifier"],
         )
@@ -286,16 +286,16 @@ def test_phase_judge_filters_by_call_types(pila, tmp_path, monkeypatch):
 # Edge cases: missing / empty calls.ndjson
 # ---------------------------------------------------------------------------
 
-def test_phase_judge_missing_ndjson(pila, tmp_path, monkeypatch):
+def test_phase_judge_missing_ndjson(leerie, tmp_path, monkeypatch):
     """phase_judge() with no calls.ndjson returns 0 judged and empty index."""
     run_dir = tmp_path / "run"
     run_dir.mkdir(parents=True, exist_ok=True)
     judge_dir = tmp_path / "judge-out"
-    st = _make_state(pila, run_dir)
-    _patch_invoke(pila, monkeypatch)
+    st = _make_state(leerie, run_dir)
+    _patch_invoke(leerie, monkeypatch)
 
     result = asyncio.run(
-        pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert result["judged"] == 0
@@ -304,16 +304,16 @@ def test_phase_judge_missing_ndjson(pila, tmp_path, monkeypatch):
     assert not (judge_dir / "INDEX.json").exists()
 
 
-def test_phase_judge_empty_ndjson(pila, tmp_path, monkeypatch):
+def test_phase_judge_empty_ndjson(leerie, tmp_path, monkeypatch):
     """phase_judge() with an empty calls.ndjson (no records) returns 0 judged."""
     run_dir = tmp_path / "run"
     judge_dir = tmp_path / "judge-out"
-    st = _make_state(pila, run_dir)
+    st = _make_state(leerie, run_dir)
     _write_ndjson(run_dir / "calls.ndjson", [])
-    _patch_invoke(pila, monkeypatch)
+    _patch_invoke(leerie, monkeypatch)
 
     result = asyncio.run(
-        pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
+        leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
     )
 
     assert result["judged"] == 0
@@ -323,20 +323,20 @@ def test_phase_judge_empty_ndjson(pila, tmp_path, monkeypatch):
 # Importability check
 # ---------------------------------------------------------------------------
 
-def test_phase_judge_importable(pila):
-    """phase_judge and judge_capture must be importable from pila."""
-    assert hasattr(pila, "phase_judge"), (
-        "phase_judge is not defined in orchestrator/pila.py")
-    assert callable(pila.phase_judge)
-    assert hasattr(pila, "judge_capture"), (
-        "judge_capture is not defined in orchestrator/pila.py")
-    assert callable(pila.judge_capture)
+def test_phase_judge_importable(leerie):
+    """phase_judge and judge_capture must be importable from leerie."""
+    assert hasattr(leerie, "phase_judge"), (
+        "phase_judge is not defined in orchestrator/leerie.py")
+    assert callable(leerie.phase_judge)
+    assert hasattr(leerie, "judge_capture"), (
+        "judge_capture is not defined in orchestrator/leerie.py")
+    assert callable(leerie.judge_capture)
 
 
-def test_judge_schema_in_schemas(pila):
+def test_judge_schema_in_schemas(leerie):
     """SCHEMAS['judge'] must exist with required fields."""
-    assert "judge" in pila.SCHEMAS, "SCHEMAS['judge'] not found"
-    schema = pila.SCHEMAS["judge"]
+    assert "judge" in leerie.SCHEMAS, "SCHEMAS['judge'] not found"
+    schema = leerie.SCHEMAS["judge"]
     required = set(schema.get("required", []))
     expected = {"passed", "dimensions", "rationale", "suggested_fixes"}
     assert expected <= required, (

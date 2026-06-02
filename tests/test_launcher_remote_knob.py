@@ -1,7 +1,7 @@
-"""Tests for the --remote / PILA_REMOTE / pila.toml `remote` launcher knob.
+"""Tests for the --remote / LEERIE_REMOTE / leerie.toml `remote` launcher knob.
 
-The parsing logic lives entirely in the bash launcher (`pila`), not in
-pila.py, so these tests invoke a minimal bash harness that isolates the
+The parsing logic lives entirely in the bash launcher (`leerie`), not in
+leerie.py, so these tests invoke a minimal bash harness that isolates the
 three-source precedence logic (CLI > env > TOML) and echoes the resolved
 REMOTE value.  They are analogous to test_finalize_sh_behavior.py in that
 they exercise bash scripts directly via subprocess.
@@ -14,7 +14,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Minimal bash harness — mirrors the exact parsing block from `pila` so the
+# Minimal bash harness — mirrors the exact parsing block from `leerie` so the
 # tests stay coupled to the real logic rather than re-implementing it.
 _HARNESS = """\
 #!/usr/bin/env bash
@@ -22,15 +22,15 @@ set -euo pipefail
 USER_REPO="$1"   # path passed by the test as first argument
 
 REMOTE=false
-case "${PILA_REMOTE:-}" in
+case "${LEERIE_REMOTE:-}" in
   1|true|TRUE|yes|YES) REMOTE=true ;;
 esac
-if [ -f "$USER_REPO/pila.toml" ]; then
+if [ -f "$USER_REPO/leerie.toml" ]; then
   toml_remote="$(awk '/^[[:space:]]*remote[[:space:]]*=/ {
                         gsub(/^[[:space:]]*remote[[:space:]]*=[[:space:]]*/, "", $0);
                         gsub(/^"|"$/, "", $0);
                         print; exit
-                      }' "$USER_REPO/pila.toml" 2>/dev/null || true)"
+                      }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
   case "${toml_remote:-}" in
     1|true|TRUE|yes|YES) REMOTE=true ;;
   esac
@@ -63,69 +63,69 @@ def test_default_is_local(tmp_path):
     assert _run(tmp_path, {}, []) == "false"
 
 
-def test_env_pila_remote_1(tmp_path):
-    assert _run(tmp_path, {"PILA_REMOTE": "1"}, []) == "true"
+def test_env_leerie_remote_1(tmp_path):
+    assert _run(tmp_path, {"LEERIE_REMOTE": "1"}, []) == "true"
 
 
-def test_env_pila_remote_true(tmp_path):
-    assert _run(tmp_path, {"PILA_REMOTE": "true"}, []) == "true"
+def test_env_leerie_remote_true(tmp_path):
+    assert _run(tmp_path, {"LEERIE_REMOTE": "true"}, []) == "true"
 
 
-def test_env_pila_remote_TRUE(tmp_path):
-    assert _run(tmp_path, {"PILA_REMOTE": "TRUE"}, []) == "true"
+def test_env_leerie_remote_TRUE(tmp_path):
+    assert _run(tmp_path, {"LEERIE_REMOTE": "TRUE"}, []) == "true"
 
 
-def test_env_pila_remote_yes(tmp_path):
-    assert _run(tmp_path, {"PILA_REMOTE": "yes"}, []) == "true"
+def test_env_leerie_remote_yes(tmp_path):
+    assert _run(tmp_path, {"LEERIE_REMOTE": "yes"}, []) == "true"
 
 
-def test_env_pila_remote_YES(tmp_path):
-    assert _run(tmp_path, {"PILA_REMOTE": "YES"}, []) == "true"
+def test_env_leerie_remote_YES(tmp_path):
+    assert _run(tmp_path, {"LEERIE_REMOTE": "YES"}, []) == "true"
 
 
-def test_env_pila_remote_0_stays_false(tmp_path):
-    assert _run(tmp_path, {"PILA_REMOTE": "0"}, []) == "false"
+def test_env_leerie_remote_0_stays_false(tmp_path):
+    assert _run(tmp_path, {"LEERIE_REMOTE": "0"}, []) == "false"
 
 
-def test_env_pila_remote_false_stays_false(tmp_path):
-    assert _run(tmp_path, {"PILA_REMOTE": "false"}, []) == "false"
+def test_env_leerie_remote_false_stays_false(tmp_path):
+    assert _run(tmp_path, {"LEERIE_REMOTE": "false"}, []) == "false"
 
 
 def test_toml_remote_true(tmp_path):
-    (tmp_path / "pila.toml").write_text("remote = true\n")
+    (tmp_path / "leerie.toml").write_text("remote = true\n")
     assert _run(tmp_path, {}, []) == "true"
 
 
 def test_toml_remote_1(tmp_path):
-    (tmp_path / "pila.toml").write_text("remote = 1\n")
+    (tmp_path / "leerie.toml").write_text("remote = 1\n")
     assert _run(tmp_path, {}, []) == "true"
 
 
 def test_toml_remote_false_stays_false(tmp_path):
-    (tmp_path / "pila.toml").write_text("remote = false\n")
+    (tmp_path / "leerie.toml").write_text("remote = false\n")
     assert _run(tmp_path, {}, []) == "false"
 
 
 def test_cli_flag_wins_over_env_false(tmp_path):
     """CLI --remote wins when env says false."""
-    assert _run(tmp_path, {"PILA_REMOTE": "0"}, ["--remote"]) == "true"
+    assert _run(tmp_path, {"LEERIE_REMOTE": "0"}, ["--remote"]) == "true"
 
 
 def test_cli_flag_wins_over_toml_false(tmp_path):
-    (tmp_path / "pila.toml").write_text("remote = false\n")
+    (tmp_path / "leerie.toml").write_text("remote = false\n")
     assert _run(tmp_path, {}, ["--remote"]) == "true"
 
 
 def test_env_wins_over_toml(tmp_path):
     """Env is a session-scoped knob; TOML is the committed per-repo default.
-    PILA_REMOTE=1 overrides remote=false in pila.toml."""
-    (tmp_path / "pila.toml").write_text("remote = false\n")
-    assert _run(tmp_path, {"PILA_REMOTE": "1"}, []) == "true"
+    LEERIE_REMOTE=1 overrides remote=false in leerie.toml."""
+    (tmp_path / "leerie.toml").write_text("remote = false\n")
+    assert _run(tmp_path, {"LEERIE_REMOTE": "1"}, []) == "true"
 
 
 def test_toml_missing_key_stays_false(tmp_path):
-    """A pila.toml with an unrelated key should not set REMOTE."""
-    (tmp_path / "pila.toml").write_text("source_of_truth = codebase\n")
+    """A leerie.toml with an unrelated key should not set REMOTE."""
+    (tmp_path / "leerie.toml").write_text("source_of_truth = codebase\n")
     assert _run(tmp_path, {}, []) == "false"
 
 

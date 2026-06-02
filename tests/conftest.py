@@ -1,7 +1,7 @@
-"""Shared pytest fixtures for the pila test suite.
+"""Shared pytest fixtures for the leerie test suite.
 
-pila.py is a single script (no package), so we load it once as a
-module via importlib and expose it to every test via the `pila`
+leerie.py is a single script (no package), so we load it once as a
+module via importlib and expose it to every test via the `leerie`
 fixture.
 """
 from __future__ import annotations
@@ -12,13 +12,13 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PILA_PY = REPO_ROOT / "orchestrator" / "pila.py"
+LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 
 @pytest.fixture(scope="session")
-def pila():
-    """The pila module loaded from orchestrator/pila.py."""
-    spec = importlib.util.spec_from_file_location("pila", PILA_PY)
+def leerie():
+    """The leerie module loaded from orchestrator/leerie.py."""
+    spec = importlib.util.spec_from_file_location("leerie", LEERIE_PY)
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod

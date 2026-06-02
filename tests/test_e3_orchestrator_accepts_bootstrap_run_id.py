@@ -20,7 +20,7 @@ from __future__ import annotations
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PILA_PY = REPO_ROOT / "orchestrator" / "pila.py"
+LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 
 def test_main_honors_launcher_supplied_bootstrap_run_id():
@@ -28,7 +28,7 @@ def test_main_honors_launcher_supplied_bootstrap_run_id():
     with `_bootstrap-` AND `args.resume` is False. This preserves the
     launcher's chosen id through to State construction so the launcher
     and orchestrator agree on the log/state path."""
-    src = PILA_PY.read_text()
+    src = LEERIE_PY.read_text()
     # The elif guard. Order matters — must be checked AFTER args.resume
     # (which has its own resolve_run_id path) and BEFORE the unconditional
     # bootstrap-id generator.
@@ -63,7 +63,7 @@ def test_main_bootstrap_branch_ordered_correctly():
     A reversed order would either ignore the bootstrap path on resume
     (correct: resume has its own resolver) or skip the launcher id
     silently (wrong: orchestrator would self-generate)."""
-    src = PILA_PY.read_text()
+    src = LEERIE_PY.read_text()
     # Find the three lines in order.
     resume_idx = src.find("if args.resume:")
     elif_idx = src.find('elif args.run_id and args.run_id.startswith("_bootstrap-"):')

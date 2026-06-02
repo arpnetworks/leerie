@@ -1,8 +1,8 @@
-"""Part D D2: `pila --stop`/`--kill`/`--finalize` must accept the
+"""Part D D2: `leerie --stop`/`--kill`/`--finalize` must accept the
 bootstrap-id (`_bootstrap-<6hex>`) of an in-flight detached fly run.
 
 During the bootstrap window (~1 min from launch to end-of-classify),
-the host has only `.pila/runs/_bootstrap-<id>/fly-machine.json` — the
+the host has only `.leerie/runs/_bootstrap-<id>/fly-machine.json` — the
 orchestrator has not yet written `run.json` (that lives on the Fly
 Machine). The verbs need to fall back to `fly-machine.json` for the
 `fly_machine_id` lookup, matching scripts/remote/attach.sh's
@@ -20,7 +20,7 @@ import subprocess
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PILA = REPO_ROOT / "pila"
+LEERIE = REPO_ROOT / "leerie"
 
 
 def _stub_flyctl(tmp_path: Path) -> None:
@@ -36,31 +36,31 @@ def _stub_flyctl(tmp_path: Path) -> None:
 
 
 def _bootstrap_run(tmp_path: Path, run_id: str, machine_id: str) -> Path:
-    """Set up `.pila/runs/<run_id>/fly-machine.json` with no run.json.
+    """Set up `.leerie/runs/<run_id>/fly-machine.json` with no run.json.
     This is the in-flight bootstrap state on the host."""
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / run_id
+    run_dir = user_repo / ".leerie" / "runs" / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "fly-machine.json").write_text(json.dumps({
         "fly_machine_id": machine_id,
-        "fly_app": "pila",
+        "fly_app": "leerie",
     }))
     return run_dir
 
 
-def _run_pila(tmp_path: Path, *args: str,
+def _run_leerie(tmp_path: Path, *args: str,
               stdin: str = "") -> subprocess.CompletedProcess:
-    """Run pila with stubbed flyctl on PATH. cwd is the fake user-repo
-    so pila's USER_REPO=$(pwd -P) resolves there (the launcher hard-
+    """Run leerie with stubbed flyctl on PATH. cwd is the fake user-repo
+    so leerie's USER_REPO=$(pwd -P) resolves there (the launcher hard-
     overrides USER_REPO from $PWD at line 39, ignoring the env var)."""
     user_repo = tmp_path / "user-repo"
     return subprocess.run(
-        [str(PILA), *args],
+        [str(LEERIE), *args],
         cwd=str(user_repo),
         env={
             "PATH": f"{tmp_path}:{os.environ['PATH']}",
             "HOME": str(tmp_path),
-            "PILA_NO_RUNTIME_INSTALL": "1",  # don't trigger install path
+            "LEERIE_NO_RUNTIME_INSTALL": "1",  # don't trigger install path
         },
         input=stdin,
         capture_output=True, text=True, check=False,
@@ -70,12 +70,12 @@ def _run_pila(tmp_path: Path, *args: str,
 # --- D2 fallback: --stop ---------------------------------------------------
 
 def test_stop_accepts_bootstrap_id_with_only_fly_machine_json(tmp_path: Path):
-    """`pila --stop _bootstrap-aaaaaa` must work when the host has
+    """`leerie --stop _bootstrap-aaaaaa` must work when the host has
     only fly-machine.json (no run.json yet). This is exactly the
     state the detach banner points the user at."""
     _stub_flyctl(tmp_path)
     run_dir = _bootstrap_run(tmp_path, "_bootstrap-aaaaaa", "mach-boot1")
-    result = _run_pila(tmp_path, "--stop", "_bootstrap-aaaaaa")
+    result = _run_leerie(tmp_path, "--stop", "_bootstrap-aaaaaa")
     assert result.returncode == 0, \
         f"--stop failed for bootstrap id; stderr:\n{result.stderr}"
     # flyctl must have been invoked with `machine stop mach-boot1`.
@@ -94,10 +94,10 @@ def test_stop_accepts_bootstrap_id_with_only_fly_machine_json(tmp_path: Path):
 # --- D2 fallback: --kill ---------------------------------------------------
 
 def test_kill_accepts_bootstrap_id_with_only_fly_machine_json(tmp_path: Path):
-    """`pila --kill _bootstrap-bbbbbb --force` works against a bootstrap dir."""
+    """`leerie --kill _bootstrap-bbbbbb --force` works against a bootstrap dir."""
     _stub_flyctl(tmp_path)
     run_dir = _bootstrap_run(tmp_path, "_bootstrap-bbbbbb", "mach-boot2")
-    result = _run_pila(tmp_path, "--kill", "_bootstrap-bbbbbb", "--force")
+    result = _run_leerie(tmp_path, "--kill", "_bootstrap-bbbbbb", "--force")
     assert result.returncode == 0, \
         f"--kill failed for bootstrap id; stderr:\n{result.stderr}"
     invocations = (tmp_path / "flyctl.log").read_text()
@@ -123,7 +123,7 @@ def test_kill_orphan_prompt_says_machine_id_not_run_id(tmp_path: Path):
     user_repo.mkdir()
     # Type a wrong confirmation token to trigger the prompt path and
     # capture the prompt text from stderr.
-    result = _run_pila(tmp_path, "--kill", "--machine-id", "mach-orphan-xyz",
+    result = _run_leerie(tmp_path, "--kill", "--machine-id", "mach-orphan-xyz",
                        stdin="wrong-token\n")
     # Confirmation mismatch — exit 1 — but the prompt text is what we
     # care about, and it's printed before read.
@@ -137,7 +137,7 @@ def test_kill_run_id_prompt_says_run_id(tmp_path: Path):
     label says "run-id"."""
     _stub_flyctl(tmp_path)
     _bootstrap_run(tmp_path, "_bootstrap-ccccc1", "mach-ccccc1")
-    result = _run_pila(tmp_path, "--kill", "_bootstrap-ccccc1",
+    result = _run_leerie(tmp_path, "--kill", "_bootstrap-ccccc1",
                        stdin="wrong-token\n")
     assert "Type the run-id to confirm" in result.stderr, \
         f"expected 'Type the run-id to confirm' in stderr; got:\n{result.stderr}"

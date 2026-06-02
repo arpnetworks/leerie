@@ -12,25 +12,25 @@ this test catches it.
 from __future__ import annotations
 
 
-def test_planner_schema_top_level_required(pila):
+def test_planner_schema_top_level_required(leerie):
     """Planner must emit domain, subtasks, status, and confidence."""
-    planner = pila.SCHEMAS["planner"]
+    planner = leerie.SCHEMAS["planner"]
     required = set(planner["required"])
     assert {"domain", "subtasks", "status", "confidence"}.issubset(required)
 
 
-def test_planner_schema_status_enum(pila):
+def test_planner_schema_status_enum(leerie):
     """status is the ready/blocked enum."""
-    status = pila.SCHEMAS["planner"]["properties"]["status"]
+    status = leerie.SCHEMAS["planner"]["properties"]["status"]
     assert status["type"] == "string"
     assert set(status["enum"]) == {"ready", "blocked"}
 
 
-def test_planner_schema_confidence_required_fields(pila):
+def test_planner_schema_confidence_required_fields(leerie):
     """The four discipline fields are required-when-confidence-is-present.
     Combined with confidence being top-level required, a planner that
     skipped any of them fails its own schema."""
-    conf = pila.SCHEMAS["planner"]["properties"]["confidence"]
+    conf = leerie.SCHEMAS["planner"]["properties"]["confidence"]
     assert conf["type"] == "object"
     required = set(conf["required"])
     expected = {"task_understanding", "decomposition_quality", "basis",
@@ -39,24 +39,24 @@ def test_planner_schema_confidence_required_fields(pila):
     assert expected.issubset(required)
 
 
-def test_planner_confidence_axes_are_numbers(pila):
-    props = pila.SCHEMAS["planner"]["properties"]["confidence"]["properties"]
+def test_planner_confidence_axes_are_numbers(leerie):
+    props = leerie.SCHEMAS["planner"]["properties"]["confidence"]["properties"]
     assert props["task_understanding"]["type"] == "number"
     assert props["decomposition_quality"]["type"] == "number"
 
 
-def test_implementer_schema_top_level_required(pila):
+def test_implementer_schema_top_level_required(leerie):
     """Implementer must emit subtask_id, status, and confidence."""
-    impl = pila.SCHEMAS["implementer"]
+    impl = leerie.SCHEMAS["implementer"]
     required = set(impl["required"])
     assert {"subtask_id", "status", "confidence"}.issubset(required)
 
 
-def test_implementer_schema_confidence_required_fields(pila):
+def test_implementer_schema_confidence_required_fields(leerie):
     """The implementer's confidence object must require the same
     discipline fields as the planner's (DESIGN §8 — same disciplines,
     different axes)."""
-    conf = pila.SCHEMAS["implementer"]["properties"]["confidence"]
+    conf = leerie.SCHEMAS["implementer"]["properties"]["confidence"]
     assert conf["type"] == "object"
     required = set(conf["required"])
     expected = {"root_cause", "solution", "basis",
@@ -65,26 +65,26 @@ def test_implementer_schema_confidence_required_fields(pila):
     assert expected.issubset(required)
 
 
-def test_implementer_confidence_axes_are_numbers(pila):
-    props = pila.SCHEMAS["implementer"]["properties"]["confidence"]["properties"]
+def test_implementer_confidence_axes_are_numbers(leerie):
+    props = leerie.SCHEMAS["implementer"]["properties"]["confidence"]["properties"]
     assert props["root_cause"]["type"] == "number"
     assert props["solution"]["type"] == "number"
 
 
-def test_conformer_schema_top_level_required(pila):
+def test_conformer_schema_top_level_required(leerie):
     """Conformer must emit confidence (the §8 self-gate). Same
     structural enforcement as planner/implementer — the orchestrator
     does not read it, but the schema rejects payloads that skip it."""
-    conf = pila.SCHEMAS["conformer"]
+    conf = leerie.SCHEMAS["conformer"]
     required = set(conf["required"])
     assert "confidence" in required
 
 
-def test_conformer_schema_confidence_required_fields(pila):
+def test_conformer_schema_confidence_required_fields(leerie):
     """The conformer's confidence object must require the same
     discipline fields as planner/implementer (DESIGN §8 — same
     disciplines, different axes)."""
-    conf = pila.SCHEMAS["conformer"]["properties"]["confidence"]
+    conf = leerie.SCHEMAS["conformer"]["properties"]["confidence"]
     assert conf["type"] == "object"
     required = set(conf["required"])
     expected = {"conformance", "basis", "falsifiers_tested",
@@ -92,15 +92,15 @@ def test_conformer_schema_confidence_required_fields(pila):
     assert expected.issubset(required)
 
 
-def test_gap_to_close_keys_match_score_axes(pila):
+def test_gap_to_close_keys_match_score_axes(leerie):
     """The gap_to_close sub-object's keys mirror the score axes so a
     below-threshold score has a clear field to fill. Catches future
     drift where someone renames an axis without updating the gap
     field."""
-    planner_gap = pila.SCHEMAS["planner"]["properties"]["confidence"]["properties"]["gap_to_close"]
+    planner_gap = leerie.SCHEMAS["planner"]["properties"]["confidence"]["properties"]["gap_to_close"]
     assert set(planner_gap["properties"].keys()) == {
         "task_understanding", "decomposition_quality"}
-    impl_gap = pila.SCHEMAS["implementer"]["properties"]["confidence"]["properties"]["gap_to_close"]
+    impl_gap = leerie.SCHEMAS["implementer"]["properties"]["confidence"]["properties"]["gap_to_close"]
     assert set(impl_gap["properties"].keys()) == {"root_cause", "solution"}
-    conformer_gap = pila.SCHEMAS["conformer"]["properties"]["confidence"]["properties"]["gap_to_close"]
+    conformer_gap = leerie.SCHEMAS["conformer"]["properties"]["confidence"]["properties"]["gap_to_close"]
     assert set(conformer_gap["properties"].keys()) == {"conformance"}

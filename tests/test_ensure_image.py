@@ -1,10 +1,10 @@
-"""Tests for ensure_image() in the pila launcher.
+"""Tests for ensure_image() in the leerie launcher.
 
 Phase 1B: the launcher's RUNTIME=fly branch calls ensure_image() before
 provision_machine to close the operator-step gap where the first remote
 run fails because the registry tag wasn't built/pushed yet.
 
-Strategy: cache positive hits at ~/.cache/pila/published-tags.txt; on
+Strategy: cache positive hits at ~/.cache/leerie/published-tags.txt; on
 miss, invoke build-push.sh --push (which is idempotent at the registry).
 
 ensure_image() lives in the bash launcher, so the tests use the same
@@ -21,7 +21,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Bash harness that mirrors ensure_image() from the launcher. We don't
-# source `pila` directly because it runs preflight + dispatch on source;
+# source `leerie` directly because it runs preflight + dispatch on source;
 # the function block is small enough to keep in sync via the
 # coupling test below.
 _HARNESS = r"""
@@ -31,8 +31,8 @@ set -euo pipefail
 # Test inputs:
 #   $XDG_CACHE_HOME → forced to a temp dir so the test never touches
 #                     the real user cache.
-#   $PILA_REPO      → forced to a temp dir holding a stub build-push.sh.
-#   $PILA_FLY_APP   → app name (default: pila).
+#   $LEERIE_REPO      → forced to a temp dir holding a stub build-push.sh.
+#   $LEERIE_FLY_APP   → app name (default: leerie).
 #   $LOCAL_BUILD    → "true" to forward --local-build to build-push.sh.
 #   PATH            → must include a stub `flyctl` that handles
 #                     `apps list --json` and `apps create`.
@@ -40,17 +40,17 @@ set -euo pipefail
 
 ensure_image() {
   local tag="$1" cache_dir cache_file
-  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/pila"
+  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/leerie"
   cache_file="$cache_dir/published-tags.txt"
   if [ -f "$cache_file" ] && grep -Fxq "$tag" "$cache_file" 2>/dev/null; then
     return 0
   fi
-  local build_push="$PILA_REPO/scripts/remote/build-push.sh"
+  local build_push="$LEERIE_REPO/scripts/remote/build-push.sh"
   if [ ! -x "$build_push" ]; then
-    echo "pila: error: $build_push not found or not executable" >&2
+    echo "leerie: error: $build_push not found or not executable" >&2
     return 1
   fi
-  local fly_app="${PILA_FLY_APP:-pila}"
+  local fly_app="${LEERIE_FLY_APP:-leerie}"
 
   # Auto-create the Fly app if missing. flyctl apps list returns a JSON
   # array; check for a Name match. The remote builder and registry push
@@ -65,24 +65,24 @@ try:
 except Exception:
     sys.exit(1)
 ' "$fly_app"; then
-    echo "[pila] remote: Fly app '$fly_app' does not exist — creating it" >&2
+    echo "[leerie] remote: Fly app '$fly_app' does not exist — creating it" >&2
     if ! flyctl apps create "$fly_app" 2>&1; then
-      echo "pila: error: flyctl apps create $fly_app failed" >&2
+      echo "leerie: error: flyctl apps create $fly_app failed" >&2
       echo "  Create it manually: flyctl apps create $fly_app" >&2
       return 1
     fi
   fi
 
   # Forward --local-build to build-push.sh when the launcher was invoked
-  # with --local-build or PILA_LOCAL_BUILD=1.
+  # with --local-build or LEERIE_LOCAL_BUILD=1.
   local build_args=(--app "$fly_app" --push)
   if [ "${LOCAL_BUILD:-false}" = "true" ]; then
     build_args+=(--local-build)
   fi
 
-  echo "[pila] remote: ensuring image $tag is published (cache miss)" >&2
+  echo "[leerie] remote: ensuring image $tag is published (cache miss)" >&2
   if ! "$build_push" "${build_args[@]}"; then
-    echo "pila: error: build-push.sh failed; remote run cannot proceed" >&2
+    echo "leerie: error: build-push.sh failed; remote run cannot proceed" >&2
     return 1
   fi
   mkdir -p "$cache_dir"
@@ -156,24 +156,24 @@ def _stub_build_push(repo: Path, *, exit_code: int = 0, log_file: Path | None = 
 def test_cache_hit_skips_build_push(tmp_path: Path):
     """If the tag is in the cache, ensure_image returns 0 without invoking build-push.
     Cache hit also skips flyctl apps list (the short-circuit is the first thing)."""
-    repo = tmp_path / "pila-repo"
+    repo = tmp_path / "leerie-repo"
     repo.mkdir()
     log = tmp_path / "build-push-invocations.log"
     _stub_build_push(repo, log_file=log)
 
     cache_home = tmp_path / "cache"
-    cache_dir = cache_home / "pila"
+    cache_dir = cache_home / "leerie"
     cache_dir.mkdir(parents=True)
     (cache_dir / "published-tags.txt").write_text(
-        "registry.fly.io/pila:0.2.1\n"
+        "registry.fly.io/leerie:0.2.1\n"
     )
 
     # No flyctl stub needed — cache hit skips that step.
     result = _run(
-        "registry.fly.io/pila:0.2.1",
+        "registry.fly.io/leerie:0.2.1",
         env={
             "XDG_CACHE_HOME": str(cache_home),
-            "PILA_REPO": str(repo),
+            "LEERIE_REPO": str(repo),
         },
         cwd=tmp_path,
     )
@@ -186,35 +186,35 @@ def test_cache_hit_skips_build_push(tmp_path: Path):
 def test_cache_miss_invokes_build_push_and_records_tag(tmp_path: Path):
     """On cache miss, ensure_image runs build-push.sh and appends the tag to the cache.
     With an existing Fly app, skips apps create."""
-    repo = tmp_path / "pila-repo"
+    repo = tmp_path / "leerie-repo"
     repo.mkdir()
     log = tmp_path / "build-push-invocations.log"
     _stub_build_push(repo, log_file=log)
-    _stub_flyctl(tmp_path, existing_apps=["pila"])
+    _stub_flyctl(tmp_path, existing_apps=["leerie"])
 
     cache_home = tmp_path / "cache"
 
     result = _run(
-        "registry.fly.io/pila:9.9.9",
+        "registry.fly.io/leerie:9.9.9",
         env={
             "XDG_CACHE_HOME": str(cache_home),
-            "PILA_REPO": str(repo),
-            "PILA_FLY_APP": "pila",
+            "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "leerie",
         },
         cwd=tmp_path,
         flyctl_dir=tmp_path,
     )
     assert result.returncode == 0, result.stderr
-    # build-push.sh should have been invoked with --app pila --push.
+    # build-push.sh should have been invoked with --app leerie --push.
     assert log.exists(), "build-push.sh should be invoked on cache miss"
     invocation = log.read_text().strip()
-    assert "--app pila --push" in invocation, invocation
+    assert "--app leerie --push" in invocation, invocation
     # No --local-build forwarded by default.
     assert "--local-build" not in invocation, invocation
     # Tag should now be recorded in the cache.
-    cache_file = cache_home / "pila" / "published-tags.txt"
+    cache_file = cache_home / "leerie" / "published-tags.txt"
     assert cache_file.exists()
-    assert "registry.fly.io/pila:9.9.9" in cache_file.read_text()
+    assert "registry.fly.io/leerie:9.9.9" in cache_file.read_text()
     # flyctl apps list called, but apps create NOT called (app exists).
     flyctl_log = (tmp_path / "flyctl.log").read_text()
     assert "apps list --json" in flyctl_log
@@ -223,18 +223,18 @@ def test_cache_miss_invokes_build_push_and_records_tag(tmp_path: Path):
 
 def test_build_push_failure_propagates(tmp_path: Path):
     """If build-push.sh exits non-zero, ensure_image returns 1 and does not cache."""
-    repo = tmp_path / "pila-repo"
+    repo = tmp_path / "leerie-repo"
     repo.mkdir()
     _stub_build_push(repo, exit_code=2)
-    _stub_flyctl(tmp_path, existing_apps=["pila"])
+    _stub_flyctl(tmp_path, existing_apps=["leerie"])
 
     cache_home = tmp_path / "cache"
 
     result = _run(
-        "registry.fly.io/pila:bad",
+        "registry.fly.io/leerie:bad",
         env={
             "XDG_CACHE_HOME": str(cache_home),
-            "PILA_REPO": str(repo),
+            "LEERIE_REPO": str(repo),
         },
         cwd=tmp_path,
         flyctl_dir=tmp_path,
@@ -243,13 +243,13 @@ def test_build_push_failure_propagates(tmp_path: Path):
     assert "build-push.sh failed" in result.stderr
     # The failed tag must NOT be recorded — that's how the cache stays
     # a positive list (a missing tag means "probe", not "absent").
-    cache_file = cache_home / "pila" / "published-tags.txt"
+    cache_file = cache_home / "leerie" / "published-tags.txt"
     assert not cache_file.exists() or "bad" not in cache_file.read_text()
 
 
 def test_missing_build_push_script_errors(tmp_path: Path):
     """If scripts/remote/build-push.sh is missing, ensure_image errors with a clear message."""
-    repo = tmp_path / "pila-repo"
+    repo = tmp_path / "leerie-repo"
     repo.mkdir()
     # No build-push.sh.
 
@@ -257,10 +257,10 @@ def test_missing_build_push_script_errors(tmp_path: Path):
 
     # No flyctl stub needed — error occurs before the apps-list step.
     result = _run(
-        "registry.fly.io/pila:0.0.0",
+        "registry.fly.io/leerie:0.0.0",
         env={
             "XDG_CACHE_HOME": str(cache_home),
-            "PILA_REPO": str(repo),
+            "LEERIE_REPO": str(repo),
         },
         cwd=tmp_path,
     )
@@ -271,24 +271,24 @@ def test_missing_build_push_script_errors(tmp_path: Path):
 
 def test_positive_cache_only_unrelated_tags_still_probe(tmp_path: Path):
     """A cache entry for tag A must not satisfy a lookup for tag B."""
-    repo = tmp_path / "pila-repo"
+    repo = tmp_path / "leerie-repo"
     repo.mkdir()
     log = tmp_path / "build-push.log"
     _stub_build_push(repo, log_file=log)
-    _stub_flyctl(tmp_path, existing_apps=["pila"])
+    _stub_flyctl(tmp_path, existing_apps=["leerie"])
 
     cache_home = tmp_path / "cache"
-    cache_dir = cache_home / "pila"
+    cache_dir = cache_home / "leerie"
     cache_dir.mkdir(parents=True)
     (cache_dir / "published-tags.txt").write_text(
-        "registry.fly.io/pila:0.1.0\n"
+        "registry.fly.io/leerie:0.1.0\n"
     )
 
     result = _run(
-        "registry.fly.io/pila:0.2.0",
+        "registry.fly.io/leerie:0.2.0",
         env={
             "XDG_CACHE_HOME": str(cache_home),
-            "PILA_REPO": str(repo),
+            "LEERIE_REPO": str(repo),
         },
         cwd=tmp_path,
         flyctl_dir=tmp_path,
@@ -299,11 +299,11 @@ def test_positive_cache_only_unrelated_tags_still_probe(tmp_path: Path):
 
 def test_no_auto_publish_flag_consumed_by_launcher():
     """The launcher consumes --no-auto-publish in REWRITTEN_ARGS, not forwarded to orch."""
-    pila_launcher = REPO_ROOT / "pila"
-    text = pila_launcher.read_text()
+    leerie_launcher = REPO_ROOT / "leerie"
+    text = leerie_launcher.read_text()
     # The flag must be parsed early (env + arg loop).
     assert "NO_AUTO_PUBLISH" in text
-    assert "PILA_NO_AUTO_PUBLISH" in text
+    assert "LEERIE_NO_AUTO_PUBLISH" in text
     # The flag must be in the REWRITTEN_ARGS consumption block so the
     # orchestrator's argparse never sees it.
     assert "--no-auto-publish)" in text
@@ -316,8 +316,8 @@ def test_ensure_image_harness_matches_launcher():
     file accordingly. This test catches drift by checking that key tokens
     co-occur in both places.
     """
-    pila_launcher = REPO_ROOT / "pila"
-    launcher_text = pila_launcher.read_text()
+    leerie_launcher = REPO_ROOT / "leerie"
+    launcher_text = leerie_launcher.read_text()
     # The function body's load-bearing lines must appear in both.
     sentinels = [
         'cache_file="$cache_dir/published-tags.txt"',
@@ -339,7 +339,7 @@ def test_ensure_image_harness_matches_launcher():
 def test_missing_fly_app_triggers_apps_create(tmp_path: Path):
     """When `flyctl apps list` doesn't include the target app, ensure_image
     invokes `flyctl apps create <app>` before build-push.sh."""
-    repo = tmp_path / "pila-repo"
+    repo = tmp_path / "leerie-repo"
     repo.mkdir()
     log = tmp_path / "build-push.log"
     _stub_build_push(repo, log_file=log)
@@ -351,8 +351,8 @@ def test_missing_fly_app_triggers_apps_create(tmp_path: Path):
         "registry.fly.io/myapp:9.9.9",
         env={
             "XDG_CACHE_HOME": str(cache_home),
-            "PILA_REPO": str(repo),
-            "PILA_FLY_APP": "myapp",
+            "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "myapp",
         },
         cwd=tmp_path,
         flyctl_dir=tmp_path,
@@ -367,19 +367,19 @@ def test_missing_fly_app_triggers_apps_create(tmp_path: Path):
 def test_existing_fly_app_skips_apps_create(tmp_path: Path):
     """When `flyctl apps list` includes the target app, ensure_image
     does NOT call `flyctl apps create`."""
-    repo = tmp_path / "pila-repo"
+    repo = tmp_path / "leerie-repo"
     repo.mkdir()
     log = tmp_path / "build-push.log"
     _stub_build_push(repo, log_file=log)
-    _stub_flyctl(tmp_path, existing_apps=["pila", "otherapp"])
+    _stub_flyctl(tmp_path, existing_apps=["leerie", "otherapp"])
 
     cache_home = tmp_path / "cache"
     result = _run(
-        "registry.fly.io/pila:9.9.9",
+        "registry.fly.io/leerie:9.9.9",
         env={
             "XDG_CACHE_HOME": str(cache_home),
-            "PILA_REPO": str(repo),
-            "PILA_FLY_APP": "pila",
+            "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "leerie",
         },
         cwd=tmp_path,
         flyctl_dir=tmp_path,
@@ -393,7 +393,7 @@ def test_existing_fly_app_skips_apps_create(tmp_path: Path):
 def test_apps_create_failure_propagates(tmp_path: Path):
     """If `flyctl apps create` fails, ensure_image returns 1 and doesn't
     invoke build-push.sh."""
-    repo = tmp_path / "pila-repo"
+    repo = tmp_path / "leerie-repo"
     repo.mkdir()
     log = tmp_path / "build-push.log"
     _stub_build_push(repo, log_file=log)
@@ -401,38 +401,38 @@ def test_apps_create_failure_propagates(tmp_path: Path):
 
     cache_home = tmp_path / "cache"
     result = _run(
-        "registry.fly.io/pila:9.9.9",
+        "registry.fly.io/leerie:9.9.9",
         env={
             "XDG_CACHE_HOME": str(cache_home),
-            "PILA_REPO": str(repo),
-            "PILA_FLY_APP": "pila",
+            "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "leerie",
         },
         cwd=tmp_path,
         flyctl_dir=tmp_path,
     )
     assert result.returncode == 1
-    assert "flyctl apps create pila failed" in result.stderr
+    assert "flyctl apps create leerie failed" in result.stderr
     assert not log.exists() or log.read_text() == "", \
         "build-push.sh must not be invoked when apps create fails"
 
 
 def test_local_build_env_forwards_flag_to_build_push(tmp_path: Path):
     """When LOCAL_BUILD=true is exported (mirroring --local-build /
-    PILA_LOCAL_BUILD=1 in the launcher), ensure_image forwards
+    LEERIE_LOCAL_BUILD=1 in the launcher), ensure_image forwards
     --local-build to build-push.sh."""
-    repo = tmp_path / "pila-repo"
+    repo = tmp_path / "leerie-repo"
     repo.mkdir()
     log = tmp_path / "build-push.log"
     _stub_build_push(repo, log_file=log)
-    _stub_flyctl(tmp_path, existing_apps=["pila"])
+    _stub_flyctl(tmp_path, existing_apps=["leerie"])
 
     cache_home = tmp_path / "cache"
     result = _run(
-        "registry.fly.io/pila:9.9.9",
+        "registry.fly.io/leerie:9.9.9",
         env={
             "XDG_CACHE_HOME": str(cache_home),
-            "PILA_REPO": str(repo),
-            "PILA_FLY_APP": "pila",
+            "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "leerie",
             "LOCAL_BUILD": "true",
         },
         cwd=tmp_path,
@@ -445,12 +445,12 @@ def test_local_build_env_forwards_flag_to_build_push(tmp_path: Path):
 
 def test_local_build_flag_consumed_by_launcher():
     """The launcher consumes --local-build in REWRITTEN_ARGS, not forwarded to orch.
-    Also honors PILA_LOCAL_BUILD env var."""
-    pila_launcher = REPO_ROOT / "pila"
-    text = pila_launcher.read_text()
+    Also honors LEERIE_LOCAL_BUILD env var."""
+    leerie_launcher = REPO_ROOT / "leerie"
+    text = leerie_launcher.read_text()
     # The flag must be parsed early (env + arg loop).
     assert "LOCAL_BUILD" in text
-    assert "PILA_LOCAL_BUILD" in text
+    assert "LEERIE_LOCAL_BUILD" in text
     # The flag must be in the REWRITTEN_ARGS consumption block so the
     # orchestrator's argparse never sees it.
     assert "--local-build)" in text

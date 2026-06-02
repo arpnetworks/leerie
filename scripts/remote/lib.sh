@@ -9,7 +9,7 @@
 # Atomically merge key/value pairs into a run.json sidecar on the host.
 #
 # Usage:
-#   update_run_json "$USER_REPO/.pila/runs/<run-id>/run.json" \
+#   update_run_json "$USER_REPO/.leerie/runs/<run-id>/run.json" \
 #                   key1 value1 [key2 value2 ...]
 #
 # Values are treated as strings and JSON-encoded. The merge is read →
@@ -97,21 +97,21 @@ iso_now() {
 #   local wrapper
 #   wrapper="$(fly_rsync_wrapper "$FLY_APP")"
 #   trap 'rm -f "$wrapper"' EXIT
-#   PILA_FLY_APP="$FLY_APP" rsync -a --from0 --files-from=/tmp/list \
-#     -e "$wrapper" "$USER_REPO/" "$PILA_MACHINE_ID:/work/"
+#   LEERIE_FLY_APP="$FLY_APP" rsync -a --from0 --files-from=/tmp/list \
+#     -e "$wrapper" "$USER_REPO/" "$LEERIE_MACHINE_ID:/work/"
 #
-# The wrapper exports `PILA_FLY_APP` (from the caller's env) and uses it
+# The wrapper exports `LEERIE_FLY_APP` (from the caller's env) and uses it
 # to address the right app; the machine ID arrives via rsync's host arg.
 #
 # Returns: prints the wrapper's path to stdout. Caller is responsible
 # for `rm -f` on the path when done.
 fly_rsync_wrapper() {
-  local fly_app="${1:-${PILA_FLY_APP:-pila}}"
+  local fly_app="${1:-${LEERIE_FLY_APP:-leerie}}"
   local wrapper
-  wrapper="$(mktemp -t pila-fly-rsync.XXXXXX)"
+  wrapper="$(mktemp -t leerie-fly-rsync.XXXXXX)"
   # The wrapper itself is portable POSIX sh. The heredoc is UNquoted so
   # we can bake the resolved $fly_app value into the wrapper at emit
-  # time (default for $PILA_FLY_APP). Every OTHER variable inside is
+  # time (default for $LEERIE_FLY_APP). Every OTHER variable inside is
   # escaped with `\$` so it's evaluated when rsync invokes the wrapper
   # later, not when the heredoc is expanded host-side.
   cat > "$wrapper" <<WRAPPER
@@ -120,7 +120,7 @@ fly_rsync_wrapper() {
 # Invoked by rsync as: <this-script> <host> <remote-cmd> [args...]
 # We pass <remote-cmd> [args...] as a single -C string to flyctl.
 set -e
-FLY_APP="\${PILA_FLY_APP:-$fly_app}"
+FLY_APP="\${LEERIE_FLY_APP:-$fly_app}"
 MACHINE="\$1"
 shift
 # Build the remote command string. printf %q is bash-only; use a
@@ -138,7 +138,7 @@ WRAPPER
 # Emit a POSIX-sh script (to stdout) that:
 #   1. If $1 looks like a bootstrap id (`_bootstrap-<hex>`), waits for the
 #      orchestrator to rename the run dir, then reads the handover file
-#      (`/work/.pila/launcher-<bootstrap>.runid`) for the final id.
+#      (`/work/.leerie/launcher-<bootstrap>.runid`) for the final id.
 #      Otherwise treats $1 as the final id directly.
 #   2. Tails the orchestrator log at the final path.
 #   3. Watches the orchestrator pid (from orchestrator.pid). When the pid
@@ -147,8 +147,8 @@ WRAPPER
 #   4. If AUTO_FINALIZE_TOKEN is set in the wrapper's environment, prints
 #      that token on the *last* line of stderr instead of (after) the
 #      banner; callers can grep for the token to trigger
-#      `pila --finalize` automatically. Decoupled from the wrapper itself
-#      because exec'ing `pila` back inside the Fly machine is wrong; the
+#      `leerie --finalize` automatically. Decoupled from the wrapper itself
+#      because exec'ing `leerie` back inside the Fly machine is wrong; the
 #      auto-finalize step has to run on the host.
 #
 # Usage (caller):
@@ -161,19 +161,19 @@ WRAPPER
 # bash). It uses `tail -F` which all of those support.
 render_tail_wrapper() {
   cat <<'TAIL_SH'
-# Run-id input: prefer the PILA_TAIL_RUN_ID env var (works under
+# Run-id input: prefer the LEERIE_TAIL_RUN_ID env var (works under
 # `flyctl ssh console --command` which discards positional args), fall
 # back to $1 (works under `flyctl machine exec ... -- sh -c "..." -- id`).
-ID="${PILA_TAIL_RUN_ID:-$1}"
+ID="${LEERIE_TAIL_RUN_ID:-$1}"
 if [ -z "$ID" ]; then
-  echo "[pila] remote: render_tail_wrapper got empty run-id (PILA_TAIL_RUN_ID unset and \$1 empty)" >&2
+  echo "[leerie] remote: render_tail_wrapper got empty run-id (LEERIE_TAIL_RUN_ID unset and \$1 empty)" >&2
   exit 2
 fi
-HANDOVER="/work/.pila/launcher-${ID}.runid"
+HANDOVER="/work/.leerie/launcher-${ID}.runid"
 
 # Wait briefly for the orchestrator to write its log file. Without this,
 # `tail -F` against a not-yet-existent file just spins.
-LOG="/work/.pila/runs/${ID}/orchestrator.log"
+LOG="/work/.leerie/runs/${ID}/orchestrator.log"
 for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ -f "$LOG" ] && break
   sleep 1
@@ -186,27 +186,27 @@ case "$ID" in
   _bootstrap-*)
     ( tail -F "$LOG" 2>/dev/null ) &
     TAIL_PID=$!
-    while [ -d "/work/.pila/runs/${ID}" ]; do
+    while [ -d "/work/.leerie/runs/${ID}" ]; do
       sleep 1
     done
     kill "$TAIL_PID" 2>/dev/null || true
     wait "$TAIL_PID" 2>/dev/null || true
     if [ ! -f "$HANDOVER" ]; then
-      echo "[pila] remote: bootstrap dir gone but no handover at $HANDOVER" >&2
+      echo "[leerie] remote: bootstrap dir gone but no handover at $HANDOVER" >&2
       exit 2
     fi
     FINAL="$(head -1 "$HANDOVER" 2>/dev/null)"
     if [ -z "$FINAL" ]; then
-      echo "[pila] remote: handover file empty at $HANDOVER" >&2
+      echo "[leerie] remote: handover file empty at $HANDOVER" >&2
       exit 2
     fi
-    echo "[pila] remote: run-id promoted to ${FINAL}" >&2
+    echo "[leerie] remote: run-id promoted to ${FINAL}" >&2
     ID="$FINAL"
-    LOG="/work/.pila/runs/${ID}/orchestrator.log"
+    LOG="/work/.leerie/runs/${ID}/orchestrator.log"
     ;;
 esac
 
-PID_FILE="/work/.pila/runs/${ID}/orchestrator.pid"
+PID_FILE="/work/.leerie/runs/${ID}/orchestrator.pid"
 ORCH_PID="$(head -1 "$PID_FILE" 2>/dev/null)"
 
 ( tail -F "$LOG" 2>/dev/null ) &
@@ -229,12 +229,12 @@ kill "$TAIL_PID" 2>/dev/null || true
 wait "$TAIL_PID" 2>/dev/null || true
 
 echo "" >&2
-echo "[pila] remote: orchestrator exited — syncing run branch + state to host..." >&2
+echo "[leerie] remote: orchestrator exited — syncing run branch + state to host..." >&2
 
 # Auto-finalize hook: when the calling host sets AUTO_FINALIZE_TOKEN,
 # print it as the wrapper's last stderr line. The host-side caller
 # greps for the token, captures the final run-id, and exec's
-# `pila --finalize <id>` on the host (the machine cannot do it; auth
+# `leerie --finalize <id>` on the host (the machine cannot do it; auth
 # lives on the host).
 if [ -n "$AUTO_FINALIZE_TOKEN" ]; then
   echo "${AUTO_FINALIZE_TOKEN}${ID}" >&2
@@ -247,7 +247,7 @@ TAIL_SH
 #
 # Behavior:
 #   1. command -v flyctl. If found, skip to step 3.
-#   2. If --no-runtime-install / PILA_NO_RUNTIME_INSTALL=1, print install
+#   2. If --no-runtime-install / LEERIE_NO_RUNTIME_INSTALL=1, print install
 #      hint and return 1 (preserves the pre-auto-install contract).
 #      Otherwise prompt to install via:
 #        - macOS: brew install flyctl
@@ -260,14 +260,14 @@ TAIL_SH
 #      auth check is re-run.
 #
 # Honors:
-#   PILA_NO_RUNTIME_INSTALL=1   skip auto-install, fall back to hint+exit
-#   PILA_NONINTERACTIVE=1        never prompt; install/auth must already be set up
+#   LEERIE_NO_RUNTIME_INSTALL=1   skip auto-install, fall back to hint+exit
+#   LEERIE_NONINTERACTIVE=1        never prompt; install/auth must already be set up
 #
 # Idempotent: safe to call multiple times. Returns 0 if flyctl is ready.
 require_flyctl() {
   if ! command -v flyctl >/dev/null 2>&1; then
-    if [ "${PILA_NO_RUNTIME_INSTALL:-0}" = "1" ] || [ "${PILA_NONINTERACTIVE:-0}" = "1" ]; then
-      echo "pila: flyctl not found on PATH." >&2
+    if [ "${LEERIE_NO_RUNTIME_INSTALL:-0}" = "1" ] || [ "${LEERIE_NONINTERACTIVE:-0}" = "1" ]; then
+      echo "leerie: flyctl not found on PATH." >&2
       echo "  Install from https://fly.io/docs/flyctl/install/" >&2
       echo "  or: brew install flyctl (macOS)" >&2
       return 1
@@ -282,14 +282,14 @@ require_flyctl() {
       fi
     fi
     if ! command -v flyctl >/dev/null 2>&1; then
-      echo "pila: flyctl install reported success but binary still not on PATH." >&2
+      echo "leerie: flyctl install reported success but binary still not on PATH." >&2
       echo "  Check $HOME/.fly/bin or restart your shell." >&2
       return 1
     fi
   fi
   if ! flyctl auth status >/dev/null 2>&1; then
-    if [ "${PILA_NONINTERACTIVE:-0}" = "1" ]; then
-      echo "pila: flyctl is not authenticated." >&2
+    if [ "${LEERIE_NONINTERACTIVE:-0}" = "1" ]; then
+      echo "leerie: flyctl is not authenticated." >&2
       echo "  Run: flyctl auth login" >&2
       return 1
     fi
@@ -303,7 +303,7 @@ require_flyctl() {
 # --- require_fly_ssh ------------------------------------------------------
 # Ensure the host's SSH agent has a Fly-issued certificate for SSH-based
 # file transfer via `flyctl ssh console -C "..." < tar`. Certs expire after
-# 24 hours; if missing/expired the SSH attempts hang or error. Pila uses
+# 24 hours; if missing/expired the SSH attempts hang or error. Leerie uses
 # SSH for seeding repo+auth into the machine because flyctl removed
 # `--stdin` from `machine exec` and the alternative argv-based payload
 # transfer hits ARG_MAX on macOS for typical Claude config (~640 MB).
@@ -315,8 +315,8 @@ require_flyctl() {
 # This is best-effort: if `flyctl ssh issue` fails (e.g. user is on a
 # restricted org), seed-auth will surface the original SSH error.
 require_fly_ssh() {
-  local fly_app="${1:-$PILA_FLY_APP}"
-  local fly_org="${PILA_FLY_ORG:-personal}"
+  local fly_app="${1:-$LEERIE_FLY_APP}"
+  local fly_org="${LEERIE_FLY_ORG:-personal}"
   # Probe: a quick ssh attempt against a non-existent machine. Fly's
   # error is "no started VMs" which means auth succeeded; any other
   # error (hangs, "could not connect to WireGuard", etc.) means we
@@ -333,19 +333,19 @@ require_fly_ssh() {
   # certainly Fly's (regular SSH key authentication doesn't put
   # certs in the agent; only Fly does for this user).
   if ssh-add -l 2>/dev/null | grep -qE "CERT\)"; then
-    echo "[pila] remote: ssh-agent has cert(s); skipping issue step" >&2
+    echo "[leerie] remote: ssh-agent has cert(s); skipping issue step" >&2
     return 0
   fi
-  echo "[pila] remote: issuing Fly SSH certificate (24h) for org=$fly_org" >&2
+  echo "[leerie] remote: issuing Fly SSH certificate (24h) for org=$fly_org" >&2
   if ! flyctl ssh issue --agent --hours 24 "$fly_org" >/dev/null 2>&1; then
     # Best-effort: if we have ANY ssh-add cert, hope it's a Fly one
     # and let the subsequent ssh console attempt either succeed or
     # surface the real error.
     if ssh-add -l >/dev/null 2>&1; then
-      echo "pila: warning: flyctl ssh issue failed (possible Fly API outage); proceeding with existing agent state" >&2
+      echo "leerie: warning: flyctl ssh issue failed (possible Fly API outage); proceeding with existing agent state" >&2
       return 0
     fi
-    echo "pila: warning: flyctl ssh issue failed and no ssh-agent cert available; seed-auth may fail" >&2
+    echo "leerie: warning: flyctl ssh issue failed and no ssh-agent cert available; seed-auth may fail" >&2
     return 1
   fi
   return 0
@@ -372,7 +372,7 @@ wait_for_fly_ssh_ready() {
   local max_attempts=12
   while [ "$attempts" -lt "$max_attempts" ]; do
     # `</dev/null` is load-bearing: if stdin is a TTY (the normal
-    # case when pila is run interactively), flyctl ssh console hangs
+    # case when leerie is run interactively), flyctl ssh console hangs
     # after the SSH session is established — empirically observed,
     # 11+ minutes without returning. Detaching stdin lets flyctl
     # complete the -C "true" command and exit cleanly in <5 s.
@@ -389,7 +389,7 @@ wait_for_fly_ssh_ready() {
       sleep 5
     fi
   done
-  echo "pila: warning: machine $machine_id did not accept SSH within 60s" >&2
+  echo "leerie: warning: machine $machine_id did not accept SSH within 60s" >&2
   return 1
 }
 
@@ -401,7 +401,7 @@ _require_flyctl_install() {
   echo "" >&2
   case "$os" in
     Darwin)
-      echo "[pila] flyctl is not installed. Install via:" >&2
+      echo "[leerie] flyctl is not installed. Install via:" >&2
       echo "         brew install flyctl" >&2
       printf "       Run it now? [Y/n] " >&2
       local ans
@@ -409,21 +409,21 @@ _require_flyctl_install() {
       case "${ans:-Y}" in
         [Yy]*|"") ;;
         *)
-          echo "pila: aborted by user; install flyctl manually and re-run." >&2
+          echo "leerie: aborted by user; install flyctl manually and re-run." >&2
           return 1
           ;;
       esac
       if ! command -v brew >/dev/null 2>&1; then
-        echo "pila: brew not found. Install Homebrew first: https://brew.sh" >&2
+        echo "leerie: brew not found. Install Homebrew first: https://brew.sh" >&2
         return 1
       fi
       if ! brew install flyctl; then
-        echo "pila: brew install flyctl failed" >&2
+        echo "leerie: brew install flyctl failed" >&2
         return 1
       fi
       ;;
     Linux)
-      echo "[pila] flyctl is not installed. Install via:" >&2
+      echo "[leerie] flyctl is not installed. Install via:" >&2
       echo "         curl -L https://fly.io/install.sh | sh" >&2
       printf "       Run it now? [Y/n] " >&2
       local ans
@@ -431,17 +431,17 @@ _require_flyctl_install() {
       case "${ans:-Y}" in
         [Yy]*|"") ;;
         *)
-          echo "pila: aborted by user; install flyctl manually and re-run." >&2
+          echo "leerie: aborted by user; install flyctl manually and re-run." >&2
           return 1
           ;;
       esac
       if ! curl -L https://fly.io/install.sh | sh; then
-        echo "pila: flyctl install script failed" >&2
+        echo "leerie: flyctl install script failed" >&2
         return 1
       fi
       ;;
     *)
-      echo "pila: don't know how to install flyctl on $os." >&2
+      echo "leerie: don't know how to install flyctl on $os." >&2
       echo "  Install manually from https://fly.io/docs/flyctl/install/" >&2
       return 1
       ;;
@@ -452,23 +452,23 @@ _require_flyctl_install() {
 # Internal: prompt + run flyctl auth login. Opens a browser.
 _require_flyctl_login() {
   echo "" >&2
-  echo "[pila] flyctl is installed but not authenticated." >&2
+  echo "[leerie] flyctl is installed but not authenticated." >&2
   printf "       Run 'flyctl auth login' now (opens browser)? [Y/n] " >&2
   local ans
   read -r ans
   case "${ans:-Y}" in
     [Yy]*|"") ;;
     *)
-      echo "pila: aborted by user; run 'flyctl auth login' manually and re-run." >&2
+      echo "leerie: aborted by user; run 'flyctl auth login' manually and re-run." >&2
       return 1
       ;;
   esac
   if ! flyctl auth login; then
-    echo "pila: flyctl auth login failed" >&2
+    echo "leerie: flyctl auth login failed" >&2
     return 1
   fi
   if ! flyctl auth status >/dev/null 2>&1; then
-    echo "pila: flyctl auth login reported success but auth status still fails." >&2
+    echo "leerie: flyctl auth login reported success but auth status still fails." >&2
     return 1
   fi
   return 0

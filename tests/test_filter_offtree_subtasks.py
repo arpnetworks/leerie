@@ -13,25 +13,25 @@ Tests use real `tmp_path` directories so symlink resolution and
 from __future__ import annotations
 
 
-def _capture_logs(pila, monkeypatch):
+def _capture_logs(leerie, monkeypatch):
     lines: list[str] = []
-    monkeypatch.setattr(pila, "log", lambda msg: lines.append(msg))
+    monkeypatch.setattr(leerie, "log", lambda msg: lines.append(msg))
     return lines
 
 
-def _make_state(pila, tmp_path):
+def _make_state(leerie, tmp_path):
     """Build a minimal State instance with a writable state.json."""
-    pila_root = tmp_path / ".pila"
-    st = pila.State(pila_root=pila_root, run_id="run-id")
+    leerie_root = tmp_path / ".leerie"
+    st = leerie.State(leerie_root=leerie_root, run_id="run-id")
     st.run_dir.mkdir(parents=True, exist_ok=True)
     st.data = {}
     return st
 
 
-def test_happy_path_no_drop(pila, tmp_path, monkeypatch):
+def test_happy_path_no_drop(leerie, tmp_path, monkeypatch):
     """All files resolve under repo_root → no drop, st.data unchanged."""
-    lines = _capture_logs(pila, monkeypatch)
-    st = _make_state(pila, tmp_path)
+    lines = _capture_logs(leerie, monkeypatch)
+    st = _make_state(leerie, tmp_path)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     (repo_root / "src").mkdir()
@@ -41,18 +41,18 @@ def test_happy_path_no_drop(pila, tmp_path, monkeypatch):
         {"id": "feat-002", "files_likely_touched": ["src/b.py"]},
     ]}]
 
-    pila.filter_offtree_subtasks(plans, repo_root, [], st)
+    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
 
     assert [s["id"] for s in plans[0]["subtasks"]] == ["feat-001", "feat-002"]
     assert "dropped_subtasks" not in st.data
     assert lines == []
 
 
-def test_inspect_dir_leak_drops_subtask(pila, tmp_path, monkeypatch):
+def test_inspect_dir_leak_drops_subtask(leerie, tmp_path, monkeypatch):
     """A file under an inspect-dir is read-only; drop with the specific
     'resolves under inspect-dir' reason."""
-    lines = _capture_logs(pila, monkeypatch)
-    st = _make_state(pila, tmp_path)
+    lines = _capture_logs(leerie, monkeypatch)
+    st = _make_state(leerie, tmp_path)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     inspect = tmp_path / "inspect" / "api"
@@ -65,7 +65,7 @@ def test_inspect_dir_leak_drops_subtask(pila, tmp_path, monkeypatch):
          "files_likely_touched": ["src/lib/messages.ts"]},
     ]}]
 
-    pila.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
+    leerie.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
 
     assert [s["id"] for s in plans[0]["subtasks"]] == ["bugfix-006"]
     assert "bugfix-005" in st.data["dropped_subtasks"]
@@ -74,11 +74,11 @@ def test_inspect_dir_leak_drops_subtask(pila, tmp_path, monkeypatch):
     assert any("filter_offtree_subtasks: dropped 1 subtask(s)" in l for l in lines)
 
 
-def test_generic_offtree_path_drops_with_generic_reason(pila, tmp_path, monkeypatch):
+def test_generic_offtree_path_drops_with_generic_reason(leerie, tmp_path, monkeypatch):
     """A path under neither repo_root nor any inspect-dir gets the generic
     'does not resolve under repo root' reason."""
-    lines = _capture_logs(pila, monkeypatch)
-    st = _make_state(pila, tmp_path)
+    lines = _capture_logs(leerie, monkeypatch)
+    st = _make_state(leerie, tmp_path)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
@@ -86,18 +86,18 @@ def test_generic_offtree_path_drops_with_generic_reason(pila, tmp_path, monkeypa
         {"id": "feat-001", "files_likely_touched": ["/tmp/foo.py"]},
     ]}]
 
-    pila.filter_offtree_subtasks(plans, repo_root, [], st)
+    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
 
     assert plans[0]["subtasks"] == []
     reasons = st.data["dropped_subtasks"]["feat-001"]["reasons"]
     assert any("does not resolve under repo root" in r for r in reasons)
 
 
-def test_empty_files_likely_touched_is_ok(pila, tmp_path, monkeypatch):
+def test_empty_files_likely_touched_is_ok(leerie, tmp_path, monkeypatch):
     """A subtask with no files_likely_touched survives untouched (the field
     is allowed to be omitted)."""
-    lines = _capture_logs(pila, monkeypatch)
-    st = _make_state(pila, tmp_path)
+    lines = _capture_logs(leerie, monkeypatch)
+    st = _make_state(leerie, tmp_path)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
 
@@ -106,18 +106,18 @@ def test_empty_files_likely_touched_is_ok(pila, tmp_path, monkeypatch):
         {"id": "config-002", "files_likely_touched": []},
     ]}]
 
-    pila.filter_offtree_subtasks(plans, repo_root, [], st)
+    leerie.filter_offtree_subtasks(plans, repo_root, [], st)
 
     assert [s["id"] for s in plans[0]["subtasks"]] == ["config-001", "config-002"]
     assert "dropped_subtasks" not in st.data
     assert lines == []
 
 
-def test_mixed_plans_filter_independently(pila, tmp_path, monkeypatch):
+def test_mixed_plans_filter_independently(leerie, tmp_path, monkeypatch):
     """Each plan's subtasks list is filtered independently; survivors stay
     in their original plan."""
-    _capture_logs(pila, monkeypatch)
-    st = _make_state(pila, tmp_path)
+    _capture_logs(leerie, monkeypatch)
+    st = _make_state(leerie, tmp_path)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     inspect = tmp_path / "inspect" / "api"
@@ -136,19 +136,19 @@ def test_mixed_plans_filter_independently(pila, tmp_path, monkeypatch):
         ]},
     ]
 
-    pila.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
+    leerie.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
 
     assert [s["id"] for s in plans[0]["subtasks"]] == ["feat-001"]
     assert [s["id"] for s in plans[1]["subtasks"]] == ["bugfix-002"]
     assert set(st.data["dropped_subtasks"].keys()) == {"feat-002", "bugfix-001"}
 
 
-def test_schedule_after_filter_has_no_dropped_sid(pila, tmp_path, monkeypatch):
+def test_schedule_after_filter_has_no_dropped_sid(leerie, tmp_path, monkeypatch):
     """Integration with schedule(): after filter drops a sid, the schedule
     waves do not reference it. This is the load-bearing spot-check from
     the plan."""
-    _capture_logs(pila, monkeypatch)
-    st = _make_state(pila, tmp_path)
+    _capture_logs(leerie, monkeypatch)
+    st = _make_state(leerie, tmp_path)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     inspect = tmp_path / "inspect"
@@ -162,8 +162,8 @@ def test_schedule_after_filter_has_no_dropped_sid(pila, tmp_path, monkeypatch):
          "depends_on": [], "requires": [], "provides": []},
     ]}]
 
-    pila.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
-    subtasks, waves = pila.schedule(plans)
+    leerie.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
+    subtasks, waves = leerie.schedule(plans)
 
     assert "feat-002" not in subtasks
     flat = [sid for w in waves for sid in w]
@@ -171,14 +171,14 @@ def test_schedule_after_filter_has_no_dropped_sid(pila, tmp_path, monkeypatch):
     assert "feat-001" in flat
 
 
-def test_dropped_subtask_provides_tag_survivor_requires(pila, tmp_path, monkeypatch):
+def test_dropped_subtask_provides_tag_survivor_requires(leerie, tmp_path, monkeypatch):
     """Cross-subtask interaction: when a dropped subtask provides a tag
     a survivor requires, the existing validate_plan check fires die() with
     'requires X but nothing provides it'. This locks in the diagnostic
     chain: user sees both the drop warning and the missing-tag error."""
     import pytest
-    _capture_logs(pila, monkeypatch)
-    st = _make_state(pila, tmp_path)
+    _capture_logs(leerie, monkeypatch)
+    st = _make_state(leerie, tmp_path)
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
     inspect = tmp_path / "inspect"
@@ -200,7 +200,7 @@ def test_dropped_subtask_provides_tag_survivor_requires(pila, tmp_path, monkeypa
          "size": "small"},
     ]}]
 
-    pila.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
-    subtasks, _ = pila.schedule(plans)
+    leerie.filter_offtree_subtasks(plans, repo_root, [str(inspect)], st)
+    subtasks, _ = leerie.schedule(plans)
     with pytest.raises(SystemExit):
-        pila.validate_plan(subtasks)
+        leerie.validate_plan(subtasks)

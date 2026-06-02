@@ -3,13 +3,13 @@
 Part H: build-push.sh defaults to BUILD_MODE=remote (Fly's remote
 builder via `flyctl deploy --build-only --push --remote-only`); the
 legacy local nerdctl/docker path is opt-in via --local-build or
-PILA_LOCAL_BUILD=1.
+LEERIE_LOCAL_BUILD=1.
 
 These tests stub `flyctl` and `nerdctl`/`docker`, run build-push.sh
 in --dry-run mode where possible, and assert on:
 - Default mode is remote.
 - --local-build flips to local.
-- PILA_LOCAL_BUILD=1 flips to local.
+- LEERIE_LOCAL_BUILD=1 flips to local.
 - Remote mode invokes `flyctl deploy --build-only --push --remote-only`
   with `--config <tmp-fly.toml>` (the temp file has the `[build] image`
   line stripped).
@@ -45,11 +45,11 @@ def _stub_container_cmd(tmp_path: Path, name: str) -> Path:
         "#!/usr/bin/env bash\n"
         f"echo \"$@\" >> {tmp_path}/{name}.log\n"
         'if [ "$1" = "inspect" ]; then\n'
-        '  echo "/opt/pila-image/scripts/container-entry.sh"\n'
+        '  echo "/opt/leerie-image/scripts/container-entry.sh"\n'
         '  exit 0\n'
         'fi\n'
         'if [ "$1" = "run" ]; then\n'
-        '  echo "pila 0.0.0-test"\n'
+        '  echo "leerie 0.0.0-test"\n'
         '  exit 0\n'
         'fi\n'
         "exit 0\n"
@@ -110,10 +110,10 @@ def test_local_build_flag_switches_to_local(tmp_path: Path):
     assert not flyctl_log.exists() or flyctl_log.read_text() == ""
 
 
-def test_pila_local_build_env_switches_to_local(tmp_path: Path):
-    """PILA_LOCAL_BUILD=1 → BUILD_MODE=local (equivalent to --local-build)."""
+def test_leerie_local_build_env_switches_to_local(tmp_path: Path):
+    """LEERIE_LOCAL_BUILD=1 → BUILD_MODE=local (equivalent to --local-build)."""
     r = _run(tmp_path, "--app", "testapp", "--push",
-             env_extra={"PILA_LOCAL_BUILD": "1"})
+             env_extra={"LEERIE_LOCAL_BUILD": "1"})
     assert r.returncode == 0, r.stderr
     nerdctl_log = (tmp_path / "nerdctl.log").read_text()
     assert "build" in nerdctl_log
@@ -159,23 +159,23 @@ def test_local_mode_uses_nerdctl_when_available(tmp_path: Path):
     assert "local build tool: nerdctl" in r.stdout
 
 
-# --- regression: build context must be $PILA_REPO, not caller's cwd ------
+# --- regression: build context must be $LEERIE_REPO, not caller's cwd ------
 
-def test_remote_mode_cds_to_pila_repo_before_invoking_flyctl(tmp_path: Path):
-    """When `pila` is invoked from another repo (e.g. cd ~/myrepo && pila
-    --runtime fly), build-push.sh must `cd $PILA_REPO` before running
+def test_remote_mode_cds_to_leerie_repo_before_invoking_flyctl(tmp_path: Path):
+    """When `leerie` is invoked from another repo (e.g. cd ~/myrepo && leerie
+    --runtime fly), build-push.sh must `cd $LEERIE_REPO` before running
     `flyctl deploy`. Otherwise flyctl uploads the user's repo as the
     build context, and the Dockerfile's `COPY orchestrator/` fails
     with "orchestrator: not found". Regression test for the Part H
     live-test failure.
 
-    Verifies the launcher source contains the cd-into-PILA_REPO step.
+    Verifies the launcher source contains the cd-into-LEERIE_REPO step.
     """
     text = BUILD_PUSH.read_text()
-    # The (cd "$PILA_REPO" ; ...) subshell pattern must wrap the
+    # The (cd "$LEERIE_REPO" ; ...) subshell pattern must wrap the
     # flyctl deploy invocation in the remote-mode function.
-    assert 'cd "$PILA_REPO"' in text, \
-        "remote-mode flyctl invocation must run from cwd=$PILA_REPO"
+    assert 'cd "$LEERIE_REPO"' in text, \
+        "remote-mode flyctl invocation must run from cwd=$LEERIE_REPO"
     # And the comment block explaining why must be present (a refactor
     # that drops the cd should NOT also drop the explanation).
     assert "build context" in text
@@ -189,4 +189,4 @@ def test_help_mentions_local_build_caveat():
     mistake."""
     text = BUILD_PUSH.read_text()
     assert "nerdctl-in-Colima" in text
-    assert "Most pila users should NOT" in text
+    assert "Most leerie users should NOT" in text

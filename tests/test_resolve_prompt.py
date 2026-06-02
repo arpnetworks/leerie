@@ -15,21 +15,21 @@ import pytest
     "classifier", "planner", "reconciler", "provision", "implementer",
     "integrator", "conformer",
 ])
-def test_resolve_prompt_returns_valid_triple(pila, call_type):
-    kind, content, hint = pila.resolve_prompt(call_type)
+def test_resolve_prompt_returns_valid_triple(leerie, call_type):
+    kind, content, hint = leerie.resolve_prompt(call_type)
     assert kind == "file", f"unexpected kind {kind!r} for {call_type}"
     assert content and content.strip(), f"empty content for {call_type}"
     assert hint == f"prompts/{call_type}.md"
 
 
-def test_resolve_prompt_covers_all_worker_types(pila):
+def test_resolve_prompt_covers_all_worker_types(leerie):
     """Parity: every WORKER_TYPES member must be handled without error."""
-    for call_type in pila.WORKER_TYPES:
-        kind, content, hint = pila.resolve_prompt(call_type)
+    for call_type in leerie.WORKER_TYPES:
+        kind, content, hint = leerie.resolve_prompt(call_type)
         assert kind == "file"
         assert content
 
 
-def test_resolve_prompt_unknown_raises(pila):
+def test_resolve_prompt_unknown_raises(leerie):
     with pytest.raises((ValueError, KeyError)):
-        pila.resolve_prompt("nonexistent_worker")
+        leerie.resolve_prompt("nonexistent_worker")

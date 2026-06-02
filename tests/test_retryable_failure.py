@@ -14,8 +14,8 @@ from pathlib import Path
 
 import pytest
 
-PILA_PY = (Path(__file__).resolve().parent.parent
-               / "orchestrator" / "pila.py")
+LEERIE_PY = (Path(__file__).resolve().parent.parent
+               / "orchestrator" / "leerie.py")
 
 
 # --- behavior of _retryable_failure ---------------------------------------
@@ -25,8 +25,8 @@ PILA_PY = (Path(__file__).resolve().parent.parent
     "dirty_worktree",
     "empty_handoff",
 ])
-def test_retryable_kinds_return_true(pila, kind):
-    assert pila._retryable_failure(kind) is True
+def test_retryable_kinds_return_true(leerie, kind):
+    assert leerie._retryable_failure(kind) is True
 
 
 @pytest.mark.parametrize("kind", [
@@ -38,16 +38,16 @@ def test_retryable_kinds_return_true(pila, kind):
     "no commits ahead of the run",
     "checkpoint_path 'foo' does not exist on disk",
 ])
-def test_terminal_kinds_return_false(pila, kind):
-    assert pila._retryable_failure(kind) is False
+def test_terminal_kinds_return_false(leerie, kind):
+    assert leerie._retryable_failure(kind) is False
 
 
-def test_retryable_kinds_constant_matches_documented_set(pila):
+def test_retryable_kinds_constant_matches_documented_set(leerie):
     """The retryable enum must be exactly the three documented kinds.
     Adding a kind requires updating IMPLEMENTATION.md's "The two-tier
     retry policy" section (under §5 "Deterministic enforcement points")
     in the same change."""
-    assert pila._RETRYABLE_FAILURE_KINDS == frozenset(
+    assert leerie._RETRYABLE_FAILURE_KINDS == frozenset(
         {"no_commits", "dirty_worktree", "empty_handoff"}
     )
 
@@ -68,11 +68,11 @@ _PRODUCER_RETRYABLE_KINDS = {
 }
 
 
-def test_producer_kinds_all_classified_retryable(pila):
+def test_producer_kinds_all_classified_retryable(leerie):
     """Every kind a producer can tag on a retryable path must be in
     `_RETRYABLE_FAILURE_KINDS`. If a producer tags a new kind and
     forgets to add it to the enum, this test catches the drift."""
-    missing = _PRODUCER_RETRYABLE_KINDS - pila._RETRYABLE_FAILURE_KINDS
+    missing = _PRODUCER_RETRYABLE_KINDS - leerie._RETRYABLE_FAILURE_KINDS
     assert not missing, (
         f"producers emit {missing!r} on retryable paths but "
         f"_RETRYABLE_FAILURE_KINDS does not accept them — the retry "
@@ -81,22 +81,22 @@ def test_producer_kinds_all_classified_retryable(pila):
     )
 
 
-def test_check_branch_has_commits_tags_no_commits(pila):
+def test_check_branch_has_commits_tags_no_commits(leerie):
     """`check_branch_has_commits` must return `("no_commits", ...)` on
     its retryable arm. If the kind is renamed or the producer is
     rewritten to return a different shape, this test fails."""
-    src = inspect.getsource(pila.check_branch_has_commits)
+    src = inspect.getsource(leerie.check_branch_has_commits)
     assert '"no_commits"' in src, (
         "check_branch_has_commits no longer tags `no_commits` — the "
         "retry classifier would not treat its failure as retryable."
     )
 
 
-def test_validate_result_tags_empty_handoff_for_missing_checkpoint(pila):
+def test_validate_result_tags_empty_handoff_for_missing_checkpoint(leerie):
     """`validate_result`'s incomplete-handoff + missing-checkpoint arm
     must tag `("empty_handoff", ...)` — this is the Claude Code
     session-limit / rate-limit safety net path."""
-    src = inspect.getsource(pila.validate_result)
+    src = inspect.getsource(leerie.validate_result)
     assert '"empty_handoff"' in src, (
         "validate_result no longer tags `empty_handoff` for the "
         "incomplete-handoff missing-checkpoint case — the session-"
@@ -105,11 +105,11 @@ def test_validate_result_tags_empty_handoff_for_missing_checkpoint(pila):
     )
 
 
-def test_settle_subtask_tags_dirty_worktree(pila):
+def test_settle_subtask_tags_dirty_worktree(leerie):
     """The inline dirty-worktree check in `settle_subtask` is the only
-    producer of the `dirty_worktree` kind. Find it in the pila.py
+    producer of the `dirty_worktree` kind. Find it in the leerie.py
     source text and confirm the literal appears."""
-    source = PILA_PY.read_text()
+    source = LEERIE_PY.read_text()
     settle_match = re.search(
         r"^(?:async )?def settle_subtask\b.*?"
         r"(?=^(?:async )?(?:def |class ))",
@@ -128,7 +128,7 @@ def test_settle_subtask_fail_calls_use_two_arg_signature():
     pass exactly two positional args: (kind, reason). The legacy
     single-arg shape `fail(reason)` would raise `TypeError` at runtime
     because `fail` was changed to take a structured `failure_kind`
-    discriminator. The original refactor missed pila.py:10293's
+    discriminator. The original refactor missed leerie.py:10293's
     worker-self-reported-failed arm because no test exercised that
     branch (the path is rare in production — see the "Per-subtask
     checks" table in IMPLEMENTATION.md §5 "Deterministic enforcement
@@ -138,7 +138,7 @@ def test_settle_subtask_fail_calls_use_two_arg_signature():
     Concretely guards: the worker-self-reported `status: "failed"`
     arm in settle_subtask must pass a structured kind alongside the
     worker's freeform summary."""
-    source = PILA_PY.read_text()
+    source = LEERIE_PY.read_text()
     tree = ast.parse(source)
 
     # Locate settle_subtask in the module's top-level functions.
@@ -147,7 +147,7 @@ def test_settle_subtask_fail_calls_use_two_arg_signature():
         if isinstance(node, ast.AsyncFunctionDef) and node.name == "settle_subtask":
             settle = node
             break
-    assert settle is not None, "could not locate settle_subtask in pila.py AST"
+    assert settle is not None, "could not locate settle_subtask in leerie.py AST"
 
     # Find every Call node inside settle_subtask whose callee is the
     # bare name `fail` — the local closure. Exclude the def itself.

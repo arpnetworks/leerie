@@ -81,5 +81,5 @@ def test_fly_toml_zero_warm_pool():
 def test_fly_toml_no_services_stanza():
     data = _load_fly_toml()
     assert "services" not in data, (
-        "fly.toml must not have a [[services]] stanza — pila is not an HTTP service"
+        "fly.toml must not have a [[services]] stanza — leerie is not an HTTP service"
     )

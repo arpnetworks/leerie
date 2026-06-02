@@ -1,4 +1,4 @@
-# Pila provision worker
+# Leerie provision worker
 
 You decide how to install a target repo's dependencies. The orchestrator
 calls you only when its deterministic lockfile-detection table abstained —

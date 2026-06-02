@@ -1,4 +1,4 @@
-"""Tests for Phase 3: PTY-over-SSH attach (`pila --attach`).
+"""Tests for Phase 3: PTY-over-SSH attach (`leerie --attach`).
 
 Covers:
   - scripts/remote/attach.sh resolution logic
@@ -20,7 +20,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ATTACH_SH = REPO_ROOT / "scripts" / "remote" / "attach.sh"
 PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
-LAUNCHER = REPO_ROOT / "pila"
+LAUNCHER = REPO_ROOT / "leerie"
 
 
 def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
@@ -99,13 +99,13 @@ def test_attach_fails_when_flyctl_unauthenticated(tmp_path: Path):
 # --- attach.sh: resolution strategies ------------------------------------
 
 def test_attach_resolves_from_fly_machine_json(tmp_path: Path):
-    """A .pila/runs/<id>/fly-machine.json record provides the machine id."""
+    """A .leerie/runs/<id>/fly-machine.json record provides the machine id."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "my-run-001"
+    run_dir = user_repo / ".leerie" / "runs" / "my-run-001"
     run_dir.mkdir(parents=True)
     (run_dir / "fly-machine.json").write_text(json.dumps({
-        "fly_app": "pila",
+        "fly_app": "leerie",
         "fly_machine_id": "mach-from-fly-machine-json",
         "started_at": "2026-05-29T16:00:00+00:00",
         "run_id": "my-run-001",
@@ -129,7 +129,7 @@ def test_attach_falls_back_to_run_json(tmp_path: Path):
     from run.json (Phase 2's sidecar field)."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "my-run-002"
+    run_dir = user_repo / ".leerie" / "runs" / "my-run-002"
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps({
         "run_id": "my-run-002",
@@ -149,16 +149,16 @@ def test_attach_falls_back_to_run_json(tmp_path: Path):
 
 
 def test_attach_resolves_from_pid_record_when_no_run_id(tmp_path: Path):
-    """No run-id: scan .pila/remote/<pid>.json; exactly one active record
+    """No run-id: scan .leerie/remote/<pid>.json; exactly one active record
     means use it."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
-    remote_dir = user_repo / ".pila" / "remote"
+    remote_dir = user_repo / ".leerie" / "remote"
     remote_dir.mkdir(parents=True)
     # Use this process's PID so the kill -0 check succeeds.
     my_pid = os.getpid()
     (remote_dir / f"{my_pid}.json").write_text(json.dumps({
-        "fly_app": "pila",
+        "fly_app": "leerie",
         "fly_machine_id": "mach-from-pid-record",
         "started_at": "2026-05-29T16:00:00+00:00",
         "run_id": None,
@@ -196,13 +196,13 @@ def test_attach_errors_on_multiple_active_records(tmp_path: Path):
     """Multiple active records without a disambiguating run-id → exit 1."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
-    remote_dir = user_repo / ".pila" / "remote"
+    remote_dir = user_repo / ".leerie" / "remote"
     remote_dir.mkdir(parents=True)
     my_pid = os.getpid()
     parent_pid = os.getppid()
     for pid, mid in ((my_pid, "mach-A"), (parent_pid, "mach-B")):
         (remote_dir / f"{pid}.json").write_text(json.dumps({
-            "fly_app": "pila",
+            "fly_app": "leerie",
             "fly_machine_id": mid,
             "started_at": "2026-05-29T16:00:00+00:00",
             "run_id": None,
@@ -225,7 +225,7 @@ def test_attach_skips_stale_pid_records(tmp_path: Path):
     """A record whose PID no longer exists must be skipped (stale)."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
-    remote_dir = user_repo / ".pila" / "remote"
+    remote_dir = user_repo / ".leerie" / "remote"
     remote_dir.mkdir(parents=True)
     # A PID that's astronomically unlikely to exist.
     stale_pid = 999999
@@ -266,7 +266,7 @@ def test_attach_default_command_is_bash(tmp_path: Path):
     """Default attach drops into bash at /work with $PS1 identifying the run."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "my-run-003"
+    run_dir = user_repo / ".leerie" / "runs" / "my-run-003"
     run_dir.mkdir(parents=True)
     (run_dir / "fly-machine.json").write_text(json.dumps({
         "fly_machine_id": "mach-default",
@@ -281,7 +281,7 @@ def test_attach_default_command_is_bash(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
     assert "cd /work" in invocations
-    assert "pila@my-run-003" in invocations
+    assert "leerie@my-run-003" in invocations
     assert "exec bash" in invocations
 
 
@@ -290,12 +290,12 @@ def test_attach_tail_mode_uses_orchestrator_log_wrapper(tmp_path: Path):
     orchestrator.log, not per-worker logs). Audit Drift 1+3 fix.
 
     Also verifies the run-id is delivered to the wrapper via
-    PILA_TAIL_RUN_ID env var (Part D D1 fix): `flyctl ssh console
+    LEERIE_TAIL_RUN_ID env var (Part D D1 fix): `flyctl ssh console
     --command` ignores positional args after `--`, so the run-id must
     be embedded in the script body itself."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "my-run-004"
+    run_dir = user_repo / ".leerie" / "runs" / "my-run-004"
     run_dir.mkdir(parents=True)
     (run_dir / "fly-machine.json").write_text(json.dumps({
         "fly_machine_id": "mach-tail",
@@ -319,8 +319,8 @@ def test_attach_tail_mode_uses_orchestrator_log_wrapper(tmp_path: Path):
     assert "exec bash" not in invocations
     # D1 regression guard: the run-id must reach the wrapper via env
     # var (not positional, which flyctl ssh console drops).
-    assert "PILA_TAIL_RUN_ID='my-run-004'" in invocations or \
-           "PILA_TAIL_RUN_ID=my-run-004" in invocations, \
+    assert "LEERIE_TAIL_RUN_ID='my-run-004'" in invocations or \
+           "LEERIE_TAIL_RUN_ID=my-run-004" in invocations, \
            f"run-id missing from --command; flyctl invocation was:\n{invocations}"
 
 
@@ -329,7 +329,7 @@ def test_attach_tail_with_all_logs_uses_per_worker_logs(tmp_path: Path):
     for users who want to inspect individual worker output."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "my-run-004b"
+    run_dir = user_repo / ".leerie" / "runs" / "my-run-004b"
     run_dir.mkdir(parents=True)
     (run_dir / "fly-machine.json").write_text(json.dumps({
         "fly_machine_id": "mach-alllogs",
@@ -344,7 +344,7 @@ def test_attach_tail_with_all_logs_uses_per_worker_logs(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
     assert "tail -F" in invocations
-    assert "/work/.pila/runs/my-run-004b/logs/*.log" in invocations
+    assert "/work/.leerie/runs/my-run-004b/logs/*.log" in invocations
 
 
 def test_attach_tail_without_run_id_errors(tmp_path: Path):
@@ -353,7 +353,7 @@ def test_attach_tail_without_run_id_errors(tmp_path: Path):
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
     # Create an active record so attach.sh resolves a machine.
-    remote_dir = user_repo / ".pila" / "remote"
+    remote_dir = user_repo / ".leerie" / "remote"
     remote_dir.mkdir(parents=True)
     # Simulate an active record by using the current launcher's PID
     # (the test runs under its own PID, so we use a PID known to exist).
@@ -373,10 +373,10 @@ def test_attach_tail_without_run_id_errors(tmp_path: Path):
 
 
 def test_attach_app_flag_overrides_default(tmp_path: Path):
-    """--app overrides the default 'pila' app name."""
+    """--app overrides the default 'leerie' app name."""
     _stub_flyctl(tmp_path)
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / "my-run-005"
+    run_dir = user_repo / ".leerie" / "runs" / "my-run-005"
     run_dir.mkdir(parents=True)
     (run_dir / "fly-machine.json").write_text(json.dumps({
         "fly_machine_id": "mach-app",
@@ -396,7 +396,7 @@ def test_attach_app_flag_overrides_default(tmp_path: Path):
 # --- provision.sh writes the PID-keyed record ----------------------------
 
 def test_provision_writes_pid_keyed_record(tmp_path: Path):
-    """After successful provision, .pila/remote/<pid>.json exists with
+    """After successful provision, .leerie/remote/<pid>.json exists with
     fly_machine_id and run_id fields."""
     log = tmp_path / "flyctl.log"
     fake = tmp_path / "flyctl"
@@ -419,28 +419,28 @@ def test_provision_writes_pid_keyed_record(tmp_path: Path):
     # the subshell before exit.
     result = _run_bash(
         f"( source {PROVISION_SH}; "
-        f"  PILA_RUN_ID=my-run-006; "
+        f"  LEERIE_RUN_ID=my-run-006; "
         f"  USER_REPO={user_repo}; "
-        f"  export USER_REPO PILA_RUN_ID; "
+        f"  export USER_REPO LEERIE_RUN_ID; "
         f"  provision_machine && "
-        f'  cat "{user_repo}/.pila/remote/$$.json"; '
+        f'  cat "{user_repo}/.leerie/remote/$$.json"; '
         f")",
         env={
-            "FLY_IMAGE_TAG": "registry.fly.io/pila:test",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )
     assert result.returncode == 0, result.stderr
     record = json.loads(result.stdout.strip())
     assert record["fly_machine_id"] == "mach-001"
-    assert record["fly_app"] == "pila"
+    assert record["fly_app"] == "leerie"
     assert record["run_id"] == "my-run-006"
     assert isinstance(record["launcher_pid"], int)
 
 
 def test_destroy_removes_pid_keyed_record(tmp_path: Path):
     """destroy_machine removes the PID-keyed record so subsequent
-    `pila --attach` reports 'no active remote machine'."""
+    `leerie --attach` reports 'no active remote machine'."""
     log = tmp_path / "flyctl.log"
     fake = tmp_path / "flyctl"
     fake.write_text(
@@ -467,11 +467,11 @@ def test_destroy_removes_pid_keyed_record(tmp_path: Path):
         f"  _try_fetch_branch_for_teardown() {{ return 0; }}; "
         f"  USER_REPO={user_repo}; export USER_REPO; "
         f"  provision_machine; "
-        f"  echo \"during=$(ls {user_repo}/.pila/remote/ 2>/dev/null | wc -l)\"; "
+        f"  echo \"during=$(ls {user_repo}/.leerie/remote/ 2>/dev/null | wc -l)\"; "
         f"); "
-        f"echo \"after=$(ls {user_repo}/.pila/remote/ 2>/dev/null | wc -l)\"",
+        f"echo \"after=$(ls {user_repo}/.leerie/remote/ 2>/dev/null | wc -l)\"",
         env={
-            "FLY_IMAGE_TAG": "registry.fly.io/pila:test",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )
@@ -504,9 +504,9 @@ def test_launcher_routes_attach_fastpath():
 
 
 def test_launcher_attach_execs_attach_sh():
-    """The --attach branch in pila must exec scripts/remote/attach.sh."""
+    """The --attach branch in leerie must exec scripts/remote/attach.sh."""
     text = LAUNCHER.read_text()
-    assert 'exec "$PILA_REPO/scripts/remote/attach.sh"' in text
+    assert 'exec "$LEERIE_REPO/scripts/remote/attach.sh"' in text
 
 
 # --- coupling: schema match between provision.sh and attach.sh -----------
@@ -520,6 +520,6 @@ def test_pid_record_schema_consumed_by_attach():
         assert f'"{field}"' in provision_text, f"provision.sh missing {field}"
     # attach.sh extracts at least fly_machine_id, run_id, launcher_pid:
     # (fly_app is not read by attach.sh — the --app flag overrides it; the
-    # default comes from $PILA_FLY_APP for both writer and reader.)
+    # default comes from $LEERIE_FLY_APP for both writer and reader.)
     for field in ("fly_machine_id", "launcher_pid", "run_id"):
         assert field in attach_text, f"attach.sh missing {field}"

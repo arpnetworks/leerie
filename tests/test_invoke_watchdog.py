@@ -7,14 +7,14 @@
     when available.
   - A3: stdin=DEVNULL passed to create_subprocess_exec so a worker
     inherits no TTY from the orchestrator's `nerdctl run -it` container.
-  - A5: PILA_WORKER_DEBUG=1 in the orchestrator env injects DEBUG=* and
+  - A5: LEERIE_WORKER_DEBUG=1 in the orchestrator env injects DEBUG=* and
     ANTHROPIC_LOG=debug into the worker subprocess env.
 
 Plus the D1 plumbing test:
 
   - claude_p threads its resolved `caps["worker_idle_warn_sec"]` value
     through to _invoke's `idle_warn_sec` kwarg so per-run overrides
-    (CLI / env / pila.toml) take effect rather than being silently
+    (CLI / env / leerie.toml) take effect rather than being silently
     ignored in favor of DEFAULT_CAPS.
 
 All tests mock asyncio.create_subprocess_exec so no real `claude -p`
@@ -135,8 +135,8 @@ class _DelayedProc:
 
 
 @pytest.fixture
-def pila_dir(tmp_path):
-    cd = tmp_path / ".pila"
+def leerie_dir(tmp_path):
+    cd = tmp_path / ".leerie"
     cd.mkdir()
     (cd / "logs").mkdir()
     return cd
@@ -144,7 +144,7 @@ def pila_dir(tmp_path):
 
 # ---- A3: stdin=DEVNULL --------------------------------------------------
 
-def test_create_subprocess_exec_passes_stdin_devnull(pila, pila_dir,
+def test_create_subprocess_exec_passes_stdin_devnull(leerie, leerie_dir,
                                                       monkeypatch):
     """The worker must never inherit the orchestrator's stdin. Inside a
     `nerdctl run -it` container the orchestrator's stdin is /dev/pts/0
@@ -160,9 +160,9 @@ def test_create_subprocess_exec_passes_stdin_devnull(pila, pila_dir,
         return _DelayedProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=60, sid="t-stdin", pila_dir=pila_dir,
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-stdin", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
     assert captured.get("stdin") == asyncio.subprocess.DEVNULL, (
@@ -175,7 +175,7 @@ def test_create_subprocess_exec_passes_stdin_devnull(pila, pila_dir,
 
 # ---- A1: spawn heartbeat ------------------------------------------------
 
-def test_spawn_heartbeat_logged_at_normal_verbosity(pila, pila_dir,
+def test_spawn_heartbeat_logged_at_normal_verbosity(leerie, leerie_dir,
                                                      monkeypatch, capsys):
     """Immediately after create_subprocess_exec returns, _invoke must
     log a `[<sid>] spawned (pid=…)` line. Without this, the user sees
@@ -193,9 +193,9 @@ def test_spawn_heartbeat_logged_at_normal_verbosity(pila, pila_dir,
         return _DelayedProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=60, sid="t-spawn", pila_dir=pila_dir,
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-spawn", leerie_dir=leerie_dir,
         verbosity="normal"))
 
     out = capsys.readouterr().out
@@ -204,7 +204,7 @@ def test_spawn_heartbeat_logged_at_normal_verbosity(pila, pila_dir,
     )
 
 
-def test_spawn_heartbeat_suppressed_at_quiet(pila, pila_dir,
+def test_spawn_heartbeat_suppressed_at_quiet(leerie, leerie_dir,
                                               monkeypatch, capsys):
     """At quiet, the spawn heartbeat is suppressed — quiet emits phase
     boundaries + errors only. The watchdog warning (a degraded-state
@@ -217,9 +217,9 @@ def test_spawn_heartbeat_suppressed_at_quiet(pila, pila_dir,
         return _DelayedProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=60, sid="t-spawn-q", pila_dir=pila_dir,
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-spawn-q", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
     out = capsys.readouterr().out
@@ -231,7 +231,7 @@ def test_spawn_heartbeat_suppressed_at_quiet(pila, pila_dir,
 
 # ---- A2 + A4: idle watchdog --------------------------------------------
 
-def test_idle_watchdog_warns_on_silent_worker(pila, pila_dir,
+def test_idle_watchdog_warns_on_silent_worker(leerie, leerie_dir,
                                                 monkeypatch, capsys):
     """The watchdog fires when no stdout event arrives within
     `worker_idle_warn_sec`. We simulate a worker that goes silent for
@@ -247,10 +247,10 @@ def test_idle_watchdog_warns_on_silent_worker(pila, pila_dir,
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
     # Patch DEFAULT_CAPS so the watchdog fires after 0.3s of silence,
     # well below the simulated 1.0s gap. Restore on test exit.
-    monkeypatch.setitem(pila.DEFAULT_CAPS, "worker_idle_warn_sec", 0.3)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=10, sid="t-idle", pila_dir=pila_dir,
+    monkeypatch.setitem(leerie.DEFAULT_CAPS, "worker_idle_warn_sec", 0.3)
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=10, sid="t-idle", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
     out = capsys.readouterr().out
@@ -259,7 +259,7 @@ def test_idle_watchdog_warns_on_silent_worker(pila, pila_dir,
     )
 
 
-def test_idle_watchdog_does_not_fire_on_active_worker(pila, pila_dir,
+def test_idle_watchdog_does_not_fire_on_active_worker(leerie, leerie_dir,
                                                        monkeypatch,
                                                        capsys):
     """A worker that emits events steadily must NOT trigger a watchdog
@@ -282,10 +282,10 @@ def test_idle_watchdog_does_not_fire_on_active_worker(pila, pila_dir,
         return _DelayedProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    monkeypatch.setitem(pila.DEFAULT_CAPS, "worker_idle_warn_sec", 10.0)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=30, sid="t-active", pila_dir=pila_dir,
+    monkeypatch.setitem(leerie.DEFAULT_CAPS, "worker_idle_warn_sec", 10.0)
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=30, sid="t-active", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
     out = capsys.readouterr().out
@@ -294,7 +294,7 @@ def test_idle_watchdog_does_not_fire_on_active_worker(pila, pila_dir,
     )
 
 
-def test_idle_watchdog_cancels_cleanly_on_success(pila, pila_dir,
+def test_idle_watchdog_cancels_cleanly_on_success(leerie, leerie_dir,
                                                     monkeypatch):
     """The watchdog must be cancelled on every exit path so it never
     outlives the worker. If the try/finally lifecycle were missing, the
@@ -309,25 +309,25 @@ def test_idle_watchdog_cancels_cleanly_on_success(pila, pila_dir,
         return _DelayedProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    monkeypatch.setitem(pila.DEFAULT_CAPS, "worker_idle_warn_sec", 30.0)
+    monkeypatch.setitem(leerie.DEFAULT_CAPS, "worker_idle_warn_sec", 30.0)
 
     async def runner():
         # Must complete inside the timeout — if the watchdog leaks,
         # asyncio.wait_for() will time out.
-        return await asyncio.wait_for(pila._invoke(
-            ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-            timeout=10, sid="t-cancel", pila_dir=pila_dir,
+        return await asyncio.wait_for(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=10, sid="t-cancel", leerie_dir=leerie_dir,
             verbosity="quiet"), timeout=5.0)
 
     result = asyncio.run(runner())
     assert result["subtype"] == "success"
 
 
-def test_idle_watchdog_includes_stderr_tail(pila, pila_dir,
+def test_idle_watchdog_includes_stderr_tail(leerie, leerie_dir,
                                               monkeypatch, capsys):
     """When the worker is writing to stderr but not stdout (the most
     likely shape of a credential-refresh hang or a `--debug` CLI under
-    PILA_WORKER_DEBUG=1), the watchdog must surface the stderr tail
+    LEERIE_WORKER_DEBUG=1), the watchdog must surface the stderr tail
     alongside the silence warning so the user has something
     actionable."""
     events = [json.dumps({"type": "result", "subtype": "success",
@@ -339,10 +339,10 @@ def test_idle_watchdog_includes_stderr_tail(pila, pila_dir,
                             stderr_payload=stderr_payload)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    monkeypatch.setitem(pila.DEFAULT_CAPS, "worker_idle_warn_sec", 0.3)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=10, sid="t-tail", pila_dir=pila_dir,
+    monkeypatch.setitem(leerie.DEFAULT_CAPS, "worker_idle_warn_sec", 0.3)
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=10, sid="t-tail", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
     out = capsys.readouterr().out
@@ -355,10 +355,10 @@ def test_idle_watchdog_includes_stderr_tail(pila, pila_dir,
     )
 
 
-# ---- A5: PILA_WORKER_DEBUG env passthrough -----------------------------
+# ---- A5: LEERIE_WORKER_DEBUG env passthrough -----------------------------
 
-def test_pila_worker_debug_injects_env(pila, pila_dir, monkeypatch):
-    """When PILA_WORKER_DEBUG is set in the orchestrator's environment,
+def test_leerie_worker_debug_injects_env(leerie, leerie_dir, monkeypatch):
+    """When LEERIE_WORKER_DEBUG is set in the orchestrator's environment,
     the worker subprocess must inherit DEBUG=* and ANTHROPIC_LOG=debug
     so its internal state surfaces (via stderr, which the watchdog
     flushes). This is the diagnostic toggle for the next silent-hang
@@ -372,15 +372,15 @@ def test_pila_worker_debug_injects_env(pila, pila_dir, monkeypatch):
         return _DelayedProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    monkeypatch.setenv("PILA_WORKER_DEBUG", "1")
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=60, sid="t-debug", pila_dir=pila_dir,
+    monkeypatch.setenv("LEERIE_WORKER_DEBUG", "1")
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-debug", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
     env = captured.get("env")
     assert env is not None, (
-        "expected env= to be passed when PILA_WORKER_DEBUG is set"
+        "expected env= to be passed when LEERIE_WORKER_DEBUG is set"
     )
     assert env.get("DEBUG") == "*", (
         f"expected DEBUG=* in worker env; got {env.get('DEBUG')!r}"
@@ -391,9 +391,9 @@ def test_pila_worker_debug_injects_env(pila, pila_dir, monkeypatch):
     )
 
 
-def test_no_env_override_when_pila_worker_debug_unset(pila, pila_dir,
+def test_no_env_override_when_leerie_worker_debug_unset(leerie, leerie_dir,
                                                        monkeypatch):
-    """When PILA_WORKER_DEBUG is NOT set, env= must be None so the
+    """When LEERIE_WORKER_DEBUG is NOT set, env= must be None so the
     worker simply inherits the parent environment (preserving the
     OAuth token, mise PATH, etc.). Passing a partial env dict would
     break the worker by stripping required variables."""
@@ -406,14 +406,14 @@ def test_no_env_override_when_pila_worker_debug_unset(pila, pila_dir,
         return _DelayedProc(events)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    monkeypatch.delenv("PILA_WORKER_DEBUG", raising=False)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=60, sid="t-no-debug", pila_dir=pila_dir,
+    monkeypatch.delenv("LEERIE_WORKER_DEBUG", raising=False)
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-no-debug", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
     assert captured.get("env") is None, (
-        "without PILA_WORKER_DEBUG, env= must be None so the worker "
+        "without LEERIE_WORKER_DEBUG, env= must be None so the worker "
         "inherits the orchestrator's full environment (token, PATH, "
         "etc.). Passing a partial dict would strip required vars."
     )
@@ -421,15 +421,15 @@ def test_no_env_override_when_pila_worker_debug_unset(pila, pila_dir,
 
 # ---- DEFAULT_CAPS cap registration --------------------------------------
 
-def test_worker_idle_warn_sec_in_default_caps(pila):
+def test_worker_idle_warn_sec_in_default_caps(leerie):
     """The new cap must be present in DEFAULT_CAPS and a positive
     number. This is the structural test that prevents drift between
     code and IMPLEMENTATION.md's caps table."""
-    assert "worker_idle_warn_sec" in pila.DEFAULT_CAPS, (
+    assert "worker_idle_warn_sec" in leerie.DEFAULT_CAPS, (
         "DEFAULT_CAPS must declare worker_idle_warn_sec — "
         "claude_p falls back to DEFAULT_CAPS when the cap is absent."
     )
-    v = pila.DEFAULT_CAPS["worker_idle_warn_sec"]
+    v = leerie.DEFAULT_CAPS["worker_idle_warn_sec"]
     assert isinstance(v, (int, float)) and v > 0, (
         f"worker_idle_warn_sec must be a positive number; got {v!r}"
     )
@@ -437,10 +437,10 @@ def test_worker_idle_warn_sec_in_default_caps(pila):
 
 # ---- D1: per-run override threads from caps through to _invoke ---------
 
-def _make_state(pila, run_dir: Path):
+def _make_state(leerie, run_dir: Path):
     """Minimal State-alike enough for claude_p to record telemetry —
     mirrors the helper in test_capture_call.py."""
-    st = pila.State.__new__(pila.State)
+    st = leerie.State.__new__(leerie.State)
     st.run_id = "test-run-d1"
     st.run_dir = run_dir
     st.path = run_dir / "state.json"
@@ -466,12 +466,12 @@ _OK_ENVELOPE = {
 
 
 def test_idle_warn_sec_threads_from_caps_through_claude_p(
-        pila, tmp_path, monkeypatch):
+        leerie, tmp_path, monkeypatch):
     """Regression test for the D1 defect: `claude_p` must pass its
     resolved `caps["worker_idle_warn_sec"]` value down to `_invoke` as
     the `idle_warn_sec` kwarg. Otherwise the watchdog silently falls
     back to `DEFAULT_CAPS["worker_idle_warn_sec"]` and any per-run
-    override (CLI / env / pila.toml) is ignored.
+    override (CLI / env / leerie.toml) is ignored.
 
     The watchdog itself runs inside `_invoke`; here we don't need to
     trigger it — we just spy on the kwargs `claude_p` passes to
@@ -483,18 +483,18 @@ def test_idle_warn_sec_threads_from_caps_through_claude_p(
         captured.update(kwargs)
         return _OK_ENVELOPE
 
-    monkeypatch.setattr(pila, "_invoke", spy_invoke)
-    monkeypatch.setattr(pila.State, "bump_workers",
+    monkeypatch.setattr(leerie, "_invoke", spy_invoke)
+    monkeypatch.setattr(leerie.State, "bump_workers",
                         lambda self, caps: None)
 
     run_dir = tmp_path / "runs" / "test-run-d1"
-    st = _make_state(pila, run_dir)
+    st = _make_state(leerie, run_dir)
     # The override value MUST be visibly different from
     # DEFAULT_CAPS["worker_idle_warn_sec"] so the assertion is
     # discriminating — a stale read of DEFAULT_CAPS would surface as
     # the wrong value here.
     override_value = 42
-    assert override_value != pila.DEFAULT_CAPS["worker_idle_warn_sec"], (
+    assert override_value != leerie.DEFAULT_CAPS["worker_idle_warn_sec"], (
         "test setup error: pick an override value that differs from "
         "the default so the assertion can distinguish them"
     )
@@ -504,7 +504,7 @@ def test_idle_warn_sec_threads_from_caps_through_claude_p(
         "worker_idle_warn_sec": override_value,
     }
 
-    asyncio.run(pila.claude_p(
+    asyncio.run(leerie.claude_p(
         user_prompt="x",
         system_prompt="y",
         schema_key="classifier",
@@ -523,13 +523,13 @@ def test_idle_warn_sec_threads_from_caps_through_claude_p(
         f"to _invoke as the idle_warn_sec kwarg so per-run overrides "
         f"take effect; got idle_warn_sec={captured.get('idle_warn_sec')!r}. "
         f"This is the D1 regression — if the watchdog reads DEFAULT_CAPS "
-        f"directly, any CLI / env / pila.toml override is silently "
+        f"directly, any CLI / env / leerie.toml override is silently "
         f"ignored."
     )
 
 
 def test_idle_warn_sec_falls_back_to_default_when_cap_absent(
-        pila, tmp_path, monkeypatch):
+        leerie, tmp_path, monkeypatch):
     """If a caller passes a caps dict that doesn't carry
     `worker_idle_warn_sec`, `claude_p` falls back to the DEFAULT_CAPS
     value rather than crashing. This is the safety hatch for older
@@ -541,16 +541,16 @@ def test_idle_warn_sec_falls_back_to_default_when_cap_absent(
         captured.update(kwargs)
         return _OK_ENVELOPE
 
-    monkeypatch.setattr(pila, "_invoke", spy_invoke)
-    monkeypatch.setattr(pila.State, "bump_workers",
+    monkeypatch.setattr(leerie, "_invoke", spy_invoke)
+    monkeypatch.setattr(leerie.State, "bump_workers",
                         lambda self, caps: None)
 
     run_dir = tmp_path / "runs" / "test-run-d1b"
-    st = _make_state(pila, run_dir)
+    st = _make_state(leerie, run_dir)
     # caps deliberately omits worker_idle_warn_sec.
     caps = {"worker_timeout_sec": 60, "max_total_workers": 99}
 
-    asyncio.run(pila.claude_p(
+    asyncio.run(leerie.claude_p(
         user_prompt="x",
         system_prompt="y",
         schema_key="classifier",
@@ -565,7 +565,7 @@ def test_idle_warn_sec_falls_back_to_default_when_cap_absent(
     ))
 
     assert captured.get("idle_warn_sec") == \
-        pila.DEFAULT_CAPS["worker_idle_warn_sec"], (
+        leerie.DEFAULT_CAPS["worker_idle_warn_sec"], (
         "when caps lacks worker_idle_warn_sec, claude_p must pass the "
         "DEFAULT_CAPS value to _invoke (not None, not zero); got "
         f"idle_warn_sec={captured.get('idle_warn_sec')!r}"
@@ -574,26 +574,26 @@ def test_idle_warn_sec_falls_back_to_default_when_cap_absent(
 
 # ---- Live stderr streaming (Fix 2) ------------------------------------
 
-def test_stderr_written_to_log_file_live(pila, pila_dir, monkeypatch):
+def test_stderr_written_to_log_file_live(leerie, leerie_dir, monkeypatch):
     """Each stderr line must be written to the per-sid log file with a
     `[ts] stderr` header, regardless of verbosity. This is the property
-    that lets `tail -f .pila/logs/<sid>.log` show stderr as it arrives,
+    that lets `tail -f .leerie/logs/<sid>.log` show stderr as it arrives,
     instead of (today) buffering silently until the worker exits or the
     watchdog fires."""
     events = [json.dumps({"type": "result", "subtype": "success",
                           "num_turns": 1, "is_error": False})]
-    stderr_payload = b"Claude configuration file not found at: /home/pila/.claude.json"
+    stderr_payload = b"Claude configuration file not found at: /home/leerie/.claude.json"
 
     async def fake(*cmd, **kwargs):
         return _DelayedProc(events, stderr_payload=stderr_payload)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=60, sid="t-stderr-file", pila_dir=pila_dir,
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-stderr-file", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
-    log_text = (pila_dir / "logs" / "t-stderr-file.log").read_text()
+    log_text = (leerie_dir / "logs" / "t-stderr-file.log").read_text()
     assert "stderr" in log_text, (
         "per-sid log file must contain a `stderr` header for each "
         "stderr line; got log text:\n" + log_text)
@@ -602,7 +602,7 @@ def test_stderr_written_to_log_file_live(pila, pila_dir, monkeypatch):
         "got log text:\n" + log_text)
 
 
-def test_stderr_echoed_to_orchestrator_at_stream(pila, pila_dir,
+def test_stderr_echoed_to_orchestrator_at_stream(leerie, leerie_dir,
                                                   monkeypatch, capsys):
     """At `stream` verbosity, each stderr line must be echoed to the
     orchestrator log as `[<sid>] stderr: <line>` so the user sees worker
@@ -616,9 +616,9 @@ def test_stderr_echoed_to_orchestrator_at_stream(pila, pila_dir,
         return _DelayedProc(events, stderr_payload=stderr_payload)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=60, sid="t-stderr-stream", pila_dir=pila_dir,
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-stderr-stream", leerie_dir=leerie_dir,
         verbosity="stream"))
 
     out = capsys.readouterr().out
@@ -630,7 +630,7 @@ def test_stderr_echoed_to_orchestrator_at_stream(pila, pila_dir,
         + out)
 
 
-def test_stderr_not_echoed_at_quiet(pila, pila_dir, monkeypatch, capsys):
+def test_stderr_not_echoed_at_quiet(leerie, leerie_dir, monkeypatch, capsys):
     """At `quiet` verbosity, stderr lines must NOT appear in the
     orchestrator's stdout. The per-sid log file still gets them — that
     invariant is covered by `test_stderr_written_to_log_file_live`."""
@@ -642,9 +642,9 @@ def test_stderr_not_echoed_at_quiet(pila, pila_dir, monkeypatch, capsys):
         return _DelayedProc(events, stderr_payload=stderr_payload)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=60, sid="t-stderr-quiet", pila_dir=pila_dir,
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-stderr-quiet", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
     out = capsys.readouterr().out
@@ -652,13 +652,13 @@ def test_stderr_not_echoed_at_quiet(pila, pila_dir, monkeypatch, capsys):
         "stderr must not echo to the orchestrator at `quiet` verbosity; "
         f"got:\n{out}")
     # File still gets it.
-    log_text = (pila_dir / "logs" / "t-stderr-quiet.log").read_text()
+    log_text = (leerie_dir / "logs" / "t-stderr-quiet.log").read_text()
     assert "chatty progress message" in log_text, (
         "per-sid log file must still capture stderr even at quiet; got "
         f"log text:\n{log_text}")
 
 
-def test_stderr_activity_resets_idle_watchdog(pila, pila_dir,
+def test_stderr_activity_resets_idle_watchdog(leerie, leerie_dir,
                                                monkeypatch, capsys):
     """A worker that emits stderr but no stdout is `recovery-loop`
     shaped — the worker is alive, talking, just stuck before its first
@@ -686,10 +686,10 @@ def test_stderr_activity_resets_idle_watchdog(pila, pila_dir,
     # 0.1s stderr arrival resets the clock so the watchdog wake at
     # 0.4s sees only 0.3s of silence — under the 0.3s threshold by
     # the tightest margin; bump warn to 0.4 to be safe.
-    monkeypatch.setitem(pila.DEFAULT_CAPS, "worker_idle_warn_sec", 0.4)
-    asyncio.run(pila._invoke(
-        ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-        timeout=10, sid="t-stderr-liveness", pila_dir=pila_dir,
+    monkeypatch.setitem(leerie.DEFAULT_CAPS, "worker_idle_warn_sec", 0.4)
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=10, sid="t-stderr-liveness", leerie_dir=leerie_dir,
         verbosity="quiet"))
 
     out = capsys.readouterr().out
@@ -698,9 +698,9 @@ def test_stderr_activity_resets_idle_watchdog(pila, pila_dir,
         + out)
 
 
-def test_stderr_chunks_preserved_for_exit_error(pila, pila_dir,
+def test_stderr_chunks_preserved_for_exit_error(leerie, leerie_dir,
                                                  monkeypatch):
-    """The exit-time WorkerError path (pila.py ~line 4195) decodes the
+    """The exit-time WorkerError path (leerie.py ~line 4195) decodes the
     full `stderr_chunks` buffer and includes it in the error message.
     Live streaming must NOT consume the buffer — it has to keep
     appending so the existing error path still works."""
@@ -711,10 +711,10 @@ def test_stderr_chunks_preserved_for_exit_error(pila, pila_dir,
         return _DelayedProc([], stderr_payload=stderr_payload)
 
     monkeypatch.setattr("asyncio.create_subprocess_exec", fake)
-    with pytest.raises(pila.WorkerError) as excinfo:
-        asyncio.run(pila._invoke(
-            ["claude", "-p", "x"], cwd=str(pila_dir.parent),
-            timeout=60, sid="t-stderr-exiterr", pila_dir=pila_dir,
+    with pytest.raises(leerie.WorkerError) as excinfo:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="t-stderr-exiterr", leerie_dir=leerie_dir,
             verbosity="quiet"))
     msg = str(excinfo.value)
     assert "authentication failed for tenant Z" in msg, (

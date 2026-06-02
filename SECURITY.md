@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Pila is pre-1.0. Only the latest minor release line receives security
+Leerie is pre-1.0. Only the latest minor release line receives security
 fixes.
 
 | Version | Supported |
@@ -10,13 +10,13 @@ fixes.
 | 0.2.x   | yes       |
 | < 0.2   | no        |
 
-Because Pila is pre-1.0, the public surface (CLI flags, `.pila/`
-layout, worker schemas, `pila.toml` keys) may change between minor
+Because Leerie is pre-1.0, the public surface (CLI flags, `.leerie/`
+layout, worker schemas, `leerie.toml` keys) may change between minor
 versions. Pin a commit if you need stability.
 
 ## Reporting a vulnerability
 
-Email **andres@enricai.com** with the subject prefix **`[pila-security]`**.
+Email **andres@enricai.com** with the subject prefix **`[leerie-security]`**.
 Please do not open a public GitHub issue or pull request for a suspected
 vulnerability.
 
@@ -24,7 +24,7 @@ What to include:
 
 - A description of the issue and its impact
 - A minimal reproduction (task, repo state, invocation)
-- The Pila commit you reproduced on
+- The Leerie commit you reproduced on
 - Your contact info for follow-up
 
 What to expect:
@@ -37,7 +37,7 @@ What to expect:
 
 ## Threat model context
 
-Pila's threat model is shaped by one load-bearing fact: **acting workers
+Leerie's threat model is shaped by one load-bearing fact: **acting workers
 run `claude -p --dangerously-skip-permissions`**. That is intentional — it is
 what makes the run unattended. The mitigation is not removing the flag; it
 is the worktree isolation and staging-branch review documented in
@@ -55,14 +55,14 @@ Any defect that violates the documented isolation or enforcement boundary:
   symlink into the main checkout, letting a worker write outside its
   worktree
 - **State-write vulnerabilities** — `validate_resume_state()` or the
-  `State.save()` write path being exploitable via a poisoned `.pila/`
-  directory (e.g., an attacker writing `.pila/state.json` so the next
+  `State.save()` write path being exploitable via a poisoned `.leerie/`
+  directory (e.g., an attacker writing `.leerie/state.json` so the next
   `--resume` does something unintended)
 - **Command injection** — unquoted or unsanitized expansion in
   `scripts/*.sh` that lets a task description, repo name, or filename
   inject shell commands
 - **Auto-merge bypass** — any defect causing a subtask branch to land
-  on the run branch (`pila/runs/<id>`) without the documented
+  on the run branch (`leerie/runs/<id>`) without the documented
   integrator gates, or causing the run-branch validation step to be
   skipped. (Phase 6 does not merge into the working branch — it pushes
   the run branch and opens a PR; the human review on that PR is the
@@ -73,7 +73,7 @@ Any defect that violates the documented isolation or enforcement boundary:
 
 ### Not vulnerabilities
 
-These are accepted risks of running Pila as designed; please do not
+These are accepted risks of running Leerie as designed; please do not
 report them as security issues:
 
 - **A worker doing something destructive inside its own worktree** —
@@ -83,7 +83,7 @@ report them as security issues:
   the integrator does exactly that by design; the safety boundary is at
   the user's review of the phase-6 PR, not at staging.
 - **Running on a repository whose `claude` CLI is misconfigured** —
-  Pila does not validate the user's `claude` credentials or
+  Leerie does not validate the user's `claude` credentials or
   permissions; this is upstream of the orchestrator.
 - **High disk usage from worktrees** — each subtask gets its own
   worktree; resource consumption is operational, not adversarial.

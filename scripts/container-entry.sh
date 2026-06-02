@@ -1,8 +1,8 @@
 #!/bin/sh
-# container-entry.sh — PID 1 of the pila container.
+# container-entry.sh — PID 1 of the leerie container.
 #
-# Bind-mounted from $PILA_HOME/scripts/container-entry.sh on the host to
-# /opt/pila-image/scripts/container-entry.sh inside the container, and
+# Bind-mounted from $LEERIE_HOME/scripts/container-entry.sh on the host to
+# /opt/leerie-image/scripts/container-entry.sh inside the container, and
 # referenced by Dockerfile's ENTRYPOINT.
 #
 # All it does: cd into the user's repo (bind-mounted at /work) and exec the
@@ -22,7 +22,7 @@ cd /work
 # machine stays up. The remote launcher invokes the orchestrator
 # separately by piping a Python wrapper through
 # `flyctl ssh console -C "python3 -"` (the wrapper uses
-# subprocess.Popen with start_new_session=True + user="pila" so the
+# subprocess.Popen with start_new_session=True + user="leerie" so the
 # orchestrator detaches cleanly with the right identity). The
 # container entrypoint just needs to keep the namespace alive. Local
 # nerdctl always passes argv (the task + flags), so this branch
@@ -31,4 +31,4 @@ if [ "$#" -eq 0 ]; then
   exec sleep infinity
 fi
 
-exec python3 /opt/pila-image/orchestrator/pila.py "$@"
+exec python3 /opt/leerie-image/orchestrator/leerie.py "$@"

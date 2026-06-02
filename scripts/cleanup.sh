@@ -1,28 +1,28 @@
 #!/usr/bin/env bash
-# cleanup.sh — remove a pila run's worktrees and (optionally) branches.
+# cleanup.sh — remove a leerie run's worktrees and (optionally) branches.
 #
 # Run from the repo root. Default behavior is run-scoped: cleanup never
 # touches more than one run at a time unless --all-runs is passed.
 #
 # Modes:
 #   cleanup.sh --run-id <id> [--branches | --subtask-branches]
-#     Remove .pila/runs/<id>/worktrees/* and prune git metadata.
-#     With --branches also delete pila/runs/<id> and
-#     pila/subtasks/<id>/* branches.
+#     Remove .leerie/runs/<id>/worktrees/* and prune git metadata.
+#     With --branches also delete leerie/runs/<id> and
+#     leerie/subtasks/<id>/* branches.
 #     With --subtask-branches delete only the subtask branches and keep
-#     pila/runs/<id> (the post-finalize default — the run branch is
+#     leerie/runs/<id> (the post-finalize default — the run branch is
 #     the PR head and must outlive the orchestrator).
 #
 #   cleanup.sh --all-runs [--branches | --subtask-branches]
-#     Same as above, applied to every directory under .pila/runs/
+#     Same as above, applied to every directory under .leerie/runs/
 #     (excluding _bootstrap-* — use --bootstrap for those).
 #
 #   cleanup.sh --bootstrap
-#     Remove orphaned .pila/runs/_bootstrap-* directories (runs that
+#     Remove orphaned .leerie/runs/_bootstrap-* directories (runs that
 #     died before classify completed and so have no stable run_id).
 #
 #   cleanup.sh  (no flag)
-#     Scans .pila/runs/*/state.json for the most recently failed run
+#     Scans .leerie/runs/*/state.json for the most recently failed run
 #     (most recent without finished_at), prompts y/N, cleans only that run.
 set -euo pipefail
 
@@ -43,7 +43,7 @@ clean_one_run() {
   # (full_purge) path inside the orchestrator, not this script.
   local run_id="$1"
   local branch_scope="$2"
-  local run_dir=".pila/runs/${run_id}"
+  local run_dir=".leerie/runs/${run_id}"
 
   if [ -d "${run_dir}/worktrees" ]; then
     for d in "${run_dir}/worktrees"/*/; do
@@ -56,7 +56,7 @@ clean_one_run() {
       # stale worktree directory persists across cleanups and blocks
       # `--resume`'s new-worktree.sh from re-creating the worktree at
       # the same path. Path is sandboxed under
-      # .pila/runs/<run-id>/worktrees/<sid>; the leading `[ -d ]` plus
+      # .leerie/runs/<run-id>/worktrees/<sid>; the leading `[ -d ]` plus
       # the glob restricts scope to that directory's children.
       if [ -d "$d" ]; then
         rm -rf "$d"
@@ -69,27 +69,27 @@ clean_one_run() {
   git worktree prune
 
   # Per-run branches live under two disjoint namespaces:
-  #   pila/runs/<run-id>           (the run branch itself)
-  #   pila/subtasks/<run-id>/<sid> (one branch per subtask)
+  #   leerie/runs/<run-id>           (the run branch itself)
+  #   leerie/subtasks/<run-id>/<sid> (one branch per subtask)
   # See DESIGN.md §3 for why the namespaces are split.
   case "$branch_scope" in
     1)  # --branches: delete both
       for b in $(git for-each-ref --format='%(refname:short)' \
-                 "refs/heads/pila/runs/${run_id}" \
-                 "refs/heads/pila/subtasks/${run_id}/"); do
+                 "refs/heads/leerie/runs/${run_id}" \
+                 "refs/heads/leerie/subtasks/${run_id}/"); do
         git branch -D "$b" 2>/dev/null || true
       done
       echo "cleanup: removed worktrees + branches for run ${run_id} (state dir kept as audit trail at ${run_dir}; rm -rf manually if no longer needed)"
       ;;
     2)  # --subtask-branches: delete subtask branches only
       for b in $(git for-each-ref --format='%(refname:short)' \
-                 "refs/heads/pila/subtasks/${run_id}/"); do
+                 "refs/heads/leerie/subtasks/${run_id}/"); do
         git branch -D "$b" 2>/dev/null || true
       done
-      echo "cleanup: removed worktrees + subtask branches for run ${run_id} (run branch pila/runs/${run_id} and state dir kept; pass --branches to delete the run branch too)"
+      echo "cleanup: removed worktrees + subtask branches for run ${run_id} (run branch leerie/runs/${run_id} and state dir kept; pass --branches to delete the run branch too)"
       ;;
     *)  # default: keep both
-      echo "cleanup: removed worktrees for run ${run_id} (branches pila/runs/${run_id} + pila/subtasks/${run_id}/* and state dir kept; pass --subtask-branches or --branches to delete branches too)"
+      echo "cleanup: removed worktrees for run ${run_id} (branches leerie/runs/${run_id} + leerie/subtasks/${run_id}/* and state dir kept; pass --subtask-branches or --branches to delete branches too)"
       ;;
   esac
 }
@@ -98,10 +98,10 @@ most_recent_failed_run() {
   # Find the most-recent run without finished_at. Echo run_id or "".
   local newest=""
   local newest_started=""
-  if [ ! -d .pila/runs ]; then
+  if [ ! -d .leerie/runs ]; then
     return
   fi
-  for dir in .pila/runs/*/; do
+  for dir in .leerie/runs/*/; do
     [ -d "$dir" ] || continue
     local base
     base="$(basename "$dir")"
@@ -176,12 +176,12 @@ BR_FLAG=0
 
 if [ "$BOOTSTRAP" = "true" ]; then
   # ----- orphaned bootstrap directories -----------------------------------
-  if [ ! -d .pila/runs ]; then
-    echo "cleanup: no .pila/runs/ to scan"
+  if [ ! -d .leerie/runs ]; then
+    echo "cleanup: no .leerie/runs/ to scan"
     exit 0
   fi
   removed=0
-  for dir in .pila/runs/_bootstrap-*/; do
+  for dir in .leerie/runs/_bootstrap-*/; do
     [ -d "$dir" ] || continue
     rm -rf "$dir"
     echo "cleanup: removed orphaned $(basename "$dir")"
@@ -195,12 +195,12 @@ fi
 
 if [ "$ALL_RUNS" = "true" ]; then
   # ----- every per-run directory (excluding _bootstrap-*) -----------------
-  if [ ! -d .pila/runs ]; then
-    echo "cleanup: no .pila/runs/ to clean"
+  if [ ! -d .leerie/runs ]; then
+    echo "cleanup: no .leerie/runs/ to clean"
     exit 0
   fi
   cleaned=0
-  for dir in .pila/runs/*/; do
+  for dir in .leerie/runs/*/; do
     [ -d "$dir" ] || continue
     base="$(basename "$dir")"
     case "$base" in _bootstrap-*) continue ;; esac
@@ -215,8 +215,8 @@ fi
 
 if [ -n "$RUN_ID" ]; then
   # ----- single-run cleanup ----------------------------------------------
-  if [ ! -d ".pila/runs/${RUN_ID}" ]; then
-    echo "cleanup: no run directory at .pila/runs/${RUN_ID}" >&2
+  if [ ! -d ".leerie/runs/${RUN_ID}" ]; then
+    echo "cleanup: no run directory at .leerie/runs/${RUN_ID}" >&2
     exit 1
   fi
   clean_one_run "$RUN_ID" "$BR_FLAG"

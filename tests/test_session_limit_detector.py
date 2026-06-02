@@ -28,8 +28,8 @@ VERBATIM = "You've hit your session limit · resets 3:10am (America/Bogota)"
 
 # --- positive cases -------------------------------------------------------
 
-def test_verbatim_message_returns_exit_with_parsed_reset_at(pila):
-    exc = pila.detect_session_limit(VERBATIM)
+def test_verbatim_message_returns_exit_with_parsed_reset_at(leerie):
+    exc = leerie.detect_session_limit(VERBATIM)
     assert exc is not None
     assert exc.raw_message == VERBATIM
     assert exc.reset_at is not None
@@ -39,42 +39,42 @@ def test_verbatim_message_returns_exit_with_parsed_reset_at(pila):
     assert exc.reset_at.tzinfo.key == "America/Bogota"
 
 
-def test_pm_time_normalizes_correctly(pila):
+def test_pm_time_normalizes_correctly(leerie):
     text = "You've hit your session limit · resets 7:30pm (UTC)"
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at.hour == 19
     assert exc.reset_at.minute == 30
 
 
-def test_midnight_12am_normalizes_to_hour_zero(pila):
+def test_midnight_12am_normalizes_to_hour_zero(leerie):
     text = "You've hit your session limit · resets 12:00am (UTC)"
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at.hour == 0
 
 
-def test_noon_12pm_stays_hour_twelve(pila):
+def test_noon_12pm_stays_hour_twelve(leerie):
     text = "You've hit your session limit · resets 12:00pm (UTC)"
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at.hour == 12
 
 
-def test_case_insensitive_prefix(pila):
+def test_case_insensitive_prefix(leerie):
     text = "YOU'VE HIT YOUR SESSION LIMIT · resets 3:10am (UTC)"
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
 
 
-def test_case_insensitive_ampm(pila):
+def test_case_insensitive_ampm(leerie):
     text = "You've hit your session limit · resets 3:10AM (UTC)"
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at.hour == 3
 
 
-def test_reset_time_in_past_rolls_to_tomorrow(pila, monkeypatch):
+def test_reset_time_in_past_rolls_to_tomorrow(leerie, monkeypatch):
     """If the parsed reset time is earlier than now (or equal), it's
     tomorrow. Without this the auto-resume would sleep for a negative
     duration and skip entirely."""
@@ -85,10 +85,10 @@ def test_reset_time_in_past_rolls_to_tomorrow(pila, monkeypatch):
         @classmethod
         def now(cls, tz=None):
             return fixed_now if tz is None else fixed_now.astimezone(tz)
-    monkeypatch.setattr(pila, "datetime", _FrozenDateTime)
+    monkeypatch.setattr(leerie, "datetime", _FrozenDateTime)
 
     text = "You've hit your session limit · resets 1:00am (UTC)"
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is not None
     # Tomorrow's 1am, not today's
@@ -98,15 +98,15 @@ def test_reset_time_in_past_rolls_to_tomorrow(pila, monkeypatch):
 
 # --- negative cases — must NOT match --------------------------------------
 
-def test_empty_text_returns_none(pila):
-    assert pila.detect_session_limit("") is None
+def test_empty_text_returns_none(leerie):
+    assert leerie.detect_session_limit("") is None
 
 
-def test_unrelated_text_returns_none(pila):
-    assert pila.detect_session_limit("The user asked a question.") is None
+def test_unrelated_text_returns_none(leerie):
+    assert leerie.detect_session_limit("The user asked a question.") is None
 
 
-def test_workers_discussing_rate_limit_code_returns_none(pila):
+def test_workers_discussing_rate_limit_code_returns_none(leerie):
     """The barnacle false-positive case I found in worker logs — a
     legitimate assistant text discussing rate-limit handling in code.
     Must NOT match. The detector's load-bearing requirement is that
@@ -116,63 +116,63 @@ def test_workers_discussing_rate_limit_code_returns_none(pila):
             'debug. `logger.warn` at line ~211: "hot path rate-limited '
             'for ${siteId}... not falling back" — this duplicates the '
             'event content.')
-    assert pila.detect_session_limit(text) is None
+    assert leerie.detect_session_limit(text) is None
 
 
-def test_general_rate_limit_mention_returns_none(pila):
+def test_general_rate_limit_mention_returns_none(leerie):
     text = "The API was rate-limited, but we caught the 429 and retried."
-    assert pila.detect_session_limit(text) is None
+    assert leerie.detect_session_limit(text) is None
 
 
 # --- parse-failure cases — must match but with reset_at=None --------------
 
-def test_unknown_timezone_returns_exit_with_none_reset(pila):
+def test_unknown_timezone_returns_exit_with_none_reset(leerie):
     """An unparseable timezone name must produce a clean fallback to
     manual --resume, not a wrong-time sleep."""
     text = "You've hit your session limit · resets 3:10am (Mars/Olympus)"
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is None
 
 
-def test_no_reset_clause_returns_exit_with_none_reset(pila):
+def test_no_reset_clause_returns_exit_with_none_reset(leerie):
     """The prefix matches but there's no `resets ...` clause."""
     text = "You've hit your session limit — please try again later."
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is None
 
 
-def test_malformed_time_returns_exit_with_none_reset(pila):
+def test_malformed_time_returns_exit_with_none_reset(leerie):
     """Hour out of range (25:xx) must fall back to None, not crash."""
     text = "You've hit your session limit · resets 25:00am (UTC)"
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is None
 
 
-def test_malformed_minute_returns_exit_with_none_reset(pila):
+def test_malformed_minute_returns_exit_with_none_reset(leerie):
     text = "You've hit your session limit · resets 3:99am (UTC)"
-    exc = pila.detect_session_limit(text)
+    exc = leerie.detect_session_limit(text)
     assert exc is not None
     assert exc.reset_at is None
 
 
 # --- exception shape ------------------------------------------------------
 
-def test_rate_limited_exit_is_baseexception(pila):
+def test_rate_limited_exit_is_baseexception(leerie):
     """Must subclass BaseException (not Exception) so the broad
     `except Exception` handlers inside orchestrate() don't swallow it
     — same pattern as InterruptedBySignal."""
-    assert issubclass(pila.RateLimitedExit, BaseException)
-    assert not issubclass(pila.RateLimitedExit, Exception)
+    assert issubclass(leerie.RateLimitedExit, BaseException)
+    assert not issubclass(leerie.RateLimitedExit, Exception)
 
 
-def test_rate_limited_exit_carries_fields(pila):
+def test_rate_limited_exit_carries_fields(leerie):
     """The exit's `reset_at` and `raw_message` are how main()'s
     handler decides between auto-resume and manual-resume — they
     must be set as attributes, not just constructor args."""
-    exc = pila.RateLimitedExit(reset_at=None, raw_message="hi")
+    exc = leerie.RateLimitedExit(reset_at=None, raw_message="hi")
     assert exc.reset_at is None
     assert exc.raw_message == "hi"
     assert str(exc) == "hi"
@@ -186,7 +186,7 @@ def test_main_has_rate_limited_exit_arm():
     handler and the auto-resume path wouldn't run."""
     from pathlib import Path
     src = (Path(__file__).resolve().parent.parent
-           / "orchestrator" / "pila.py").read_text()
+           / "orchestrator" / "leerie.py").read_text()
     assert "except RateLimitedExit" in src
 
 
@@ -196,7 +196,7 @@ def test_main_rate_limit_arm_appears_before_keyboard_interrupt():
     specific one needs to come first or it never fires."""
     from pathlib import Path
     src = (Path(__file__).resolve().parent.parent
-           / "orchestrator" / "pila.py").read_text()
+           / "orchestrator" / "leerie.py").read_text()
     rl_pos = src.find("except RateLimitedExit")
     ki_pos = src.find("except KeyboardInterrupt")
     assert rl_pos != -1

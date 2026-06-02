@@ -1,11 +1,11 @@
-"""Tests for the --runtime / PILA_RUNTIME / pila.toml `runtime` launcher knob.
+"""Tests for the --runtime / LEERIE_RUNTIME / leerie.toml `runtime` launcher knob.
 
 config-004 added a canonical RUNTIME variable that supersedes the legacy
 REMOTE/--remote interface.  The parsing logic lives in the bash launcher
-(`pila`), so these tests use a minimal bash harness that mirrors the exact
+(`leerie`), so these tests use a minimal bash harness that mirrors the exact
 resolution block and echoes the resolved RUNTIME value.
 
-The legacy --remote / PILA_REMOTE / pila.toml `remote=true` aliases are also
+The legacy --remote / LEERIE_REMOTE / leerie.toml `remote=true` aliases are also
 tested here because they map to RUNTIME=fly and the two knobs interact via
 the backward-compat alias path.
 """
@@ -16,14 +16,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-# Bash harness that mirrors the RUNTIME resolution block from `pila`.
+# Bash harness that mirrors the RUNTIME resolution block from `leerie`.
 # Precedence (lowest → highest): default → TOML → env → CLI.
 # The block order matches the fixed launcher:
 #   1. default RUNTIME=local
-#   2. legacy pila.toml remote=true → RUNTIME=fly
-#   3. canonical pila.toml runtime=...
-#   4. legacy PILA_REMOTE env alias → RUNTIME=fly
-#   5. canonical PILA_RUNTIME env
+#   2. legacy leerie.toml remote=true → RUNTIME=fly
+#   3. canonical leerie.toml runtime=...
+#   4. legacy LEERIE_REMOTE env alias → RUNTIME=fly
+#   5. canonical LEERIE_RUNTIME env
 #   6. CLI --remote (legacy) / --runtime=VALUE / --runtime VALUE
 _HARNESS = r"""
 #!/usr/bin/env bash
@@ -33,13 +33,13 @@ shift   # remaining args are simulated CLI
 
 RUNTIME=local
 
-if [ -f "$USER_REPO/pila.toml" ]; then
+if [ -f "$USER_REPO/leerie.toml" ]; then
   # step 2: legacy toml
   toml_remote="$(awk '/^[[:space:]]*remote[[:space:]]*=/ {
                         gsub(/^[[:space:]]*remote[[:space:]]*=[[:space:]]*/, "", $0);
                         gsub(/^"|"$/, "", $0);
                         print; exit
-                      }' "$USER_REPO/pila.toml" 2>/dev/null || true)"
+                      }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
   case "${toml_remote:-}" in
     1|true|TRUE|yes|YES) RUNTIME=fly ;;
   esac
@@ -48,28 +48,28 @@ if [ -f "$USER_REPO/pila.toml" ]; then
                          gsub(/^[[:space:]]*runtime[[:space:]]*=[[:space:]]*/, "", $0);
                          gsub(/^"|"$/, "", $0);
                          print; exit
-                       }' "$USER_REPO/pila.toml" 2>/dev/null || true)"
+                       }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
   case "${toml_runtime:-}" in
     local|fly) RUNTIME="${toml_runtime}" ;;
     "")        : ;;
     *)
-      echo "pila: pila.toml: runtime=${toml_runtime} is not one of local|fly" >&2
+      echo "leerie: leerie.toml: runtime=${toml_runtime} is not one of local|fly" >&2
       exit 1
       ;;
   esac
 fi
 
 # step 4: legacy env alias
-case "${PILA_REMOTE:-}" in
+case "${LEERIE_REMOTE:-}" in
   1|true|TRUE|yes|YES) RUNTIME=fly ;;
 esac
 
 # step 5: canonical env
-case "${PILA_RUNTIME:-}" in
-  local|fly) RUNTIME="${PILA_RUNTIME}" ;;
+case "${LEERIE_RUNTIME:-}" in
+  local|fly) RUNTIME="${LEERIE_RUNTIME}" ;;
   "")        : ;;
   *)
-    echo "pila: PILA_RUNTIME=${PILA_RUNTIME} is not one of local|fly" >&2
+    echo "leerie: LEERIE_RUNTIME=${LEERIE_RUNTIME} is not one of local|fly" >&2
     exit 1
     ;;
 esac
@@ -81,7 +81,7 @@ for arg in "$@"; do
     --runtime=local)   RUNTIME=local ;;
     --runtime=fly)     RUNTIME=fly ;;
     --runtime=*)
-      echo "pila: --runtime=${arg#--runtime=} is not one of local|fly" >&2
+      echo "leerie: --runtime=${arg#--runtime=} is not one of local|fly" >&2
       exit 1
       ;;
   esac
@@ -94,7 +94,7 @@ for arg in "$@"; do
     case "$arg" in
       local|fly) RUNTIME="$arg" ;;
       *)
-        echo "pila: --runtime $arg is not one of local|fly" >&2
+        echo "leerie: --runtime $arg is not one of local|fly" >&2
         exit 1
         ;;
     esac
@@ -138,26 +138,26 @@ def test_default_is_local(tmp_path):
     assert out == "local"
 
 
-# ── canonical env PILA_RUNTIME ───────────────────────────────────────────────
+# ── canonical env LEERIE_RUNTIME ───────────────────────────────────────────────
 
 
-def test_pila_runtime_fly(tmp_path):
-    out, _ = _run(tmp_path, {"PILA_RUNTIME": "fly"}, [])
+def test_leerie_runtime_fly(tmp_path):
+    out, _ = _run(tmp_path, {"LEERIE_RUNTIME": "fly"}, [])
     assert out == "fly"
 
 
-def test_pila_runtime_local_explicit(tmp_path):
-    out, _ = _run(tmp_path, {"PILA_RUNTIME": "local"}, [])
+def test_leerie_runtime_local_explicit(tmp_path):
+    out, _ = _run(tmp_path, {"LEERIE_RUNTIME": "local"}, [])
     assert out == "local"
 
 
-def test_pila_runtime_empty_treated_as_unset(tmp_path):
-    out, _ = _run(tmp_path, {"PILA_RUNTIME": ""}, [])
+def test_leerie_runtime_empty_treated_as_unset(tmp_path):
+    out, _ = _run(tmp_path, {"LEERIE_RUNTIME": ""}, [])
     assert out == "local"
 
 
-def test_pila_runtime_invalid_exits_nonzero(tmp_path):
-    _, err = _run(tmp_path, {"PILA_RUNTIME": "nope"}, [], expect_fail=True)
+def test_leerie_runtime_invalid_exits_nonzero(tmp_path):
+    _, err = _run(tmp_path, {"LEERIE_RUNTIME": "nope"}, [], expect_fail=True)
     assert "is not one of local|fly" in err
     assert "nope" in err
 
@@ -166,26 +166,26 @@ def test_pila_runtime_invalid_exits_nonzero(tmp_path):
 
 
 def test_toml_runtime_fly(tmp_path):
-    (tmp_path / "pila.toml").write_text("runtime = fly\n")
+    (tmp_path / "leerie.toml").write_text("runtime = fly\n")
     out, _ = _run(tmp_path, {}, [])
     assert out == "fly"
 
 
 def test_toml_runtime_local_explicit(tmp_path):
-    (tmp_path / "pila.toml").write_text("runtime = local\n")
+    (tmp_path / "leerie.toml").write_text("runtime = local\n")
     out, _ = _run(tmp_path, {}, [])
     assert out == "local"
 
 
 def test_toml_runtime_invalid_exits_nonzero(tmp_path):
-    (tmp_path / "pila.toml").write_text("runtime = bogus\n")
+    (tmp_path / "leerie.toml").write_text("runtime = bogus\n")
     _, err = _run(tmp_path, {}, [], expect_fail=True)
     assert "is not one of local|fly" in err
     assert "bogus" in err
 
 
 def test_toml_runtime_unrelated_key_stays_local(tmp_path):
-    (tmp_path / "pila.toml").write_text("source_of_truth = codebase\n")
+    (tmp_path / "leerie.toml").write_text("source_of_truth = codebase\n")
     out, _ = _run(tmp_path, {}, [])
     assert out == "local"
 
@@ -222,18 +222,18 @@ def test_cli_runtime_invalid_exits_nonzero(tmp_path):
 
 
 def test_cli_wins_over_env(tmp_path):
-    out, _ = _run(tmp_path, {"PILA_RUNTIME": "fly"}, ["--runtime=local"])
+    out, _ = _run(tmp_path, {"LEERIE_RUNTIME": "fly"}, ["--runtime=local"])
     assert out == "local"
 
 
 def test_env_wins_over_toml(tmp_path):
-    (tmp_path / "pila.toml").write_text("runtime = fly\n")
-    out, _ = _run(tmp_path, {"PILA_RUNTIME": "local"}, [])
+    (tmp_path / "leerie.toml").write_text("runtime = fly\n")
+    out, _ = _run(tmp_path, {"LEERIE_RUNTIME": "local"}, [])
     assert out == "local"
 
 
 def test_cli_wins_over_toml(tmp_path):
-    (tmp_path / "pila.toml").write_text("runtime = fly\n")
+    (tmp_path / "leerie.toml").write_text("runtime = fly\n")
     out, _ = _run(tmp_path, {}, ["--runtime=local"])
     assert out == "local"
 
@@ -241,8 +241,8 @@ def test_cli_wins_over_toml(tmp_path):
 # ── legacy backward-compat aliases ────────────────────────────────────────────
 
 
-def test_legacy_env_pila_remote_maps_to_fly(tmp_path):
-    out, _ = _run(tmp_path, {"PILA_REMOTE": "1"}, [])
+def test_legacy_env_leerie_remote_maps_to_fly(tmp_path):
+    out, _ = _run(tmp_path, {"LEERIE_REMOTE": "1"}, [])
     assert out == "fly"
 
 
@@ -252,19 +252,19 @@ def test_legacy_cli_remote_maps_to_fly(tmp_path):
 
 
 def test_legacy_toml_remote_true_maps_to_fly(tmp_path):
-    (tmp_path / "pila.toml").write_text("remote = true\n")
+    (tmp_path / "leerie.toml").write_text("remote = true\n")
     out, _ = _run(tmp_path, {}, [])
     assert out == "fly"
 
 
 def test_canonical_env_beats_legacy_env(tmp_path):
-    """PILA_RUNTIME=local beats PILA_REMOTE=1 because canonical is resolved after."""
-    out, _ = _run(tmp_path, {"PILA_REMOTE": "1", "PILA_RUNTIME": "local"}, [])
+    """LEERIE_RUNTIME=local beats LEERIE_REMOTE=1 because canonical is resolved after."""
+    out, _ = _run(tmp_path, {"LEERIE_REMOTE": "1", "LEERIE_RUNTIME": "local"}, [])
     assert out == "local"
 
 
 def test_canonical_toml_beats_legacy_toml(tmp_path):
-    """runtime=local wins over remote=true in the same pila.toml."""
-    (tmp_path / "pila.toml").write_text("remote = true\nruntime = local\n")
+    """runtime=local wins over remote=true in the same leerie.toml."""
+    (tmp_path / "leerie.toml").write_text("remote = true\nruntime = local\n")
     out, _ = _run(tmp_path, {}, [])
     assert out == "local"

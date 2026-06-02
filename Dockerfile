@@ -1,27 +1,27 @@
-# pila container image — see docs/IMPLEMENTATION.md §0.5 "Container shape".
+# leerie container image — see docs/IMPLEMENTATION.md §0.5 "Container shape".
 #
-# Built locally on first `pila` run; tagged `pila:<VERSION>` so a pila upgrade
+# Built locally on first `leerie` run; tagged `leerie:<VERSION>` so a leerie upgrade
 # rebuilds once and reuses layers thereafter.
 #
-# LOCAL MODE: the launcher bind-mounts $PILA_HOME → /opt/pila-image:ro at
-# runtime, shadowing the baked-in COPY layers. Editing orchestrator/pila.py
+# LOCAL MODE: the launcher bind-mounts $LEERIE_HOME → /opt/leerie-image:ro at
+# runtime, shadowing the baked-in COPY layers. Editing orchestrator/leerie.py
 # on the host takes effect on the next run without an image rebuild.
 #
 # REGISTRY / FLY MODE: the COPY instructions below bake orchestrator/,
-# scripts/, prompts/, and .claude-plugin/ into /opt/pila-image/ so the
+# scripts/, prompts/, and .claude-plugin/ into /opt/leerie-image/ so the
 # image is self-contained without a bind-mount. An image rebuild IS required
 # after source changes.
 #
-# Lives at /opt/pila-image/ (NOT /work/.pila-image/) so the remote-seed
+# Lives at /opt/leerie-image/ (NOT /work/.leerie-image/) so the remote-seed
 # phase can `rm -rf /work` without clobbering the orchestrator code.
 
 FROM debian:13-slim
 
-# Base tools pila + claude -p + typical worker tasks need.
-# build-essential covers native-module compilation (sharp, bcrypt, etc.) so
+# Base tools leerie + claude -p + typical worker tasks need.
+# build-essential covers native-module comleerietion (sharp, bcrypt, etc.) so
 # `npm install` doesn't fail on first run in a fresh worktree.
 # procps provides `ps`, which the orchestrator's PPID-walk fast-cleanup path
-# (pila.py:925) calls between waves. Without it the walk silently degrades
+# (leerie.py:925) calls between waves. Without it the walk silently degrades
 # to no-op via the OSError catch — correctness is fine, but the documented
 # fast-happy-path is gone. ~1MB image cost.
 # rsync is the receiver for the dirty-delta phase of seed-repo.sh
@@ -45,8 +45,8 @@ RUN pip3 install --break-system-packages --no-cache-dir -r /tmp/requirements.txt
     && rm /tmp/requirements.txt
 
 # GitHub CLI — the finalize phase pushes the run branch and opens a PR via
-# `gh pr create` (pila.py:5828). Without this, default-mode runs die at the
-# preflight `shutil.which("gh")` check (pila.py:1282). GitHub publishes a
+# `gh pr create` (leerie.py:5828). Without this, default-mode runs die at the
+# preflight `shutil.which("gh")` check (leerie.py:1282). GitHub publishes a
 # Debian apt repo with arch-aware packages; install from there.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       gnupg \
@@ -64,7 +64,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # and .nvmrc / .python-version / .ruby-version / rust-toolchain.toml
 # via the MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS env below (those
 # files are opt-in in current mise; without the env they are silently
-# ignored). go.mod's `go 1.X` line is NOT parsed by mise; pila
+# ignored). go.mod's `go 1.X` line is NOT parsed by mise; leerie
 # synthesizes a .go-version override at provision time.
 #
 # The mise.run script reads $MISE_VERSION; pin for reproducibility.
@@ -86,13 +86,13 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="${MISE_VERSION}" sh \
 # needed.
 #
 # DATA_DIR is where mise installs per-repo runtime versions; the
-# launcher bind-mounts this from ~/.cache/pila/mise-data so installs
+# launcher bind-mounts this from ~/.cache/leerie/mise-data so installs
 # survive across runs. SYSTEM_DATA_DIR is where the LTS fallback
 # lives (baked below). The resolver checks DATA_DIR first then falls
 # through to SYSTEM_DATA_DIR (mise.jdx.dev/mise-cookbook/docker.html).
 ENV MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=node,python,ruby,rust
 ENV MISE_NODE_COREPACK=true
-ENV MISE_DATA_DIR=/home/pila/.local/share/mise
+ENV MISE_DATA_DIR=/home/leerie/.local/share/mise
 ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
 
 # Pre-install LTS Node + Python via `mise install --system`. Lands
@@ -115,13 +115,13 @@ RUN set -eux; \
 #   1. mise's system shims (mise install --system populates these).
 #   2. LTS Node bin (image-baked claude lives here).
 #   3. (then the pre-existing PATH)
-# At runtime the user dir's shims at /home/pila/.local/share/mise/shims
+# At runtime the user dir's shims at /home/leerie/.local/share/mise/shims
 # don't appear here because they're added by `mise activate` or by
 # wrapping commands with `mise exec --` — both of which the
 # orchestrator does explicitly when invoking install commands.
 ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:$PATH
 
-# Claude Code CLI. Pila enforces ≥ 2.1.22 at runtime (pila.py:1245).
+# Claude Code CLI. Leerie enforces ≥ 2.1.22 at runtime (leerie.py:1245).
 # Installs globally against the LTS Node — lands at
 # /usr/local/share/mise/installs/node/lts-current/lib/node_modules
 # with a bin shim at .../bin/claude (on PATH via the line above).
@@ -133,63 +133,63 @@ RUN npm install -g @anthropic-ai/claude-code
 ARG HOST_UID=501
 ARG HOST_GID=20
 RUN if ! getent group "${HOST_GID}" >/dev/null 2>&1; then \
-      groupadd -g "${HOST_GID}" pila; \
+      groupadd -g "${HOST_GID}" leerie; \
     fi; \
-    useradd -u "${HOST_UID}" -g "${HOST_GID}" -m -s /bin/bash pila
+    useradd -u "${HOST_UID}" -g "${HOST_GID}" -m -s /bin/bash leerie
 
 # Relax git's CVE-2022-24765 safe.directory check inside the container.
 # Under Colima/virtiofs the /work bind-mount root reports a gid that
-# does not match the pila user (stat shows /work as 501:1000 vs the
-# pila user's 501:20), which trips the check when worker bash tools
+# does not match the leerie user (stat shows /work as 501:1000 vs the
+# leerie user's 501:20), which trips the check when worker bash tools
 # run `git -C <worktree-subdir> ...` against per-subtask worktree
-# subdirs. The container is single-tenant (pila user only) and /work
+# subdirs. The container is single-tenant (leerie user only) and /work
 # is its only repo, so the system-wide /etc/gitconfig is the cleanest
 # mitigation — it applies to every user inside the container with no
 # HOME-handling risk (matches the posture of every major CI image).
 RUN git config --system --add safe.directory '*'
 
 # /inspect/ holds read-only bind mounts the launcher creates per
-# --inspect-dir flag. Pre-created (and owned by pila) so the mount targets
+# --inspect-dir flag. Pre-created (and owned by leerie) so the mount targets
 # exist when nerdctl creates them at runtime.
-RUN mkdir -p /inspect && chown pila:"${HOST_GID}" /inspect
+RUN mkdir -p /inspect && chown leerie:"${HOST_GID}" /inspect
 
-# Pre-create the pila user's MISE_DATA_DIR and the per-tool cache
+# Pre-create the leerie user's MISE_DATA_DIR and the per-tool cache
 # mount targets so the launcher's bind-mounts attach cleanly and the
 # user dir owns the right metadata for mise's first run. Also chown
-# /home/pila itself — `useradd -m` produces /home/pila with mode 0755
+# /home/leerie itself — `useradd -m` produces /home/leerie with mode 0755
 # but observed images have it as root:root, so the runtime user can't
 # create new dotfiles (e.g. `mise install` invokes gpg, which mkdirs
 # ~/.gnupg and fails with EACCES). The .gnupg subdir is pre-created
 # at mode 0700, which GPG requires.
-RUN mkdir -p /home/pila/.local/share/mise \
-             /home/pila/.cache/pila/pnpm-store \
-             /home/pila/.cache/pila/pip \
-             /home/pila/.cache/pila/go-mod \
-             /home/pila/.cache/pila/cargo \
-             /home/pila/.gnupg \
-    && chown pila:"${HOST_GID}" /home/pila \
-    && chown -R pila:"${HOST_GID}" /home/pila/.local /home/pila/.cache /home/pila/.gnupg \
-    && chmod 700 /home/pila/.gnupg
+RUN mkdir -p /home/leerie/.local/share/mise \
+             /home/leerie/.cache/leerie/pnpm-store \
+             /home/leerie/.cache/leerie/pip \
+             /home/leerie/.cache/leerie/go-mod \
+             /home/leerie/.cache/leerie/cargo \
+             /home/leerie/.gnupg \
+    && chown leerie:"${HOST_GID}" /home/leerie \
+    && chown -R leerie:"${HOST_GID}" /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg \
+    && chmod 700 /home/leerie/.gnupg
 
-# Bake the orchestrator source into the image at /opt/pila-image/ so the
+# Bake the orchestrator source into the image at /opt/leerie-image/ so the
 # image is self-contained on Fly.io Machines (no host bind mount available).
 # Lives OUTSIDE /work so the remote-seed phase can `rm -rf /work` without
-# clobbering the orchestrator code. Local runs bind-mount the host pila
-# repo at /opt/pila-image:ro (see launcher) — same path inside the
-# container, so /opt/pila-image/orchestrator/pila.py works identically
-# in both modes. COPY runs as root; chown transfers ownership to pila.
-COPY orchestrator/ /opt/pila-image/orchestrator/
-COPY scripts/ /opt/pila-image/scripts/
-COPY prompts/ /opt/pila-image/prompts/
-COPY .claude-plugin/ /opt/pila-image/.claude-plugin/
-RUN chown -R pila:"${HOST_GID}" /opt/pila-image
-# /work must be writable by pila for the orchestrator to create
-# /work/.pila on remote (Fly Machine) runs. Local runs bind-mount
+# clobbering the orchestrator code. Local runs bind-mount the host leerie
+# repo at /opt/leerie-image:ro (see launcher) — same path inside the
+# container, so /opt/leerie-image/orchestrator/leerie.py works identically
+# in both modes. COPY runs as root; chown transfers ownership to leerie.
+COPY orchestrator/ /opt/leerie-image/orchestrator/
+COPY scripts/ /opt/leerie-image/scripts/
+COPY prompts/ /opt/leerie-image/prompts/
+COPY .claude-plugin/ /opt/leerie-image/.claude-plugin/
+RUN chown -R leerie:"${HOST_GID}" /opt/leerie-image
+# /work must be writable by leerie for the orchestrator to create
+# /work/.leerie on remote (Fly Machine) runs. Local runs bind-mount
 # $(pwd):/work which masks the image's /work permission; remote runs
-# use the image's /work directly, so it must be owned by pila.
-RUN mkdir -p /work && chown pila:"${HOST_GID}" /work
+# use the image's /work directly, so it must be owned by leerie.
+RUN mkdir -p /work && chown leerie:"${HOST_GID}" /work
 
-USER pila
+USER leerie
 WORKDIR /work
 
-ENTRYPOINT ["/opt/pila-image/scripts/container-entry.sh"]
+ENTRYPOINT ["/opt/leerie-image/scripts/container-entry.sh"]

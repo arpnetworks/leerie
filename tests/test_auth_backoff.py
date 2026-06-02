@@ -28,8 +28,8 @@ import pytest
     {"api_error_status": None,
      "result": "INVALID AUTHENTICATION provided"},
 ])
-def test_auth_or_quota_envelopes_match(pila, envelope):
-    assert pila._is_auth_or_quota_failure(envelope) is True
+def test_auth_or_quota_envelopes_match(leerie, envelope):
+    assert leerie._is_auth_or_quota_failure(envelope) is True
 
 
 # --- negatives: should NOT classify as auth/quota -------------------------
@@ -49,21 +49,21 @@ def test_auth_or_quota_envelopes_match(pila, envelope):
     {"api_error_status": None,
      "result": "the run produced no structured_output"},
 ])
-def test_non_auth_envelopes_do_not_match(pila, envelope):
-    assert pila._is_auth_or_quota_failure(envelope) is False
+def test_non_auth_envelopes_do_not_match(leerie, envelope):
+    assert leerie._is_auth_or_quota_failure(envelope) is False
 
 
-def test_classifier_tolerates_non_string_result(pila):
+def test_classifier_tolerates_non_string_result(leerie):
     """`result` is normally a string, but `str(None)` is `'None'` — the
     classifier coerces via str() so a missing key never raises."""
-    assert pila._is_auth_or_quota_failure({"result": None}) is False
+    assert leerie._is_auth_or_quota_failure({"result": None}) is False
 
 
 # --- cap is wired into DEFAULT_CAPS ---------------------------------------
 
-def test_auth_retry_max_sec_is_in_default_caps(pila):
+def test_auth_retry_max_sec_is_in_default_caps(leerie):
     """The backoff budget lives in DEFAULT_CAPS per CLAUDE.md
     'caps are real Python counters' rule."""
-    assert "auth_retry_max_sec" in pila.DEFAULT_CAPS
-    assert isinstance(pila.DEFAULT_CAPS["auth_retry_max_sec"], int)
-    assert pila.DEFAULT_CAPS["auth_retry_max_sec"] > 0
+    assert "auth_retry_max_sec" in leerie.DEFAULT_CAPS
+    assert isinstance(leerie.DEFAULT_CAPS["auth_retry_max_sec"], int)
+    assert leerie.DEFAULT_CAPS["auth_retry_max_sec"] > 0

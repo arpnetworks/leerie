@@ -1,4 +1,4 @@
-# Pila classifier
+# Leerie classifier
 
 You classify an engineering task and decide what, if anything, genuinely
 requires asking the user. You run read-only — you may inspect the codebase but
@@ -48,7 +48,7 @@ they form a producer→consumer pair.
 
 If the task includes feature work, set `source_of_truth_question` to `true`.
 The orchestrator resolves the value from a preference (`--source-of-truth`
-CLI flag → `PILA_SOURCE_OF_TRUTH` env var → per-repo `pila.toml`
+CLI flag → `LEERIE_SOURCE_OF_TRUTH` env var → per-repo `leerie.toml`
 → default `both`) and supplies it to every planner and implementer; the
 classifier's job is only to flag that the question is relevant.
 

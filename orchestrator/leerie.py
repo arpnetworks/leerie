@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Pila — deterministic task orchestrator for Claude Code.
+Leerie — deterministic task orchestrator for Claude Code.
 
 Runs entirely on the Claude Code CLI / subscription. Every unit of LLM work is
 a `claude -p` headless invocation. This script owns ALL control flow — phase
@@ -11,10 +11,10 @@ Each worker is a separate `claude -p` process, so there is no subagent nesting
 anywhere. The script is the orchestrator; each `claude -p` call is a leaf.
 
 Usage:
-    pila "<task description>"
-    pila --resume
-    pila "<task>" --answers answers.json
-    pila "<task>" --clarify             # opt into surfacing intent questions
+    leerie "<task description>"
+    leerie --resume
+    leerie "<task>" --answers answers.json
+    leerie "<task>" --clarify             # opt into surfacing intent questions
 
 Run it from the root of the target git repository.
 """
@@ -49,7 +49,7 @@ from tenacity import (
     wait_exponential_jitter,
 )
 
-ROOT = Path(__file__).resolve().parent.parent       # pila plugin/repo root
+ROOT = Path(__file__).resolve().parent.parent       # leerie plugin/repo root
 PROMPTS = ROOT / "prompts"
 SCRIPTS = ROOT / "scripts"
 
@@ -99,7 +99,7 @@ DEFAULT_CAPS = {
     # pools / webpack workers / tsc) is unbounded — the only orchestrator-
     # side knob that bounds total in-flight memory load is the worker count.
     # At max_parallel=4 a typical Next.js repo can run 3+ concurrent Node
-    # toolchain processes (each 1-2 GiB RSS) before pila even notices, which
+    # toolchain processes (each 1-2 GiB RSS) before leerie even notices, which
     # is exactly the load profile that OOM'd the finalmemoriam run.
     # max_parallel=2 keeps the worst-case peak within reach of a 16 GiB VM.
     # Users with larger VMs / lighter toolchains can opt up via --max-parallel.
@@ -130,14 +130,14 @@ DEFAULT_CAPS = {
     "worker_idle_warn_sec": 300,
     # Worker-internal evidence-gate iterations for planner and implementer
     # (DESIGN §8 + §13). User-tunable via --confidence-rounds /
-    # PILA_CONFIDENCE_ROUNDS / pila.toml; see IMPLEMENTATION.md §2
+    # LEERIE_CONFIDENCE_ROUNDS / leerie.toml; see IMPLEMENTATION.md §2
     # "Confidence rounds". The orchestrator does not count these iterations
     # — the cap is passed into each worker's prompt and the worker bounds
     # itself. Surfacing the knob is for tuning persistence, not for
     # promoting a prompt-governed limit to a code guarantee.
     "confidence_rounds": 8,
     # Per-worker cgroup v2 memory cap (bytes). Each `claude -p` worker is
-    # enrolled in its own child cgroup at /sys/fs/cgroup/pila-w-<sid>/ and
+    # enrolled in its own child cgroup at /sys/fs/cgroup/leerie-w-<sid>/ and
     # the cgroup's memory.max is set to this value. When a worker's tool
     # subtree (vitest, tsc, webpack workers, etc.) tries to allocate past
     # the cap, the kernel OOM-kills inside the cgroup — sshd / pid 1 /
@@ -146,7 +146,7 @@ DEFAULT_CAPS = {
     # Colima VM showed agetty → journald → sshd → lima-guestagent killed
     # because a vitest worker blew past 1.85 GB RSS inside the
     # container's single memcg). Resolved at runtime by
-    # resolve_worker_memory_max — CLI > env > pila.toml > default. The
+    # resolve_worker_memory_max — CLI > env > leerie.toml > default. The
     # default value of None means "auto-derive from /proc/meminfo at run
     # start" (see _auto_worker_memory_max).
     "worker_memory_max_bytes": None,
@@ -239,17 +239,17 @@ CATEGORY_ABBREV = {
     "documentation": "docs",
 }
 
-# Paths an implementer (or conformer) may never write to. `.pila/` and
+# Paths an implementer (or conformer) may never write to. `.leerie/` and
 # `.git/` are coordination-only — the run state lives in the former, git
 # plumbing in the latter; neither is the implementer's surface. Inside
 # `.claude/`, the three documented user-deliverable subtrees are exempt
 # (`agents/`, `commands/`, `skills/`) because they ARE legitimate
-# deliverables — pila's own self-healing skill, for instance, instructs
+# deliverables — leerie's own self-healing skill, for instance, instructs
 # consumers to write a subagent file at `.claude/agents/<name>.md`.
 # Top-level `.claude/` files (`settings.json`, `settings.local.json`,
 # any future per-session state) stay protected — they are coordination
 # and config, not deliverable customizations. See DESIGN §9.
-_PROTECTED_PREFIXES = (".pila/", ".git/")
+_PROTECTED_PREFIXES = (".leerie/", ".git/")
 _CLAUDE_DELIVERABLE_PREFIXES = (
     ".claude/agents/", ".claude/commands/", ".claude/skills/",
 )
@@ -278,7 +278,7 @@ _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
 # Write/Edit are deliberately omitted: by default, the §12 "read-only
 # worker" contract stays mechanically enforced — anything outside this
 # allowlist falls through and is rejected in non-interactive mode. The
-# top-level `pila --dangerously-skip-permissions` flag (DESIGN §12 last
+# top-level `leerie --dangerously-skip-permissions` flag (DESIGN §12 last
 # paragraph) is the documented escape hatch: when set, claude_p passes
 # --dangerously-skip-permissions to every worker, including the inspect
 # bucket; the allowlist still names what the worker can call without
@@ -300,66 +300,66 @@ ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit"
 # so cross-repo references like "~/src/enric/beacon" fail with "blocked,
 # outside allowed working directories". Repeatable on the CLI; env var is
 # colon-separated; TOML key is a comma-separated string. Empty by default.
-INSPECT_DIRS_ENV = "PILA_INSPECT_DIRS"
-INSPECT_DIRS_FILE = "pila.toml"
+INSPECT_DIRS_ENV = "LEERIE_INSPECT_DIRS"
+INSPECT_DIRS_FILE = "leerie.toml"
 
 EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
 
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
-# --source-of-truth CLI flag → PILA_SOURCE_OF_TRUTH env var →
-# per-repo pila.toml → 'both'. CLI/env are session knobs, so they
+# --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
+# per-repo leerie.toml → 'both'. CLI/env are session knobs, so they
 # outrank the committed file default. The preference is never surfaced
 # as an interactive question: any explicit setting overrides the
 # default, and unset means the caller implicitly accepted 'both'.
 SOURCE_OF_TRUTH_VALUES = ("codebase", "research", "both")
-SOURCE_OF_TRUTH_ENV = "PILA_SOURCE_OF_TRUTH"
-SOURCE_OF_TRUTH_FILE = "pila.toml"
+SOURCE_OF_TRUTH_ENV = "LEERIE_SOURCE_OF_TRUTH"
+SOURCE_OF_TRUTH_FILE = "leerie.toml"
 
 # Runtime mode — see IMPLEMENTATION.md §2 "Runtime mode". Resolution order:
-# --runtime CLI flag → PILA_RUNTIME env var → per-repo pila.toml → 'local'.
+# --runtime CLI flag → LEERIE_RUNTIME env var → per-repo leerie.toml → 'local'.
 # CLI/env are session knobs and outrank the committed file default.
 RUNTIME_VALUES = ("local", "fly")
-RUNTIME_ENV = "PILA_RUNTIME"
+RUNTIME_ENV = "LEERIE_RUNTIME"
 RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
 
 # Confidence-rounds preference — see IMPLEMENTATION.md §2 "Confidence
 # rounds". Resolution order: --confidence-rounds CLI flag →
-# PILA_CONFIDENCE_ROUNDS env var → pila.toml → DEFAULT_CAPS
+# LEERIE_CONFIDENCE_ROUNDS env var → leerie.toml → DEFAULT_CAPS
 # fallback. The TOML file is shared with source-of-truth and model
 # resolution.
-CONFIDENCE_ROUNDS_ENV = "PILA_CONFIDENCE_ROUNDS"
+CONFIDENCE_ROUNDS_ENV = "LEERIE_CONFIDENCE_ROUNDS"
 CONFIDENCE_ROUNDS_FILE = SOURCE_OF_TRUTH_FILE
 
 # max-workers preference. Same resolution shape as confidence_rounds.
-# CLI --max-workers wins; then PILA_MAX_WORKERS env; then max_workers
-# in pila.toml; then DEFAULT_CAPS fallback.
-MAX_WORKERS_ENV = "PILA_MAX_WORKERS"
+# CLI --max-workers wins; then LEERIE_MAX_WORKERS env; then max_workers
+# in leerie.toml; then DEFAULT_CAPS fallback.
+MAX_WORKERS_ENV = "LEERIE_MAX_WORKERS"
 MAX_WORKERS_FILE = SOURCE_OF_TRUTH_FILE
 
 # Per-worker memory cap (cgroup v2 memory.max). Same resolution shape:
-# CLI --worker-memory-max wins; then PILA_WORKER_MEMORY_MAX env; then
-# worker_memory_max in pila.toml; then auto-derive from /proc/meminfo
+# CLI --worker-memory-max wins; then LEERIE_WORKER_MEMORY_MAX env; then
+# worker_memory_max in leerie.toml; then auto-derive from /proc/meminfo
 # at startup. Accepted suffixes: K, M, G, T (case-insensitive, IEC
 # binary — 1G == 1024**3 bytes). See _parse_memory_size.
-WORKER_MEMORY_MAX_ENV = "PILA_WORKER_MEMORY_MAX"
+WORKER_MEMORY_MAX_ENV = "LEERIE_WORKER_MEMORY_MAX"
 WORKER_MEMORY_MAX_FILE = SOURCE_OF_TRUTH_FILE
 
 # --no-push preference (DESIGN §6 "Push + PR"): skip the push + open-PR
-# step at finalize. Resolution order: --no-push CLI flag → PILA_NO_PUSH
-# env → no_push in pila.toml → default False.
+# step at finalize. Resolution order: --no-push CLI flag → LEERIE_NO_PUSH
+# env → no_push in leerie.toml → default False.
 # --no-verify is CLI-only (no env/TOML mirror) to match CLAUDE.md's
 # "never skip hooks unless asked" principle — env/TOML defaults for
 # hook-skipping would dilute the "user explicitly asked" semantics.
-NO_PUSH_ENV = "PILA_NO_PUSH"
+NO_PUSH_ENV = "LEERIE_NO_PUSH"
 NO_PUSH_FILE = SOURCE_OF_TRUTH_FILE
 
 # --clarify preference (DESIGN §11): opt into surfacing intent questions
-# to the user. Resolution order: --clarify CLI flag → PILA_CLARIFY
-# env → clarify in pila.toml → default False. Same precedence and
+# to the user. Resolution order: --clarify CLI flag → LEERIE_CLARIFY
+# env → clarify in leerie.toml → default False. Same precedence and
 # parse rules as --no-push; mirrored env+TOML because "ask me questions"
 # is a stable per-user preference, unlike --no-verify (a per-invocation
 # safety override).
-CLARIFY_ENV = "PILA_CLARIFY"
+CLARIFY_ENV = "LEERIE_CLARIFY"
 CLARIFY_FILE = SOURCE_OF_TRUTH_FILE
 
 # --dangerously-skip-permissions escape hatch (DESIGN §12). Forces
@@ -369,8 +369,8 @@ CLARIFY_FILE = SOURCE_OF_TRUTH_FILE
 # reconciler / provision. Named identically to the underlying CLI flag
 # on purpose: choosing it means the user understands they are removing
 # a guardrail. Resolution order: --dangerously-skip-permissions CLI
-# flag → PILA_DANGEROUSLY_SKIP_PERMISSIONS env → pila.toml → False.
-DANGEROUS_SKIP_PERMS_ENV = "PILA_DANGEROUSLY_SKIP_PERMISSIONS"
+# flag → LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env → leerie.toml → False.
+DANGEROUS_SKIP_PERMS_ENV = "LEERIE_DANGEROUSLY_SKIP_PERMISSIONS"
 DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 
 # --pr-template selector. When the target repo has multiple PR templates
@@ -379,19 +379,19 @@ DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 # .md in the directory wins. Has no effect when the repo uses a single
 # top-level template (pull_request_template.md / .github/...) or when
 # no template exists at all. Resolution order: --pr-template CLI flag →
-# PILA_PR_TEMPLATE env → pr_template in pila.toml → None.
-PR_TEMPLATE_ENV = "PILA_PR_TEMPLATE"
+# LEERIE_PR_TEMPLATE env → pr_template in leerie.toml → None.
+PR_TEMPLATE_ENV = "LEERIE_PR_TEMPLATE"
 PR_TEMPLATE_FILE = SOURCE_OF_TRUTH_FILE
 
 # Verbosity — see IMPLEMENTATION.md §2 "Verbosity". Four levels with
 # stackable -v/-q shortcuts following the clig.dev / cargo / kubectl
-# convention. Default is `stream` because the user invoking pila
-# is opening to watch; -q drops to pila's pre-streaming behavior;
+# convention. Default is `stream` because the user invoking leerie
+# is opening to watch; -q drops to leerie's pre-streaming behavior;
 # -qq goes fully quiet (errors still emit per clig.dev "errors emit at
 # every level" anti-pattern guard).
 VERBOSITY_VALUES = ("quiet", "normal", "stream", "debug")
 VERBOSITY_DEFAULT = "stream"
-VERBOSITY_ENV = "PILA_VERBOSITY"
+VERBOSITY_ENV = "LEERIE_VERBOSITY"
 VERBOSITY_FILE = SOURCE_OF_TRUTH_FILE
 
 # Subtask statuses that count as "done" for the progress counter.
@@ -405,9 +405,9 @@ MODEL_VALUES = ("sonnet", "opus", "haiku")
 # Global default. Used when no per-worker default applies. DESIGN §5 +
 # IMPLEMENTATION.md §2: judgment workers (everything except implementer)
 # run on Opus by default; implementer's per-worker default is sonnet.
-# Users can override globally with --model / PILA_MODEL / `model =`
-# in pila.toml, or per-worker with --model-<worker> /
-# PILA_MODEL_<WORKER> / `model_<worker> =`.
+# Users can override globally with --model / LEERIE_MODEL / `model =`
+# in leerie.toml, or per-worker with --model-<worker> /
+# LEERIE_MODEL_<WORKER> / `model_<worker> =`.
 MODEL_DEFAULT = "opus"
 # Per-worker defaults applied *after* user overrides (CLI/env/TOML) but
 # *before* the global MODEL_DEFAULT fallback. Only workers that need a
@@ -419,8 +419,8 @@ MODEL_DEFAULT_PER_WORKER = {
     "heal": "sonnet",
     "pr_writer": "sonnet",
 }
-MODEL_ENV = "PILA_MODEL"
-MODEL_FILE = "pila.toml"
+MODEL_ENV = "LEERIE_MODEL"
+MODEL_FILE = "leerie.toml"
 # Effort selection — see IMPLEMENTATION.md §2 "Effort selection". The
 # `claude -p` CLI exposes `--effort {low,medium,high,xhigh,max}` to dial
 # reasoning depth. The CLI exposes no --temperature and no --seed, so
@@ -438,45 +438,45 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "integrator": "high",
     "pr_writer": "high",
 }
-EFFORT_ENV = "PILA_EFFORT"
+EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "provision",
                 "implementer", "integrator", "conformer")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
-MODEL_JUDGE_ENV = "PILA_MODEL_JUDGE"
-MODEL_HEAL_ENV = "PILA_MODEL_HEAL"
-MODEL_PR_WRITER_ENV = "PILA_MODEL_PR_WRITER"
+MODEL_JUDGE_ENV = "LEERIE_MODEL_JUDGE"
+MODEL_HEAL_ENV = "LEERIE_MODEL_HEAL"
+MODEL_PR_WRITER_ENV = "LEERIE_MODEL_PR_WRITER"
 
 # Telemetry enabled/disabled — see IMPLEMENTATION.md §2 "Telemetry".
-# Resolution order: --telemetry/--no-telemetry CLI → PILA_TELEMETRY env →
-# telemetry in pila.toml → True (on by default). NDJSON events land in
-# <run-dir>/<telemetry_subdir>/ which is already under .pila/ and thus
+# Resolution order: --telemetry/--no-telemetry CLI → LEERIE_TELEMETRY env →
+# telemetry in leerie.toml → True (on by default). NDJSON events land in
+# <run-dir>/<telemetry_subdir>/ which is already under .leerie/ and thus
 # covered by the existing .gitignore exclusion.
 TELEMETRY_DEFAULT = True
-TELEMETRY_ENV = "PILA_TELEMETRY"
-TELEMETRY_FILE = "pila.toml"
+TELEMETRY_ENV = "LEERIE_TELEMETRY"
+TELEMETRY_FILE = "leerie.toml"
 
 # Telemetry event subdir — the directory name appended to <run-dir> where
 # NDJSON event files are written. Resolution order: --telemetry-dir CLI →
-# PILA_TELEMETRY_DIR env → telemetry_dir in pila.toml → "events".
+# LEERIE_TELEMETRY_DIR env → telemetry_dir in leerie.toml → "events".
 TELEMETRY_SUBDIR_DEFAULT = "events"
-TELEMETRY_SUBDIR_ENV = "PILA_TELEMETRY_DIR"
-TELEMETRY_SUBDIR_FILE = "pila.toml"
+TELEMETRY_SUBDIR_ENV = "LEERIE_TELEMETRY_DIR"
+TELEMETRY_SUBDIR_FILE = "leerie.toml"
 
 # Judge output directory name — relative to <run-dir>. Holds LLM judge
-# output files. Resolution order: --judge-dir CLI → PILA_JUDGE_DIR env →
-# judge_dir in pila.toml → "judge-out".
+# output files. Resolution order: --judge-dir CLI → LEERIE_JUDGE_DIR env →
+# judge_dir in leerie.toml → "judge-out".
 JUDGE_DIR_DEFAULT = "judge-out"
-JUDGE_DIR_ENV = "PILA_JUDGE_DIR"
-JUDGE_DIR_FILE = "pila.toml"
+JUDGE_DIR_ENV = "LEERIE_JUDGE_DIR"
+JUDGE_DIR_FILE = "leerie.toml"
 
 # Heal output directory name — relative to <run-dir>. Holds LLM self-heal
-# loop output files. Resolution order: --heal-dir CLI → PILA_HEAL_DIR env →
-# heal_dir in pila.toml → "heal-out".
+# loop output files. Resolution order: --heal-dir CLI → LEERIE_HEAL_DIR env →
+# heal_dir in leerie.toml → "heal-out".
 HEAL_DIR_DEFAULT = "heal-out"
-HEAL_DIR_ENV = "PILA_HEAL_DIR"
-HEAL_DIR_FILE = "pila.toml"
+HEAL_DIR_ENV = "LEERIE_HEAL_DIR"
+HEAL_DIR_FILE = "leerie.toml"
 
 # Heal-loop convergence knobs — see IMPLEMENTATION.md §2 "Heal-loop convergence
 # parameters". User-tunable knobs use the standard CLI/env/TOML/default
@@ -486,10 +486,10 @@ HEAL_SUCCESS_THRESHOLD_DEFAULT = 0.9  # pass-rate bar for SUCCESS verdict
 HEAL_PLATEAU_WINDOW_DEFAULT = 3     # look-back window for plateau detection
 HEAL_PLATEAU_DELTA_DEFAULT = 0.03   # minimum improvement to avoid plateau
 HEAL_N_REPLAYS_DEFAULT = 5          # replays per sample per iteration
-HEAL_MAX_ROUNDS_ENV = "PILA_HEAL_MAX_ROUNDS"
-HEAL_SUCCESS_THRESHOLD_ENV = "PILA_HEAL_SUCCESS_THRESHOLD"
-HEAL_MAX_ROUNDS_FILE = "pila.toml"
-HEAL_SUCCESS_THRESHOLD_FILE = "pila.toml"
+HEAL_MAX_ROUNDS_ENV = "LEERIE_HEAL_MAX_ROUNDS"
+HEAL_SUCCESS_THRESHOLD_ENV = "LEERIE_HEAL_SUCCESS_THRESHOLD"
+HEAL_MAX_ROUNDS_FILE = "leerie.toml"
+HEAL_SUCCESS_THRESHOLD_FILE = "leerie.toml"
 
 
 
@@ -704,7 +704,7 @@ SCHEMAS: dict[str, dict] = {
             "added_subtasks": {
                 # Genuine gap — propose a new subtask to fill it. Shape
                 # mirrors planner-output subtasks (same required fields).
-                # Pila stamps `_added_by_reconciler: true` on every entry
+                # Leerie stamps `_added_by_reconciler: true` on every entry
                 # in `_apply_reconciler_output` — the model has no business
                 # setting it (any guarantee that matters lives in code,
                 # not in the model's response).
@@ -1077,8 +1077,8 @@ SCHEMAS: dict[str, dict] = {
     "pr_writer": {
         # DESIGN §6 *Finalization*: LLM-written PR title + body that
         # respects the target repo's PR template when one exists. The
-        # launcher prepends "pila: " to the title (the worker must NOT)
-        # so pila-opened PRs stay easy to spot in lists. `used_template`
+        # launcher prepends "leerie: " to the title (the worker must NOT)
+        # so leerie-opened PRs stay easy to spot in lists. `used_template`
         # is the repo-relative path of the template that was filled out,
         # or null when no template was found.
         "type": "object",
@@ -1143,11 +1143,11 @@ def now() -> str:
 
 
 def log(msg: str) -> None:
-    print(f"[pila {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
+    print(f"[leerie {datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
 def die(msg: str, code: int = 1):
-    print(f"pila: error: {msg}", file=sys.stderr, flush=True)
+    print(f"leerie: error: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
 
@@ -1341,7 +1341,7 @@ class _DescendantTracker:
     wrapper exits, its children (the actual long-running command) are
     immediately reparented to PID 1 by the kernel.
 
-    Result: by the time `claude -p` itself exits and pila's `_invoke`
+    Result: by the time `claude -p` itself exits and leerie's `_invoke`
     can call a post-hoc `_enumerate_descendants(claude_p.pid)`, the
     backgrounded subprocesses are no longer descendants — they're
     orphans of init. A snapshot taken at exit-time finds nothing.
@@ -1354,7 +1354,7 @@ class _DescendantTracker:
 
     Polling cost is negligible: ~10ms per `ps` call every 500ms ≈ 2%
     CPU during a worker's run. There is one tracker instance per
-    worker; all of them share pila's single asyncio event loop, so
+    worker; all of them share leerie's single asyncio event loop, so
     even with `max_parallel` concurrent workers the polling stays on
     one CPU."""
 
@@ -1439,7 +1439,7 @@ async def _terminate_proc_tree(proc: asyncio.subprocess.Process) -> None:
     cleanup of detached backgrounded subprocesses (Claude Code's Bash
     tool with `run_in_background: true`) is handled separately by
     `_DescendantTracker`, because by the time a clean `claude -p` exit
-    is observable to pila those subprocesses have already reparented to
+    is observable to leerie those subprocesses have already reparented to
     PID 1 and are no longer reachable from this helper's PPID walk.
     All signal-delivery races (process already gone, PGID recycled)
     are swallowed; the helper never raises.
@@ -1496,8 +1496,8 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     failures are caught — one bad worktree shouldn't block the others.
 
     If `full_purge` is True (the user's explicit Ctrl-C gesture):
-    additionally delete the run branch (`pila/runs/<run-id>`) and
-    every subtask branch (`pila/subtasks/<run-id>/*`), and
+    additionally delete the run branch (`leerie/runs/<run-id>`) and
+    every subtask branch (`leerie/subtasks/<run-id>/*`), and
     recursively remove `st.run_dir`. The run is gone; `--resume` can't
     recover it.
 
@@ -1554,7 +1554,7 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
             # bookkeeping pass, and the surviving directory blocked
             # `--resume`'s new-worktree.sh from re-creating the
             # worktree at the same path. Safe to rm because the path
-            # is sandboxed under .pila/runs/<run-id>/worktrees/<sid>;
+            # is sandboxed under .leerie/runs/<run-id>/worktrees/<sid>;
             # we re-check via .resolve() to make sure a symlink or
             # refactor hasn't escaped the sandbox.
             if entry.exists():
@@ -1580,12 +1580,12 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     if not full_purge:
         return
     # Full purge: delete branches and the run dir. The run branch lives
-    # at pila/runs/<run-id> and subtask branches under
-    # pila/subtasks/<run-id>/<sid> — see compute_run_branch for the
+    # at leerie/runs/<run-id> and subtask branches under
+    # leerie/subtasks/<run-id>/<sid> — see compute_run_branch for the
     # namespace-disjointness rationale.
     branch_globs = [
-        f"refs/heads/pila/runs/{st.run_id}",
-        f"refs/heads/pila/subtasks/{st.run_id}/",
+        f"refs/heads/leerie/runs/{st.run_id}",
+        f"refs/heads/leerie/subtasks/{st.run_id}/",
     ]
     for glob in branch_globs:
         r = subprocess.run(
@@ -1606,7 +1606,7 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
         shutil.rmtree(st.run_dir, ignore_errors=True)
 
 
-async def _reset_subtask_worktree(sid: str, pila_dir: Path, run_id: str) -> None:
+async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> None:
     """Remove the per-subtask worktree directory and branch so a corrective
     retry can start clean from `new-worktree.sh`'s "fresh subtask" path.
     Without this, retrying after a `complete`-with-no-commits failure
@@ -1620,8 +1620,8 @@ async def _reset_subtask_worktree(sid: str, pila_dir: Path, run_id: str) -> None
     and that is the expected idempotent case. Mirrors the rmtree
     fallback in `_cleanup_on_abnormal_exit` for the case where git
     administratively succeeded but left the directory behind."""
-    worktree = pila_dir / "worktrees" / sid
-    branch = f"pila/subtasks/{run_id}/{sid}"
+    worktree = leerie_dir / "worktrees" / sid
+    branch = f"leerie/subtasks/{run_id}/{sid}"
     await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
     await run_proc(["git", "branch", "-D", branch])
     if worktree.exists():
@@ -1662,7 +1662,7 @@ def _check_claude_cli_version() -> None:
         return  # unrecognized format — defer to smoke test
     if found < MIN_CLAUDE_CLI:
         die(
-            f"claude CLI {'.'.join(map(str, found))} is too old; pila "
+            f"claude CLI {'.'.join(map(str, found))} is too old; leerie "
             f"requires >= {'.'.join(map(str, MIN_CLAUDE_CLI))} for "
             "--json-schema (introduced for `claude -p` in v2.1.22). "
             "Upgrade with the native installer: "
@@ -1680,9 +1680,9 @@ def _check_claude_cli_version() -> None:
 
 # --- run identifier (DESIGN §6 "The run identifier") --------------------
 #
-# A run_id namespaces a single pila invocation across its branch
-# (`pila/runs/<run-id>`), state directory (`.pila/runs/<run-id>/`),
-# and PR title (`pila: <run-id>`). Built from three deterministic
+# A run_id namespaces a single leerie invocation across its branch
+# (`leerie/runs/<run-id>`), state directory (`.leerie/runs/<run-id>/`),
+# and PR title (`leerie: <run-id>`). Built from three deterministic
 # inputs known by the end of Phase 1: short-category abbrev, sanitized
 # task slug, and a 6-hex digest of `started_at`. Two concurrent runs
 # in the same repo produce two different run_ids by construction.
@@ -1764,15 +1764,15 @@ def compute_run_id(categories: list[str], task: str, started_at: str) -> str:
 def compute_run_branch(run_id: str) -> str:
     """The git branch name carrying a run's integrated work.
 
-    The `pila/runs/` prefix is **mandatory**, not cosmetic. Subtask
-    branches live under the sibling prefix `pila/subtasks/<run-id>/<sid>`
+    The `leerie/runs/` prefix is **mandatory**, not cosmetic. Subtask
+    branches live under the sibling prefix `leerie/subtasks/<run-id>/<sid>`
     (see `compute_subtask_branch`). Git's loose ref store represents each
     ref as a file inside `refs/heads/…/`, so a ref AT a path and a ref
     UNDER that same path cannot coexist. If both lived under
-    `pila/<run-id>` the first `git worktree add` for a subtask would
+    `leerie/<run-id>` the first `git worktree add` for a subtask would
     fail with `cannot lock ref …`. The disjoint `runs/` and `subtasks/`
     sub-namespaces make that collision structurally impossible."""
-    return f"pila/runs/{run_id}"
+    return f"leerie/runs/{run_id}"
 
 
 def compute_subtask_branch(run_id: str, sid: str) -> str:
@@ -1784,7 +1784,7 @@ def compute_subtask_branch(run_id: str, sid: str) -> str:
     same string; this helper exists so the shape is grep-able from
     Python and any future Python call site that needs a subtask branch
     name goes through one function."""
-    return f"pila/subtasks/{run_id}/{sid}"
+    return f"leerie/subtasks/{run_id}/{sid}"
 
 
 # --- run.json sidecar invariants (IMPLEMENTATION.md §8) -----------------
@@ -1804,7 +1804,7 @@ def _validate_run_json(data: dict) -> None:
     6. If `killed_at` is set, `fly_machine_id` must also be set — you
        cannot have destroyed a machine you don't have a pointer to.
 
-    Raises ValueError on any violation. Caller (e.g., `pila --list`)
+    Raises ValueError on any violation. Caller (e.g., `leerie --list`)
     decides whether to die, warn, or render as `status=corrupt-sidecar`."""
     if not isinstance(data, dict):
         raise ValueError("run.json must be a JSON object")
@@ -1849,7 +1849,7 @@ def _validate_run_json(data: dict) -> None:
         )
     # `sync_failed_at`: set by decide_teardown's clean-exit branch when
     # fetch_branch fails. The machine is left RUNNING (work-preserving)
-    # and the user is told to recover manually + then `pila --kill`.
+    # and the user is told to recover manually + then `leerie --kill`.
     # Orthogonal to paused/pushed/killed — the machine isn't paused or
     # killed, just has un-synced work — so no mutual exclusion with the
     # other terminal states. Mutex'd against pushed/killed (a synced+
@@ -1923,9 +1923,9 @@ def compose_pr_body(state: dict, run_id: str) -> str:
         f"- Finished: {_or_na(finished_at)}\n"
         f"- Waves: {wave_count}, subtasks: {subtask_count}\n"
         f"- Workers: {_or_na(worker_count)}\n"
-        f"- Generated by pila on `{_or_na(working_branch)}`.\n"
+        f"- Generated by leerie on `{_or_na(working_branch)}`.\n"
         "\n"
-        f"See `.pila/runs/{run_id}/state.json` for full run state.\n"
+        f"See `.leerie/runs/{run_id}/state.json` for full run state.\n"
     )
 
 
@@ -1959,8 +1959,8 @@ def _write_run_json(run_dir: Path, **fields) -> None:
 
 # --- run discovery and resolution (DESIGN §6 multi-run resume) ----------
 
-def discover_runs(pila_root: Path) -> list[dict]:
-    """Enumerate `.pila/runs/*/state.json`, returning one summary
+def discover_runs(leerie_root: Path) -> list[dict]:
+    """Enumerate `.leerie/runs/*/state.json`, returning one summary
     dict per discovered run. Skip the `_bootstrap-*` directories silently
     (those are pre-classify, not real runs). Malformed state.json files
     are skipped with a logged warning, never raising.
@@ -1969,11 +1969,11 @@ def discover_runs(pila_root: Path) -> list[dict]:
     state.json path), `task`, `started_at`, `finished_at`, `categories`.
     Other state.json fields are passed through unchanged. Sorted by
     `started_at` descending (newest first) for stable display in
-    `pila --list`.
+    `leerie --list`.
 
-    Pure read; no writes. Returns [] if `pila_root/runs` doesn't
+    Pure read; no writes. Returns [] if `leerie_root/runs` doesn't
     exist."""
-    runs_dir = pila_root / "runs"
+    runs_dir = leerie_root / "runs"
     if not runs_dir.is_dir():
         return []
     out: list[dict] = []
@@ -2002,7 +2002,7 @@ def discover_runs(pila_root: Path) -> list[dict]:
     return out
 
 
-def resolve_run_id(pila_root: Path, cli_run_id: str | None) -> str:
+def resolve_run_id(leerie_root: Path, cli_run_id: str | None) -> str:
     """Pick the run_id to operate on. Used by `--resume` and `--list`.
 
     Policy (DESIGN §6 "the run branch is the resume contract"):
@@ -2016,16 +2016,16 @@ def resolve_run_id(pila_root: Path, cli_run_id: str | None) -> str:
     a matching dir exists on disk with a `state.json`, accept it even
     though `discover_runs` filters bootstrap dirs by default. This
     handles the narrow case where the user paused a remote run via
-    `pila --stop` *before* phase_classify completed: the run dir on
+    `leerie --stop` *before* phase_classify completed: the run dir on
     the machine is still `_bootstrap-<hex>`, the handover file doesn't
     exist yet, and the launcher's E1 logic correctly leaves
-    PILA_RUN_ID alone. The orchestrator then needs to resume against
+    LEERIE_RUN_ID alone. The orchestrator then needs to resume against
     the bootstrap dir without dying. DESIGN §6 *Detached orchestrator
     (remote mode)*.
 
     Never guesses across multiple runs. `--resume` against an ambiguous
     repo is a hard error, not a heuristic."""
-    runs = discover_runs(pila_root)
+    runs = discover_runs(leerie_root)
     if cli_run_id is not None:
         for r in runs:
             if r["run_id"] == cli_run_id:
@@ -2033,44 +2033,44 @@ def resolve_run_id(pila_root: Path, cli_run_id: str | None) -> str:
         # Bootstrap-id carve-out (see docstring): allow explicit
         # _bootstrap-* even though discover_runs filters those out.
         if cli_run_id.startswith("_bootstrap-"):
-            candidate = pila_root / "runs" / cli_run_id
+            candidate = leerie_root / "runs" / cli_run_id
             if (candidate / "state.json").is_file():
                 return cli_run_id
         available = ", ".join(r["run_id"] for r in runs) or "(none)"
         die(
             f"--run-id {cli_run_id!r} does not match any known run. "
-            f"Available: {available}. Use `pila --list` to enumerate."
+            f"Available: {available}. Use `leerie --list` to enumerate."
         )
     if not runs:
         die(
-            "no runs found under .pila/runs/. Start a new run with "
-            "`./pila \"<task>\"`."
+            "no runs found under .leerie/runs/. Start a new run with "
+            "`./leerie \"<task>\"`."
         )
     if len(runs) == 1:
         return runs[0]["run_id"]
-    available = "\n  ".join(_format_run_for_disambiguation(r, pila_root)
+    available = "\n  ".join(_format_run_for_disambiguation(r, leerie_root)
                             for r in runs)
     die(
         "multiple runs present; pass --run-id <id> to disambiguate:\n  "
-        f"{available}\nUse `pila --list` to see full details."
+        f"{available}\nUse `leerie --list` to see full details."
     )
 
 
-def _format_run_for_disambiguation(run: dict, pila_root: Path) -> str:
+def _format_run_for_disambiguation(run: dict, leerie_root: Path) -> str:
     """Build the per-row hint string for `resolve_run_id`'s
     multiple-runs error message. Combines run_id, derived status,
     started_at, and a last-activity time so the user can tell which
-    run is live without an extra `pila --list` invocation.
+    run is live without an extra `leerie --list` invocation.
 
     Reads run.json from disk for `_derive_run_status` (same source
-    `pila --list` consults). Falls back gracefully when sidecar or
+    `leerie --list` consults). Falls back gracefully when sidecar or
     state.json is unreadable — disambiguation is best-effort UX, not
     a correctness boundary."""
     run_id = run["run_id"]
     started = run.get("started_at") or "?"
     # Derived status — uses run.json sidecar if present, falls back to
     # state.json fields. Same pattern as list_runs().
-    run_dir = pila_root / "runs" / run_id
+    run_dir = leerie_root / "runs" / run_id
     run_json: dict | None = None
     sidecar = run_dir / "run.json"
     if sidecar.is_file():
@@ -2122,7 +2122,7 @@ def _format_age(seconds: float) -> str:
     return f"{d}d{h}h ago" if h else f"{d}d ago"
 
 
-# --- run status (consumed by `pila --list`) -------------------------
+# --- run status (consumed by `leerie --list`) -------------------------
 
 # The nine derived statuses returned by `_derive_run_status`. Status is
 # *derived* from run.json + state.json fields, not stored, so the value
@@ -2152,7 +2152,7 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
       5. pushed_at set             → `done-pushed-no-pr`.
       6. sync_failed_at set        → `sync-failed-running` (machine still up,
                                      work not on host yet — recover via
-                                     `pila --finalize` then `--kill`).
+                                     `leerie --finalize` then `--kill`).
       7. finished_at set           → `done-local` (run completed, --no-push).
       8. killed_at set             → `killed-remote` (explicit --kill).
       9. paused_at set             → `paused-remote` (pause-on-failure or --stop).
@@ -2193,16 +2193,16 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
     return "in-progress"
 
 
-def _collect_run_rows(pila_root: Path) -> list[tuple[str, str, str, str, str]]:
+def _collect_run_rows(leerie_root: Path) -> list[tuple[str, str, str, str, str]]:
     """Build (run_id, started_at, status, machine, branch) rows for every
-    run under `pila_root/runs/`. Pure data-gathering; rendering is the
+    run under `leerie_root/runs/`. Pure data-gathering; rendering is the
     caller's concern. `machine` is the Fly Machine ID for remote runs and
     empty string for local runs."""
-    runs = discover_runs(pila_root)
+    runs = discover_runs(leerie_root)
     rows: list[tuple[str, str, str, str, str]] = []
     for state in runs:
         run_id = state["run_id"]
-        run_dir = pila_root / "runs" / run_id
+        run_dir = leerie_root / "runs" / run_id
         run_json: dict | None = None
         sidecar = run_dir / "run.json"
         if sidecar.is_file():
@@ -2247,36 +2247,36 @@ def _render_run_table(rows: list[tuple[str, str, str, str, str]]) -> None:
             print(fmt.format(r[0], r[1], r[2], r[4]))
 
 
-def list_runs(pila_root: Path, status_filter: str | None = None) -> None:
+def list_runs(leerie_root: Path, status_filter: str | None = None) -> None:
     """Render a sortable columnar table of runs to stdout. Used by
-    `pila --list`. Reads run.json sidecar (commit 4) for status
+    `leerie --list`. Reads run.json sidecar (commit 4) for status
     derivation; falls back to state.json fields for runs without a
     sidecar.
 
     `status_filter` (if given) restricts the table to rows whose derived
     status matches. Validated against `RUN_STATUSES` by argparse before
     this is called; an unknown value here renders an empty table."""
-    rows = _collect_run_rows(pila_root)
+    rows = _collect_run_rows(leerie_root)
     if status_filter is not None:
         rows = [r for r in rows if r[2] == status_filter]
     if not rows:
         if status_filter is not None:
             print(f"no runs with status={status_filter}")
         else:
-            print("no runs under .pila/runs/")
+            print("no runs under .leerie/runs/")
         return
     _render_run_table(rows)
 
 
-def list_paused_runs(pila_root: Path) -> None:
+def list_paused_runs(leerie_root: Path) -> None:
     """Deprecated alias: routes through `list_runs(status_filter=
-    "paused-remote")`. The new equivalent is `pila --list --status
+    "paused-remote")`. The new equivalent is `leerie --list --status
     paused-remote`. Kept for backward-compat."""
-    list_runs(pila_root, status_filter="paused-remote")
+    list_runs(leerie_root, status_filter="paused-remote")
 
 
 def _read_toml_key(path: Path, key: str) -> str | None:
-    """Read a single `key = value` from a flat pila.toml. Returns
+    """Read a single `key = value` from a flat leerie.toml. Returns
     None when the file does not exist or the key is absent. Strips
     matched surrounding double or single quotes from the value. Used
     by both source-of-truth and model resolvers — keeping one parser
@@ -2329,8 +2329,8 @@ def resolve_task_argument(raw: str) -> str:
 def resolve_source_of_truth(repo_root: Path,
                             cli_value: str | None = None) -> str:
     """Resolve the source-of-truth preference. Order:
-    --source-of-truth CLI flag → PILA_SOURCE_OF_TRUTH env var →
-    pila.toml → default 'both'. argparse validates `cli_value` via
+    --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
+    leerie.toml → default 'both'. argparse validates `cli_value` via
     choices=, so it is trusted when set. env and file values are
     rejected via die() if not in SOURCE_OF_TRUTH_VALUES — a bad
     config is caught at startup, not during a planner run."""
@@ -2355,7 +2355,7 @@ def resolve_source_of_truth(repo_root: Path,
 def resolve_runtime(repo_root: Path,
                     cli_value: str | None = None) -> str:
     """Resolve the runtime mode. Order:
-    --runtime CLI flag → PILA_RUNTIME env var → pila.toml → default 'local'.
+    --runtime CLI flag → LEERIE_RUNTIME env var → leerie.toml → default 'local'.
     argparse validates `cli_value` via choices=, so it is trusted when set.
     env and file values are rejected via die() if not in RUNTIME_VALUES — a
     bad config is caught at startup, not during a worker run."""
@@ -2380,7 +2380,7 @@ def resolve_runtime(repo_root: Path,
 def resolve_pr_template(repo_root: Path,
                         cli_value: str | None = None) -> str | None:
     """Resolve the --pr-template selector. Order:
-    --pr-template CLI flag → PILA_PR_TEMPLATE env → pila.toml → None.
+    --pr-template CLI flag → LEERIE_PR_TEMPLATE env → leerie.toml → None.
     Returns the basename of the desired template inside a
     PULL_REQUEST_TEMPLATE/ directory (case preserved, .md optional).
     No validation against MODEL_VALUES-style enum since the choice is
@@ -2401,8 +2401,8 @@ def resolve_pr_template(repo_root: Path,
 def resolve_confidence_rounds(repo_root: Path,
                               cli_value: int | None = None) -> int:
     """Resolve the confidence-rounds cap. Order:
-    --confidence-rounds CLI flag → PILA_CONFIDENCE_ROUNDS env var →
-    pila.toml → DEFAULT_CAPS["confidence_rounds"]. argparse validates
+    --confidence-rounds CLI flag → LEERIE_CONFIDENCE_ROUNDS env var →
+    leerie.toml → DEFAULT_CAPS["confidence_rounds"]. argparse validates
     `cli_value` is a positive int via `type=`, so it is trusted when set.
     env and file values are rejected via die() when not a positive int —
     bad config caught at startup, not during a planner run."""
@@ -2433,7 +2433,7 @@ def resolve_confidence_rounds(repo_root: Path,
 def resolve_max_workers(repo_root: Path,
                         cli_value: int | None = None) -> int:
     """Resolve the max-workers cap. Order:
-    --max-workers CLI flag → PILA_MAX_WORKERS env var → pila.toml →
+    --max-workers CLI flag → LEERIE_MAX_WORKERS env var → leerie.toml →
     DEFAULT_CAPS["max_total_workers"]. argparse validates `cli_value` is an
     int via `type=int` so it is trusted when set. env and file values are
     rejected via die() when not a positive int — bad config caught at
@@ -2526,8 +2526,8 @@ def resolve_worker_memory_max(repo_root: Path,
                               max_parallel: int,
                               cli_value: str | None = None) -> int:
     """Resolve the per-worker cgroup memory cap (bytes). Order:
-    --worker-memory-max CLI flag → PILA_WORKER_MEMORY_MAX env →
-    pila.toml `worker_memory_max` → auto-derive from /proc/meminfo.
+    --worker-memory-max CLI flag → LEERIE_WORKER_MEMORY_MAX env →
+    leerie.toml `worker_memory_max` → auto-derive from /proc/meminfo.
 
     All sources accept the same format ("4G", "512M", "1024") and are
     validated by _parse_memory_size, which die()s on bad input — bad
@@ -2549,8 +2549,8 @@ def resolve_inspect_dirs(repo_root: Path,
                          cli_values: list[str] | None = None) -> list[str]:
     """Resolve the extra inspection directories for classifier/planner/
     reconciler/provision. Order: --inspect-dir CLI flags (one or more, repeatable) →
-    PILA_INSPECT_DIRS env var (colon-separated) → inspect_dirs in
-    pila.toml (comma-separated string) → []. Paths are expanded
+    LEERIE_INSPECT_DIRS env var (colon-separated) → inspect_dirs in
+    leerie.toml (comma-separated string) → []. Paths are expanded
     (~ → $HOME) and resolved to absolute form so a relative path in TOML
     still works after the orchestrator changes cwd. Non-existent paths
     are accepted at resolve time — the CLI surfaces a clearer error if
@@ -2634,7 +2634,7 @@ def _resolve_bool_pref(repo_root: Path, cli_value: bool, *,
 def resolve_no_push(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --no-push preference. Order:
     --no-push CLI flag (action='store_true', so True if passed) →
-    PILA_NO_PUSH env var → no_push in pila.toml → False.
+    LEERIE_NO_PUSH env var → no_push in leerie.toml → False.
     `--no-verify` has no env/TOML mirror (see NO_PUSH_ENV comment)."""
     return _resolve_bool_pref(
         repo_root, cli_value,
@@ -2644,7 +2644,7 @@ def resolve_no_push(repo_root: Path, cli_value: bool) -> bool:
 def resolve_clarify(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --clarify preference. Order:
     --clarify CLI flag (action='store_true', so True if passed) →
-    PILA_CLARIFY env var → clarify in pila.toml → False.
+    LEERIE_CLARIFY env var → clarify in leerie.toml → False.
     See DESIGN §11 for the clarification semantics."""
     return _resolve_bool_pref(
         repo_root, cli_value,
@@ -2655,8 +2655,8 @@ def resolve_dangerously_skip_permissions(
         repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --dangerously-skip-permissions preference. Order:
     --dangerously-skip-permissions CLI flag (action='store_true') →
-    PILA_DANGEROUSLY_SKIP_PERMISSIONS env var →
-    dangerously_skip_permissions in pila.toml → False.
+    LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env var →
+    dangerously_skip_permissions in leerie.toml → False.
 
     When True, EVERY claude -p worker — including the judgment workers
     (classifier, planner, reconciler, provision) that run in the real
@@ -2688,7 +2688,7 @@ def _positive_int(s: str) -> int:
 def resolve_verbosity(repo_root: Path,
                       cli_value: str | None = None) -> str:
     """Resolve the verbosity level. Order:
-    --verbosity CLI flag → PILA_VERBOSITY env var → pila.toml →
+    --verbosity CLI flag → LEERIE_VERBOSITY env var → leerie.toml →
     VERBOSITY_DEFAULT. argparse validates `cli_value` via choices=, so
     it is trusted when set. env and file values are rejected via die()
     if not in VERBOSITY_VALUES — a bad config is caught at startup,
@@ -2744,10 +2744,10 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
     precedence (highest first):
       1. --model-<worker> CLI flag
       2. --model CLI flag (global default for this run)
-      3. PILA_MODEL_<WORKER> env var
-      4. PILA_MODEL env var
-      5. model_<worker> in pila.toml
-      6. model in pila.toml
+      3. LEERIE_MODEL_<WORKER> env var
+      4. LEERIE_MODEL env var
+      5. model_<worker> in leerie.toml
+      6. model in leerie.toml
       7. MODEL_DEFAULT_PER_WORKER[<worker>] (e.g., implementer → sonnet)
       8. MODEL_DEFAULT (opus)
     `args` is the parsed argparse.Namespace (CLI values are already
@@ -2788,7 +2788,7 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
         models[worker] = (per_cli or global_cli or per_env or global_env
                           or per_file or global_file or per_worker_default)
     # Judge and heal use dedicated flags (--judge-model / --heal-model) and
-    # dedicated env vars (PILA_MODEL_JUDGE / PILA_MODEL_HEAL) rather
+    # dedicated env vars (LEERIE_MODEL_JUDGE / LEERIE_MODEL_HEAL) rather
     # than the --model-<W> pattern — they're post-run skill workers that don't
     # participate in the --model global-default resolution path. They still
     # fall back to the global override so `--model sonnet` applies everywhere.
@@ -2820,10 +2820,10 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
     resolve_models() rung-for-rung. Per-worker precedence (highest first):
       1. --effort-<worker> CLI flag
       2. --effort CLI flag (global default for this run)
-      3. PILA_EFFORT_<WORKER> env var
-      4. PILA_EFFORT env var
-      5. effort_<worker> in pila.toml
-      6. effort in pila.toml
+      3. LEERIE_EFFORT_<WORKER> env var
+      4. LEERIE_EFFORT env var
+      5. effort_<worker> in leerie.toml
+      6. effort in leerie.toml
       7. EFFORT_DEFAULT_PER_WORKER[<worker>] (e.g., planner → "high")
       8. EFFORT_DEFAULT (None — flag omitted from CLI invocation)
     A None value means "do not pass --effort"; claude_p's build() omits
@@ -2879,8 +2879,8 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
 def resolve_telemetry_enabled(repo_root: Path,
                               cli_value: bool | None = None) -> bool:
     """Resolve the telemetry enabled/disabled preference. Order:
-    --telemetry/--no-telemetry CLI flag → PILA_TELEMETRY env var →
-    telemetry in pila.toml → TELEMETRY_DEFAULT (True). cli_value is
+    --telemetry/--no-telemetry CLI flag → LEERIE_TELEMETRY env var →
+    telemetry in leerie.toml → TELEMETRY_DEFAULT (True). cli_value is
     True when --telemetry was passed, False when --no-telemetry was passed,
     None when neither was passed (argparse store_true/store_false pair with
     default None). env and file values are rejected via die() if not parseable
@@ -2911,8 +2911,8 @@ def resolve_telemetry_enabled(repo_root: Path,
 def resolve_telemetry_subdir(repo_root: Path,
                              cli_value: str | None = None) -> str:
     """Resolve the telemetry event subdirectory name. Order:
-    --telemetry-dir CLI flag → PILA_TELEMETRY_DIR env var →
-    telemetry_dir in pila.toml → TELEMETRY_SUBDIR_DEFAULT ("events").
+    --telemetry-dir CLI flag → LEERIE_TELEMETRY_DIR env var →
+    telemetry_dir in leerie.toml → TELEMETRY_SUBDIR_DEFAULT ("events").
     The value is a plain directory name (or relative path) appended to
     the run dir — not validated against the filesystem at resolve time."""
     if cli_value and cli_value.strip():
@@ -2929,8 +2929,8 @@ def resolve_telemetry_subdir(repo_root: Path,
 
 def resolve_judge_dir(repo_root: Path, cli_value: str | None = None) -> str:
     """Resolve the judge output directory name. Order:
-    --judge-dir CLI flag → PILA_JUDGE_DIR env var →
-    judge_dir in pila.toml → JUDGE_DIR_DEFAULT ("judge-out").
+    --judge-dir CLI flag → LEERIE_JUDGE_DIR env var →
+    judge_dir in leerie.toml → JUDGE_DIR_DEFAULT ("judge-out").
     The value is a plain directory name (or relative path) appended to
     the run dir — not validated against the filesystem at resolve time."""
     if cli_value and cli_value.strip():
@@ -2947,8 +2947,8 @@ def resolve_judge_dir(repo_root: Path, cli_value: str | None = None) -> str:
 
 def resolve_heal_dir(repo_root: Path, cli_value: str | None = None) -> str:
     """Resolve the heal output directory name. Order:
-    --heal-dir CLI flag → PILA_HEAL_DIR env var →
-    heal_dir in pila.toml → HEAL_DIR_DEFAULT ("heal-out").
+    --heal-dir CLI flag → LEERIE_HEAL_DIR env var →
+    heal_dir in leerie.toml → HEAL_DIR_DEFAULT ("heal-out").
     The value is a plain directory name (or relative path) appended to
     the run dir — not validated against the filesystem at resolve time."""
     if cli_value and cli_value.strip():
@@ -2965,8 +2965,8 @@ def resolve_heal_dir(repo_root: Path, cli_value: str | None = None) -> str:
 
 def resolve_heal_max_rounds(repo_root: Path, cli_value: int | None = None) -> int:
     """Resolve the heal-loop max-iterations cap. Order:
-    --heal-max-rounds CLI flag → PILA_HEAL_MAX_ROUNDS env var →
-    heal_max_rounds in pila.toml → HEAL_MAX_ROUNDS_DEFAULT (10).
+    --heal-max-rounds CLI flag → LEERIE_HEAL_MAX_ROUNDS env var →
+    heal_max_rounds in leerie.toml → HEAL_MAX_ROUNDS_DEFAULT (10).
     An invalid (non-positive) value in env or file is rejected via die()."""
     if cli_value is not None:
         return cli_value
@@ -2995,8 +2995,8 @@ def resolve_heal_max_rounds(repo_root: Path, cli_value: int | None = None) -> in
 def resolve_heal_success_threshold(repo_root: Path,
                                    cli_value: float | None = None) -> float:
     """Resolve the heal-loop success pass-rate threshold. Order:
-    --heal-success-threshold CLI flag → PILA_HEAL_SUCCESS_THRESHOLD env var →
-    heal_success_threshold in pila.toml → HEAL_SUCCESS_THRESHOLD_DEFAULT (0.9).
+    --heal-success-threshold CLI flag → LEERIE_HEAL_SUCCESS_THRESHOLD env var →
+    heal_success_threshold in leerie.toml → HEAL_SUCCESS_THRESHOLD_DEFAULT (0.9).
     Value must be in (0, 1]; invalid values in env or file are rejected via die()."""
     if cli_value is not None:
         return cli_value
@@ -3030,7 +3030,7 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     boilerplate out of the call sites.
 
     `start_new_session=True` isolates the child into its own POSIX
-    session/process group, distinct from pila's own. This is what lets
+    session/process group, distinct from leerie's own. This is what lets
     `_terminate_proc_tree` send `os.killpg(proc.pid, ...)` on the
     cleanup path without accidentally signaling the orchestrator's own
     group. The flag is a no-op on Windows."""
@@ -3104,7 +3104,7 @@ async def run_streaming(
 
     `label` is appended to the persistent log's section header — useful
     when multiple commands write to the same log file (provision.log
-    accumulates `mise install`, `.pila-setup.sh`, etc.).
+    accumulates `mise install`, `.leerie-setup.sh`, etc.).
 
     The DRY counterpart to `run_proc`: identical contract for the
     process-group/exception-safety story, different I/O shape. Pick
@@ -3234,7 +3234,7 @@ async def run_script(name: str, *args: str) -> subprocess.CompletedProcess:
 # test suites, enforcing structural rules.
 # =========================================================================
 
-async def preflight(pila_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
+async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                     skip_smoke: bool = False, no_push: bool = False) -> None:
     """Hard checks before any LLM work. Fails fast rather than wasting workers."""
 
@@ -3250,13 +3250,13 @@ async def preflight(pila_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     dirty = [l for l in r.stdout.splitlines() if not l.startswith("??")]
     if dirty:
         die(f"working tree has {len(dirty)} modified/staged file(s). "
-            "Commit or stash before running pila.")
+            "Commit or stash before running leerie.")
 
-    # 3. (removed in per-run refactor) The global pila/* branch and
-    #    .pila/worktrees/* checks used to fail a second concurrent
+    # 3. (removed in per-run refactor) The global leerie/* branch and
+    #    .leerie/worktrees/* checks used to fail a second concurrent
     #    run; they no longer apply now that each run namespaces its
-    #    branches as pila/runs/<run-id> (and subtask branches as
-    #    pila/subtasks/<run-id>/<sid>) and its worktrees under the
+    #    branches as leerie/runs/<run-id> (and subtask branches as
+    #    leerie/subtasks/<run-id>/<sid>) and its worktrees under the
     #    per-run dir. A run_id collision is detected separately at
     #    State.rename_to() (filesystem side) and during setup-run.sh
     #    (git side). See DESIGN.md §6 and §14 ("single-clone parallelism").
@@ -3286,7 +3286,7 @@ async def preflight(pila_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         try:
             envelope = await _invoke(cmd, cwd=os.getcwd(), timeout=90,
                                      sid="smoke",
-                                     pila_dir=pila_dir,
+                                     leerie_dir=leerie_dir,
                                      verbosity=verbosity)
         except subprocess.TimeoutExpired:
             die("claude -p smoke test timed out — auth issue or network problem")
@@ -3499,7 +3499,7 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
 
 # --- per-repo dependency provisioning ----------------------------------------
 # See DESIGN.md §6½ "Per-repo dependency provisioning" and IMPLEMENTATION.md
-# §6½ for the layered design (.pila-setup.sh → mise install → table → LLM
+# §6½ for the layered design (.leerie-setup.sh → mise install → table → LLM
 # fallback → worktree replay).
 
 # argv[0] allowlist for any provision command — both table-emitted commands
@@ -3694,7 +3694,7 @@ def validate_provision_recipe(recipe: list[dict]) -> None:
 # verification corpus in tests/test_readme_extractor.py): catches 13/15.
 # The two known misses (Supabase, esbuild) are marketing-style READMEs
 # that delegate install to external docs — those repos route through
-# .pila-setup.sh.
+# .leerie-setup.sh.
 _README_SECTION_RE = re.compile(
     r"(?i)\b("
     r"install"
@@ -4312,8 +4312,8 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
     Returns a fatal error string if protected paths were touched.
     Logs a non-fatal warning for unexpected scope. Returns None when clean.
 
-    The diff is computed against the run branch (`pila/runs/<run-id>`)
-    — the base every subtask branched off of. Hardcoding `pila/staging`
+    The diff is computed against the run branch (`leerie/runs/<run-id>`)
+    — the base every subtask branched off of. Hardcoding `leerie/staging`
     here used to silently disable the check after the per-run refactor
     (the branch doesn't exist), so the protected-path enforcement was off."""
     run_branch = compute_run_branch(st.run_id)
@@ -4381,7 +4381,7 @@ async def check_merge_committed(staging: Path) -> str | None:
 
 
 async def check_integrator_commit(staging: Path) -> str | None:
-    """Return an error if the integrator's merge commit touched .pila/ files.
+    """Return an error if the integrator's merge commit touched .leerie/ files.
     The integrator should only touch project files, never coordination artifacts."""
     r = await run_proc(
         ["git", "show", "--name-only", "--format=", "HEAD"],
@@ -4390,7 +4390,7 @@ async def check_integrator_commit(staging: Path) -> str | None:
     if r.returncode != 0:
         return None
     bad = [f for f in r.stdout.strip().splitlines()
-           if f and f.startswith(".pila/")]
+           if f and f.startswith(".leerie/")]
     if bad:
         return f"integrator commit touched coordination files: {bad}"
     return None
@@ -4403,7 +4403,7 @@ async def check_branch_has_commits(sid: str, worktree: str,
                                    ) -> tuple[str, str] | None:
     """Return `(failure_kind, message)` if the implementer's subtask
     branch has no commits ahead of the run branch (`parent_branch` —
-    typically `pila/runs/<run-id>`), else None. An empty diff means the
+    typically `leerie/runs/<run-id>`), else None. An empty diff means the
     worker produced schema-valid JSON claiming success while doing
     nothing — a silent no-op that wastes an integration attempt. The
     `"no_commits"` kind is retryable per `_RETRYABLE_FAILURE_KINDS`."""
@@ -4460,7 +4460,7 @@ def validate_resume_state(data: dict) -> None:
     if "task" not in data or not str(data.get("task", "")).strip():
         die("state.json has no usable 'task' — cannot resume. "
             "Inspect the run's state.json manually "
-            "(under .pila/runs/<run-id>/).")
+            "(under .leerie/runs/<run-id>/).")
 
     # waves is optional (absent if interrupted before scheduling); if present
     # it must be well-formed, and completed_waves must be in range.
@@ -4609,7 +4609,7 @@ def _summarize_stream_event(sid: str, event: dict, verbosity: str) -> str | None
     only governs what surfaces inline.
 
     Levels in increasing detail: quiet, normal, stream, debug. At
-    quiet/normal, individual events are dropped (pila's existing
+    quiet/normal, individual events are dropped (leerie's existing
     phase / subtask-status log lines stand alone), with the one
     exception of result-with-error which surfaces at every level
     (clig.dev "errors emit at every level")."""
@@ -4779,7 +4779,7 @@ def _get_progress(st: "State") -> tuple[int, int] | None:
 # --- cgroup v2 containment for worker subtrees ---------------------------
 # Each `claude -p` worker (and every descendant it forks: bash children,
 # vitest pools, webpack workers, tsc, etc.) is enrolled in its own child
-# cgroup at /sys/fs/cgroup/pila-w-<sid>/. The cgroup's memory.max and
+# cgroup at /sys/fs/cgroup/leerie-w-<sid>/. The cgroup's memory.max and
 # pids.max bound how much RAM / how many PIDs the worker subtree may
 # consume. When the worker subtree exceeds memory.max, the kernel OOM-
 # kills inside that cgroup — sshd / pid 1 / sibling workers are not
@@ -4788,11 +4788,11 @@ def _get_progress(st: "State") -> tuple[int, int] | None:
 #
 # Delegation is purely file-permission based on cgroup v2; no
 # CAP_SYS_ADMIN required. The launcher mounts /sys/fs/cgroup writable
-# into the container (see `pila` launcher: --mount type=bind,source=
+# into the container (see `leerie` launcher: --mount type=bind,source=
 # /sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared). If
 # the mount is not writable (older launcher, host kernel <5.x, custom
 # container shape), the probe degrades the path to no-op with a
-# warn-once log line — pila must never die because the cap can't be
+# warn-once log line — leerie must never die because the cap can't be
 # applied.
 
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -4819,7 +4819,7 @@ def _cgroup_probe() -> bool:
     global _CGROUP_PROBE_RESULT
     if _CGROUP_PROBE_RESULT is not None:
         return _CGROUP_PROBE_RESULT
-    probe_dir = _CGROUP_ROOT / "pila-probe"
+    probe_dir = _CGROUP_ROOT / "leerie-probe"
     try:
         probe_dir.mkdir(exist_ok=True)
         probe_dir.rmdir()
@@ -4843,7 +4843,7 @@ def _cgroup_create(sid: str, memory_max_bytes: int,
     so a config change between spawns takes effect."""
     if not _cgroup_probe():
         return None
-    path = _CGROUP_ROOT / f"pila-w-{sid}"
+    path = _CGROUP_ROOT / f"leerie-w-{sid}"
     try:
         path.mkdir(exist_ok=True)
         (path / "memory.max").write_text(str(memory_max_bytes))
@@ -4892,7 +4892,7 @@ def _cgroup_destroy(cgroup_path: Path | None) -> None:
 
 
 async def _invoke(cmd: list[str], cwd: str, timeout: int,
-                  sid: str, pila_dir: Path, verbosity: str,
+                  sid: str, leerie_dir: Path, verbosity: str,
                   progress: tuple[int, int] | None = None,
                   idle_warn_sec: float | None = None,
                   worker_memory_max_bytes: int | None = None,
@@ -4903,7 +4903,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     line of stdout is one JSON event. The final `type: "result"` event
     is the envelope (same shape as the non-streaming `--output-format
     json` path produces). All events are appended to
-    `.pila/logs/<sid>.log` regardless of verbosity. Inline summaries
+    `.leerie/logs/<sid>.log` regardless of verbosity. Inline summaries
     surface to the orchestrator log according to `verbosity` (see
     `_summarize_stream_event`).
 
@@ -4914,7 +4914,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     `subprocess.TimeoutExpired`, cancellation kills the child and
     re-raises. A worker that exits without emitting any `result` event
     raises `WorkerError` — same error class callers already handle."""
-    log_path = pila_dir / "logs" / f"{sid}.log"
+    log_path = leerie_dir / "logs" / f"{sid}.log"
     # `limit=10MB` overrides asyncio's StreamReader 64KB-per-line default.
     # A single `claude -p` event can plausibly exceed 64KB: the
     # implementer's `structured_output` tool_use carries the full
@@ -4925,15 +4925,15 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # wraps and re-raises as ValueError("Separator is not found,
     # and chunk exceed the limit"). Either name in `except` works —
     # but the user-visible exception is ValueError.
-    # PILA_WORKER_DEBUG=1 injects DEBUG=* and ANTHROPIC_LOG=debug into the
+    # LEERIE_WORKER_DEBUG=1 injects DEBUG=* and ANTHROPIC_LOG=debug into the
     # worker's environment. The point: if a worker hangs before emitting
     # any stdout event, rerunning with this env var makes the CLI emit its
     # internal state to stderr (which the watchdog below surfaces), so an
     # otherwise-invisible silent stall becomes diagnosable without
-    # redeploying pila. The variable is opt-in because verbose CLI logging
+    # redeploying leerie. The variable is opt-in because verbose CLI logging
     # is noisy on healthy runs.
     worker_env = None
-    if os.environ.get("PILA_WORKER_DEBUG"):
+    if os.environ.get("LEERIE_WORKER_DEBUG"):
         worker_env = os.environ.copy()
         worker_env["DEBUG"] = "*"
         worker_env["ANTHROPIC_LOG"] = "debug"
@@ -4987,7 +4987,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # Code's Bash tool uses `run_in_background: true` to fire-and-forget
     # long-running commands (test runners, builds, dev servers); those
     # subprocesses outlive `claude -p`'s exit and are orphaned to init by the
-    # time pila could PPID-walk post-exit. The tracker observes them while
+    # time leerie could PPID-walk post-exit. The tracker observes them while
     # the chain is still intact, then SIGKILLs the accumulated set at the
     # end. See DESIGN §6 *Cleanup on abnormal exit*.
     descendant_tracker = _DescendantTracker(proc.pid)
@@ -5004,7 +5004,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         nonlocal envelope, last_event_at
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
-        # connected to a TTY, so `tail -f .pila/logs/<sid>.log` would
+        # connected to a TTY, so `tail -f .leerie/logs/<sid>.log` would
         # show nothing until the file closed at worker end — defeating
         # the entire live-progress property of the streaming feature.
         with log_path.open("a", buffering=1) as log_file:
@@ -5034,7 +5034,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     # Inline summary (verbosity-gated). Multi-line
                     # summaries (multi-block events, multi-line text)
                     # are emitted one log() call per line so each
-                    # line gets its own [pila HH:MM:SS] prefix —
+                    # line gets its own [leerie HH:MM:SS] prefix —
                     # otherwise the timestamp only renders on line 1
                     # and lines 2+ visually disconnect from the
                     # orchestrator's timestamped log stream.
@@ -5072,7 +5072,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                 # the ValueError would propagate through claude_p's
                 # retry loop unhandled and surface as a Python
                 # traceback. Convert to WorkerError so callers see a
-                # pila-shaped error and the retry path treats it
+                # leerie-shaped error and the retry path treats it
                 # as a worker fault.
                 raise WorkerError(
                     "claude -p emitted a line exceeding the 10 MiB "
@@ -5089,7 +5089,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         #
         # Solves the failure class where a worker emits a fatal message
         # to stderr (e.g. "Claude configuration file not found" from
-        # the claude-code recovery-loop bug) but pila doesn't surface
+        # the claude-code recovery-loop bug) but leerie doesn't surface
         # it until the 300s watchdog fires (or never, if the recovery
         # loop spins indefinitely with no exit).
         nonlocal last_event_at  # stderr activity counts as liveness
@@ -5109,7 +5109,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                 # (line ~4082): asyncio's StreamReader raises
                 # ValueError when a single line exceeds the 10 MiB
                 # buffer limit. Convert to WorkerError so callers see
-                # a pila-shaped error consistent with the stdout path.
+                # a leerie-shaped error consistent with the stdout path.
                 raise WorkerError(
                     "claude -p stderr emitted a line exceeding the "
                     f"10 MiB buffer limit: {e}") from e
@@ -5144,7 +5144,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             if gap < warn_sec:
                 continue
             # Stderr tail: if the CLI is logging to stderr (e.g. when
-            # PILA_WORKER_DEBUG=1), surface the most recent bytes
+            # LEERIE_WORKER_DEBUG=1), surface the most recent bytes
             # alongside the silence warning so the user has something
             # actionable. Truncated to the last 400 chars to keep the
             # orchestrator log readable.
@@ -5178,7 +5178,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             # worker's whole subtree (claude -p + its tool-call
             # grandchildren via PPID walk) and reap any backgrounded
             # subprocesses the tracker observed during the run. Then
-            # re-raise. Pila's gather_or_cancel relies on this for clean
+            # re-raise. Leerie's gather_or_cancel relies on this for clean
             # aborts.
             watchdog_task.cancel()
             await _terminate_proc_tree(proc)
@@ -5198,7 +5198,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # any worker-tree process that survived _terminate_proc_tree /
         # descendant_tracker.stop_and_reap above — a backstop for the
         # backgrounded grandchild class. Then rmdir the cgroup so we
-        # don't accumulate /sys/fs/cgroup/pila-w-* entries across a
+        # don't accumulate /sys/fs/cgroup/leerie-w-* entries across a
         # long-running orchestrator. Best-effort: ENOENT etc. are
         # swallowed inside _cgroup_destroy.
         _cgroup_destroy(cgroup_path)
@@ -5254,7 +5254,7 @@ def _collect_memory_sample(st: "State") -> dict:
         not being joined.
       - phase / worker_count contextualize the other axes.
 
-    `/proc/self/fd` is the canonical Linux FD source; pila's orchestrator
+    `/proc/self/fd` is the canonical Linux FD source; leerie's orchestrator
     runs as PID 1 inside the container (Linux), so the proc-fs path is
     valid. ru_maxrss is in KB on Linux (in bytes on macOS, but the
     orchestrator never runs on bare macOS — the launcher does, and we
@@ -5359,7 +5359,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
 
     Worker activity streams as one JSON event per stdout line
     (`--output-format stream-json --verbose`). `_invoke` writes the raw
-    events to `.pila/logs/<sid>.log` and emits per-event inline
+    events to `.leerie/logs/<sid>.log` and emits per-event inline
     summaries gated by `st.data["verbosity"]`. The final `result` event
     is returned as the envelope — same shape as the pre-streaming
     single-result mode (`structured_output` present on schema success).
@@ -5407,7 +5407,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             f"expected one of {sorted(_allowed_schema_keys)}"
         )
     schema = json.dumps(SCHEMAS[schema_key], separators=(",", ":"))
-    pila_dir = st.path.parent
+    leerie_dir = st.path.parent
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
 
     def build(extra_user: str = "") -> list[str]:
@@ -5452,7 +5452,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         one calls.ndjson row so the audit trail is complete."""
         _t0 = time.monotonic()
         envelope = await _invoke(build(retry_note), cwd, timeout,
-                                 sid, pila_dir, verbosity,
+                                 sid, leerie_dir, verbosity,
                                  progress=_get_progress(st),
                                  idle_warn_sec=caps.get(
                                      "worker_idle_warn_sec",
@@ -5663,7 +5663,7 @@ class _ReplayState:
     """Minimal State-alike for replay_capture: no persistent writes.
 
     Satisfies the interface claude_p() calls on the state object (bump_workers,
-    add_telemetry, .data, .run_id, .run_dir, .path) without touching .pila/.
+    add_telemetry, .data, .run_id, .run_dir, .path) without touching .leerie/.
     All save() calls are no-ops. last_envelope captures the envelope returned
     by _invoke so replay_capture can return (envelope, structured_output).
     """
@@ -5709,13 +5709,13 @@ class State:
     fall inside a `st.data[k] = v; st.save()` pair.
 
     Per-run scope: every State instance is anchored at
-    `pila_root / "runs" / run_id / state.json`. Two State instances with
+    `leerie_root / "runs" / run_id / state.json`. Two State instances with
     different run_ids share no on-disk state. See DESIGN.md §6 and §10."""
 
-    def __init__(self, pila_root: Path, run_id: str):
-        self.pila_root = pila_root
+    def __init__(self, leerie_root: Path, run_id: str):
+        self.leerie_root = leerie_root
         self.run_id = run_id
-        self.run_dir = pila_root / "runs" / run_id
+        self.run_dir = leerie_root / "runs" / run_id
         self.path = self.run_dir / "state.json"
         self.data: dict = {}
 
@@ -5739,10 +5739,10 @@ class State:
         already exists — that would mean two runs with the same
         microsecond `started_at` (extraordinarily unlikely, but caught
         as a hard error rather than silently overwritten)."""
-        new_dir = self.pila_root / "runs" / new_run_id
+        new_dir = self.leerie_root / "runs" / new_run_id
         if new_dir.exists():
             die(
-                f"run_id collision: .pila/runs/{new_run_id}/ already exists. "
+                f"run_id collision: .leerie/runs/{new_run_id}/ already exists. "
                 "This is extraordinarily unlikely; rerun, or "
                 f"`--resume --run-id {new_run_id}` to continue the existing run."
             )
@@ -6475,11 +6475,11 @@ _DOCS_ONLY_CATEGORIES = frozenset({"documentation"})
 
 async def run_setup_hook(repo_root: Path, log_dir: Path,
                           st: "State") -> None:
-    """Execute `<repo>/.pila-setup.sh` if present. Idempotent via
+    """Execute `<repo>/.leerie-setup.sh` if present. Idempotent via
     `st.data["provision"]["sh_hook_ran"]` — re-entering this function
     after the hook has already run is a no-op.
 
-    The script runs as the `pila` container user (non-root), in the
+    The script runs as the `leerie` container user (non-root), in the
     repo root, with the same environment workers will see. Output
     streams to `<log_dir>/setup-hook.log`. Nonzero exit → `die()`.
 
@@ -6500,28 +6500,28 @@ async def run_setup_hook(repo_root: Path, log_dir: Path,
     - Install system services.
 
     If a repo needs a system package the language layer can't provide,
-    the documented workaround is to maintain a fork of the pila
+    the documented workaround is to maintain a fork of the leerie
     Dockerfile that installs it at image-build time and override
-    `IMAGE_TAG`. Out of scope for pila to automate.
+    `IMAGE_TAG`. Out of scope for leerie to automate.
     """
     prov = st.data.setdefault("provision", {})
     if prov.get("sh_hook_ran"):
         return
-    hook = repo_root / ".pila-setup.sh"
+    hook = repo_root / ".leerie-setup.sh"
     if not hook.exists():
         return
-    # A path at .pila-setup.sh that isn't a regular file (most likely a
+    # A path at .leerie-setup.sh that isn't a regular file (most likely a
     # directory committed by mistake) is silent-failure-shaped: workers
     # would later die with confusing "command not found" messages from
     # the unrun setup. Surface the misshape here with a clear message.
     if not hook.is_file():
         die(
-            f".pila-setup.sh at {hook} exists but is not a regular "
+            f".leerie-setup.sh at {hook} exists but is not a regular "
             "file (it's a directory or special file). Remove the "
             "misnamed entry or replace it with an executable script."
         )
 
-    log("phase 1½: running .pila-setup.sh")
+    log("phase 1½: running .leerie-setup.sh")
     st.data["current_phase"] = "phase 1½: setup-hook"
     st.save()
     log_dir.mkdir(parents=True, exist_ok=True)
@@ -6533,14 +6533,14 @@ async def run_setup_hook(repo_root: Path, log_dir: Path,
             cwd=str(repo_root),
             timeout=600,  # 10 minutes
             log_path=log_path,
-            label=".pila-setup.sh",
+            label=".leerie-setup.sh",
             verbosity=verbosity,
         )
     except subprocess.TimeoutExpired as exc:
-        die(f".pila-setup.sh did not complete within 10 minutes\n"
+        die(f".leerie-setup.sh did not complete within 10 minutes\n"
             f"(see {log_path})\n{exc.output or ''}")
     if rc != 0:
-        die(f".pila-setup.sh exited {rc}\n(see {log_path})\n{tail}")
+        die(f".leerie-setup.sh exited {rc}\n(see {log_path})\n{tail}")
     prov["sh_hook_ran"] = True
     st.save()
 
@@ -6569,7 +6569,7 @@ def _go_already_pinned(repo_root: Path) -> bool:
     """Return True if the repo already specifies a Go version mise would
     pick up — via `.go-version`, a `go` entry in `.tool-versions`, or a
     `[tools] go = "..."` in `mise.toml`/`.mise.toml`. In any of these
-    cases pila should NOT synthesize an override; the existing pin wins.
+    cases leerie should NOT synthesize an override; the existing pin wins.
     """
     if (repo_root / ".go-version").is_file():
         return True
@@ -6608,10 +6608,10 @@ _LEADING_V_RE = re.compile(r"^[vV]+")
 # Idiomatic version files mise reads natively *when discovery walks
 # the repo* — but NOT when `MISE_OVERRIDE_CONFIG_FILENAMES` is set
 # (verified against mise discussions #6598 / #7058). When the override
-# fires (because pila synthesized a go pin), every idiomatic file the
+# fires (because leerie synthesized a go pin), every idiomatic file the
 # repo committed for some OTHER language is silently dropped — workers
 # end up running on the image-baked LTS instead of the pinned version.
-# So when the override fires, pila scans these files and injects their
+# So when the override fires, leerie scans these files and injects their
 # pins into the override's `[tools]` section.
 _IDIOMATIC_VERSION_FILES = (
     # (filename, mise tool key, value transformer)
@@ -6666,7 +6666,7 @@ def _read_idiomatic_pins(repo_root: Path,
 
     Used to bridge the `MISE_OVERRIDE_CONFIG_FILENAMES` semantic: when
     the override is set, mise reads ONLY the listed files; idiomatic
-    discovery is suppressed. Pila must therefore copy the pins forward
+    discovery is suppressed. Leerie must therefore copy the pins forward
     explicitly. See DESIGN §6½ "Per-repo dependency provisioning."
 
     `.tool-versions` is parsed line-by-line (asdf-compatible format:
@@ -6753,7 +6753,7 @@ def synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     **Known limits of the existing-mise-config scanner:**
     `_existing_mise_toml_tool_keys` reads tool pins from the canonical
     `[tools]` section with bare keys (`node = "20"`). Two valid TOML
-    forms are NOT detected — when present, pila will re-inject pins
+    forms are NOT detected — when present, leerie will re-inject pins
     from idiomatic files alongside the existing ones, producing
     duplicate keys that mise rejects mid-run:
 
@@ -6763,7 +6763,7 @@ def synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     Both are rare in practice (the canonical form is what mise's
     docs and `mise use` write). Repos that hit these can switch to
     the canonical form. A proper fix would need `tomllib` (3.11+
-    stdlib) — pila's minimum is 3.10 — or a hand-written inline-
+    stdlib) — leerie's minimum is 3.10 — or a hand-written inline-
     table parser; neither is justified by current usage.
 
     See DESIGN §6½ and IMPLEMENTATION §6½ step 3.
@@ -6786,7 +6786,7 @@ def synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
     override_path = run_dir / "mise-overrides.toml"
 
     header_comment = (
-        "# Synthesized by pila from go.mod (DESIGN §6½).\n"
+        "# Synthesized by leerie from go.mod (DESIGN §6½).\n"
         "# mise's go plugin does not parse go.mod itself; idiomatic\n"
         "# version files (.nvmrc, .python-version, etc.) are copied in\n"
         "# because MISE_OVERRIDE_CONFIG_FILENAMES suppresses discovery.\n"
@@ -6829,7 +6829,7 @@ def synth_mise_go_override(repo_root: Path, run_dir: Path) -> Path | None:
         stripped = line.strip()
         # Detect entering the [tools] table. A subsequent table header
         # (`[other]`) exits it. Subtables (`[tools.something]`) are also
-        # valid TOML but are out of scope for this synthesis — pila only
+        # valid TOML but are out of scope for this synthesis — leerie only
         # cares about adding scalar keys to the top-level [tools].
         if not in_tools and stripped == "[tools]":
             in_tools = True
@@ -6869,7 +6869,7 @@ _MISE_SIGNAL_FILES = (
 def _repo_has_version_signal(repo_root: Path,
                               override_file: Path | None) -> bool:
     """Return True if the repo declares any runtime version pin mise
-    can act on, OR if pila already synthesized an override file. False
+    can act on, OR if leerie already synthesized an override file. False
     means there's nothing for `mise install` to do; the LTS fallback
     in the image is the right answer."""
     if override_file is not None:
@@ -6885,7 +6885,7 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
                             override_file: Path | None = None) -> None:
     """Invoke `mise install` at the repo root. If `override_file` is
     provided, exports `MISE_OVERRIDE_CONFIG_FILENAMES` so mise reads
-    pila's synthesized config instead of the default discovery walk.
+    leerie's synthesized config instead of the default discovery walk.
 
     Captures resolved versions via `mise ls --current --json` and stores
     the raw blob at `st.data["provision"]["mise_versions"]` — callers can
@@ -6895,7 +6895,7 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
     last 40 lines of mise output.
 
     No-signals short-circuit: if the repo has zero version pins (no
-    `mise.toml`, `.tool-versions`, idiomatic file, or pila-synthesized
+    `mise.toml`, `.tool-versions`, idiomatic file, or leerie-synthesized
     override), this function is a logged no-op. The image-baked LTS
     Node and Python on PATH then become the workers' runtime. Without
     this guard, mise's exact behavior for `mise install` with no
@@ -7034,11 +7034,11 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
 
     if not sys.stdin.isatty():
         # launched non-interactively (e.g. via the plugin skill): defer.
-        pila_dir = st.path.parent
-        (pila_dir / "pending-questions.json").write_text(json.dumps({
+        leerie_dir = st.path.parent
+        (leerie_dir / "pending-questions.json").write_text(json.dumps({
             "questions": pending,
         }, indent=2))
-        log("clarification needed; wrote .pila/pending-questions.json")
+        log("clarification needed; wrote .leerie/pending-questions.json")
         sys.exit(EXIT_NEEDS_ANSWERS)
 
     for q in pending:
@@ -7052,7 +7052,7 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
     return answers
 
 
-def absorb_supplied_answers(args, st: State, pila_dir: Path) -> None:
+def absorb_supplied_answers(args, st: State, leerie_dir: Path) -> None:
     """Merge --answers FILE into st.data['answers'] and propagate the
     update to existing subtask spec files. Safe to call on both initial
     runs and on --resume; a no-op when --answers is not set.
@@ -7068,7 +7068,7 @@ def absorb_supplied_answers(args, st: State, pila_dir: Path) -> None:
     job here is to get those answers into state and onto disk so the
     next worker invocation sees them.
 
-    The subtask-spec rewrite mirrors pila.py around the
+    The subtask-spec rewrite mirrors leerie.py around the
     needs-clarification branch of settle_subtask: every existing spec
     file gets its `_clarification_answers` field overwritten with the
     current st.data['answers']. This is intentionally aggressive — a
@@ -7106,7 +7106,7 @@ def absorb_supplied_answers(args, st: State, pila_dir: Path) -> None:
     # their `_clarification_answers`. Specs are written once at
     # phase_plan time with the then-current answers; later answers must
     # be flushed through.
-    sub_dir = pila_dir / "subtasks"
+    sub_dir = leerie_dir / "subtasks"
     if sub_dir.exists():
         for spec_path in sub_dir.glob("*.json"):
             try:
@@ -7125,7 +7125,7 @@ def surface_clarification(sid: str, question: dict, checkpoint_path: str,
       - Interactive (TTY): prompt right here, store the answer in
         st.data['answers'][question.id], and return True so the caller
         re-spawns the implementer as a CONTINUATION.
-      - Non-interactive: write .pila/pending-clarifications.json
+      - Non-interactive: write .leerie/pending-clarifications.json
         with the question, the subtask id, and the checkpoint path,
         then sys.exit(EXIT_NEEDS_ANSWERS) so the calling layer can
         collect the answer and resume.
@@ -7135,21 +7135,21 @@ def surface_clarification(sid: str, question: dict, checkpoint_path: str,
     first. The caller is responsible for bumping the
     subtask_continuations counter before treating this as the
     continuation step."""
-    pila_dir = st.path.parent
+    leerie_dir = st.path.parent
     answers = st.data.setdefault("answers", {})
 
     if not sys.stdin.isatty():
         # Persist enough state for the surrounding layer to resume.
         # The question id keys the answer; the checkpoint path is
         # what the re-spawned worker will read.
-        (pila_dir / "pending-clarifications.json").write_text(
+        (leerie_dir / "pending-clarifications.json").write_text(
             json.dumps({
                 "subtask_id": sid,
                 "question": question,
                 "checkpoint_path": checkpoint_path,
             }, indent=2))
         log(f"  {sid}: clarification needed; wrote "
-            ".pila/pending-clarifications.json")
+            ".leerie/pending-clarifications.json")
         # Save state so the answer the user supplies on the re-run
         # lands in a state.json that already knows about this subtask's
         # progress so far.
@@ -7206,7 +7206,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
 
       1. Docs-only short-circuit. If classify returned only
          documentation categories, persist `kind: none` and return.
-      2. `.pila-setup.sh` hook if present.
+      2. `.leerie-setup.sh` hook if present.
       3. Synthesize a mise go-override from `go.mod` if needed.
       4. `mise install` at the repo root (reads .tool-versions natively
          and .nvmrc / .python-version / .ruby-version /
@@ -7264,7 +7264,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
     # inherit os.environ via _invoke), and any `mise exec --` they
     # invoke from their worktrees — sees the synthesized go pin.
     # Without this, mise's discovery in the worktree wouldn't find the
-    # synth (the override file lives under .pila/, which isn't in the
+    # synth (the override file lives under .leerie/, which isn't in the
     # worktree's tracked-file set) and `mise exec -- go ...` would
     # fall through to system PATH where Go isn't installed.
     if override is not None:
@@ -7621,7 +7621,7 @@ def _apply_reconciler_output(
     added = output.get("added_subtasks", [])
     if added:
         # Fail loud on id collisions. schedule() merges all subtasks
-        # into a single dict keyed by id (pila.py: see `schedule`),
+        # into a single dict keyed by id (leerie.py: see `schedule`),
         # so a duplicate id would silently overwrite a real subtask and
         # vanish its requires/provides/depends_on from the DAG. The
         # reconciler's prompt warns against this, but prompts are
@@ -7914,7 +7914,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     # Pre-condition: subtask ids are globally unique across plans. The
     # planner prompt tells each domain to scope ids to itself with a
     # domain-prefix, and the 8 CATEGORIES map to distinct prefixes
-    # (pila.py: CATEGORIES / _ID_PREFIXES), so in practice this
+    # (leerie.py: CATEGORIES / _ID_PREFIXES), so in practice this
     # invariant holds. But prompts are advisory per CLAUDE.md; if a
     # planner ignores the rule, schedule()'s dict-flatten (line ~2997:
     # `subtasks[s["id"]] = s`) would silently overwrite, vanishing the
@@ -8234,7 +8234,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             die(
                 f"reconciler's revised output ignored "
                 f"{len(unaddressed)} named cycle(s):\n{bullets}\n"
-                "Pila requires every named cycle to be addressed by at "
+                "Leerie requires every named cycle to be addressed by at "
                 "least one of dropped_requires / dependency_edges / "
                 "merged_subtasks. The retry prompt listed the legal "
                 "operations per cycle; the model defied the structural "
@@ -8369,7 +8369,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         # named unresolved entry? Same fail-loud discipline as the
         # cycle-gate's must-include check. Pass `output` (attempt-1's
         # output) so the validator can accept renames whose `from` is
-        # the consumer's pre-revert tag — matches what pila's own
+        # the consumer's pre-revert tag — matches what leerie's own
         # recommendation produces.
         unaddressed = _validate_unresolved_must_include(
             output3, still_unresolved, output)
@@ -8379,7 +8379,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 f"reconciler's revised output ignored "
                 f"{len(unaddressed)} named unresolved-requires entry/"
                 f"entries:\n{bullets}\n"
-                "Pila requires every named unresolved entry to be "
+                "Leerie requires every named unresolved entry to be "
                 "addressed by at least one of renames / added_provides "
                 "/ added_subtasks / conditional_drops / dropped_requires "
                 "/ unresolvable. "
@@ -8967,7 +8967,7 @@ def _build_cycle_retry_prompt(
     parts: list[str] = []
     parts.append(
         "Your previous reconciler output created "
-        f"{len(sccs)} dependency cycle(s) in the merged plan. Pila has "
+        f"{len(sccs)} dependency cycle(s) in the merged plan. Leerie has "
         "analyzed each cycle and computed a recommended resolution using "
         "structural signals. You must either emit the recommendation "
         "verbatim or propose an alternative from the bounded set below. "
@@ -9026,7 +9026,7 @@ def _build_cycle_retry_prompt(
             parts.append(f"    - {opt}{marker}")
     parts.append(
         "\nEmit the same eight-array output as before, with the "
-        "additions necessary to break every cycle. Pila will re-run "
+        "additions necessary to break every cycle. Leerie will re-run "
         "cycle detection on your revised output and reject any response "
         "that still has cycles — including new cycles your revisions "
         "introduce.\n\n--- ORIGINAL INPUT ---\n"
@@ -9057,7 +9057,7 @@ def _build_size_retry_prompt(
     parts: list[str] = []
     parts.append(
         f"Your previous reconciler output emitted {len(oversized)} "
-        "`added_subtask`(s) with `size: large`. Pila enforces "
+        "`added_subtask`(s) with `size: large`. Leerie enforces "
         "`size ∈ {small, medium}` on all reconciler-added subtasks — "
         "the same constraint planners are bound to. A `large` subtask "
         "bundles work that must be implementable in one worker context; "
@@ -9098,7 +9098,7 @@ def _build_size_retry_prompt(
         "subtask must have `size: small` or `size: medium`."
         "\n\nEmit the same eight-array output as before, with the "
         "oversized subtask(s) replaced by the split subtasks in "
-        "`added_subtasks`. Pila will re-run the size gate on your "
+        "`added_subtasks`. Leerie will re-run the size gate on your "
         "revised output and reject any response that still emits "
         "`size: large`.\n\n--- ORIGINAL INPUT ---\n"
     )
@@ -9171,7 +9171,7 @@ def _validate_must_include(
 def _tag_jaccard(a: str, b: str) -> float:
     """Token-set Jaccard similarity over hyphen-split tokens.
 
-    Pila's capability-tag namespace tends toward hyphenated phrases
+    Leerie's capability-tag namespace tends toward hyphenated phrases
     where true synonyms share root tokens (e.g. `cdk-stacks-authored`
     ≈ `infra-stacks-authored` share `stacks`+`authored` → 2/4 = 0.5).
     The unresolved-tags retry heuristic uses this to rank candidate
@@ -9226,7 +9226,7 @@ def _recommend_unresolved_resolution(
 
     The recommendation framing in the retry prompt treats this output
     as a *hint* (string-similarity prior), NOT as the answer the model
-    must emit verbatim. Historical scan showed pila renames usually
+    must emit verbatim. Historical scan showed leerie renames usually
     span vocabularies with low textual overlap; the heuristic is
     calibrated for synonym-asymmetric cases (like captured run
     075210), not general renames.
@@ -9323,7 +9323,7 @@ def _build_unresolved_retry_prompt(
         "Your previous reconciler output left "
         f"{len(unresolved)} cross-domain `requires` tag(s) still "
         "unresolved after applying your renames / added_provides / "
-        "added_subtasks. Pila has computed string-similarity hints "
+        "added_subtasks. Leerie has computed string-similarity hints "
         "from the post-mutation `provides` namespace. Use the hints "
         "if they're semantically correct; if a hint is only "
         "textually close (a 'false friend' — e.g. a narrow synonym "
@@ -9391,7 +9391,7 @@ def _build_unresolved_retry_prompt(
         if pre_revert_tag != tag:
             parts.append(
                 f"\n  NOTE: Your attempt 1 renamed '{pre_revert_tag}' → "
-                f"'{tag}' on this consumer. Pila reverts your attempt-1 "
+                f"'{tag}' on this consumer. Leerie reverts your attempt-1 "
                 f"output before re-applying attempt 2 against the "
                 f"pre-mutation plans — so the consumer's requires entry "
                 f"holds the ORIGINAL '{pre_revert_tag}' at apply time. "
@@ -9435,7 +9435,7 @@ def _build_unresolved_retry_prompt(
             "one-sentence reason (aborts the run cleanly).")
 
     parts.append(
-        "\nEmit the same eight-array output as before. Pila will "
+        "\nEmit the same eight-array output as before. Leerie will "
         "re-check unresolved-requires AND re-run the cycle gate on "
         "your revised output; an attempt that still has unresolved "
         "tags will abort the run with the structured report.\n\n"
@@ -9466,11 +9466,11 @@ def _validate_unresolved_must_include(
     For rename / added_provides / added_subtasks ops, accept a match
     if the op covers EITHER the unresolved (post-mutation) tag OR the
     consumer's pre-revert tag (looked up via `attempt_1_output`'s
-    renames). This matches what pila's own recommendation + must-include
+    renames). This matches what leerie's own recommendation + must-include
     examples produce: the pre-revert tag is what the consumer's
     requires entry holds at apply time after the retry's revert
     restores the pre-mutation state. Without this dual-tag
-    acceptance pila would reject its own recommendations as not
+    acceptance leerie would reject its own recommendations as not
     addressing the unresolved entry; without ALSO accepting the
     post-mutation form a model that legitimately re-emits the rename
     + addresses the resulting post-mutation entry would be rejected.
@@ -9641,7 +9641,7 @@ def detect_no_work(plans: list[dict]) -> dict[str, str] | None:
     the task is already satisfied on HEAD. Else return None.
 
     The basis is read from `plan["confidence"]["basis"]` (a required
-    string in the planner schema, `pila.py:587-608`). Falls back to a
+    string in the planner schema, `leerie.py:587-608`). Falls back to a
     placeholder string if the field is missing or non-string, rather
     than raising — the orchestrator's job here is to surface the
     planner's reasoning, not to re-validate the schema.
@@ -9675,7 +9675,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
     launcher polls `finished_at` as the "ready to push" sentinel, and
     there is no run branch to push (none was materialized). `_derive_
     run_status` reads `finished_at` + the missing `pushed_at` / `pr_url`
-    and renders the run as `done-local` in `pila --list`.
+    and renders the run as `done-local` in `leerie --list`.
 
     Does NOT invoke `finalize.sh` / `cleanup.sh` — `finalize.sh` would
     fail its non-empty-branch check and `cleanup.sh` has no subtask
@@ -9765,7 +9765,7 @@ def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
     return subtasks, waves
 
 
-def write_plan(pila_dir: Path, task: str, st: State,
+def write_plan(leerie_dir: Path, task: str, st: State,
                subtasks: dict, waves: list[list[str]]) -> None:
     """Persist the merged plan and per-subtask spec files the implementers read."""
     answers = st.data.get("answers", {})
@@ -9777,10 +9777,10 @@ def write_plan(pila_dir: Path, task: str, st: State,
     # treating them as build-graph edges. Empty list when no planner
     # declared any `extent: external` entry — common case.
     preconditions = st.data.get("external_preconditions", []) or []
-    (pila_dir / "plan.json").write_text(json.dumps(
+    (leerie_dir / "plan.json").write_text(json.dumps(
         {"task": task, "waves": waves, "subtasks": subtasks,
          "preconditions": preconditions}, indent=2))
-    sub_dir = pila_dir / "subtasks"
+    sub_dir = leerie_dir / "subtasks"
     for sid, s in subtasks.items():
         spec = dict(s)
         spec["_task"] = task
@@ -9849,7 +9849,7 @@ def _format_provision_recipe_section(recipe: list[dict],
     return "\n".join(lines)
 
 
-async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
+async def run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
                           models: dict[str, str],
                           efforts: dict[str, str | None],
                           continuation: bool = False, note: str = "") -> dict:
@@ -9879,8 +9879,8 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
     can_ask_user = st.data.get("clarify", False)
 
     up = [f"Execute subtask `{sid}`.",
-          f"PILA_DIR is {pila_dir} (absolute).",
-          f"Read your spec at {pila_dir}/subtasks/{sid}.json.",
+          f"LEERIE_DIR is {leerie_dir} (absolute).",
+          f"Read your spec at {leerie_dir}/subtasks/{sid}.json.",
           "Your current working directory IS your isolated worktree — make and "
           "commit all code changes here.",
           # DESIGN §8 + §13: evidence-gate bound, prompt-governed.
@@ -9898,7 +9898,7 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
         up.append(recipe_section)
     if continuation:
         up.append(f"This is a CONTINUATION. Read the checkpoint at "
-                  f"{pila_dir}/checkpoints/{sid}.md, validate it against the "
+                  f"{leerie_dir}/checkpoints/{sid}.md, validate it against the "
                   f"actual repo state, then continue.")
     if note:
         up.append(f"NOTE FROM ORCHESTRATOR: {note}")
@@ -9919,7 +9919,7 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
         # `failure_kind="empty_handoff"` (retryable); see the TimeoutExpired
         # arm below for the full retry-classification rationale.
         return {"subtask_id": sid, "status": "incomplete-handoff",
-                "checkpoint_path": str(pila_dir / "checkpoints" / f"{sid}.md"),
+                "checkpoint_path": str(leerie_dir / "checkpoints" / f"{sid}.md"),
                 "summary": f"worker produced no schema-valid result: {e}"}
     except subprocess.TimeoutExpired:
         # worker hit the per-process wall-clock cap (`worker_timeout_sec`,
@@ -9935,7 +9935,7 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
         # which `_retryable_failure` accepts as retryable; the
         # failed_retries cap then bounds the chain.
         #
-        # Why retry rather than terminal: pila's typical usage is
+        # Why retry rather than terminal: leerie's typical usage is
         # unattended (overnight runs), so a transient hang has real
         # value in recovering on a fresh process. The worst case —
         # one extra 90-min worker invocation bounded by failed_retries
@@ -9944,7 +9944,7 @@ async def run_implementer(sid: str, pila_dir: Path, caps: dict, st: State,
         # would need a separate cap (not currently in scope).
         timeout = caps.get("worker_timeout_sec", "?")
         return {"subtask_id": sid, "status": "incomplete-handoff",
-                "checkpoint_path": str(pila_dir / "checkpoints" / f"{sid}.md"),
+                "checkpoint_path": str(leerie_dir / "checkpoints" / f"{sid}.md"),
                 "summary": (f"worker timed out after {timeout}s "
                             "(worker_timeout_sec cap) — fresh implementer "
                             "can continue from any partial checkpoint")}
@@ -10193,7 +10193,7 @@ async def _unprefixed_conformer_commits(worktree: str, before_sha: str,
             if line and not line.startswith(prefix)]
 
 
-async def run_conformer(sid: str, pila_dir: Path, worktree: str,
+async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
                         caps: dict, st: State, models: dict[str, str],
                         efforts: dict[str, str | None],
                         rules_files: list[Path],
@@ -10204,16 +10204,16 @@ async def run_conformer(sid: str, pila_dir: Path, worktree: str,
     is recorded as a warning by the caller — DESIGN §9: the phase is
     advisory)."""
     sys_prompt = load_prompt("conformer")
-    repo_root = st.pila_root.parent
+    repo_root = st.leerie_root.parent
     rules_paths_str = ", ".join(
         str(p.relative_to(repo_root)) if str(p).startswith(str(repo_root))
         else str(p)
         for p in rules_files
     ) or "(none)"
     up = [f"Run the post-work conformance phase for subtask `{sid}`.",
-          f"PILA_DIR is {pila_dir} (absolute). Your subtask spec "
-          f"is at {pila_dir}/subtasks/{sid}.json and the implementer's "
-          f"success-criteria notes are at {pila_dir}/criteria/{sid}.md "
+          f"LEERIE_DIR is {leerie_dir} (absolute). Your subtask spec "
+          f"is at {leerie_dir}/subtasks/{sid}.json and the implementer's "
+          f"success-criteria notes are at {leerie_dir}/criteria/{sid}.md "
           "— both read-only inputs.",
           "Your current working directory IS the subtask's worktree. Make "
           "and commit any fixes here. Every commit subject must start "
@@ -10288,7 +10288,7 @@ def _conformance_clean(conf_res: dict) -> bool:
     return True
 
 
-async def _run_conformance_phase(sid: str, pila_dir: Path,
+async def _run_conformance_phase(sid: str, leerie_dir: Path,
                                  worktree: str, subtask: dict, caps: dict,
                                  st: State, models: dict[str, str],
                                  efforts: dict[str, str | None]
@@ -10299,7 +10299,7 @@ async def _run_conformance_phase(sid: str, pila_dir: Path,
     violations on conformer commits, exhausted rounds — surface as
     entries in `warnings`. The subtask still returns `complete`."""
     warnings: list[str] = []
-    repo_root = st.pila_root.parent
+    repo_root = st.leerie_root.parent
     rules_files = discover_rules_files(repo_root)
     blt = _infer_build_lint_test(repo_root)
     run_branch = compute_run_branch(st.run_id)
@@ -10308,7 +10308,7 @@ async def _run_conformance_phase(sid: str, pila_dir: Path,
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(worktree)
         last_res = await run_conformer(
-            sid, pila_dir, worktree, caps, st, models, efforts,
+            sid, leerie_dir, worktree, caps, st, models, efforts,
             rules_files=rules_files, blt_commands=blt, diff_base=run_branch)
 
         if last_res is None:
@@ -10325,7 +10325,7 @@ async def _run_conformance_phase(sid: str, pila_dir: Path,
         # Empty diff (worker added no commits) is fine and common: a
         # well-formed result with no fixes is a legitimate "nothing to do."
         # check_diff_scope returns a string ONLY for a protected-path
-        # violation — .pila/, .git/, or top-level .claude/ files;
+        # violation — .leerie/, .git/, or top-level .claude/ files;
         # .claude/{agents,commands,skills}/ are exempt per
         # is_protected_path(). The scope-volume warning is logged
         # side-channel and does not surface here.
@@ -10367,7 +10367,7 @@ async def _run_conformance_phase(sid: str, pila_dir: Path,
     return last_res, warnings
 
 
-async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
+async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
                          efforts: dict[str, str | None]) -> dict:
     """Drive one subtask to a terminal state.
@@ -10386,8 +10386,8 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
     retries = 0
     note = ""
     continuation = False
-    worktree = str(pila_dir / "worktrees" / sid)
-    subtask_path = pila_dir / "subtasks" / f"{sid}.json"
+    worktree = str(leerie_dir / "worktrees" / sid)
+    subtask_path = leerie_dir / "subtasks" / f"{sid}.json"
     subtask = json.loads(subtask_path.read_text()) if subtask_path.exists() else {}
 
     async def fail(kind: str, reason: str) -> dict | None:
@@ -10415,13 +10415,13 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
         if retries > caps["failed_retries"]:
             log(f"  {sid}: retry cap reached — terminating")
             return res
-        await _reset_subtask_worktree(sid, pila_dir, st.run_id)
+        await _reset_subtask_worktree(sid, leerie_dir, st.run_id)
         continuation = False
         note = f"Previous attempt failed: {reason}"
         return None
 
     while True:
-        res = await run_implementer(sid, pila_dir, caps, st, models, efforts,
+        res = await run_implementer(sid, leerie_dir, caps, st, models, efforts,
                                     continuation=continuation, note=note)
 
         # cross-field invariant check — catches a worker that lied about
@@ -10495,7 +10495,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             conf_warnings: list[str] = []
             try:
                 conf_res, conf_warnings = await _run_conformance_phase(
-                    sid, pila_dir, worktree, subtask, caps, st, models, efforts)
+                    sid, leerie_dir, worktree, subtask, caps, st, models, efforts)
             except Exception as e:
                 conf_warnings.append(
                     f"conformance phase raised {type(e).__name__}: {e} — "
@@ -10515,11 +10515,11 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
 
         if status == "incomplete-handoff":
             # Worktree convention from scripts/new-worktree.sh:
-            # .pila/worktrees/<subtask-id>. The freshness check on
+            # .leerie/worktrees/<subtask-id>. The freshness check on
             # `## Files touched` validates paths against this directory;
             # if it no longer exists (e.g. cleanup ran early), the check
             # is skipped gracefully.
-            wt_root = pila_dir / "worktrees" / sid
+            wt_root = leerie_dir / "worktrees" / sid
             cp_err = validate_checkpoint(res.get("checkpoint_path") or "",
                                          worktree_root=wt_root)
             if cp_err:
@@ -10545,7 +10545,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             # the user's answer. Consumes from the same
             # subtask_continuations budget — there is no extra "ask the
             # user" allowance.
-            wt_root = pila_dir / "worktrees" / sid
+            wt_root = leerie_dir / "worktrees" / sid
             cp_err = validate_checkpoint(res.get("checkpoint_path") or "",
                                          worktree_root=wt_root)
             if cp_err:
@@ -10570,7 +10570,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
             # to the next implementer — the spec was written once at
             # phase_plan time with the then-current answers; clarifications
             # captured later must be propagated.
-            spec_path = pila_dir / "subtasks" / f"{sid}.json"
+            spec_path = leerie_dir / "subtasks" / f"{sid}.json"
             if spec_path.exists():
                 spec = json.loads(spec_path.read_text())
                 spec["_clarification_answers"] = st.data.get("answers", {})
@@ -10598,7 +10598,7 @@ async def settle_subtask(sid: str, pila_dir: Path, caps: dict, st: State,
 
 
 async def integrate_wave(wave: list[str], results: dict[str, dict],
-                         pila_dir: Path, caps: dict, st: State,
+                         leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
                          efforts: dict[str, str | None]) -> list[str]:
     """Merge each completed subtask branch into staging (git merge, not
@@ -10610,7 +10610,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     the run is terminated with the integrator's diagnosis — an unresolved
     conflict must not silently proceed onto a corrupt staging tree."""
     integrated, integrated_so_far = [], []
-    staging = (pila_dir / "worktrees" / "staging").resolve()
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
     for sid in wave:
         if results.get(sid, {}).get("status") != "complete":
             continue
@@ -10636,7 +10636,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
         log(f"  conflict integrating {sid}; spawning integrator")
         sys_prompt = load_prompt("integrator")
         up = (f"Resolve the in-progress merge conflict in this worktree.\n"
-              f"PILA_DIR is {pila_dir}.\n"
+              f"LEERIE_DIR is {leerie_dir}.\n"
               f"Incoming subtask: {sid}\n"
               f"Already-integrated subtasks it may conflict with: "
               f"{', '.join(integrated_so_far) or 'none'}")
@@ -10686,7 +10686,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     return integrated
 
 
-async def phase_execute(pila_dir: Path, st: State, caps: dict,
+async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                         models: dict[str, str],
                         efforts: dict[str, str | None]) -> None:
     """Phases 4-5: create staging, then run waves sequentially; within a wave,
@@ -10702,7 +10702,7 @@ async def phase_execute(pila_dir: Path, st: State, caps: dict,
 
     async def settle_one(sid: str) -> tuple[str, dict]:
         async with sem:
-            r = await settle_subtask(sid, pila_dir, caps, st, models, efforts)
+            r = await settle_subtask(sid, leerie_dir, caps, st, models, efforts)
             log(f"  {sid}: {r.get('status')}")
             return sid, r
 
@@ -10724,13 +10724,13 @@ async def phase_execute(pila_dir: Path, st: State, caps: dict,
             die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
                 f"See {st.path}; resolve and re-run with --resume.")
 
-        await integrate_wave(wave, results, pila_dir, caps, st, models, efforts)
+        await integrate_wave(wave, results, leerie_dir, caps, st, models, efforts)
 
         # Deterministic post-integration safety net: an unresolved
         # conflict marker means integration broke the tree. Per-subtask
         # quality is the implementer's §8 confidence gate — there is no
         # LLM wave-level re-validation (see DESIGN §8, §9).
-        staging_path = pila_dir / "worktrees" / "staging"
+        staging_path = leerie_dir / "worktrees" / "staging"
         marker_err = await scan_conflict_markers(staging_path)
         if marker_err:
             die(f"wave {wi + 1}: {marker_err}\n"
@@ -10766,7 +10766,7 @@ _PR_TEMPLATE_SINGLE_LOCATIONS = (
     "docs/pull_request_template.md",
 )
 # Directories where GitHub looks for *multiple* templates. Any .md
-# inside any of these counts; pila defaults to the alphabetically
+# inside any of these counts; leerie defaults to the alphabetically
 # first basename, with --pr-template overriding the choice.
 _PR_TEMPLATE_MULTI_DIRS = (
     ".github/PULL_REQUEST_TEMPLATE",
@@ -10795,7 +10795,7 @@ def find_pr_template(repo_root: Path,
     Case sensitivity: file lookups use the literal paths above
     (lowercase `pull_request_template.md`, uppercase
     `PULL_REQUEST_TEMPLATE/`) — GitHub itself accepts both cases but
-    pila normalizes on the canonical casing rather than scanning every
+    leerie normalizes on the canonical casing rather than scanning every
     case-variant.
     """
     for rel in _PR_TEMPLATE_SINGLE_LOCATIONS:
@@ -10825,7 +10825,7 @@ def find_pr_template(repo_root: Path,
 
 # Byte budgets for the pr_writer payload. The launcher passes the whole
 # JSON-encoded payload as a single argv element to `claude -p`; Linux
-# ARG_MAX in the pila container (Debian 12) is ~128 KB. These caps keep
+# ARG_MAX in the leerie container (Debian 12) is ~128 KB. These caps keep
 # the largest fields well under that ceiling. The diff sample is line-
 # capped instead of byte-capped because individual diff lines can be
 # long but the worker reads them as hunks.
@@ -10856,23 +10856,23 @@ def _cap_text(s: str, max_bytes: int, label: str) -> tuple[str, bool]:
     return (truncated + sentinel, True)
 
 
-# Matches "pila:" at the very start of a string, case-insensitive, with
+# Matches "leerie:" at the very start of a string, case-insensitive, with
 # any whitespace that follows. Anchored so it can't fire mid-string
-# (does not false-positive on "pilates", "pila is great", etc.).
-_PILA_PREFIX_RE = re.compile(r"^pila:\s*", re.IGNORECASE)
+# (does not false-positive on "leerietes", "leerie is great", etc.).
+_LEERIE_PREFIX_RE = re.compile(r"^leerie:\s*", re.IGNORECASE)
 
 
-def _strip_pila_prefix(title: str) -> str:
-    """Strip a leading `pila:` from a worker-emitted PR title so the
-    launcher's unconditional `pila: ` prepend cannot produce
-    `pila: pila: ...`.
+def _strip_leerie_prefix(title: str) -> str:
+    """Strip a leading `leerie:` from a worker-emitted PR title so the
+    launcher's unconditional `leerie: ` prepend cannot produce
+    `leerie: leerie: ...`.
 
     The pr_writer prompt tells the worker not to emit the prefix, but
     DESIGN §12 *prompts are advisory, code enforces* — a guarantee
     that matters and can be checked mechanically must live in code.
     Without this guard, a single drift produces a user-visible defect
     on every PR until the prompt is patched."""
-    return _PILA_PREFIX_RE.sub("", title)
+    return _LEERIE_PREFIX_RE.sub("", title)
 
 
 def _truncate_diff_sample(diff_text: str, max_lines: int) -> tuple[str, bool]:
@@ -11042,12 +11042,12 @@ async def _compose_pr_via_llm(st: "State",
             sid="pr-writer",
         )
 
-        # Strip whitespace, then strip any leading `pila:` the worker
+        # Strip whitespace, then strip any leading `leerie:` the worker
         # may have emitted despite the prompt telling it not to —
         # DESIGN §12 *prompts are advisory, code enforces*. The
-        # launcher unconditionally prepends `pila: `, so leaving a
-        # worker-emitted prefix in place would render `pila: pila: …`.
-        title = _strip_pila_prefix((result.get("title") or "").strip()).strip()
+        # launcher unconditionally prepends `leerie: `, so leaving a
+        # worker-emitted prefix in place would render `leerie: leerie: …`.
+        title = _strip_leerie_prefix((result.get("title") or "").strip()).strip()
         body = (result.get("body") or "").strip()
         if not title or not body:
             log("pr_writer: worker returned empty title or body; "
@@ -11069,7 +11069,7 @@ async def _compose_pr_via_llm(st: "State",
             "launcher will use deterministic fallback")
 
 
-async def phase_finalize(pila_dir: Path, st: State, no_push: bool,
+async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
                          no_verify: bool,
                          caps: dict | None = None,
                          models: dict[str, str] | None = None,
@@ -11153,7 +11153,7 @@ async def phase_finalize(pila_dir: Path, st: State, no_push: bool,
 # =========================================================================
 # entry point
 # =========================================================================
-async def orchestrate(args, caps: dict, pila_dir: Path, st: State,
+async def orchestrate(args, caps: dict, leerie_dir: Path, st: State,
                       sot_pref: str, verbosity: str,
                       models: dict[str, str],
                       efforts: dict[str, str | None]) -> None:
@@ -11166,7 +11166,7 @@ async def orchestrate(args, caps: dict, pila_dir: Path, st: State,
     # the finally so it never outlives the run.
     sampler_task = asyncio.create_task(_memory_sampler(st))
     try:
-        await _run_phases(args, caps, pila_dir, st, sot_pref, verbosity,
+        await _run_phases(args, caps, leerie_dir, st, sot_pref, verbosity,
                           models, efforts)
     finally:
         sampler_task.cancel()
@@ -11174,7 +11174,7 @@ async def orchestrate(args, caps: dict, pila_dir: Path, st: State,
             await sampler_task
 
 
-async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
+async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                       sot_pref: str, verbosity: str,
                       models: dict[str, str],
                       efforts: dict[str, str | None]) -> None:
@@ -11203,7 +11203,7 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
             return
         if "waves" not in st.data:
             die("cannot resume — run did not reach the scheduling phase")
-        # Refresh the preferences in case env vars or pila.toml
+        # Refresh the preferences in case env vars or leerie.toml
         # changed since the original run started. Verbosity is
         # resolved fresh every run — the user can dial up or down on
         # resume without editing state.json.
@@ -11220,7 +11220,7 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
         # file, re-run with --resume --answers <file>. Without this
         # call the answers file was silently dropped — the re-spawned
         # worker would re-ask the same question forever. See P5-1.
-        absorb_supplied_answers(args, st, pila_dir)
+        absorb_supplied_answers(args, st, leerie_dir)
         # Re-export the mise override env var if the original run
         # synthesized one. phase_provision (which set it on os.environ
         # the first time) is skipped on resume, but downstream
@@ -11241,7 +11241,7 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
                    "dangerously_skip_permissions": bool(
                        args.dangerously_skip_permissions)}
         st.save()
-        await preflight(pila_dir, verbosity=verbosity,
+        await preflight(leerie_dir, verbosity=verbosity,
                         skip_smoke=args.skip_smoke,
                         no_push=getattr(args, "no_push", False))
         supplied = (json.loads(Path(args.answers).read_text())
@@ -11262,14 +11262,14 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
             st.rename_to(final_run_id)
             # Handover file for the remote-mode launcher's tail wrapper. The
             # launcher generated the bootstrap id host-side and is tailing
-            # `.pila/runs/<bootstrap_id>/orchestrator.log`. After this rename
+            # `.leerie/runs/<bootstrap_id>/orchestrator.log`. After this rename
             # that path is gone; the launcher's wrapper polls
-            # `.pila/launcher-<bootstrap_id>.runid` to discover the final id
+            # `.leerie/launcher-<bootstrap_id>.runid` to discover the final id
             # and re-targets the tail. See DESIGN §6 *Detached orchestrator
             # (remote mode)*. Safe (and harmless) for local runs — the file
             # is just never read.
             try:
-                handover = st.pila_root / f"launcher-{bootstrap_run_id}.runid"
+                handover = st.leerie_root / f"launcher-{bootstrap_run_id}.runid"
                 handover.write_text(final_run_id + "\n")
             except OSError:
                 pass
@@ -11277,13 +11277,13 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
             # phase_execute / phase_finalize internally re-derive their
             # working dir from st.path.parent, so they automatically
             # pick up the new location.
-            pila_dir = st.run_dir
+            leerie_dir = st.run_dir
             # Initialize run.json with the immutable run-identity fields
             # (run_id, branch, working_branch, started_at, task) so
-            # `pila --list` can enumerate this run from the moment
+            # `leerie --list` can enumerate this run from the moment
             # it has a stable identity — not only after finalize.
             # working_branch is HEAD-at-classify-time; setup-run.sh
-            # records the same value to .pila/runs/<id>/working-branch
+            # records the same value to .leerie/runs/<id>/working-branch
             # later, but we capture it here so a run that fails
             # before phase_execute still has a recoverable run.json.
             head_proc = await run_proc(
@@ -11342,10 +11342,10 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
         st.save()
         subtasks, waves = schedule(plans)
         validate_plan(subtasks)
-        write_plan(pila_dir, task, st, subtasks, waves)
+        write_plan(leerie_dir, task, st, subtasks, waves)
 
-    await phase_execute(pila_dir, st, caps, models, efforts)
-    await phase_finalize(pila_dir, st,
+    await phase_execute(leerie_dir, st, caps, models, efforts)
+    await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False),
                         caps=caps, models=models, efforts=efforts,
@@ -11354,17 +11354,17 @@ async def _run_phases(args, caps: dict, pila_dir: Path, st: State,
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="pila", description=__doc__,
+    ap = argparse.ArgumentParser(prog="leerie", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--version", action="version",
-                    version=f"pila {_read_version()}",
-                    help="print the pila version and exit")
+                    version=f"leerie {_read_version()}",
+                    help="print the leerie version and exit")
     ap.add_argument("task", nargs="?",
                     help="the task to execute (literal string, or path to "
                          "a .txt/.md file whose contents are the task)")
     ap.add_argument("--resume", action="store_true",
                     help="resume an interrupted run (auto-picks if exactly "
-                         "one run exists under .pila/runs/). "
+                         "one run exists under .leerie/runs/). "
                          "Default: off (start a new run)")
     ap.add_argument("--run-id", metavar="ID",
                     help="select a specific run by id (for --resume when "
@@ -11392,13 +11392,13 @@ def main() -> None:
                          "classifier's filter still runs but surviving "
                          "questions are dropped and the implementer makes a "
                          f"best-effort decision. Also {CLARIFY_ENV} env var "
-                         "or clarify=true in pila.toml.")
+                         "or clarify=true in leerie.toml.")
     ap.add_argument("--no-push", action="store_true",
                     help="skip the push and PR step at finalize. The run "
                          "completes with the run branch local-only; your "
                          "working branch is unchanged. Default: off (push "
                          f"and PR happen). Also {NO_PUSH_ENV} env var or "
-                         "no_push in pila.toml.")
+                         "no_push in leerie.toml.")
     ap.add_argument("--no-verify", action="store_true",
                     help="pass --no-verify to the finalize `git push` "
                          "(skips pre-push hooks). Worker commits inside "
@@ -11414,7 +11414,7 @@ def main() -> None:
                          "or none at all. Default: alphabetically first "
                          ".md. Also "
                          f"{PR_TEMPLATE_ENV} env var or pr_template in "
-                         "pila.toml.")
+                         "leerie.toml.")
     ap.add_argument("--dangerously-skip-permissions", action="store_true",
                     help="DANGEROUS: pass --dangerously-skip-permissions "
                          "to EVERY claude -p worker — including the "
@@ -11427,12 +11427,12 @@ def main() -> None:
                          "against directly. Default: off (judgment "
                          "workers narrow-allowlisted). Also "
                          f"{DANGEROUS_SKIP_PERMS_ENV} env var or "
-                         "dangerously_skip_permissions=true in pila.toml.")
+                         "dangerously_skip_permissions=true in leerie.toml.")
     ap.add_argument("--max-workers", type=_positive_int, metavar="N",
                     help=f"total worker-invocation budget "
                          f"(default {DEFAULT_CAPS['max_total_workers']}); "
                          f"also {MAX_WORKERS_ENV} and max_workers in "
-                         "pila.toml")
+                         "leerie.toml")
     ap.add_argument("--max-parallel", type=int,
                     help=f"override concurrent workers per wave "
                          f"(default {DEFAULT_CAPS['max_parallel']})")
@@ -11441,7 +11441,7 @@ def main() -> None:
                          f"implementer may run before exiting blocked "
                          f"(default {DEFAULT_CAPS['confidence_rounds']}); "
                          f"also {CONFIDENCE_ROUNDS_ENV} and "
-                         f"confidence_rounds in pila.toml")
+                         f"confidence_rounds in leerie.toml")
     ap.add_argument("--worker-memory-max", metavar="SIZE",
                     help="per-worker cgroup memory cap (e.g. '4G', "
                          "'512M', '1024'). Bounds RAM available to each "
@@ -11450,7 +11450,7 @@ def main() -> None:
                          "sshd / orchestrator. Auto-derived from "
                          "/proc/meminfo when unset. Also "
                          f"{WORKER_MEMORY_MAX_ENV} env var or "
-                         "worker_memory_max in pila.toml")
+                         "worker_memory_max in leerie.toml")
     ap.add_argument("--skip-smoke", action="store_true",
                     help="skip the live claude -p smoke test during preflight. "
                          "Default: off (smoke test runs)")
@@ -11458,12 +11458,12 @@ def main() -> None:
                     metavar="VALUE",
                     help=f"source-of-truth preference "
                          f"({'|'.join(SOURCE_OF_TRUTH_VALUES)}, default both); "
-                         f"overrides {SOURCE_OF_TRUTH_ENV} and pila.toml")
+                         f"overrides {SOURCE_OF_TRUTH_ENV} and leerie.toml")
     ap.add_argument("--runtime", choices=RUNTIME_VALUES,
                     metavar="MODE",
                     help=f"execution runtime "
                          f"({'|'.join(RUNTIME_VALUES)}, default local); "
-                         f"overrides {RUNTIME_ENV} and pila.toml")
+                         f"overrides {RUNTIME_ENV} and leerie.toml")
     ap.add_argument("--inspect-dir", action="append", metavar="PATH",
                     dest="inspect_dir",
                     help="extra directory the inspect-bucket workers "
@@ -11472,7 +11472,7 @@ def main() -> None:
                          "Use for sibling repos referenced in the task that "
                          "live outside the current repo cwd. Default: none. "
                          f"Also {INSPECT_DIRS_ENV} (colon-separated) or "
-                         "inspect_dirs in pila.toml (comma-separated).")
+                         "inspect_dirs in leerie.toml (comma-separated).")
     ap.add_argument("--model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for all workers "
                          f"({'|'.join(MODEL_VALUES)}); no global default — "
@@ -11482,13 +11482,13 @@ def main() -> None:
                          f"{MODEL_DEFAULT_PER_WORKER['implementer']} "
                          "(IMPLEMENTATION.md §2). Per-worker "
                          "--model-<worker> flags override this, as do "
-                         "PILA_MODEL[_*] env vars and pila.toml")
+                         "LEERIE_MODEL[_*] env vars and leerie.toml")
     for _w in WORKER_TYPES:
         _w_default = MODEL_DEFAULT_PER_WORKER.get(_w, MODEL_DEFAULT)
         ap.add_argument(f"--model-{_w}", choices=MODEL_VALUES, metavar="ALIAS",
                         help=f"model alias for the {_w} worker "
                              f"(default {_w_default}) — overrides "
-                             f"--model, PILA_MODEL, and pila.toml")
+                             f"--model, LEERIE_MODEL, and leerie.toml")
     # Effort selection — see IMPLEMENTATION.md §2 "Effort selection".
     # Same shape as --model: a global --effort plus per-worker --effort-<W>
     # overrides. Acting workers (implementer, conformer) have no per-worker
@@ -11502,36 +11502,36 @@ def main() -> None:
                          f"{EFFORT_DEFAULT_PER_WORKER['planner']}, acting "
                          "workers (implementer, conformer) default to unset "
                          "(IMPLEMENTATION.md §2). Per-worker --effort-<worker> "
-                         "flags override this, as do PILA_EFFORT[_*] env vars "
-                         "and pila.toml")
+                         "flags override this, as do LEERIE_EFFORT[_*] env vars "
+                         "and leerie.toml")
     for _w in WORKER_TYPES:
         _e_default = EFFORT_DEFAULT_PER_WORKER.get(_w, "unset")
         ap.add_argument(f"--effort-{_w}", choices=EFFORT_VALUES, metavar="LEVEL",
                         help=f"reasoning depth for the {_w} worker "
                              f"(default {_e_default}) — overrides "
-                             f"--effort, PILA_EFFORT, and pila.toml")
+                             f"--effort, LEERIE_EFFORT, and leerie.toml")
     ap.add_argument("--judge-model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for the judge post-run worker "
                          f"(default {MODEL_DEFAULT_PER_WORKER['judge']}); "
-                         f"also {MODEL_JUDGE_ENV} or model_judge in pila.toml")
+                         f"also {MODEL_JUDGE_ENV} or model_judge in leerie.toml")
     ap.add_argument("--heal-model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for the heal post-run worker "
                          f"(default {MODEL_DEFAULT_PER_WORKER['heal']}); "
-                         f"also {MODEL_HEAL_ENV} or model_heal in pila.toml")
+                         f"also {MODEL_HEAL_ENV} or model_heal in leerie.toml")
     ap.add_argument("--pr-writer-model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for the pr_writer finalize worker "
                          f"(default {MODEL_DEFAULT_PER_WORKER['pr_writer']}); "
                          f"also {MODEL_PR_WRITER_ENV} or model_pr_writer "
-                         f"in pila.toml")
+                         f"in leerie.toml")
     ap.add_argument("--heal-max-rounds", type=int, metavar="N",
                     help=f"maximum heal-loop iterations per call_type "
                          f"(default {HEAL_MAX_ROUNDS_DEFAULT}); "
-                         f"also {HEAL_MAX_ROUNDS_ENV} or heal_max_rounds in pila.toml")
+                         f"also {HEAL_MAX_ROUNDS_ENV} or heal_max_rounds in leerie.toml")
     ap.add_argument("--heal-success-threshold", type=float, metavar="RATE",
                     help=f"pass-rate threshold for heal-loop SUCCESS verdict "
                          f"(default {HEAL_SUCCESS_THRESHOLD_DEFAULT}); "
                          f"also {HEAL_SUCCESS_THRESHOLD_ENV} or "
-                         "heal_success_threshold in pila.toml")
+                         "heal_success_threshold in leerie.toml")
     # Verbosity: explicit --verbosity wins; -v/-q stackable shortcuts
     # anchor to `normal` (the pre-streaming behavior). So `-v` = stream,
     # `-vv` = debug, `-q` = normal, `-qq` = quiet. See IMPLEMENTATION.md
@@ -11540,7 +11540,7 @@ def main() -> None:
     ap.add_argument("--verbosity", choices=VERBOSITY_VALUES, metavar="LEVEL",
                     help=f"output verbosity ({'/'.join(VERBOSITY_VALUES)}, "
                          f"default {VERBOSITY_DEFAULT}); overrides "
-                         f"{VERBOSITY_ENV} and pila.toml")
+                         f"{VERBOSITY_ENV} and leerie.toml")
     ap.add_argument("-v", "--verbose", action="count", default=0,
                     help="shortcut: -v=stream, -vv=debug. Default: 0 "
                          "(no -v; falls through to --verbosity)")
@@ -11556,26 +11556,26 @@ def main() -> None:
                           action="store_true", default=None,
                           help=f"enable telemetry (default on); also "
                                f"{TELEMETRY_ENV}=1 or telemetry=true in "
-                               "pila.toml")
+                               "leerie.toml")
     _tel_grp.add_argument("--no-telemetry", dest="telemetry",
                           action="store_false",
                           help=f"disable telemetry event writing "
                                f"(default: telemetry is on); also "
                                f"{TELEMETRY_ENV}=0 or telemetry=false in "
-                               "pila.toml")
+                               "leerie.toml")
     ap.add_argument("--telemetry-dir", metavar="DIR",
                     help=f"subdirectory name under the run dir for telemetry "
                          f"NDJSON events (default '{TELEMETRY_SUBDIR_DEFAULT}'); "
                          f"also {TELEMETRY_SUBDIR_ENV} or telemetry_dir in "
-                         "pila.toml")
+                         "leerie.toml")
     ap.add_argument("--judge-dir", metavar="DIR",
                     help=f"subdirectory name under the run dir for LLM judge "
                          f"output (default '{JUDGE_DIR_DEFAULT}'); also "
-                         f"{JUDGE_DIR_ENV} or judge_dir in pila.toml")
+                         f"{JUDGE_DIR_ENV} or judge_dir in leerie.toml")
     ap.add_argument("--heal-dir", metavar="DIR",
                     help=f"subdirectory name under the run dir for LLM self-heal "
                          f"output (default '{HEAL_DIR_DEFAULT}'); also "
-                         f"{HEAL_DIR_ENV} or heal_dir in pila.toml")
+                         f"{HEAL_DIR_ENV} or heal_dir in leerie.toml")
     ap.add_argument("--phase", choices=["judge", "heal"], metavar="PHASE",
                     help="run a post-run skill phase against an existing run's "
                          "captured LLM calls instead of starting a new run. "
@@ -11591,15 +11591,15 @@ def main() -> None:
     args = ap.parse_args()
 
     # --list / --list-paused short-circuit everything else: read
-    # .pila/runs/* and exit. No git/CLI checks needed; the user might
+    # .leerie/runs/* and exit. No git/CLI checks needed; the user might
     # be inspecting runs from outside a git repo.
     if args.list_runs:
-        pila_root = Path(".pila").resolve()
-        list_runs(pila_root, status_filter=args.status_filter)
+        leerie_root = Path(".leerie").resolve()
+        list_runs(leerie_root, status_filter=args.status_filter)
         return
     if args.list_paused:
-        pila_root = Path(".pila").resolve()
-        list_paused_runs(pila_root)
+        leerie_root = Path(".leerie").resolve()
+        list_paused_runs(leerie_root)
         return
 
     if not shutil.which("claude"):
@@ -11637,17 +11637,17 @@ def main() -> None:
                  or resolve_verbosity(Path(os.getcwd()), None))
 
     # The on-disk layout is per-run: every run gets its own subdirectory
-    # `pila_root/runs/<run-id>/` (see DESIGN.md §6, §10). For a fresh
+    # `leerie_root/runs/<run-id>/` (see DESIGN.md §6, §10). For a fresh
     # run we don't know the final run_id until phase_classify has chosen
     # a category, so state lives in `_bootstrap-<6hex>/` until then; the
     # rename to the final run_id happens in orchestrate() after classify.
-    pila_root = Path(".pila").resolve()
-    pila_root.mkdir(parents=True, exist_ok=True)
-    (pila_root / "runs").mkdir(parents=True, exist_ok=True)
+    leerie_root = Path(".leerie").resolve()
+    leerie_root.mkdir(parents=True, exist_ok=True)
+    (leerie_root / "runs").mkdir(parents=True, exist_ok=True)
     if args.resume:
         # Auto-pick if exactly one run exists; die with the available list
         # if multiple are in flight unless --run-id picks one explicitly.
-        run_id = resolve_run_id(pila_root, args.run_id)
+        run_id = resolve_run_id(leerie_root, args.run_id)
     elif args.run_id and args.run_id.startswith("_bootstrap-"):
         # Launcher-supplied bootstrap id (DESIGN §6 *Detached orchestrator
         # (remote mode)*). The remote-mode launcher generates the bootstrap
@@ -11661,12 +11661,12 @@ def main() -> None:
         # concurrent invocations don't pick the same one. Renamed to the
         # final `<short_category>-<slug>-<6hex>` after classify.
         run_id = "_bootstrap-" + hashlib.sha1(now().encode()).hexdigest()[:6]
-    st = State(pila_root, run_id)
+    st = State(leerie_root, run_id)
     for sub in ("", "subtasks", "criteria", "checkpoints", "logs"):
         (st.run_dir / sub).mkdir(parents=True, exist_ok=True)
 
     # Resolve source-of-truth and per-worker model preferences once per run.
-    # Both die() on a bad value so typos in pila.toml or env vars are
+    # Both die() on a bad value so typos in leerie.toml or env vars are
     # caught at startup, not mid-planner. argparse already rejected any bad
     # --source-of-truth / --model[-*] before we got here.
     repo_root = Path(os.getcwd())
@@ -11683,8 +11683,8 @@ def main() -> None:
     if _e_pairs:
         log("efforts: " + ", ".join(_e_pairs))
 
-    # Resolve --no-push: CLI flag → PILA_NO_PUSH env → no_push in
-    # pila.toml → False. Re-attach to args so orchestrate() /
+    # Resolve --no-push: CLI flag → LEERIE_NO_PUSH env → no_push in
+    # leerie.toml → False. Re-attach to args so orchestrate() /
     # preflight() / phase_finalize() see the resolved value uniformly via
     # `args.no_push` regardless of where the choice came from.
     args.no_push = resolve_no_push(repo_root, args.no_push)
@@ -11713,8 +11713,8 @@ def main() -> None:
     args.pr_template = resolve_pr_template(
         repo_root, getattr(args, "pr_template", None))
 
-    # Resolve --inspect-dir: CLI flags (repeatable) → PILA_INSPECT_DIRS
-    # env (colon-separated) → inspect_dirs in pila.toml (comma-separated)
+    # Resolve --inspect-dir: CLI flags (repeatable) → LEERIE_INSPECT_DIRS
+    # env (colon-separated) → inspect_dirs in leerie.toml (comma-separated)
     # → []. Re-attached to args so orchestrate() can fold it into state.
     args.inspect_dirs = resolve_inspect_dirs(
         repo_root, getattr(args, "inspect_dir", None))
@@ -11734,8 +11734,8 @@ def main() -> None:
     # --phase judge|heal: post-run skill phases. Short-circuit the normal
     # orchestrate() flow — just pick an existing run and run the skill.
     if args.phase:
-        phase_run_id = resolve_run_id(pila_root, args.run_id)
-        phase_st = State(pila_root, phase_run_id)
+        phase_run_id = resolve_run_id(leerie_root, args.run_id)
+        phase_st = State(leerie_root, phase_run_id)
         if not phase_st.load():
             die(f"no state.json found for run {phase_run_id!r}; "
                 f"the run may not have reached the execute phase yet")
@@ -11891,15 +11891,15 @@ def main() -> None:
                 interrupted_during_sleep = True
                 exit_code = 130
             if not interrupted_during_sleep:
-                launcher = str(ROOT / "pila")
+                launcher = str(ROOT / "leerie")
                 log(f"  auto-resuming: exec {launcher} "
                     f"--resume --run-id {st.run_id}")
                 os.execvp(launcher,
-                          ["pila", "--resume", "--run-id", st.run_id])
+                          ["leerie", "--resume", "--run-id", st.run_id])
                 # Unreachable: execvp replaces the process.
         else:
             log(f"  could not parse reset time; "
-                f"resume manually: pila --resume --run-id {st.run_id}")
+                f"resume manually: leerie --resume --run-id {st.run_id}")
             exit_code = 75  # EX_TEMPFAIL
     except KeyboardInterrupt:
         # Ctrl-C → worktree cleanup only; state and branches preserved

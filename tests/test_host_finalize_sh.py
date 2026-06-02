@@ -3,7 +3,7 @@
 Companion to tests/test_finalize_sh_behavior.py (which covers
 scripts/finalize.sh, the in-container verifier). This file covers
 scripts/host-finalize.sh, the host-side push+PR block extracted from
-the pila launcher to make `pila --finalize <run-id>` actually finalize
+the leerie launcher to make `leerie --finalize <run-id>` actually finalize
 (Audit Drift 7).
 
 The tests source host-finalize.sh in a bash subprocess with stubbed
@@ -36,7 +36,7 @@ def _make_stub_bin(tmp_path: Path, name: str, body: str) -> None:
 def _make_run(tmp_path: Path, run_id: str, run_json: dict,
               state_json: dict | None = None) -> Path:
     user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".pila" / "runs" / run_id
+    run_dir = user_repo / ".leerie" / "runs" / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "run.json").write_text(json.dumps(run_json))
     if state_json is not None:
@@ -51,7 +51,7 @@ def _run_host_finalize(tmp_path: Path, run_dir: Path,
     host_finalize <run_dir>. Returns the CompletedProcess."""
     _make_stub_bin(tmp_path, "git", git_body)
     _make_stub_bin(tmp_path, "gh", gh_body)
-    user_repo = run_dir.parent.parent.parent  # .pila/runs/<id>/.. → .pila → repo
+    user_repo = run_dir.parent.parent.parent  # .leerie/runs/<id>/.. → .leerie → repo
     script = f". {HOST_FINALIZE_SH}; host_finalize {run_dir}"
     return subprocess.run(
         ["bash", "-c", script],
@@ -70,7 +70,7 @@ def test_skips_when_no_push_true(tmp_path):
     """run.json has no_push=true → skip with the "no_push=true" message,
     return 0 without touching git or gh."""
     run_dir = _make_run(tmp_path, "feat-x-aaaaaa", run_json={
-        "branch": "pila/runs/feat-x-aaaaaa",
+        "branch": "leerie/runs/feat-x-aaaaaa",
         "working_branch": "main",
         "no_push": True,
         "finished_at": "2026-05-29T16:00:00+00:00",
@@ -85,7 +85,7 @@ def test_skips_when_no_push_true(tmp_path):
 def test_skips_when_already_pushed(tmp_path):
     """run.json has pushed_at set → idempotent re-invocation; return 0."""
     run_dir = _make_run(tmp_path, "feat-y-aaaaaa", run_json={
-        "branch": "pila/runs/feat-y-aaaaaa",
+        "branch": "leerie/runs/feat-y-aaaaaa",
         "working_branch": "main",
         "pushed_at": "2026-05-29T16:00:00+00:00",
         "finished_at": "2026-05-29T15:00:00+00:00",
@@ -110,7 +110,7 @@ def test_records_push_error_on_git_push_failure(tmp_path):
     """git push fails → push_error set on sidecar, pushed_at stays null,
     function returns 1."""
     run_dir = _make_run(tmp_path, "feat-q-aaaaaa", run_json={
-        "branch": "pila/runs/feat-q-aaaaaa",
+        "branch": "leerie/runs/feat-q-aaaaaa",
         "working_branch": "main",
         "finished_at": "2026-05-29T16:00:00+00:00",
     })
@@ -136,7 +136,7 @@ def test_records_pushed_at_on_success(tmp_path):
     run_dir = _make_run(
         tmp_path, "feat-s-aaaaaa",
         run_json={
-            "branch": "pila/runs/feat-s-aaaaaa",
+            "branch": "leerie/runs/feat-s-aaaaaa",
             "working_branch": "main",
             "finished_at": "2026-05-29T16:00:00+00:00",
             "pr_title": "feat: do thing",
@@ -162,7 +162,7 @@ def test_pr_failure_is_non_fatal(tmp_path):
     run_dir = _make_run(
         tmp_path, "feat-p-aaaaaa",
         run_json={
-            "branch": "pila/runs/feat-p-aaaaaa",
+            "branch": "leerie/runs/feat-p-aaaaaa",
             "working_branch": "main",
             "finished_at": "2026-05-29T16:00:00+00:00",
         },

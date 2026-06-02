@@ -1,4 +1,4 @@
-# Pila reconciler
+# Leerie reconciler
 
 You bridge **capability-tag vocabulary drift** between parallel planners.
 
@@ -135,11 +135,11 @@ A JSON object with eight arrays. Each array may be empty:
 
 ## Cycle-breaking (the retry mode)
 
-After applying your output, pila runs Tarjan's SCC over the merged graph
+After applying your output, leerie runs Tarjan's SCC over the merged graph
 to verify it's acyclic. Two renames can each be locally correct yet jointly
 close a cycle — e.g. `feat-A` renames a requires to a tag `feat-B`
 provides, while `feat-B` renames a requires to a tag `feat-A` provides.
-Pila detects this in Python (not your job to verify), names the SCC + the
+Leerie detects this in Python (not your job to verify), names the SCC + the
 mutations that closed each edge, computes a *recommended* resolution from
 structural signals (planner-declared `depends_on` direction;
 `files_likely_touched` overlap), and **respawns you once** with that
@@ -149,13 +149,13 @@ In retry mode, the input prompt will name each cycle, the offending
 mutations, the recommendation, and the must-include set. You must either:
 
 - Emit the recommendation verbatim (it's computed deterministically from
-  signals pila can see in code; it's correct in the common cases), OR
+  signals leerie can see in code; it's correct in the common cases), OR
 - Pick a different operation from the bounded set with a structural
   reason in the `reason` field.
 
 You may **not** use `unresolvable` for a cycle — cycles must be broken
 with one of `dropped_requires` / `dependency_edges` / `merged_subtasks`.
-Pila's apply step rejects revised outputs that ignore a named cycle.
+Leerie's apply step rejects revised outputs that ignore a named cycle.
 
 Operation guide for the cycle-breaking ops:
 
@@ -172,10 +172,10 @@ Operation guide for the cycle-breaking ops:
   `depends_on` already encoding it. Note: for cycles where one direction
   is *already* a planner-declared `depends_on` (e.g. run 1's `feat-009 →
   feat-008` planner edge + a reconciler-renamed `requires` closing the
-  reverse direction), pila's recommendation is `dropped_requires` alone —
+  reverse direction), leerie's recommendation is `dropped_requires` alone —
   the planner-declared edge is already in the graph, so adding it again
   via `dependency_edges` is redundant. Use `dependency_edges` only when
-  you have a structural reason to assert an ordering pila's heuristic
+  you have a structural reason to assert an ordering leerie's heuristic
   didn't compute (e.g., neither direction is planner-declared, files
   aren't shared, and the model has domain knowledge that one ordering is
   correct). In that case, pair it with `dropped_requires` to remove the
@@ -193,7 +193,7 @@ Operation guide for the cycle-breaking ops:
 The mechanical floor (gate + must-include validation + post-retry re-check)
 is the guarantee. The recommendation primes you toward the structurally
 correct answer; you don't need to mentally execute SCC detection or
-verify acyclicity unaided. If your revised output still cycles, pila
+verify acyclicity unaided. If your revised output still cycles, leerie
 aborts with the full SCC report.
 
 The **same retry pattern fires on a second failure class**: an
@@ -201,7 +201,7 @@ unresolved `requires` tag that survives your first attempt's renames,
 added_provides, and added_subtasks. The common cause is inventing a
 new tag in your added_subtasks/added_provides without renaming the
 original consumer's tag to match (two synonyms for the same concept
-that never get unified). On detection, pila respawns you with a retry
+that never get unified). On detection, leerie respawns you with a retry
 prompt that surfaces string-similarity hints — top candidate
 `provides` tags ranked by Jaccard over hyphen-tokens. The
 recommendation is framed as a *hint* (a prior), not the answer:
@@ -225,7 +225,7 @@ inventing a phantom producer.
 
 These rules govern your **first attempt**, where the task is resolving
 `unresolved_requires`. If your output later turns out to close a
-dependency cycle, pila will respawn you with a structured retry prompt
+dependency cycle, leerie will respawn you with a structured retry prompt
 naming the cycle and the bounded cycle-breaking ops you must pick from
 (see *Cycle-breaking (the retry mode)* above) — you don't need to think
 about cycles here.
@@ -260,7 +260,7 @@ action from this priority order:
 
    `success_criteria_seed` must be **concrete and checkable** — describe an
    automated test or observable behavior. The new subtask must produce the
-   unresolved tag in its `provides`. (Pila stamps the
+   unresolved tag in its `provides`. (Leerie stamps the
    `_added_by_reconciler: true` traceability flag on every added subtask
    — you don't need to set it.)
 
@@ -272,7 +272,7 @@ action from this priority order:
    state (a db client and its DAL belong together; an env-config module
    and an object-storage helper do not). Partition the `provides` tags
    across the new subtasks so every original tag is still produced by
-   exactly one subtask. If you emit `size: large`, pila will respawn
+   exactly one subtask. If you emit `size: large`, leerie will respawn
    you once with a structured size-resolution prompt naming each
    oversized subtask; a second `large` emission is a fatal error.
 
@@ -334,7 +334,7 @@ Input:
      "intent": "Wrap each slm_call so envelopes flow to events.ndjson",
      "provides": ["slm-capture-shim"], "requires": []},
     {"id": "feat-002", "title": "events.ndjson emitter",
-     "intent": "Write captured envelopes to .pila/runs/<id>/events.ndjson",
+     "intent": "Write captured envelopes to .leerie/runs/<id>/events.ndjson",
      "provides": ["events-ndjson-emitter"], "requires": ["slm-capture-shim"]},
     {"id": "test-001", "title": "Test slm capture",
      "intent": "Verify envelopes are captured for every slm_call",

@@ -1,8 +1,8 @@
-"""Tests for the cgroup v2 containment helpers in pila.py.
+"""Tests for the cgroup v2 containment helpers in leerie.py.
 
-These helpers live in `orchestrator/pila.py` (search for
+These helpers live in `orchestrator/leerie.py` (search for
 `_cgroup_probe`, `_cgroup_create`, `_cgroup_enroll`, `_cgroup_destroy`).
-They are best-effort: pila MUST keep running when /sys/fs/cgroup is
+They are best-effort: leerie MUST keep running when /sys/fs/cgroup is
 read-only or missing. The tests below pin three contracts:
 
   1. Probe failure makes all subsequent helpers no-op cleanly.
@@ -22,77 +22,77 @@ import pytest
 
 
 @pytest.fixture(autouse=True)
-def reset_probe_memo(pila):
+def reset_probe_memo(leerie):
     """Reset the module-level probe memo before every test. Without
     this, the first test that sets `_CGROUP_PROBE_RESULT` would force
     the same value into every subsequent test."""
-    pila._CGROUP_PROBE_RESULT = None
+    leerie._CGROUP_PROBE_RESULT = None
     yield
-    pila._CGROUP_PROBE_RESULT = None
+    leerie._CGROUP_PROBE_RESULT = None
 
 
 # ---- probe ----------------------------------------------------------------
 
-def test_probe_success_when_root_writable(pila, tmp_path, monkeypatch):
+def test_probe_success_when_root_writable(leerie, tmp_path, monkeypatch):
     """A writable directory acting as the cgroup root: probe creates
-    `pila-probe`, writes memory.max, removes the dir, returns True."""
-    monkeypatch.setattr(pila, "_CGROUP_ROOT", tmp_path)
-    assert pila._cgroup_probe() is True
+    `leerie-probe`, writes memory.max, removes the dir, returns True."""
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
+    assert leerie._cgroup_probe() is True
     # Probe must have cleaned up the probe directory.
-    assert not (tmp_path / "pila-probe").exists()
+    assert not (tmp_path / "leerie-probe").exists()
 
 
-def test_probe_failure_when_root_readonly(pila, tmp_path, monkeypatch):
+def test_probe_failure_when_root_readonly(leerie, tmp_path, monkeypatch):
     """When the root directory exists but mkdir fails, probe returns
     False and degrades gracefully."""
-    monkeypatch.setattr(pila, "_CGROUP_ROOT", tmp_path / "missing-path")
-    assert pila._cgroup_probe() is False
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path / "missing-path")
+    assert leerie._cgroup_probe() is False
 
 
-def test_probe_memoizes(pila, tmp_path, monkeypatch):
+def test_probe_memoizes(leerie, tmp_path, monkeypatch):
     """Once probe runs, the result is cached; the second call is a
     pure read of `_CGROUP_PROBE_RESULT`. Verify by making the second
     call use a path that would otherwise fail — if memoization works,
     we still get the original result."""
-    monkeypatch.setattr(pila, "_CGROUP_ROOT", tmp_path)
-    first = pila._cgroup_probe()
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
+    first = leerie._cgroup_probe()
     # Swap the root to a non-writable location; memoized result should
     # still be returned.
-    monkeypatch.setattr(pila, "_CGROUP_ROOT",
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT",
                         Path("/sys/fs/cgroup-does-not-exist"))
-    second = pila._cgroup_probe()
+    second = leerie._cgroup_probe()
     assert first == second
 
 
 # ---- create ---------------------------------------------------------------
 
-def test_create_writes_caps(pila, tmp_path, monkeypatch):
+def test_create_writes_caps(leerie, tmp_path, monkeypatch):
     """A successful create makes the directory and writes memory.max
     and pids.max with the given values."""
-    monkeypatch.setattr(pila, "_CGROUP_ROOT", tmp_path)
-    pila._cgroup_probe()  # prime the memo
-    path = pila._cgroup_create("test-sid", 256 * 1024**2, 64)
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
+    leerie._cgroup_probe()  # prime the memo
+    path = leerie._cgroup_create("test-sid", 256 * 1024**2, 64)
     assert path is not None
     assert (path / "memory.max").read_text() == str(256 * 1024**2)
     assert (path / "pids.max").read_text() == "64"
 
 
-def test_create_returns_none_when_probe_failed(pila, monkeypatch):
+def test_create_returns_none_when_probe_failed(leerie, monkeypatch):
     """If the probe says no, create is a no-op returning None — the
     worker spawns uncapped."""
-    monkeypatch.setattr(pila, "_CGROUP_ROOT",
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT",
                         Path("/sys/fs/cgroup-does-not-exist"))
-    pila._cgroup_probe()
-    assert pila._cgroup_create("sid", 1 << 30, 64) is None
+    leerie._cgroup_probe()
+    assert leerie._cgroup_create("sid", 1 << 30, 64) is None
 
 
-def test_create_idempotent(pila, tmp_path, monkeypatch):
+def test_create_idempotent(leerie, tmp_path, monkeypatch):
     """Re-creating with the same sid (e.g., handoff continuation)
     reuses the dir and rewrites the caps with the new values."""
-    monkeypatch.setattr(pila, "_CGROUP_ROOT", tmp_path)
-    pila._cgroup_probe()
-    p1 = pila._cgroup_create("sid-a", 1 << 28, 64)
-    p2 = pila._cgroup_create("sid-a", 1 << 30, 128)
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
+    leerie._cgroup_probe()
+    p1 = leerie._cgroup_create("sid-a", 1 << 28, 64)
+    p2 = leerie._cgroup_create("sid-a", 1 << 30, 128)
     assert p1 == p2
     assert (p2 / "memory.max").read_text() == str(1 << 30)
     assert (p2 / "pids.max").read_text() == "128"
@@ -100,24 +100,24 @@ def test_create_idempotent(pila, tmp_path, monkeypatch):
 
 # ---- enroll ---------------------------------------------------------------
 
-def test_enroll_writes_pid(pila, tmp_path, monkeypatch):
-    monkeypatch.setattr(pila, "_CGROUP_ROOT", tmp_path)
-    pila._cgroup_probe()
-    path = pila._cgroup_create("sid-b", 1 << 30, 64)
-    assert pila._cgroup_enroll(path, 12345) is True
+def test_enroll_writes_pid(leerie, tmp_path, monkeypatch):
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
+    leerie._cgroup_probe()
+    path = leerie._cgroup_create("sid-b", 1 << 30, 64)
+    assert leerie._cgroup_enroll(path, 12345) is True
     assert (path / "cgroup.procs").read_text() == "12345"
 
 
-def test_enroll_returns_false_on_failure(pila, tmp_path):
+def test_enroll_returns_false_on_failure(leerie, tmp_path):
     """Enroll into a path that doesn't exist returns False (logs but
     does not raise)."""
     bogus = tmp_path / "nope"
-    assert pila._cgroup_enroll(bogus, 1) is False
+    assert leerie._cgroup_enroll(bogus, 1) is False
 
 
 # ---- destroy --------------------------------------------------------------
 
-def test_destroy_attempts_cgroup_kill_then_rmdir(pila, tmp_path,
+def test_destroy_attempts_cgroup_kill_then_rmdir(leerie, tmp_path,
                                                   monkeypatch):
     """The destroy contract on a real cgroupfs: write '1' to
     cgroup.kill (atomic kill of the cgroup, kernel ≥5.14), then
@@ -125,10 +125,10 @@ def test_destroy_attempts_cgroup_kill_then_rmdir(pila, tmp_path,
     just a stray file we write; rmdir then fails (dir non-empty) but
     OSError is swallowed. The test verifies cgroup.kill IS written
     and that no exception propagates."""
-    monkeypatch.setattr(pila, "_CGROUP_ROOT", tmp_path)
-    pila._cgroup_probe()
-    path = pila._cgroup_create("sid-c", 1 << 30, 64)
-    pila._cgroup_destroy(path)
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
+    leerie._cgroup_probe()
+    path = leerie._cgroup_create("sid-c", 1 << 30, 64)
+    leerie._cgroup_destroy(path)
     # cgroup.kill was attempted (file exists on regular fs).
     assert (path / "cgroup.kill").read_text() == "1"
     # No exception propagated. Whether the dir survives depends on the
@@ -136,13 +136,13 @@ def test_destroy_attempts_cgroup_kill_then_rmdir(pila, tmp_path,
     # regular fs the files prevent rmdir but the OSError is swallowed.
 
 
-def test_destroy_handles_none(pila):
+def test_destroy_handles_none(leerie):
     """None path (cgroup containment was off for this worker) is a
     no-op, no exception."""
-    pila._cgroup_destroy(None)
+    leerie._cgroup_destroy(None)
 
 
-def test_destroy_handles_missing_path(pila, tmp_path):
+def test_destroy_handles_missing_path(leerie, tmp_path):
     """Destroy on a path that doesn't exist swallows the ENOENT and
     returns cleanly."""
-    pila._cgroup_destroy(tmp_path / "never-existed")
+    leerie._cgroup_destroy(tmp_path / "never-existed")

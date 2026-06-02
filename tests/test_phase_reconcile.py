@@ -25,21 +25,21 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PILA_PY = REPO_ROOT / "orchestrator" / "pila.py"
+LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 
 def _plan(domain: str, *subtasks: dict) -> dict:
     return {"domain": domain, "status": "ready", "subtasks": list(subtasks)}
 
 
-def _minimal_state(pila, tmp_path):
+def _minimal_state(leerie, tmp_path):
     """A State with just enough plumbing for phase_reconcile to read
     st.bump_workers and not crash. No actual workers will run — the
     short-circuit path never invokes claude_p."""
-    pila_root = tmp_path / ".pila"
+    leerie_root = tmp_path / ".leerie"
     run_id = "test-reconcile-aaa111"
-    (pila_root / "runs" / run_id).mkdir(parents=True)
-    st = pila.State(pila_root, run_id)
+    (leerie_root / "runs" / run_id).mkdir(parents=True)
+    st = leerie.State(leerie_root, run_id)
     st.data = {"task": "test", "worker_count": 0}
     st.save()
     return st
@@ -47,7 +47,7 @@ def _minimal_state(pila, tmp_path):
 
 # --- short-circuit -------------------------------------------------------
 
-def test_short_circuit_no_unresolved_returns_plans_unchanged(pila, tmp_path):
+def test_short_circuit_no_unresolved_returns_plans_unchanged(leerie, tmp_path):
     """The common case: planners agreed on capability vocabulary, every
     `requires` has a matching `provides`. phase_reconcile must return
     the plans list without spawning a worker."""
@@ -58,14 +58,14 @@ def test_short_circuit_no_unresolved_returns_plans_unchanged(pila, tmp_path):
         _plan("testing",
               {"id": "test-001", "title": "y", "requires": [req_a]}),
     ]
-    st = _minimal_state(pila, tmp_path)
+    st = _minimal_state(leerie, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
     # `models` doesn't need a "reconciler" key for the short-circuit
     # path — the worker is never invoked.
     models: dict[str, str] = {}
 
-    result = asyncio.run(pila.phase_reconcile(plans, "test task", st,
+    result = asyncio.run(leerie.phase_reconcile(plans, "test task", st,
                                                   caps, models, {}))
     # Same list, unchanged.
     assert result is plans
@@ -74,7 +74,7 @@ def test_short_circuit_no_unresolved_returns_plans_unchanged(pila, tmp_path):
     assert st.data.get("worker_count", 0) == 0
 
 
-def test_phase_reconcile_dies_on_planner_vs_planner_id_collision(pila, tmp_path):
+def test_phase_reconcile_dies_on_planner_vs_planner_id_collision(leerie, tmp_path):
     """Two planners (different domains) both emit a subtask with id
     `feat-001`. Each planner's prompt tells it to prefix its ids with
     its domain, but the prompt is advisory per CLAUDE.md; if a planner
@@ -100,17 +100,17 @@ def test_phase_reconcile_dies_on_planner_vs_planner_id_collision(pila, tmp_path)
               {"id": "feat-001", "title": "testing side",
                "provides": ["cap-b"]}),
     ]
-    st = _minimal_state(pila, tmp_path)
+    st = _minimal_state(leerie, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
     models: dict[str, str] = {}
 
     with pytest.raises(SystemExit) as exc:
-        asyncio.run(pila.phase_reconcile(plans, "task", st, caps, models, {}))
+        asyncio.run(leerie.phase_reconcile(plans, "task", st, caps, models, {}))
     assert exc.value.code != 0
 
 
-def test_phase_reconcile_collision_check_runs_before_short_circuit(pila, tmp_path):
+def test_phase_reconcile_collision_check_runs_before_short_circuit(leerie, tmp_path):
     """The planner-vs-planner check must run even when every `requires`
     is already resolved — otherwise the short-circuit at
     `if not unresolved: return plans` would let a collision slip
@@ -128,14 +128,14 @@ def test_phase_reconcile_collision_check_runs_before_short_circuit(pila, tmp_pat
               # collision.
               {"id": "feat-001", "title": "y", "provides": []}),
     ]
-    st = _minimal_state(pila, tmp_path)
+    st = _minimal_state(leerie, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
     with pytest.raises(SystemExit):
-        asyncio.run(pila.phase_reconcile(plans, "task", st, {**caps}, {}, {}))
+        asyncio.run(leerie.phase_reconcile(plans, "task", st, {**caps}, {}, {}))
 
 
-def test_phase_reconcile_collision_error_names_id_and_domains(pila, tmp_path, capsys):
+def test_phase_reconcile_collision_error_names_id_and_domains(leerie, tmp_path, capsys):
     """The die() message must name the colliding id AND every domain
     that emitted it, so a user reading the error can trace it back to
     the specific planners that misbehaved. Distinct surface form from
@@ -150,11 +150,11 @@ def test_phase_reconcile_collision_error_names_id_and_domains(pila, tmp_path, ca
         _plan("refactoring",
               {"id": "feat-001", "title": "c"}),
     ]
-    st = _minimal_state(pila, tmp_path)
+    st = _minimal_state(leerie, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
     with pytest.raises(SystemExit):
-        asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}, {}))
+        asyncio.run(leerie.phase_reconcile(plans, "task", st, caps, {}, {}))
     err = capsys.readouterr().err
     # The colliding id and all three domains are named.
     assert "feat-001" in err
@@ -166,71 +166,71 @@ def test_phase_reconcile_collision_error_names_id_and_domains(pila, tmp_path, ca
     assert "planner-vs-planner" in err
 
 
-def test_short_circuit_empty_plans(pila, tmp_path):
+def test_short_circuit_empty_plans(leerie, tmp_path):
     """Defensive: empty plans list short-circuits without error."""
     plans: list = []
-    st = _minimal_state(pila, tmp_path)
+    st = _minimal_state(leerie, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    result = asyncio.run(pila.phase_reconcile(plans, "x", st, caps, {}, {}))
+    result = asyncio.run(leerie.phase_reconcile(plans, "x", st, caps, {}, {}))
     assert result is plans
     assert result == []
 
 
-def test_short_circuit_plan_with_no_requires(pila, tmp_path):
+def test_short_circuit_plan_with_no_requires(leerie, tmp_path):
     """Plan with subtasks that have `provides` but no `requires` →
     nothing to reconcile."""
     plans = [_plan("feature-implementation",
                    {"id": "feat-001", "title": "x", "provides": ["a"]})]
-    st = _minimal_state(pila, tmp_path)
+    st = _minimal_state(leerie, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    result = asyncio.run(pila.phase_reconcile(plans, "x", st, caps, {}, {}))
+    result = asyncio.run(leerie.phase_reconcile(plans, "x", st, caps, {}, {}))
     assert result is plans
     assert st.data.get("worker_count", 0) == 0
 
 
 # --- source-text pins on phase_reconcile's contract ----------------------
 
-def test_phase_reconcile_uses_reconciler_schema(pila):
+def test_phase_reconcile_uses_reconciler_schema(leerie):
     """Worker is gated on SCHEMAS["reconciler"] — pin so the schema-key
     arg doesn't drift."""
-    src = inspect.getsource(pila.phase_reconcile)
+    src = inspect.getsource(leerie.phase_reconcile)
     assert 'schema_key="reconciler"' in src
 
 
-def test_phase_reconcile_uses_inspect_tools(pila):
+def test_phase_reconcile_uses_inspect_tools(leerie):
     """Reconciler is read-only — same tool bucket as classifier/planner.
     Pin so a refactor doesn't accidentally upgrade it to ACT_TOOLS
     (write/edit) which would let the worker modify files. INSPECT_TOOLS
     replaced READ_TOOLS to allow allowlisted read-only Bash without
     relying on --dangerously-skip-permissions (DESIGN §12)."""
-    src = inspect.getsource(pila.phase_reconcile)
+    src = inspect.getsource(leerie.phase_reconcile)
     assert "allowed_tools=INSPECT_TOOLS" in src
 
 
-def test_phase_reconcile_uses_reconciler_model(pila):
+def test_phase_reconcile_uses_reconciler_model(leerie):
     """The worker uses models['reconciler'] — pin so commit 4's wiring
     pre-condition (commit 3 adds 'reconciler' to WORKER_TYPES) doesn't
     silently regress."""
-    src = inspect.getsource(pila.phase_reconcile)
+    src = inspect.getsource(leerie.phase_reconcile)
     assert 'models["reconciler"]' in src
 
 
-def test_phase_reconcile_uses_reconciler_prompt(pila):
+def test_phase_reconcile_uses_reconciler_prompt(leerie):
     """The system prompt comes from prompts/reconciler.md."""
-    src = inspect.getsource(pila.phase_reconcile)
+    src = inspect.getsource(leerie.phase_reconcile)
     assert 'load_prompt("reconciler")' in src
 
 
-def test_phase_reconcile_dies_on_unresolvable(pila):
+def test_phase_reconcile_dies_on_unresolvable(leerie):
     """When the reconciler returns a non-empty `unresolvable` array, the
     orchestrator dies with the worker's reasoning. The check runs
     BEFORE _apply_reconciler_output so a fail-closed run leaves no
     phantom mutations. Implemented via `_check_unresolvable(output)`
     which factors the check + die out of the inline retry-loop body
     (cycle-resolution retry calls it for both attempts)."""
-    src = inspect.getsource(pila.phase_reconcile)
+    src = inspect.getsource(leerie.phase_reconcile)
     # die() and the unresolvable check must be present.
     assert "unresolvable" in src
     # `_check_unresolvable` is the helper that does the check + die. It
@@ -247,11 +247,11 @@ def test_phase_reconcile_dies_on_unresolvable(pila):
         "so a fail-closed run leaves no phantom mutations"
     )
     # The helper itself must call die() with a non-empty unresolvable.
-    helper_src = inspect.getsource(pila.phase_reconcile)
+    helper_src = inspect.getsource(leerie.phase_reconcile)
     assert "die(" in helper_src
 
 
-def test_phase_reconcile_second_pass_check_present(pila):
+def test_phase_reconcile_second_pass_check_present(leerie):
     """phase_reconcile calls `_compute_unresolved_requires` at three
     distinct sites, each gating a different state. Pin so a future
     refactor can't silently regress any of them:
@@ -274,7 +274,7 @@ def test_phase_reconcile_second_pass_check_present(pila):
     The assertion uses `>= 3` rather than `== 3` so a future
     refactor can ADD another check without tripping the pin.
     """
-    src = inspect.getsource(pila.phase_reconcile)
+    src = inspect.getsource(leerie.phase_reconcile)
     count = src.count("_compute_unresolved_requires(plans)")
     assert count >= 3, (
         f"phase_reconcile should call _compute_unresolved_requires at "
@@ -283,7 +283,7 @@ def test_phase_reconcile_second_pass_check_present(pila):
     )
 
 
-def test_phase_reconcile_precondition_passes_run_twice(pila):
+def test_phase_reconcile_precondition_passes_run_twice(leerie):
     """DESIGN §5 `requires.extent`: the precondition-collection +
     collision-promotion passes must run BOTH before the reconciler call
     AND again after `_apply_reconciler_output`. Without the second run,
@@ -291,7 +291,7 @@ def test_phase_reconcile_precondition_passes_run_twice(pila):
     are silently dropped (the P2.3 finding). Pin both invocations as a
     source-text invariant so a future refactor cannot regress to the
     single-pass behavior."""
-    src = inspect.getsource(pila.phase_reconcile)
+    src = inspect.getsource(leerie.phase_reconcile)
     promote_count = src.count("_promote_external_collisions(plans)")
     collect_count = src.count("_collect_external_preconditions(plans)")
     assert promote_count >= 2, (
@@ -306,20 +306,20 @@ def test_phase_reconcile_precondition_passes_run_twice(pila):
     )
 
 
-def test_phase_reconcile_bumps_workers(pila):
+def test_phase_reconcile_bumps_workers(leerie):
     """Worker invocation must go through st.bump_workers to count
     against max_total_workers. Pin so the reconciler counts toward the
     cap (and budget).
 
     Note: short-circuit path doesn't bump (no worker spawned)."""
-    src = inspect.getsource(pila.phase_reconcile)
+    src = inspect.getsource(leerie.phase_reconcile)
     assert "st.bump_workers(caps)" in src
 
 
-def test_phase_reconcile_uses_sid_reconciler(pila):
-    """The worker's sid (used for logs and .pila/logs/<sid>.log) is
+def test_phase_reconcile_uses_sid_reconciler(leerie):
+    """The worker's sid (used for logs and .leerie/logs/<sid>.log) is
     'reconciler'. Pin so the log file lookup is stable."""
-    src = inspect.getsource(pila.phase_reconcile)
+    src = inspect.getsource(leerie.phase_reconcile)
     assert 'sid="reconciler"' in src
 
 
@@ -332,7 +332,7 @@ def _req(tag: str, extent: str = "in_plan", reason: str = "") -> dict:
     return entry
 
 
-def test_phase_reconcile_external_only_short_circuits(pila, tmp_path):
+def test_phase_reconcile_external_only_short_circuits(leerie, tmp_path):
     """A plan whose only "unresolved" requires are `extent: external` must
     NOT invoke the reconciler — externals are out-of-graph by planner
     declaration. The function still completes the helper passes
@@ -344,10 +344,10 @@ def test_phase_reconcile_external_only_short_circuits(pila, tmp_path):
                "requires": [_req("dynamo-table", "external",
                                  "owned by api-services CDK stack")]}),
     ]
-    st = _minimal_state(pila, tmp_path)
+    st = _minimal_state(leerie, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    result = asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}, {}))
+    result = asyncio.run(leerie.phase_reconcile(plans, "task", st, caps, {}, {}))
     assert result is plans
     # No worker spawned.
     assert st.data.get("worker_count", 0) == 0
@@ -358,7 +358,7 @@ def test_phase_reconcile_external_only_short_circuits(pila, tmp_path):
     assert pre[0]["originating_subtasks"] == ["feat-001"]
 
 
-def test_phase_reconcile_promotes_collision_before_unresolved_check(pila, tmp_path):
+def test_phase_reconcile_promotes_collision_before_unresolved_check(leerie, tmp_path):
     """An `extent: external` entry whose tag is `provides`d by some
     plan must be promoted to in_plan *before* `_compute_unresolved_requires`
     runs. The combined effect: the entry becomes a normal graph edge,
@@ -371,10 +371,10 @@ def test_phase_reconcile_promotes_collision_before_unresolved_check(pila, tmp_pa
                "requires": [_req("redis-available", "external",
                                  "planner thought infra owned this")]}),
     ]
-    st = _minimal_state(pila, tmp_path)
+    st = _minimal_state(leerie, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    result = asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}, {}))
+    result = asyncio.run(leerie.phase_reconcile(plans, "task", st, caps, {}, {}))
     assert result is plans
     # Promoted: the entry's extent is now in_plan, with reason preserved.
     entry = plans[1]["subtasks"][0]["requires"][0]
@@ -385,7 +385,7 @@ def test_phase_reconcile_promotes_collision_before_unresolved_check(pila, tmp_pa
     assert st.data.get("external_preconditions", []) == []
 
 
-def test_phase_reconcile_persists_empty_preconditions_when_none(pila, tmp_path):
+def test_phase_reconcile_persists_empty_preconditions_when_none(leerie, tmp_path):
     """`external_preconditions` is always persisted (even as []) so
     write_plan() has a consistent key to read from. Catches a regression
     where st.save() is skipped on the empty path."""
@@ -395,8 +395,8 @@ def test_phase_reconcile_persists_empty_preconditions_when_none(pila, tmp_path):
         _plan("testing",
               {"id": "test-001", "title": "y", "requires": [_req("a")]}),
     ]
-    st = _minimal_state(pila, tmp_path)
+    st = _minimal_state(leerie, tmp_path)
     caps = {"max_total_workers": 40, "max_parallel": 4,
             "confidence_rounds": 8}
-    asyncio.run(pila.phase_reconcile(plans, "task", st, caps, {}, {}))
+    asyncio.run(leerie.phase_reconcile(plans, "task", st, caps, {}, {}))
     assert st.data.get("external_preconditions") == []

@@ -1,6 +1,6 @@
 """Tests for scripts/remote/fetch-branch.sh.
 
-fetch-branch.sh is sourced by the pila launcher after remote orchestration
+fetch-branch.sh is sourced by the leerie launcher after remote orchestration
 exits 0.  These tests exercise the script's bash logic in isolation via
 subprocess, with flyctl and git stubbed out so no real Fly.io calls or
 network traffic occur.
@@ -72,9 +72,9 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path, git_repo: Path) ->
     The stub handles the three flyctl machine exec invocations that
     fetch_branch makes:
       1. python3 -c '...'  — run the discovery snippet, rewriting the
-         hardcoded /work/.pila/runs path to machine_runs_dir.
+         hardcoded /work/.leerie/runs path to machine_runs_dir.
       2. git -C /work bundle create - <branch>  — run against git_repo.
-      3. tar -cC /work/.pila/runs <run-id>  — run against machine_runs_dir.
+      3. tar -cC /work/.leerie/runs <run-id>  — run against machine_runs_dir.
 
     All other invocations succeed silently.
     """
@@ -126,9 +126,9 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path, git_repo: Path) ->
         '    eval "$NEWCMD"\n'
         '    exit $?\n'
         '    ;;\n'
-        '  tar*-cC*/work/.pila/runs*)\n'
-        # rewrite "tar -cC /work/.pila/runs <run-id>" → "tar -cC $MRUNS <run-id>"
-        '    NEWCMD="${CMD//\\/work\\/.pila\\/runs/$MRUNS}"\n'
+        '  tar*-cC*/work/.leerie/runs*)\n'
+        # rewrite "tar -cC /work/.leerie/runs <run-id>" → "tar -cC $MRUNS <run-id>"
+        '    NEWCMD="${CMD//\\/work\\/.leerie\\/runs/$MRUNS}"\n'
         '    eval "$NEWCMD"\n'
         '    exit $?\n'
         '    ;;\n'
@@ -169,20 +169,20 @@ def test_fetch_branch_sh_is_executable():
 
 
 def test_fetch_branch_fails_without_machine_id():
-    """fetch_branch returns 1 when PILA_MACHINE_ID is unset."""
+    """fetch_branch returns 1 when LEERIE_MACHINE_ID is unset."""
     result = _run_bash(
         f"source {FETCH_SH}; fetch_branch",
-        env={"PILA_MACHINE_ID": "", "USER_REPO": "/tmp"},
+        env={"LEERIE_MACHINE_ID": "", "USER_REPO": "/tmp"},
     )
     assert result.returncode != 0
-    assert "PILA_MACHINE_ID" in result.stderr
+    assert "LEERIE_MACHINE_ID" in result.stderr
 
 
 def test_fetch_branch_fails_without_user_repo():
     """fetch_branch returns 1 when USER_REPO is unset."""
     result = _run_bash(
         f"source {FETCH_SH}; fetch_branch",
-        env={"PILA_MACHINE_ID": "test-machine-001", "USER_REPO": ""},
+        env={"LEERIE_MACHINE_ID": "test-machine-001", "USER_REPO": ""},
     )
     assert result.returncode != 0
     assert "USER_REPO" in result.stderr
@@ -193,7 +193,7 @@ def test_fetch_branch_fails_when_flyctl_missing():
     result = _run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
-            "PILA_MACHINE_ID": "test-machine-001",
+            "LEERIE_MACHINE_ID": "test-machine-001",
             "USER_REPO": "/tmp",
             "PATH": "/usr/bin:/bin",  # no flyctl here
         },
@@ -211,15 +211,15 @@ def test_fetch_branch_fails_when_no_completed_run(tmp_path):
     machine_runs.mkdir()
     stale_run = machine_runs / "some-run-id"
     stale_run.mkdir()
-    (stale_run / "run.json").write_text(json.dumps({"branch": "pila/runs/some-run-id"}))
+    (stale_run / "run.json").write_text(json.dumps({"branch": "leerie/runs/some-run-id"}))
 
     fake_flyctl = _make_fake_flyctl(tmp_path, machine_runs, repo)
 
     result = _run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
-            "PILA_MACHINE_ID": "test-machine-001",
-            "PILA_FLY_APP": "pila",
+            "LEERIE_MACHINE_ID": "test-machine-001",
+            "LEERIE_FLY_APP": "leerie",
             "USER_REPO": str(repo),
             "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
         },
@@ -234,7 +234,7 @@ def test_fetch_branch_streams_bundle_and_state(tmp_path):
     repo = _make_git_repo(tmp_path)
 
     run_id = "feat-test-abc123"
-    run_branch = f"pila/runs/{run_id}"
+    run_branch = f"leerie/runs/{run_id}"
 
     # Create the run branch in the repo (simulates the branch existing on the
     # machine — the bundle will be created from the local repo via stub).
@@ -259,8 +259,8 @@ def test_fetch_branch_streams_bundle_and_state(tmp_path):
     result = _run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
-            "PILA_MACHINE_ID": "test-machine-abc",
-            "PILA_FLY_APP": "pila",
+            "LEERIE_MACHINE_ID": "test-machine-abc",
+            "LEERIE_FLY_APP": "leerie",
             "USER_REPO": str(repo),
             "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
         },
@@ -278,7 +278,7 @@ def test_fetch_branch_streams_bundle_and_state(tmp_path):
     )
 
     # The state directory should be extracted on the host.
-    host_run_dir = repo / ".pila" / "runs" / run_id
+    host_run_dir = repo / ".leerie" / "runs" / run_id
     assert host_run_dir.exists(), f"host run dir not found: {host_run_dir}"
     assert (host_run_dir / "run.json").exists(), "run.json not extracted on host"
     assert (host_run_dir / "state.json").exists(), "state.json not extracted on host"
@@ -295,7 +295,7 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
         `git rev-parse --verify refs/heads/<branch>`
       - skip the bundle step when the probe fails (exit non-zero)
       - succeed overall (return 0)
-      - still stream the state directory back so `pila --list`
+      - still stream the state directory back so `leerie --list`
         shows the run as `done-local`.
 
     Critically, fetch_branch must NOT use `run.json.no_push` as a
@@ -310,7 +310,7 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
     repo = _make_git_repo(tmp_path)
 
     run_id = "bugfix-already-done-cafe42"
-    run_branch = f"pila/runs/{run_id}"
+    run_branch = f"leerie/runs/{run_id}"
 
     # Critically: do NOT create the run branch in the host repo or
     # any test fixture — the stub's git rev-parse --verify probe will
@@ -335,8 +335,8 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
     result = _run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
-            "PILA_MACHINE_ID": "no-work-machine",
-            "PILA_FLY_APP": "pila",
+            "LEERIE_MACHINE_ID": "no-work-machine",
+            "LEERIE_FLY_APP": "leerie",
             "USER_REPO": str(repo),
             "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
         },
@@ -365,9 +365,9 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
     assert run_branch not in ls_branches.stdout, (
         f"run branch {run_branch} should NOT be created for a no_push run"
     )
-    # But the state directory MUST be streamed back so `pila --list`
+    # But the state directory MUST be streamed back so `leerie --list`
     # can render the run as done-local on the host.
-    host_run_dir = repo / ".pila" / "runs" / run_id
+    host_run_dir = repo / ".leerie" / "runs" / run_id
     assert host_run_dir.exists(), (
         f"host run dir not found: {host_run_dir} — Step 3 (state-dir "
         "streaming) must still run for no_push runs"
@@ -387,7 +387,7 @@ def test_fetch_branch_picks_normal_run_over_no_push(tmp_path):
     repo = _make_git_repo(tmp_path)
 
     normal_run_id = "feat-do-something-real-123abc"
-    normal_run_branch = f"pila/runs/{normal_run_id}"
+    normal_run_branch = f"leerie/runs/{normal_run_id}"
     no_push_run_id = "bugfix-already-done-456def"
 
     # Create the normal run branch in the host repo (so the bundle
@@ -405,7 +405,7 @@ def test_fetch_branch_picks_normal_run_over_no_push(tmp_path):
     (no_push_dir / "run.json").write_text(json.dumps({
         "finished_at": "2026-05-31T19:00:00Z",
         "no_push": True,
-        "branch": f"pila/runs/{no_push_run_id}",
+        "branch": f"leerie/runs/{no_push_run_id}",
         "working_branch": "main",
     }))
     (no_push_dir / "state.json").write_text("{}")
@@ -427,10 +427,10 @@ def test_fetch_branch_picks_normal_run_over_no_push(tmp_path):
     _make_fake_flyctl(tmp_path, machine_runs, repo)
 
     result = _run_bash(
-        f'source {FETCH_SH}; fetch_branch && echo "RUN_ID=$PILA_REMOTE_RUN_ID"',
+        f'source {FETCH_SH}; fetch_branch && echo "RUN_ID=$LEERIE_REMOTE_RUN_ID"',
         env={
-            "PILA_MACHINE_ID": "mixed-machine",
-            "PILA_FLY_APP": "pila",
+            "LEERIE_MACHINE_ID": "mixed-machine",
+            "LEERIE_FLY_APP": "leerie",
             "USER_REPO": str(repo),
             "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
         },
@@ -447,11 +447,11 @@ def test_fetch_branch_picks_normal_run_over_no_push(tmp_path):
 
 
 def test_fetch_branch_exports_run_id(tmp_path):
-    """fetch_branch exports PILA_REMOTE_RUN_ID on success."""
+    """fetch_branch exports LEERIE_REMOTE_RUN_ID on success."""
     repo = _make_git_repo(tmp_path, subdir="repo")
 
     run_id = "fix-export-test-deadbeef"
-    run_branch = f"pila/runs/{run_id}"
+    run_branch = f"leerie/runs/{run_id}"
     subprocess.run(
         ["git", "-C", str(repo), "branch", run_branch],
         check=True, capture_output=True,
@@ -470,15 +470,15 @@ def test_fetch_branch_exports_run_id(tmp_path):
     fake_flyctl = _make_fake_flyctl(tmp_path, machine_runs, repo)
 
     result = _run_bash(
-        f'source {FETCH_SH}; fetch_branch && echo "RUN_ID=$PILA_REMOTE_RUN_ID"',
+        f'source {FETCH_SH}; fetch_branch && echo "RUN_ID=$LEERIE_REMOTE_RUN_ID"',
         env={
-            "PILA_MACHINE_ID": "m1",
-            "PILA_FLY_APP": "pila",
+            "LEERIE_MACHINE_ID": "m1",
+            "LEERIE_FLY_APP": "leerie",
             "USER_REPO": str(repo),
             "PATH": f"{tmp_path}:/usr/bin:/bin:/usr/local/bin",
         },
     )
     assert result.returncode == 0, f"stderr:\n{result.stderr}"
     assert f"RUN_ID={run_id}" in result.stdout, (
-        f"PILA_REMOTE_RUN_ID not exported correctly. stdout: {result.stdout}"
+        f"LEERIE_REMOTE_RUN_ID not exported correctly. stdout: {result.stdout}"
     )

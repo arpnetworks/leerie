@@ -3,10 +3,10 @@
 Per-worker precedence (highest first):
   1. --effort-<worker> CLI flag
   2. --effort CLI flag
-  3. PILA_EFFORT_<WORKER> env var
-  4. PILA_EFFORT env var
-  5. effort_<worker> in pila.toml
-  6. effort in pila.toml
+  3. LEERIE_EFFORT_<WORKER> env var
+  4. LEERIE_EFFORT env var
+  5. effort_<worker> in leerie.toml
+  6. effort in leerie.toml
   7. EFFORT_DEFAULT_PER_WORKER[<worker>] (judgment workers → "high")
   8. EFFORT_DEFAULT (None — flag omitted from CLI invocation)
 
@@ -48,82 +48,82 @@ def ns(**overrides):
 
 @pytest.fixture
 def repo_root(tmp_path, monkeypatch):
-    """An empty repo-root with every PILA_EFFORT* env var unset."""
-    monkeypatch.delenv("PILA_EFFORT", raising=False)
+    """An empty repo-root with every LEERIE_EFFORT* env var unset."""
+    monkeypatch.delenv("LEERIE_EFFORT", raising=False)
     for w in WORKERS:
-        monkeypatch.delenv(f"PILA_EFFORT_{w.upper()}", raising=False)
+        monkeypatch.delenv(f"LEERIE_EFFORT_{w.upper()}", raising=False)
     return tmp_path
 
 
-def test_all_unset_defaults_per_worker(pila, repo_root):
+def test_all_unset_defaults_per_worker(leerie, repo_root):
     """With no overrides, judgment workers default to 'high' and acting
     workers default to None (no --effort flag passed). Pins both the
     global default (None) and the per-worker override table together."""
-    efforts = pila.resolve_efforts(repo_root, ns())
+    efforts = leerie.resolve_efforts(repo_root, ns())
     worker_slice = {w: efforts[w] for w in WORKERS}
     assert worker_slice == DEFAULTS
-    assert pila.EFFORT_DEFAULT is None
+    assert leerie.EFFORT_DEFAULT is None
     # Five judgment workers default to high; nothing else.
-    assert pila.EFFORT_DEFAULT_PER_WORKER.get("planner") == "high"
-    assert pila.EFFORT_DEFAULT_PER_WORKER.get("classifier") == "high"
-    assert "implementer" not in pila.EFFORT_DEFAULT_PER_WORKER
-    assert "conformer" not in pila.EFFORT_DEFAULT_PER_WORKER
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("planner") == "high"
+    assert leerie.EFFORT_DEFAULT_PER_WORKER.get("classifier") == "high"
+    assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER
+    assert "conformer" not in leerie.EFFORT_DEFAULT_PER_WORKER
 
 
-def test_global_env_applies_to_every_worker(pila, repo_root, monkeypatch):
-    """A global PILA_EFFORT overrides the per-worker defaults too, so
+def test_global_env_applies_to_every_worker(leerie, repo_root, monkeypatch):
+    """A global LEERIE_EFFORT overrides the per-worker defaults too, so
     acting workers get the global value rather than None."""
-    monkeypatch.setenv("PILA_EFFORT", "max")
-    efforts = pila.resolve_efforts(repo_root, ns())
+    monkeypatch.setenv("LEERIE_EFFORT", "max")
+    efforts = leerie.resolve_efforts(repo_root, ns())
     assert {w: efforts[w] for w in WORKERS} == {w: "max" for w in WORKERS}
 
 
-def test_per_worker_env_overrides_global_env(pila, repo_root, monkeypatch):
-    monkeypatch.setenv("PILA_EFFORT", "low")
-    monkeypatch.setenv("PILA_EFFORT_PLANNER", "max")
-    efforts = pila.resolve_efforts(repo_root, ns())
+def test_per_worker_env_overrides_global_env(leerie, repo_root, monkeypatch):
+    monkeypatch.setenv("LEERIE_EFFORT", "low")
+    monkeypatch.setenv("LEERIE_EFFORT_PLANNER", "max")
+    efforts = leerie.resolve_efforts(repo_root, ns())
     assert efforts["planner"] == "max"
     for w in WORKERS:
         if w != "planner":
             assert efforts[w] == "low"
 
 
-def test_global_toml_applies_to_every_worker(pila, repo_root):
-    (repo_root / "pila.toml").write_text("effort = high\n")
-    efforts = pila.resolve_efforts(repo_root, ns())
+def test_global_toml_applies_to_every_worker(leerie, repo_root):
+    (repo_root / "leerie.toml").write_text("effort = high\n")
+    efforts = leerie.resolve_efforts(repo_root, ns())
     assert {w: efforts[w] for w in WORKERS} == {w: "high" for w in WORKERS}
 
 
-def test_per_worker_toml_overrides_global_toml(pila, repo_root):
-    (repo_root / "pila.toml").write_text(
+def test_per_worker_toml_overrides_global_toml(leerie, repo_root):
+    (repo_root / "leerie.toml").write_text(
         "effort = low\neffort_integrator = max\n")
-    efforts = pila.resolve_efforts(repo_root, ns())
+    efforts = leerie.resolve_efforts(repo_root, ns())
     assert efforts["integrator"] == "max"
     for w in WORKERS:
         if w != "integrator":
             assert efforts[w] == "low"
 
 
-def test_env_beats_toml(pila, repo_root, monkeypatch):
-    (repo_root / "pila.toml").write_text("effort = low\n")
-    monkeypatch.setenv("PILA_EFFORT", "max")
-    efforts = pila.resolve_efforts(repo_root, ns())
+def test_env_beats_toml(leerie, repo_root, monkeypatch):
+    (repo_root / "leerie.toml").write_text("effort = low\n")
+    monkeypatch.setenv("LEERIE_EFFORT", "max")
+    efforts = leerie.resolve_efforts(repo_root, ns())
     assert {w: efforts[w] for w in WORKERS} == {w: "max" for w in WORKERS}
 
 
-def test_global_cli_beats_global_env_and_toml(pila, repo_root, monkeypatch):
-    (repo_root / "pila.toml").write_text("effort = low\n")
-    monkeypatch.setenv("PILA_EFFORT", "low")
-    efforts = pila.resolve_efforts(repo_root, ns(effort="max"))
+def test_global_cli_beats_global_env_and_toml(leerie, repo_root, monkeypatch):
+    (repo_root / "leerie.toml").write_text("effort = low\n")
+    monkeypatch.setenv("LEERIE_EFFORT", "low")
+    efforts = leerie.resolve_efforts(repo_root, ns(effort="max"))
     assert {w: efforts[w] for w in WORKERS} == {w: "max" for w in WORKERS}
 
 
-def test_per_worker_cli_beats_everything(pila, repo_root, monkeypatch):
-    (repo_root / "pila.toml").write_text(
+def test_per_worker_cli_beats_everything(leerie, repo_root, monkeypatch):
+    (repo_root / "leerie.toml").write_text(
         "effort = low\neffort_planner = low\n")
-    monkeypatch.setenv("PILA_EFFORT", "low")
-    monkeypatch.setenv("PILA_EFFORT_PLANNER", "low")
-    efforts = pila.resolve_efforts(repo_root,
+    monkeypatch.setenv("LEERIE_EFFORT", "low")
+    monkeypatch.setenv("LEERIE_EFFORT_PLANNER", "low")
+    efforts = leerie.resolve_efforts(repo_root,
                                    ns(effort="low", effort_planner="max"))
     assert efforts["planner"] == "max"
     for w in WORKERS:
@@ -131,135 +131,135 @@ def test_per_worker_cli_beats_everything(pila, repo_root, monkeypatch):
             assert efforts[w] == "low"
 
 
-def test_full_precedence_per_worker(pila, repo_root, monkeypatch):
+def test_full_precedence_per_worker(leerie, repo_root, monkeypatch):
     # Per-worker CLI > global CLI > per-worker env > global env >
     # per-worker TOML > global TOML > per-worker default > EFFORT_DEFAULT.
     # Exercise one rung at a time on the planner (which has a per-worker
     # default of "high"). Implementer has no per-worker default — we
     # check both fallthrough behaviors at the bottom.
-    cfg = repo_root / "pila.toml"
+    cfg = repo_root / "leerie.toml"
 
     # rung 7 (per-worker default → "high" for planner)
-    assert pila.resolve_efforts(repo_root, ns())["planner"] == "high"
+    assert leerie.resolve_efforts(repo_root, ns())["planner"] == "high"
     # And rung 8 for implementer (no per-worker default, EFFORT_DEFAULT is None)
-    assert pila.resolve_efforts(repo_root, ns())["implementer"] is None
+    assert leerie.resolve_efforts(repo_root, ns())["implementer"] is None
 
     # rung 6: global TOML beats default
     cfg.write_text("effort = low\n")
-    assert pila.resolve_efforts(repo_root, ns())["planner"] == "low"
-    assert pila.resolve_efforts(repo_root, ns())["implementer"] == "low"
+    assert leerie.resolve_efforts(repo_root, ns())["planner"] == "low"
+    assert leerie.resolve_efforts(repo_root, ns())["implementer"] == "low"
 
     # rung 5: per-worker TOML beats global TOML
     cfg.write_text("effort = low\neffort_planner = medium\n")
-    assert pila.resolve_efforts(repo_root, ns())["planner"] == "medium"
+    assert leerie.resolve_efforts(repo_root, ns())["planner"] == "medium"
 
     # rung 4: global env beats both TOML rungs
-    monkeypatch.setenv("PILA_EFFORT", "max")
-    assert pila.resolve_efforts(repo_root, ns())["planner"] == "max"
+    monkeypatch.setenv("LEERIE_EFFORT", "max")
+    assert leerie.resolve_efforts(repo_root, ns())["planner"] == "max"
 
     # rung 3: per-worker env beats global env
-    monkeypatch.setenv("PILA_EFFORT_PLANNER", "low")
-    assert pila.resolve_efforts(repo_root, ns())["planner"] == "low"
+    monkeypatch.setenv("LEERIE_EFFORT_PLANNER", "low")
+    assert leerie.resolve_efforts(repo_root, ns())["planner"] == "low"
 
     # rung 2: global CLI beats env (per-worker CLI still unset)
-    assert pila.resolve_efforts(repo_root, ns(effort="xhigh"))["planner"] == "xhigh"
+    assert leerie.resolve_efforts(repo_root, ns(effort="xhigh"))["planner"] == "xhigh"
 
     # rung 1: per-worker CLI beats global CLI
-    assert pila.resolve_efforts(
+    assert leerie.resolve_efforts(
         repo_root, ns(effort="xhigh", effort_planner="max"))["planner"] == "max"
 
 
-def test_bad_global_env_dies(pila, repo_root, monkeypatch, capsys):
-    monkeypatch.setenv("PILA_EFFORT", "extreme")
+def test_bad_global_env_dies(leerie, repo_root, monkeypatch, capsys):
+    monkeypatch.setenv("LEERIE_EFFORT", "extreme")
     with pytest.raises(SystemExit) as exc:
-        pila.resolve_efforts(repo_root, ns())
+        leerie.resolve_efforts(repo_root, ns())
     assert exc.value.code != 0
     err = capsys.readouterr().err
-    assert "PILA_EFFORT" in err
+    assert "LEERIE_EFFORT" in err
     assert "extreme" in err
     assert "is not one of" in err
 
 
-def test_bad_per_worker_env_dies(pila, repo_root, monkeypatch, capsys):
-    monkeypatch.setenv("PILA_EFFORT_INTEGRATOR", "ludicrous")
+def test_bad_per_worker_env_dies(leerie, repo_root, monkeypatch, capsys):
+    monkeypatch.setenv("LEERIE_EFFORT_INTEGRATOR", "ludicrous")
     with pytest.raises(SystemExit) as exc:
-        pila.resolve_efforts(repo_root, ns())
+        leerie.resolve_efforts(repo_root, ns())
     assert exc.value.code != 0
     err = capsys.readouterr().err
-    assert "PILA_EFFORT_INTEGRATOR" in err
+    assert "LEERIE_EFFORT_INTEGRATOR" in err
     assert "ludicrous" in err
 
 
-def test_bad_global_toml_dies(pila, repo_root, capsys):
-    (repo_root / "pila.toml").write_text("effort = bogus\n")
+def test_bad_global_toml_dies(leerie, repo_root, capsys):
+    (repo_root / "leerie.toml").write_text("effort = bogus\n")
     with pytest.raises(SystemExit) as exc:
-        pila.resolve_efforts(repo_root, ns())
+        leerie.resolve_efforts(repo_root, ns())
     assert exc.value.code != 0
     err = capsys.readouterr().err
-    assert "pila.toml" in err
+    assert "leerie.toml" in err
     assert "bogus" in err
     assert "is not one of" in err
 
 
-def test_bad_per_worker_toml_dies(pila, repo_root, capsys):
-    (repo_root / "pila.toml").write_text("effort_classifier = nope\n")
+def test_bad_per_worker_toml_dies(leerie, repo_root, capsys):
+    (repo_root / "leerie.toml").write_text("effort_classifier = nope\n")
     with pytest.raises(SystemExit) as exc:
-        pila.resolve_efforts(repo_root, ns())
+        leerie.resolve_efforts(repo_root, ns())
     assert exc.value.code != 0
     err = capsys.readouterr().err
     assert "effort_classifier" in err
     assert "nope" in err
 
 
-def test_empty_env_treated_as_unset(pila, repo_root, monkeypatch):
+def test_empty_env_treated_as_unset(leerie, repo_root, monkeypatch):
     """Empty / whitespace-only env vars fall through as if unset, so the
     per-worker default table (DEFAULTS) wins — not "" for all. Pins that
     the strip-then-falsy check in resolve_efforts hasn't been replaced
     with a default-value substitution."""
-    monkeypatch.setenv("PILA_EFFORT", "")
-    monkeypatch.setenv("PILA_EFFORT_PLANNER", "   ")
-    efforts = pila.resolve_efforts(repo_root, ns())
+    monkeypatch.setenv("LEERIE_EFFORT", "")
+    monkeypatch.setenv("LEERIE_EFFORT_PLANNER", "   ")
+    efforts = leerie.resolve_efforts(repo_root, ns())
     assert {w: efforts[w] for w in WORKERS} == DEFAULTS
 
 
-def test_every_value_accepted_in_global_env(pila, repo_root, monkeypatch):
-    for level in pila.EFFORT_VALUES:
-        monkeypatch.setenv("PILA_EFFORT", level)
-        efforts = pila.resolve_efforts(repo_root, ns())
+def test_every_value_accepted_in_global_env(leerie, repo_root, monkeypatch):
+    for level in leerie.EFFORT_VALUES:
+        monkeypatch.setenv("LEERIE_EFFORT", level)
+        efforts = leerie.resolve_efforts(repo_root, ns())
         assert {w: efforts[w] for w in WORKERS} == {w: level for w in WORKERS}
 
 
-def test_post_run_workers_resolved(pila, repo_root, monkeypatch):
+def test_post_run_workers_resolved(leerie, repo_root, monkeypatch):
     """Judge and heal are not in WORKER_TYPES so they don't get per-worker
-    --effort-<W> flags, but they still honor the global PILA_EFFORT. With
+    --effort-<W> flags, but they still honor the global LEERIE_EFFORT. With
     no global override they fall through to None (no per-worker default)."""
     # Default: no override → None
-    efforts = pila.resolve_efforts(repo_root, ns())
+    efforts = leerie.resolve_efforts(repo_root, ns())
     assert efforts["judge"] is None
     assert efforts["heal"] is None
 
     # Global env propagates to post-run workers
-    monkeypatch.setenv("PILA_EFFORT", "max")
-    efforts = pila.resolve_efforts(repo_root, ns())
+    monkeypatch.setenv("LEERIE_EFFORT", "max")
+    efforts = leerie.resolve_efforts(repo_root, ns())
     assert efforts["judge"] == "max"
     assert efforts["heal"] == "max"
 
 
-def test_judgment_workers_pinned_set(pila):
+def test_judgment_workers_pinned_set(leerie):
     """Pins which workers default to 'high'. Adding a worker to the
     judgment set should be a deliberate decision, not a silent drift.
     Acting workers (implementer, conformer) must stay absent — their
     reasoning depth is bounded by the DESIGN §8 evidence gate."""
-    assert set(pila.EFFORT_DEFAULT_PER_WORKER) == {
+    assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == {
         "classifier", "planner", "reconciler", "provision", "integrator",
         "pr_writer",
     }
-    assert "implementer" not in pila.EFFORT_DEFAULT_PER_WORKER
-    assert "conformer" not in pila.EFFORT_DEFAULT_PER_WORKER
+    assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER
+    assert "conformer" not in leerie.EFFORT_DEFAULT_PER_WORKER
 
 
-def test_effort_values_set(pila):
+def test_effort_values_set(leerie):
     """Pins the supported levels exposed by `claude -p --effort`. If the
     CLI adds a level (or drops one), this test fails and the caller is
     forced to revisit EFFORT_VALUES rather than silently accepting it."""
-    assert pila.EFFORT_VALUES == ("low", "medium", "high", "xhigh", "max")
+    assert leerie.EFFORT_VALUES == ("low", "medium", "high", "xhigh", "max")

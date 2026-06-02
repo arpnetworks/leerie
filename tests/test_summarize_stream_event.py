@@ -19,46 +19,46 @@ import pytest
 
 # ----- _extract_tool_result_text: content union normalization ---------------
 
-def test_extract_text_from_string_content(pila):
+def test_extract_text_from_string_content(leerie):
     """When tool_result.content is a plain string."""
     block = {"type": "tool_result", "content": "the file says hello"}
-    assert pila._extract_tool_result_text(block) == "the file says hello"
+    assert leerie._extract_tool_result_text(block) == "the file says hello"
 
 
-def test_extract_text_from_list_content(pila):
+def test_extract_text_from_list_content(leerie):
     """When tool_result.content is a list of {type:'text', text:'...'}."""
     block = {"type": "tool_result", "content": [
         {"type": "text", "text": "line 1"},
         {"type": "text", "text": "line 2"},
     ]}
-    assert pila._extract_tool_result_text(block) == "line 1 line 2"
+    assert leerie._extract_tool_result_text(block) == "line 1 line 2"
 
 
-def test_extract_text_handles_missing_content(pila):
-    assert pila._extract_tool_result_text({}) == ""
-    assert pila._extract_tool_result_text({"content": None}) == ""
+def test_extract_text_handles_missing_content(leerie):
+    assert leerie._extract_tool_result_text({}) == ""
+    assert leerie._extract_tool_result_text({"content": None}) == ""
 
 
 # ----- _summarize_tool_use: per-tool shape ----------------------------------
 
-def test_read_tool(pila):
+def test_read_tool(leerie):
     block = {"type": "tool_use", "name": "Read",
              "input": {"file_path": "src/foo.py"}}
-    assert pila._summarize_tool_use("x", block, "stream") == "  [x read] src/foo.py"
+    assert leerie._summarize_tool_use("x", block, "stream") == "  [x read] src/foo.py"
 
 
-def test_grep_tool_with_path(pila):
+def test_grep_tool_with_path(leerie):
     block = {"type": "tool_use", "name": "Grep",
              "input": {"pattern": "TODO", "path": "src/"}}
-    assert pila._summarize_tool_use("x", block, "stream") == "  [x grep] TODO in src/"
+    assert leerie._summarize_tool_use("x", block, "stream") == "  [x grep] TODO in src/"
 
 
-def test_grep_tool_without_path(pila):
+def test_grep_tool_without_path(leerie):
     block = {"type": "tool_use", "name": "Grep", "input": {"pattern": "TODO"}}
-    assert pila._summarize_tool_use("x", block, "stream") == "  [x grep] TODO"
+    assert leerie._summarize_tool_use("x", block, "stream") == "  [x grep] TODO"
 
 
-def test_bash_tool_not_truncated_at_stream(pila):
+def test_bash_tool_not_truncated_at_stream(leerie):
     """Bash commands are not truncated at stream level. Mid-cut commands
     lose the operands at the end of a pipeline — the part a user
     reading the inline log actually needs to see. The per-worker
@@ -66,41 +66,41 @@ def test_bash_tool_not_truncated_at_stream(pila):
     long_cmd = "echo " + "a" * 200
     block = {"type": "tool_use", "name": "Bash",
              "input": {"command": long_cmd}}
-    out = pila._summarize_tool_use("x", block, "stream")
+    out = leerie._summarize_tool_use("x", block, "stream")
     # Full command preserved; only the leading prefix `  [x bash] ` is added.
     assert out == f"  [x bash] {long_cmd}"
 
 
-def test_bash_tool_stream_and_debug_identical(pila):
+def test_bash_tool_stream_and_debug_identical(leerie):
     """Bash truncation is gone at every level — stream and debug
     produce the same output. Pinning so a future change that
     re-introduces a per-level limit is caught."""
     long_cmd = "echo " + "a" * 200
     block = {"type": "tool_use", "name": "Bash",
              "input": {"command": long_cmd}}
-    out_stream = pila._summarize_tool_use("x", block, "stream")
-    out_debug = pila._summarize_tool_use("x", block, "debug")
+    out_stream = leerie._summarize_tool_use("x", block, "stream")
+    out_debug = leerie._summarize_tool_use("x", block, "debug")
     assert out_stream == out_debug
 
 
-def test_bash_tool_first_line_only(pila):
+def test_bash_tool_first_line_only(leerie):
     block = {"type": "tool_use", "name": "Bash",
              "input": {"command": "first line\nsecond line\nthird"}}
-    out = pila._summarize_tool_use("x", block, "stream")
+    out = leerie._summarize_tool_use("x", block, "stream")
     assert "second line" not in out
     assert "first line" in out
 
 
-def test_write_edit_tools(pila):
+def test_write_edit_tools(leerie):
     for name in ("Write", "Edit", "NotebookEdit"):
         block = {"type": "tool_use", "name": name,
                  "input": {"file_path": "src/foo.py"}}
-        out = pila._summarize_tool_use("x", block, "stream")
+        out = leerie._summarize_tool_use("x", block, "stream")
         assert "src/foo.py" in out
         assert name.lower() in out
 
 
-def test_structured_output_tool_stream_suppressed(pila):
+def test_structured_output_tool_stream_suppressed(leerie):
     """The StructuredOutput tool is suppressed at stream — it adds
     noise since `done` follows immediately. At debug it shows the full
     payload with the 'finalizing output' label. The per-worker file
@@ -108,15 +108,15 @@ def test_structured_output_tool_stream_suppressed(pila):
     big_payload = {"k": "v" * 2000}
     block = {"type": "tool_use", "name": "StructuredOutput",
              "input": big_payload}
-    out_stream = pila._summarize_tool_use("x", block, "stream")
-    out_debug = pila._summarize_tool_use("x", block, "debug")
+    out_stream = leerie._summarize_tool_use("x", block, "stream")
+    out_debug = leerie._summarize_tool_use("x", block, "debug")
     assert out_stream is None
     assert "finalizing output" in out_debug
     # debug shows the full payload (no truncation).
     assert "v" * 2000 in out_debug
 
 
-def test_structured_output_not_truncated_at_debug(pila):
+def test_structured_output_not_truncated_at_debug(leerie):
     """At debug level the StructuredOutput payload appears in full.
     Earlier behavior truncated to 200 chars — an awkward middle
     ground that lost the tail of any non-trivial payload. The user
@@ -125,13 +125,13 @@ def test_structured_output_not_truncated_at_debug(pila):
     big_payload = {"k": "v" * 2000}
     block = {"type": "tool_use", "name": "StructuredOutput",
              "input": big_payload}
-    out_debug = pila._summarize_tool_use("x", block, "debug")
+    out_debug = leerie._summarize_tool_use("x", block, "debug")
     # The full stringified payload appears in the output, including
     # the tail of the value (which a [:200] slice would have lost).
     assert "v" * 2000 in out_debug
 
 
-def test_unknown_tool_falls_through(pila):
+def test_unknown_tool_falls_through(leerie):
     """An unfamiliar tool name (e.g. an MCP tool) should produce a
     summary rather than a crash or KeyError. The full stringified
     input appears — earlier behavior truncated to 80 chars at stream
@@ -139,11 +139,11 @@ def test_unknown_tool_falls_through(pila):
     or API payloads."""
     block = {"type": "tool_use", "name": "mcp__supabase__list_tables",
              "input": {"project_id": "abc"}}
-    out = pila._summarize_tool_use("x", block, "stream")
+    out = leerie._summarize_tool_use("x", block, "stream")
     assert "mcp__supabase__list_tables" in out
 
 
-def test_unknown_tool_not_truncated(pila):
+def test_unknown_tool_not_truncated(leerie):
     """An MCP-tool input with a long operand (e.g. a SQL query)
     appears in full at both stream and debug. Earlier behavior
     truncated to 80 chars at stream level, mid-cutting the part of
@@ -152,8 +152,8 @@ def test_unknown_tool_not_truncated(pila):
         "tenant_id = 1 AND " * 30) + "active = true"
     block = {"type": "tool_use", "name": "mcp__supabase__execute_sql",
              "input": {"sql": long_sql}}
-    out_stream = pila._summarize_tool_use("x", block, "stream")
-    out_debug = pila._summarize_tool_use("x", block, "debug")
+    out_stream = leerie._summarize_tool_use("x", block, "stream")
+    out_debug = leerie._summarize_tool_use("x", block, "debug")
     # The full SQL appears in both — the tail of the query (the
     # "active = true" predicate) survives where [:80] would have
     # dropped it.
@@ -165,90 +165,90 @@ def test_unknown_tool_not_truncated(pila):
     assert out_stream == out_debug
 
 
-def test_tool_use_handles_missing_input(pila):
+def test_tool_use_handles_missing_input(leerie):
     """A tool_use block with no input dict (unusual but possible per
     schema) should not crash."""
     block = {"type": "tool_use", "name": "Read"}
-    out = pila._summarize_tool_use("x", block, "stream")
+    out = leerie._summarize_tool_use("x", block, "stream")
     assert "?" in out  # the file_path fallback
 
 
 # ----- _summarize_stream_event: quiet/normal drop most events --------------
 
-def test_quiet_drops_assistant_events(pila):
+def test_quiet_drops_assistant_events(leerie):
     event = {"type": "assistant",
              "message": {"content": [{"type": "text", "text": "hi"}]}}
-    assert pila._summarize_stream_event("x", event, "quiet") is None
+    assert leerie._summarize_stream_event("x", event, "quiet") is None
 
 
-def test_normal_drops_assistant_events(pila):
+def test_normal_drops_assistant_events(leerie):
     event = {"type": "assistant",
              "message": {"content": [{"type": "text", "text": "hi"}]}}
-    assert pila._summarize_stream_event("x", event, "normal") is None
+    assert leerie._summarize_stream_event("x", event, "normal") is None
 
 
-def test_quiet_surfaces_worker_errors(pila):
+def test_quiet_surfaces_worker_errors(leerie):
     """Errors emit at every level (clig.dev anti-pattern guard). A
     result event with is_error=true must produce a summary even at
     quiet, otherwise the user sees a silent failure."""
     event = {"type": "result", "subtype": "error_max_turns",
              "is_error": True, "num_turns": 5}
-    out = pila._summarize_stream_event("x", event, "quiet")
+    out = leerie._summarize_stream_event("x", event, "quiet")
     assert out is not None
     assert "worker failed" in out
     assert "error_max_turns" in out
 
 
-def test_normal_surfaces_worker_errors(pila):
+def test_normal_surfaces_worker_errors(leerie):
     event = {"type": "result", "subtype": "error_max_turns",
              "is_error": True, "num_turns": 5}
-    assert pila._summarize_stream_event("x", event, "normal") is not None
+    assert leerie._summarize_stream_event("x", event, "normal") is not None
 
 
 # ----- system/init at stream and above --------------------------------------
 
-def test_system_init_at_stream(pila):
+def test_system_init_at_stream(leerie):
     """Captured shape: {type:'system', subtype:'init', model:'...', ...}.
     Stream level shows model name; full payload goes to the file."""
     event = {"type": "system", "subtype": "init",
              "model": "claude-opus-4-7[1m]"}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert out is not None
     assert "starting" in out
     assert "claude-opus-4-7[1m]" in out
 
 
-def test_hook_events_dropped_at_stream(pila):
+def test_hook_events_dropped_at_stream(leerie):
     """SessionStart hooks fire on every claude -p invocation and are
     noise at the stream level. Surfaced only at debug."""
     event = {"type": "system", "subtype": "hook_started",
              "hook_name": "SessionStart:startup"}
-    assert pila._summarize_stream_event("x", event, "stream") is None
+    assert leerie._summarize_stream_event("x", event, "stream") is None
 
 
-def test_hook_events_visible_at_debug(pila):
+def test_hook_events_visible_at_debug(leerie):
     event = {"type": "system", "subtype": "hook_started",
              "hook_name": "SessionStart:startup"}
-    out = pila._summarize_stream_event("x", event, "debug")
+    out = leerie._summarize_stream_event("x", event, "debug")
     assert out is not None
     assert "SessionStart:startup" in out
 
 
 # ----- assistant message content[] — key path is event.message.content[] ----
 
-def test_assistant_text_block_at_stream(pila):
+def test_assistant_text_block_at_stream(leerie):
     """The key path is event.message.content[], not event.content[].
     This was the corrected path after live capture — pinning so a
     future refactor doesn't regress to the wrong path."""
     event = {"type": "assistant", "message": {
         "content": [{"type": "text", "text": "starting investigation"}],
     }}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert out is not None
     assert "starting investigation" in out
 
 
-def test_assistant_text_block_all_lines_emitted(pila):
+def test_assistant_text_block_all_lines_emitted(leerie):
     """A multi-line text block emits every non-empty line as its own
     [<sid> text] entry. Earlier behavior took only the first line,
     which dropped useful content for paragraph-style replies and
@@ -258,7 +258,7 @@ def test_assistant_text_block_all_lines_emitted(pila):
         "content": [{"type": "text",
                      "text": "first\nsecond\n\nthird"}],
     }}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert "[x text] first" in out
     assert "[x text] second" in out
     assert "[x text] third" in out
@@ -267,30 +267,30 @@ def test_assistant_text_block_all_lines_emitted(pila):
     assert "[x text] \n" not in out and not out.endswith("[x text] ")
 
 
-def test_assistant_text_block_not_truncated(pila):
+def test_assistant_text_block_not_truncated(leerie):
     """Long text lines are emitted in full at stream level. The
     100-char limit in earlier versions cut sentences mid-thought."""
     long_text = "a long sentence " * 50  # ~800 chars
     event = {"type": "assistant", "message": {
         "content": [{"type": "text", "text": long_text}],
     }}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     # The full text appears in the output (stripped of leading/trailing
     # whitespace by the per-line .strip()).
     assert long_text.strip() in out
 
 
-def test_assistant_tool_use_block(pila):
+def test_assistant_tool_use_block(leerie):
     event = {"type": "assistant", "message": {
         "content": [{"type": "tool_use", "name": "Read",
                      "input": {"file_path": "x.py"}}],
     }}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert out is not None
     assert "x.py" in out
 
 
-def test_assistant_multiple_blocks(pila):
+def test_assistant_multiple_blocks(leerie):
     """An assistant message can carry multiple blocks (e.g. some text
     plus a tool call). Both should appear in the summary."""
     event = {"type": "assistant", "message": {
@@ -299,12 +299,12 @@ def test_assistant_multiple_blocks(pila):
             {"type": "tool_use", "name": "Read", "input": {"file_path": "x.py"}},
         ],
     }}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert "reading file" in out
     assert "x.py" in out
 
 
-def test_assistant_structured_output_with_text_no_none_literal(pila):
+def test_assistant_structured_output_with_text_no_none_literal(leerie):
     """An assistant event that carries both a text block and a
     StructuredOutput tool_use at stream verbosity must not inject the
     literal string 'None' into the summary. _summarize_tool_use returns
@@ -319,7 +319,7 @@ def test_assistant_structured_output_with_text_no_none_literal(pila):
              "input": {"result": "value"}},
         ],
     }}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     # The text line must appear.
     assert out is not None
     assert "thinking..." in out
@@ -327,16 +327,16 @@ def test_assistant_structured_output_with_text_no_none_literal(pila):
     assert "None" not in out
 
 
-def test_assistant_empty_content_returns_none(pila):
+def test_assistant_empty_content_returns_none(leerie):
     """A defensive empty-content path. Stream / debug should not
     crash."""
     event = {"type": "assistant", "message": {"content": []}}
-    assert pila._summarize_stream_event("x", event, "stream") is None
+    assert leerie._summarize_stream_event("x", event, "stream") is None
 
 
 # ----- user tool_result events ---------------------------------------------
 
-def test_tool_failure_surfaces_at_stream(pila):
+def test_tool_failure_surfaces_at_stream(leerie):
     """A failing tool_result (e.g. schema validation failure) is a
     visible event at stream — the user wants to know."""
     event = {"type": "user", "message": {"content": [
@@ -344,13 +344,13 @@ def test_tool_failure_surfaces_at_stream(pila):
          "content": "Output does not match required schema: root: must have required property 'ok'",
          "tool_use_id": "tu_1"},
     ]}}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert out is not None
     assert "tool-fail" in out
     assert "Output does not match" in out
 
 
-def test_tool_failure_not_truncated(pila):
+def test_tool_failure_not_truncated(leerie):
     """A long tool-failure message (e.g. a schema validation listing
     multiple missing fields) must surface in full. Earlier behavior
     truncated to 120 chars, dropping the useful detail (`root: must
@@ -366,13 +366,13 @@ def test_tool_failure_not_truncated(pila):
         {"type": "tool_result", "is_error": True,
          "content": long_err, "tool_use_id": "tu_1"},
     ]}}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     # Full error appears, including the LAST missing field at the end.
     assert "'confidence'" in out
     assert long_err in out
 
 
-def test_tool_success_dropped_at_stream(pila):
+def test_tool_success_dropped_at_stream(leerie):
     """Successful tool_result is the noise floor — drop from inline
     at stream level. File has it."""
     event = {"type": "user", "message": {"content": [
@@ -380,21 +380,21 @@ def test_tool_success_dropped_at_stream(pila):
          "content": "file contents here",
          "tool_use_id": "tu_1"},
     ]}}
-    assert pila._summarize_stream_event("x", event, "stream") is None
+    assert leerie._summarize_stream_event("x", event, "stream") is None
 
 
-def test_tool_success_visible_at_debug(pila):
+def test_tool_success_visible_at_debug(leerie):
     event = {"type": "user", "message": {"content": [
         {"type": "tool_result", "is_error": False,
          "content": "file contents here",
          "tool_use_id": "tu_1"},
     ]}}
-    out = pila._summarize_stream_event("x", event, "debug")
+    out = leerie._summarize_stream_event("x", event, "debug")
     assert out is not None
     assert "tool-ok" in out
 
 
-def test_tool_failure_multiline_first_line_kind_tag_rest_continuation(pila):
+def test_tool_failure_multiline_first_line_kind_tag_rest_continuation(leerie):
     """A multi-line tool-fail content (rare but possible — e.g. a
     schema validator with a multi-line error format, or a compound
     Bash command whose last stage errored). Line 1 carries
@@ -409,7 +409,7 @@ def test_tool_failure_multiline_first_line_kind_tag_rest_continuation(pila):
         {"type": "tool_result", "is_error": True,
          "content": multi_err, "tool_use_id": "tu_1"},
     ]}}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert out is not None
     lines = out.splitlines()
     assert lines[0] == "  [x tool-fail] line one of the error"
@@ -425,7 +425,7 @@ def test_tool_failure_multiline_first_line_kind_tag_rest_continuation(pila):
     assert lines[2].endswith(" line three with a trailing fact")
 
 
-def test_tool_success_multiline_first_line_kind_tag_rest_continuation_at_debug(pila):
+def test_tool_success_multiline_first_line_kind_tag_rest_continuation_at_debug(leerie):
     """A Read of a multi-line file at debug verbosity: line 1 gets
     `[<sid> tool-ok]`; lines 2+ get a width-matched continuation
     that keeps the sid. Blank interior lines are filtered (the
@@ -436,7 +436,7 @@ def test_tool_success_multiline_first_line_kind_tag_rest_continuation_at_debug(p
         {"type": "tool_result", "is_error": False,
          "content": file_content, "tool_use_id": "tu_1"},
     ]}}
-    out = pila._summarize_stream_event("x", event, "debug")
+    out = leerie._summarize_stream_event("x", event, "debug")
     assert out is not None
     lines = out.splitlines()
     assert lines[0] == "  [x tool-ok] def foo():"
@@ -454,7 +454,7 @@ def test_tool_success_multiline_first_line_kind_tag_rest_continuation_at_debug(p
     assert lines[3].endswith("    return 2")
 
 
-def test_tool_success_not_truncated_at_debug(pila):
+def test_tool_success_not_truncated_at_debug(leerie):
     """At debug verbosity a successful tool_result appears in full —
     earlier behavior truncated to 120 chars. The trade-off: a
     worker reading a large file will flood the orchestrator log at
@@ -466,7 +466,7 @@ def test_tool_success_not_truncated_at_debug(pila):
         {"type": "tool_result", "is_error": False,
          "content": long_result, "tool_use_id": "tu_1"},
     ]}}
-    out = pila._summarize_stream_event("x", event, "debug")
+    out = leerie._summarize_stream_event("x", event, "debug")
     assert out is not None
     # The tail of the content survives — [:120] would have cut it.
     assert long_result.rstrip() in out
@@ -474,7 +474,7 @@ def test_tool_success_not_truncated_at_debug(pila):
 
 # ----- rate_limit_event: live-captured shape -------------------------------
 
-def test_rate_limit_threshold_crossing_surfaces(pila):
+def test_rate_limit_threshold_crossing_surfaces(leerie):
     """Captured shape: {type:'rate_limit_event', rate_limit_info:{...,
     surpassedThreshold:0.75, status:'allowed_warning', utilization:0.89}}.
     A threshold-crossing surfaces at stream — the user wants to know."""
@@ -483,31 +483,31 @@ def test_rate_limit_threshold_crossing_surfaces(pila):
         "utilization": 0.89,
         "surpassedThreshold": 0.75,
     }}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert out is not None
     assert "rate-limit" in out
     assert "89" in out  # utilization as percent
 
 
-def test_rate_limit_quiet_event_dropped_at_stream(pila):
+def test_rate_limit_quiet_event_dropped_at_stream(leerie):
     """A rate_limit_event without surpassedThreshold (routine
     accounting) is dropped at stream."""
     event = {"type": "rate_limit_event", "rate_limit_info": {
         "status": "allowed", "utilization": 0.10,
     }}
-    assert pila._summarize_stream_event("x", event, "stream") is None
+    assert leerie._summarize_stream_event("x", event, "stream") is None
 
 
-def test_rate_limit_always_visible_at_debug(pila):
+def test_rate_limit_always_visible_at_debug(leerie):
     event = {"type": "rate_limit_event", "rate_limit_info": {
         "status": "allowed", "utilization": 0.10,
     }}
-    assert pila._summarize_stream_event("x", event, "debug") is not None
+    assert leerie._summarize_stream_event("x", event, "debug") is not None
 
 
 # ----- rate_limit_event: terminal status raises RateLimitedExit -----------
 
-def test_rate_limit_terminal_status_raises_with_parsed_reset_at(pila):
+def test_rate_limit_terminal_status_raises_with_parsed_reset_at(leerie):
     """A rate_limit_event whose `status` is anything outside the known-
     allowed set raises RateLimitedExit and parses `resetsAt` (Unix
     seconds) into a UTC reset_at. Defensive match against future
@@ -518,38 +518,38 @@ def test_rate_limit_terminal_status_raises_with_parsed_reset_at(pila):
         "resetsAt": 1779941400,   # 2026-05-28T03:10:00Z
         "rateLimitType": "five_hour",
     }}
-    with pytest.raises(pila.RateLimitedExit) as ei:
-        pila._summarize_stream_event("x", event, "stream")
+    with pytest.raises(leerie.RateLimitedExit) as ei:
+        leerie._summarize_stream_event("x", event, "stream")
     assert ei.value.reset_at is not None
     assert ei.value.reset_at.tzinfo is _dt.timezone.utc
     assert int(ei.value.reset_at.timestamp()) == 1779941400
 
 
-def test_rate_limit_terminal_status_no_reset_returns_none_reset(pila):
+def test_rate_limit_terminal_status_no_reset_returns_none_reset(leerie):
     """If `resetsAt` is missing or malformed, we still raise (so the
-    user knows pila exited because of a rate-limit) but with
+    user knows leerie exited because of a rate-limit) but with
     reset_at=None — no auto-resume, just the manual-resume fallback."""
     event = {"type": "rate_limit_event", "rate_limit_info": {
         "status": "blocked",
         # no resetsAt
     }}
-    with pytest.raises(pila.RateLimitedExit) as ei:
-        pila._summarize_stream_event("x", event, "stream")
+    with pytest.raises(leerie.RateLimitedExit) as ei:
+        leerie._summarize_stream_event("x", event, "stream")
     assert ei.value.reset_at is None
 
 
-def test_rate_limit_terminal_status_malformed_reset_returns_none(pila):
+def test_rate_limit_terminal_status_malformed_reset_returns_none(leerie):
     """Non-numeric resetsAt is treated as 'no usable reset time'."""
     event = {"type": "rate_limit_event", "rate_limit_info": {
         "status": "denied",
         "resetsAt": "not a number",
     }}
-    with pytest.raises(pila.RateLimitedExit) as ei:
-        pila._summarize_stream_event("x", event, "stream")
+    with pytest.raises(leerie.RateLimitedExit) as ei:
+        leerie._summarize_stream_event("x", event, "stream")
     assert ei.value.reset_at is None
 
 
-def test_rate_limit_allowed_does_not_raise(pila):
+def test_rate_limit_allowed_does_not_raise(leerie):
     """`status='allowed'` is a routine accounting event — no raise."""
     event = {"type": "rate_limit_event", "rate_limit_info": {
         "status": "allowed",
@@ -557,10 +557,10 @@ def test_rate_limit_allowed_does_not_raise(pila):
     }}
     # Must return cleanly (the warning-log branch already dropped this
     # at 'stream' verbosity).
-    assert pila._summarize_stream_event("x", event, "stream") is None
+    assert leerie._summarize_stream_event("x", event, "stream") is None
 
 
-def test_rate_limit_allowed_warning_does_not_raise(pila):
+def test_rate_limit_allowed_warning_does_not_raise(leerie):
     """`status='allowed_warning'` (threshold-crossing alert) surfaces a
     warning log but must NOT raise — the limit has not yet been hit."""
     event = {"type": "rate_limit_event", "rate_limit_info": {
@@ -569,7 +569,7 @@ def test_rate_limit_allowed_warning_does_not_raise(pila):
         "surpassedThreshold": 0.9,
         "resetsAt": 1779941400,
     }}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert out is not None
     assert "allowed_warning" in out
     assert "91" in out
@@ -577,36 +577,36 @@ def test_rate_limit_allowed_warning_does_not_raise(pila):
 
 # ----- result envelope -----------------------------------------------------
 
-def test_result_success_summary(pila):
+def test_result_success_summary(leerie):
     """Live-captured shape: result.subtype='success', total_cost_usd,
     num_turns. Show all three at stream."""
     event = {"type": "result", "subtype": "success",
              "num_turns": 3, "total_cost_usd": 0.1290}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert "done" in out
     assert "3" in out
     assert "0.1290" in out
 
 
-def test_result_error_summary_at_stream(pila):
+def test_result_error_summary_at_stream(leerie):
     """A failing result at stream (NOT quiet — quiet has its own
     error path tested above)."""
     event = {"type": "result", "subtype": "error_max_turns",
              "num_turns": 1, "is_error": True}
-    out = pila._summarize_stream_event("x", event, "stream")
+    out = leerie._summarize_stream_event("x", event, "stream")
     assert out is not None
     assert "failed" in out or "error" in out
 
 
 # ----- unknown event type --------------------------------------------------
 
-def test_unknown_event_type_at_debug(pila):
+def test_unknown_event_type_at_debug(leerie):
     event = {"type": "future_event_type", "subtype": "novel"}
-    out = pila._summarize_stream_event("x", event, "debug")
+    out = leerie._summarize_stream_event("x", event, "debug")
     assert out is not None
     assert "future_event_type" in out
 
 
-def test_unknown_event_type_dropped_at_stream(pila):
+def test_unknown_event_type_dropped_at_stream(leerie):
     event = {"type": "future_event_type", "subtype": "novel"}
-    assert pila._summarize_stream_event("x", event, "stream") is None
+    assert leerie._summarize_stream_event("x", event, "stream") is None

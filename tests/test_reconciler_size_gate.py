@@ -55,11 +55,11 @@ def _plan(domain: str, *subtasks) -> dict:
 # _find_oversized_added_subtasks
 # ---------------------------------------------------------------------------
 
-def test_find_oversized_empty_when_no_subtasks(pila):
-    assert pila._find_oversized_added_subtasks([]) == []
+def test_find_oversized_empty_when_no_subtasks(leerie):
+    assert leerie._find_oversized_added_subtasks([]) == []
 
 
-def test_find_oversized_ignores_planner_authored_large(pila):
+def test_find_oversized_ignores_planner_authored_large(leerie):
     """A planner-authored `size: large` subtask is NOT caught by the
     size gate — the size gate only runs against reconciler-added
     subtasks. The planner case is the responsibility of `validate_plan`
@@ -68,10 +68,10 @@ def test_find_oversized_ignores_planner_authored_large(pila):
     mutations, not planner output."""
     s = _subtask("feat-001", size="large")
     plans = [_plan("feature-implementation", s)]
-    assert pila._find_oversized_added_subtasks(plans) == []
+    assert leerie._find_oversized_added_subtasks(plans) == []
 
 
-def test_find_oversized_catches_reconciler_large(pila):
+def test_find_oversized_catches_reconciler_large(leerie):
     """The captured-failure shape: reconciler-added subtask carrying
     `_added_by_reconciler: true` with `size: large`. Mirrors
     summarizer run feat-011's authoring."""
@@ -82,12 +82,12 @@ def test_find_oversized_catches_reconciler_large(pila):
                  size="large")
     s["_added_by_reconciler"] = True
     plans = [_plan("_reconciler", s)]
-    oversized = pila._find_oversized_added_subtasks(plans)
+    oversized = leerie._find_oversized_added_subtasks(plans)
     assert len(oversized) == 1
     assert oversized[0]["id"] == "feat-011"
 
 
-def test_find_oversized_ignores_reconciler_added_small_medium(pila):
+def test_find_oversized_ignores_reconciler_added_small_medium(leerie):
     """`size: small` and `size: medium` are legal on reconciler-added
     subtasks. Only `size: large` is the trigger."""
     s_small = _subtask("feat-100", size="small")
@@ -95,20 +95,20 @@ def test_find_oversized_ignores_reconciler_added_small_medium(pila):
     s_med = _subtask("feat-101", size="medium")
     s_med["_added_by_reconciler"] = True
     plans = [_plan("_reconciler", s_small, s_med)]
-    assert pila._find_oversized_added_subtasks(plans) == []
+    assert leerie._find_oversized_added_subtasks(plans) == []
 
 
-def test_find_oversized_case_insensitive(pila):
+def test_find_oversized_case_insensitive(leerie):
     """Defensive: the validate_plan check is case-insensitive (`.lower()`),
     and the size gate mirrors that — a `Large` or `LARGE` from a
     misbehaving model is still caught."""
     s = _subtask("feat-001", size="LARGE")
     s["_added_by_reconciler"] = True
     plans = [_plan("_reconciler", s)]
-    assert len(pila._find_oversized_added_subtasks(plans)) == 1
+    assert len(leerie._find_oversized_added_subtasks(plans)) == 1
 
 
-def test_find_oversized_returns_all_offenders(pila):
+def test_find_oversized_returns_all_offenders(leerie):
     """When the reconciler emits multiple oversized subtasks in one
     output, all are returned (not just the first)."""
     a = _subtask("feat-101", size="large")
@@ -118,7 +118,7 @@ def test_find_oversized_returns_all_offenders(pila):
     c = _subtask("feat-103", size="small")
     c["_added_by_reconciler"] = True
     plans = [_plan("_reconciler", a, b, c)]
-    offenders = pila._find_oversized_added_subtasks(plans)
+    offenders = leerie._find_oversized_added_subtasks(plans)
     ids = sorted(s["id"] for s in offenders)
     assert ids == ["feat-101", "feat-102"]
 
@@ -127,7 +127,7 @@ def test_find_oversized_returns_all_offenders(pila):
 # _build_size_retry_prompt
 # ---------------------------------------------------------------------------
 
-def test_size_retry_prompt_names_offender_and_provides(pila):
+def test_size_retry_prompt_names_offender_and_provides(leerie):
     """The retry prompt must name each oversized subtask by sid and
     list the `provides` tags it bundled — the partition signal."""
     s = _subtask(
@@ -139,7 +139,7 @@ def test_size_retry_prompt_names_offender_and_provides(pila):
     )
     s["_added_by_reconciler"] = True
 
-    prompt = pila._build_size_retry_prompt([s], "ORIGINAL USER PROMPT")
+    prompt = leerie._build_size_retry_prompt([s], "ORIGINAL USER PROMPT")
 
     assert "feat-011" in prompt
     assert "app-env-config-ready" in prompt
@@ -155,14 +155,14 @@ def test_size_retry_prompt_names_offender_and_provides(pila):
     assert "ORIGINAL INPUT" in prompt
 
 
-def test_size_retry_prompt_handles_multiple_offenders(pila):
+def test_size_retry_prompt_handles_multiple_offenders(leerie):
     """The prompt enumerates each offender with a section header."""
     a = _subtask("feat-101", provides=["cap-a"], size="large")
     a["_added_by_reconciler"] = True
     b = _subtask("feat-102", provides=["cap-b"], size="large")
     b["_added_by_reconciler"] = True
 
-    prompt = pila._build_size_retry_prompt([a, b], "ORIGINAL")
+    prompt = leerie._build_size_retry_prompt([a, b], "ORIGINAL")
 
     assert "OVERSIZED 1:" in prompt
     assert "OVERSIZED 2:" in prompt
@@ -171,7 +171,7 @@ def test_size_retry_prompt_handles_multiple_offenders(pila):
     assert "2 `added_subtask`(s)" in prompt
 
 
-def test_size_retry_prompt_marks_no_provides_as_smell(pila):
+def test_size_retry_prompt_marks_no_provides_as_smell(leerie):
     """A reconciler-added subtask with no `provides` is itself a smell
     (the whole point of an added subtask is to *produce* a needed
     capability). The prompt surfaces that explicitly so the model
@@ -179,7 +179,7 @@ def test_size_retry_prompt_marks_no_provides_as_smell(pila):
     s = _subtask("feat-001", provides=[], size="large")
     s["_added_by_reconciler"] = True
 
-    prompt = pila._build_size_retry_prompt([s], "ORIGINAL")
+    prompt = leerie._build_size_retry_prompt([s], "ORIGINAL")
 
     assert "(none — this is itself a smell)" in prompt
 
@@ -208,13 +208,13 @@ def _good_subtask(sid="feat-001", **overrides):
     return base
 
 
-def test_validate_plan_large_planner_wording(pila, capsys):
+def test_validate_plan_large_planner_wording(leerie, capsys):
     """A `size: large` subtask without `_added_by_reconciler` is
     planner-authored; the message blames the planner (existing
     behavior, regression guard)."""
     plan = {"feat-001": _good_subtask("feat-001", size="large")}
     with pytest.raises(SystemExit):
-        pila.validate_plan(plan)
+        leerie.validate_plan(plan)
     err = capsys.readouterr().err
     assert "feat-001: size='large'" in err
     assert "planner must split it further" in err
@@ -222,7 +222,7 @@ def test_validate_plan_large_planner_wording(pila, capsys):
     assert "reconciler must split" not in err
 
 
-def test_validate_plan_large_reconciler_wording(pila, capsys):
+def test_validate_plan_large_reconciler_wording(leerie, capsys):
     """A `size: large` subtask with `_added_by_reconciler: true` means
     the phase 2½ size gate's retry exhausted; the message must blame
     the reconciler so the user knows which prompt misbehaved."""
@@ -230,7 +230,7 @@ def test_validate_plan_large_reconciler_wording(pila, capsys):
     s["_added_by_reconciler"] = True
     plan = {"feat-011": s}
     with pytest.raises(SystemExit):
-        pila.validate_plan(plan)
+        leerie.validate_plan(plan)
     err = capsys.readouterr().err
     assert "feat-011: size='large'" in err
     assert "reconciler must split it further" in err
@@ -243,8 +243,8 @@ def test_validate_plan_large_reconciler_wording(pila, capsys):
 # _apply_reconciler_output stamps `_added_by_reconciler` mechanically
 # ---------------------------------------------------------------------------
 
-def test_apply_reconciler_output_stamps_added_by_reconciler(pila):
-    """The `_added_by_reconciler` flag MUST be stamped by pila, not
+def test_apply_reconciler_output_stamps_added_by_reconciler(leerie):
+    """The `_added_by_reconciler` flag MUST be stamped by leerie, not
     trusted from the model's response. Otherwise a defective or hostile
     model could emit `_added_by_reconciler: false` on a `size: large`
     added subtask and bypass the size gate. CLAUDE.md's central
@@ -263,7 +263,7 @@ def test_apply_reconciler_output_stamps_added_by_reconciler(pila):
         }],
     }]
     # Model emits an added_subtask WITHOUT the flag (or with false —
-    # both must be overridden by pila).
+    # both must be overridden by leerie).
     output = {
         "renames": [], "added_provides": [],
         "added_subtasks": [
@@ -275,12 +275,12 @@ def test_apply_reconciler_output_stamps_added_by_reconciler(pila):
              "success_criteria_seed": "produces bar",
              "provides": ["bar"], "requires": [], "depends_on": [],
              "size": "small",
-             "_added_by_reconciler": False},  # model lies — pila overrides
+             "_added_by_reconciler": False},  # model lies — leerie overrides
         ],
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    pila._apply_reconciler_output(plans, output)
+    leerie._apply_reconciler_output(plans, output)
 
     # Find the appended `_reconciler` plan.
     recon_plan = next(p for p in plans if p["domain"] == "_reconciler")
@@ -297,21 +297,21 @@ def test_apply_reconciler_output_stamps_added_by_reconciler(pila):
 # Size retry's work must survive a subsequent cycle retry's revert
 # ---------------------------------------------------------------------------
 
-def _minimal_state_for_retry(pila, tmp_path):
+def _minimal_state_for_retry(leerie, tmp_path):
     """Stub State with just enough plumbing for phase_reconcile +
     _spawn_reconciler to call bump_workers + st.save without crashing.
     Pattern duplicated from test_reconciler_cycle_gate.py — kept inline
     to preserve test-file independence."""
-    pila_root = tmp_path / ".pila"
+    leerie_root = tmp_path / ".leerie"
     run_id = "test-size-then-cycle-bbb222"
-    (pila_root / "runs" / run_id).mkdir(parents=True)
-    st = pila.State(pila_root, run_id)
+    (leerie_root / "runs" / run_id).mkdir(parents=True)
+    st = leerie.State(leerie_root, run_id)
     st.data = {"task": "test", "worker_count": 0}
     st.save()
     return st
 
 
-def test_size_retry_then_cycle_retry_preserves_split(pila, monkeypatch, tmp_path):
+def test_size_retry_then_cycle_retry_preserves_split(leerie, monkeypatch, tmp_path):
     """When size retry succeeds and then the cycle retry fires, the
     size retry's split MUST survive — the cycle retry's revert to the
     snapshot must restore the POST-size-retry state, not the original
@@ -400,7 +400,7 @@ def test_size_retry_then_cycle_retry_preserves_split(pila, monkeypatch, tmp_path
     # (which includes attempt 2's renames + the split). Attempt 3
     # only needs to drop one of the cycle-closing entries. The
     # consumer's requires entry holds the ORIGINAL pre-rename tag
-    # because apply-on-pre-snapshot would re-apply the renames; pila's
+    # because apply-on-pre-snapshot would re-apply the renames; leerie's
     # cycle-retry recommendation logic uses the original tag. Here,
     # attempt 3 drops config-001's original `backend-framework`
     # requires (the entry the rename rewrote to `backend-ready`).
@@ -437,14 +437,14 @@ def test_size_retry_then_cycle_retry_preserves_split(pila, monkeypatch, tmp_path
             return attempt_2_output
         return attempt_3_output
 
-    monkeypatch.setattr(pila, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-    st = _minimal_state_for_retry(pila, tmp_path)
-    caps = dict(pila.DEFAULT_CAPS)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
     models = {"reconciler": "opus"}
     efforts = {"reconciler": "high"}
 
-    result = asyncio.run(pila.phase_reconcile(
+    result = asyncio.run(leerie.phase_reconcile(
         plans, "feature task", st, caps, models, efforts))
 
     # The size split MUST survive — the three split subtasks (feat-100a,

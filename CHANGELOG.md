@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to Pila will be documented in this file.
+All notable changes to Leerie will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -36,25 +36,25 @@ validation: clean preflight + bundle clone with intact NFC bytes on
   tar pipeline did via `find .claude -print0`. Bundles only carry
   committed state; `seed_repo_dirty` only shipped `git status
   --porcelain` output (which omits gitignored entries). Net result
-  before this follow-up fix: any pila user with `.claude/` in
+  before this follow-up fix: any leerie user with `.claude/` in
   `.gitignore` lost their repo-local hooks/agents/skills/commands on
   `--runtime fly`. Restored by walking `find .claude -type f`
   host-side in `seed_repo_dirty` and appending entries to the dirty
   file list (so the existing rsync delivers them). Shipped in commit
   `94cfbc7`.
 
-- **`.pila/` no longer leaks to the machine from `git status
+- **`.leerie/` no longer leaks to the machine from `git status
   --porcelain` output.** The python filter in `seed_repo_dirty` was
-  missing the equivalent of the prior pipeline's `f.startswith(b".pila/")
-  or f == b".pila"` guard. Untracked `.pila/` (the host-side run
-  state, present on every `pila` invocation) would have rsync'd to
+  missing the equivalent of the prior pipeline's `f.startswith(b".leerie/")
+  or f == b".leerie"` guard. Untracked `.leerie/` (the host-side run
+  state, present on every `leerie` invocation) would have rsync'd to
   the machine on the dirty-delta step. Restored alongside the
   `.claude/` force-include (`94cfbc7`).
 
 - **Test coverage restored**: `test_seed_repo_respects_gitignore_and_force_includes_claude`
   ports the prior `test_seed_repo_git_aware_excludes_and_includes`
   test forward to the bundle+rsync world (asserts gitignored
-  `.claude/` IS shipped, gitignored build artifacts are NOT, `.pila/`
+  `.claude/` IS shipped, gitignored build artifacts are NOT, `.leerie/`
   is NOT). Bundle-pipe assertions also strengthened to mechanically
   enforce the `sh -c '...'` wrapper and the `protocol.file.allow=always`
   flag (a revert of either would now break tests instead of only
@@ -79,7 +79,7 @@ validation: clean preflight + bundle clone with intact NFC bytes on
       `.claude/` directory (same code path as `seed_repo_dirty` for
       `re-seed.sh`).
 
-  Same `flyctl ssh console` pipe pila already uses elsewhere (Claude
+  Same `flyctl ssh console` pipe leerie already uses elsewhere (Claude
   home stage, `fetch-branch.sh`). The `cat > ...` receiver MUST be
   wrapped in `sh -c '...'`; bare `cat > ...` fails with `cat: invalid
   option -- 'c'` because flyctl's `-C` arg isn't shell-evaluated by
@@ -93,7 +93,7 @@ validation: clean preflight + bundle clone with intact NFC bytes on
 
 ## [0.2.5] - 2026-06-01
 
-This release makes `pila --runtime fly` work end-to-end. Validated by
+This release makes `leerie --runtime fly` work end-to-end. Validated by
 a live remote run on `enricai/tab-groups-focus` that opened
 [PR #1](https://github.com/enricai/tab-groups-focus/pull/1). Three
 themes: (1) catch up to current flyctl's interface, (2) make the
@@ -107,15 +107,15 @@ in-machine environment correct for the orchestrator + workers, and
   `fetch_branch` fails. Orthogonal to `paused_at`/`pushed_at`/
   `killed_at` (the machine is neither paused nor destroyed; it's
   running with un-synced work). Mutex-checked against `pushed_at`
-  and `killed_at` by `_validate_run_json`. Surfaces in `pila --list`
+  and `killed_at` by `_validate_run_json`. Surfaces in `leerie --list`
   as new derived status `sync-failed-running`.
 - **`host_no_push` field on `fly-machine.json`** — captures the
   user's actual `--no-push` intent at launch time. Separate from
   `run.json.no_push` (which is the mechanism flag the launcher
   always forces on the in-Fly orchestrator, since the machine can't
-  push). `pila --finalize` consults `host_no_push` to decide whether
+  push). `leerie --finalize` consults `host_no_push` to decide whether
   to skip the push.
-- **`pila --finalize` already-synced fast-path** — when the host
+- **`leerie --finalize` already-synced fast-path** — when the host
   already has `run.json` with `finished_at`, `state.json`, and the
   local run branch (i.e. the auto-sync-on-teardown already ran),
   `--finalize` short-circuits past `fetch_branch` straight to
@@ -125,28 +125,28 @@ in-machine environment correct for the orchestrator + workers, and
 - **`seed-auth.sh` pre-warms `claude --version`** — the FIRST
   invocation of `claude --version` on a cold Fly machine takes
   ~17 s (Node + statsig cold start); subsequent calls return in
-  <0.2 s. seed-auth runs it once as the pila user immediately
+  <0.2 s. seed-auth runs it once as the leerie user immediately
   after credentials are in place, so the orchestrator's preflight
   call hits warm caches.
 
 ### Changed
 
-- **Orchestrator source baked at `/opt/pila-image/`** (was
-  `/work/.pila-image/`). Lives outside `/work` so the remote-seed
+- **Orchestrator source baked at `/opt/leerie-image/`** (was
+  `/work/.leerie-image/`). Lives outside `/work` so the remote-seed
   phase can `rm -rf /work` (or empty-its-contents equivalent) freely
   without clobbering the orchestrator code. Local runs bind-mount
-  `$PILA_REPO:/opt/pila-image:ro` — same path inside the container
+  `$LEERIE_REPO:/opt/leerie-image:ro` — same path inside the container
   in both modes.
 - **Repo seeding is now single-channel git-aware**, not two-channel
   clone-plus-rsync. The host has the full repo and Fly machines
   deliberately receive no GitHub credentials (DESIGN §6
   *Finalization*: workers commit on the machine, the host pushes
-  via `pila --finalize`), so the right design is to ship the
+  via `leerie --finalize`), so the right design is to ship the
   working tree directly. `seed_repo_clone` now tar-pipes a payload
   built from `git ls-files -z --cached --others --exclude-standard`
   (honors `.gitignore` at any depth) + `.git/` verbatim + the
   repo's local `.claude/` verbatim (force-included even if
-  gitignored — workers need hooks/settings/plugins) − `.pila/`
+  gitignored — workers need hooks/settings/plugins) − `.leerie/`
   always (host-side run state).
 - **`decide_teardown` on clean exit (rc=0/10/75) now syncs before
   destroying.** Earlier behavior was destroy-then-rely-on-the-user-
@@ -155,8 +155,8 @@ in-machine environment correct for the orchestrator + workers, and
   `destroy_machine`. On sync success, destroy and print the
   finalize hint. On sync failure, leave the machine RUNNING (not
   stopped) with `sync_failed_at` written to the sidecar and a
-  multi-line WARNING listing recovery commands (`pila --finalize`
-  to retry, `pila --attach` to inspect, `pila --kill` to destroy
+  multi-line WARNING listing recovery commands (`leerie --finalize`
+  to retry, `leerie --attach` to inspect, `leerie --kill` to destroy
   only after work is safely on host). Matches DESIGN §6's "destroy
   *after stream-back*" intent.
 - **Container entrypoint idles when invoked with no argv.** Fly
@@ -166,18 +166,18 @@ in-machine environment correct for the orchestrator + workers, and
   the launcher exec's the orchestrator separately via
   `flyctl ssh console -C "python3 -"`. Local nerdctl always
   passes argv, so the idle branch never fires there.
-- **In-Fly orchestrator runs as the pila user with explicit env.**
-  The detached-launch wrapper passes `user="pila"`,
-  `group=<pila gid>`, `env={HOME=/home/pila, USER=pila, PATH
+- **In-Fly orchestrator runs as the leerie user with explicit env.**
+  The detached-launch wrapper passes `user="leerie"`,
+  `group=<leerie gid>`, `env={HOME=/home/leerie, USER=leerie, PATH
   includes mise bin}`, `cwd="/work"` to `subprocess.Popen`. The
   hallpass ssh-console session lands as root with `HOME=/root`,
   which made claude look for credentials in the wrong place; this
   fixes that and ensures files created by the orchestrator are
-  owned by pila.
+  owned by leerie.
 - **Claude home stage shrunk 642 MB → 234 MB** by adding
   `.claude/local` to `CLAUDE_SKIP` in the launcher. That directory
   is the host's npm install of `@anthropic-ai/claude-code` (~408
-  MB), which the pila image already installs globally via the
+  MB), which the leerie image already installs globally via the
   Dockerfile — pure dead weight on the seed transfer.
 - **`fetch_branch` discover step captures stderr to a separate
   tmpfile** rather than merging via `2>&1`. flyctl's "Connecting
@@ -215,7 +215,7 @@ in-machine environment correct for the orchestrator + workers, and
 
 ### Fixed
 
-- **Force fresh image build by bumping pila version from 0.2.1 to
+- **Force fresh image build by bumping leerie version from 0.2.1 to
   0.2.5** (skipping 0.2.2/0.2.3/0.2.4 because those tags were
   already consumed by Depot's tag→digest cache during development
   iteration). Fly's Depot remote builder caches the resolved
@@ -228,13 +228,13 @@ in-machine environment correct for the orchestrator + workers, and
   `--depot=false`, now applied in `scripts/remote/build-push.sh`'s
   remote-builder invocation. Belt-and-braces: the version bump
   alone forces a brand-new tag with no cached digest history.
-- **Dockerfile: chown /work to pila.** Local runs bind-mount
+- **Dockerfile: chown /work to leerie.** Local runs bind-mount
   `$(pwd):/work` which masks the image's `/work` permission; remote
   (Fly) runs use the baked image's `/work` directly. Previously
-  `/work` was root-owned, so the orchestrator (running as `pila`)
-  crashed at `pila_root.mkdir('/work/.pila')` with `PermissionError`.
-  Added `RUN mkdir -p /work && chown pila:${HOST_GID} /work` before
-  the `USER pila` directive.
+  `/work` was root-owned, so the orchestrator (running as `leerie`)
+  crashed at `leerie_root.mkdir('/work/.leerie')` with `PermissionError`.
+  Added `RUN mkdir -p /work && chown leerie:${HOST_GID} /work` before
+  the `USER leerie` directive.
 - **provision.sh: parse `flyctl machine run` text output, not
   `--json`.** `flyctl machine run` does NOT accept `--json`; the
   call exited non-zero with "unknown flag: --json", `machine_id`
@@ -245,10 +245,10 @@ in-machine environment correct for the orchestrator + workers, and
   machine status` text output, not `--json`.** Same root cause as
   above (`flyctl machine status` doesn't accept `--json` either).
   Parses `State: <state>` from text via the same sed+awk pipeline.
-- **`/work/.pila`, `/work/.pila/runs`, and the run dir are all
-  chowned to pila** by the detached-orchestrator launch wrapper.
+- **`/work/.leerie`, `/work/.leerie/runs`, and the run dir are all
+  chowned to leerie** by the detached-orchestrator launch wrapper.
   Previously only the deepest run dir was chowned; the orchestrator
-  (as pila) then failed when promoting a bootstrap-id dir to its
+  (as leerie) then failed when promoting a bootstrap-id dir to its
   final id with `PermissionError` against the root-owned parent.
 - **`require_fly_ssh` skips `flyctl ssh issue` when the ssh-agent
   already has a Fly cert.** Detected via `ssh-add -l` showing any
@@ -271,24 +271,24 @@ in-machine environment correct for the orchestrator + workers, and
 - **`COPYFILE_DISABLE=1` on host-side `tar -c`** silences macOS BSD
   tar's `LIBARCHIVE.xattr.com.apple.provenance` warnings the remote
   GNU tar otherwise emits per-file. Cosmetic; no-op on Linux hosts.
-- **Git identity written to `/home/pila/.gitconfig`** (was
+- **Git identity written to `/home/leerie/.gitconfig`** (was
   `--global`, which under su-as-root would land in `/root/.gitconfig`
-  where the pila user can't read it).
-- **`chown pila:` (numeric primary group)** in seed-auth and
-  seed-repo, not `chown pila:pila`. The pila user's primary GID is
+  where the leerie user can't read it).
+- **`chown leerie:` (numeric primary group)** in seed-auth and
+  seed-repo, not `chown leerie:leerie`. The leerie user's primary GID is
   numeric (HOST_GID, defaults to 20 / staff on macOS hosts) and is
-  not necessarily a group literally named `pila`.
+  not necessarily a group literally named `leerie`.
 
 ### Added
 
-- **Cleared-but-empty terminal state — pila exits cleanly when every
+- **Cleared-but-empty terminal state — leerie exits cleanly when every
   planner confirms "task already satisfied on HEAD".** A captured
   finalmemoriam run (`bugfix-fix-two-pre-existing-repo-b5b64a`) died
-  at phase 3 with `pila: error: planners produced no subtasks`
+  at phase 3 with `leerie: error: planners produced no subtasks`
   immediately after all 3 planners (bug-fixing, testing,
   configuration-build) cleared their evidence gates and emitted
-  `status: "ready"` with `subtasks: []`. The user had asked pila to
-  fix two defects, but commit `ff2e97f` (made before this pila run
+  `status: "ready"` with `subtasks: []`. The user had asked leerie to
+  fix two defects, but commit `ff2e97f` (made before this leerie run
   started) had already shipped both fixes — and each planner
   independently verified this: the bug-fixing planner cited the
   StatCard binding diff, the testing planner found the regression
@@ -297,7 +297,7 @@ in-machine environment correct for the orchestrator + workers, and
   (`prompts/planner.md:205-208`) explicitly permits empty `subtasks`
   with `status: "ready"` — "an empty plan is a legitimate outcome of
   a cleared evidence gate" — but the orchestrator had no code branch
-  to express that answer. `schedule()` (pila.py:9548) ran an
+  to express that answer. `schedule()` (leerie.py:9548) ran an
   unconditional `die("planners produced no subtasks")` on any empty
   scheduling input, treating "task already done" identically to
   "everyone failed." This is **not** a regression from the recent
@@ -306,13 +306,13 @@ in-machine environment correct for the orchestrator + workers, and
   features. Phase 2½ never even runs in this case because there are
   no subtasks to reconcile.
 
-  Two new helpers in `orchestrator/pila.py` add the missing branch.
+  Two new helpers in `orchestrator/leerie.py` add the missing branch.
   `detect_no_work(plans) -> dict[str, str] | None` is a pure
   predicate that returns a `{domain: confidence.basis}` map iff
   *every* plan satisfies `status == "ready"` and `subtasks == []`;
   it returns `None` on any mixed outcome (one or more domains have
   subtasks → normal run proceeds) and on any blocked-only outcome
-  (the existing all-blocked die at pila.py:9543 still fires so the
+  (the existing all-blocked die at leerie.py:9543 still fires so the
   user knows a gate failed). `_finish_no_work_run(st, no_work_map)`
   is the terminal handler: it logs the no-work summary with each
   planner's basis quoted, records `no_work_required=True` +
@@ -327,14 +327,14 @@ in-machine environment correct for the orchestrator + workers, and
   `schedule()` — after the reconciler so a planner that emits empty
   subtasks but the reconciler later adds connector subtasks is not
   misclassified as no-work, and before scheduling so the bare die
-  at pila.py:9548 is unreachable on the happy path (it remains as a
+  at leerie.py:9548 is unreachable on the happy path (it remains as a
   defensive backstop for direct `schedule()` callers, e.g. tests).
   When `detect_no_work` fires, `_run_phases` returns early — phases
   4–6 are skipped entirely; no run branch is materialized, no
   `setup-run.sh` is called, no PR is opened.
 
   Two new `STATE_FIELDS` entries (`no_work_required`,
-  `no_work_reasons`) record the outcome for `pila --list` and any
+  `no_work_reasons`) record the outcome for `leerie --list` and any
   downstream tooling that cares. No new terminal status in
   `RUN_STATUSES` — `_derive_run_status` already keys "done" off
   `finished_at`, so a no-work run renders as `done-local` (no push,
@@ -343,17 +343,17 @@ in-machine environment correct for the orchestrator + workers, and
   formatter, every `_derive_run_status` test, and the launcher;
   reusing the existing derivation keeps the change small.
 
-  The launcher (`pila` bash script) is patched to honor
+  The launcher (`leerie` bash script) is patched to honor
   `run.json.no_push` after the container exits. The launcher's own
   `NO_PUSH` variable comes from CLI/env (`--no-push` /
-  `PILA_NO_PUSH`) — for the normal-finalize case both container and
+  `LEERIE_NO_PUSH`) — for the normal-finalize case both container and
   launcher see the same CLI flag so no propagation is needed. The
   no-work case breaks that symmetry: the container short-circuits
   via "task already done," not via "user opted out of push." Without
   the launcher patch, the launcher would try `git push -u origin
-  pila/runs/<run-id>` on a branch that was never created, fail with
+  leerie/runs/<run-id>` on a branch that was never created, fail with
   "src refspec does not match any," write `push_error` to run.json,
-  and `pila --list` would render the run as `push-failed` instead of
+  and `leerie --list` would render the run as `push-failed` instead of
   `done-local`. The patch reads `jq '.no_push // false' run.json`
   and exits 0 with a skip message before the push step (and before
   the empty-branch guard, since a no-push run may legitimately have
@@ -395,7 +395,7 @@ in-machine environment correct for the orchestrator + workers, and
   used `requires: [{tag: email-provider-is-ses, extent: in_plan}]`
   as a runtime gate. No subtask in any planner-domain produced that
   tag (this repo keeps Resend), so the reconciler correctly emitted
-  `unresolvable` — and `_check_unresolvable` (pila.py) fail-closed
+  `unresolvable` — and `_check_unresolvable` (leerie.py) fail-closed
   the run. The reconciler's `unresolvable.reason` *quoted* the
   planner's own "no-op the orchestrator should drop" language
   verbatim: the model knew the right answer was "drop the consumer
@@ -492,10 +492,10 @@ in-machine environment correct for the orchestrator + workers, and
   crash the scheduler.** Previously, when the reconciler's renames
   closed a cross-domain dependency cycle (each rename locally correct,
   jointly cycle-creating), the failure surfaced two phases later as
-  `pila: error: dependency cycle among subtasks: <29 of 41 sorted
+  `leerie: error: dependency cycle among subtasks: <29 of 41 sorted
   ids>` from `schedule()`'s Kahn pass — Tarjan never ran, edges were
   never attributed, the user got noise. Two captured failures on a
-  real run (`~/src/enric/summarizer/.pila/runs/`) made this concrete:
+  real run (`~/src/enric/summarizer/.leerie/runs/`) made this concrete:
   run 2's cycle was a 2-node SCC `config-005 ↔ feat-001` (both edges
   reconciler renames); run 1's was `feat-008 ↔ feat-009` (one
   planner-declared `depends_on` + one reconciler rename). The
@@ -510,7 +510,7 @@ in-machine environment correct for the orchestrator + workers, and
   respawns the reconciler once with a structured retry prompt naming
   the SCC, offending mutations, recommendation, and bounded
   must-include set of legal cycle-breaking ops. The model never has
-  to detect cycles itself — pila does that in Python and hands back
+  to detect cycles itself — leerie does that in Python and hands back
   structured feedback — which sidesteps the captured reconciler
   showing zero spontaneous cycle-awareness across 10k chars of
   reasoning. If attempt 2 still cycles, the run aborts with the SCC
@@ -540,7 +540,7 @@ in-machine environment correct for the orchestrator + workers, and
   fixtures from successful historical runs (false-positive guard
   — the gate is silent on every known-acyclic plan in the
   cross-repo canvass: centella feat-rebrand, barnacle telemetry,
-  navegando bugfix, pila feat-please-read, finalmemoriam bugfix).
+  navegando bugfix, leerie feat-please-read, finalmemoriam bugfix).
 
 ### Changed
 
@@ -548,10 +548,10 @@ in-machine environment correct for the orchestrator + workers, and
   *inside* each `claude -p` worker is unbounded — the Bash tool,
   the Task background-job pattern, and toolchain children like
   vitest pools / webpack workers / `tsc` are all uncapped from
-  pila's view. The orchestrator-side knob that bounds total
+  leerie's view. The orchestrator-side knob that bounds total
   in-flight memory load is the worker count itself. At
   `max_parallel=4`, a typical Next.js repo can run 3+ concurrent
-  Node toolchain processes (each 1-2 GiB RSS) before pila even
+  Node toolchain processes (each 1-2 GiB RSS) before leerie even
   notices — exactly the load profile that OOM'd the
   finalmemoriam run. Lowering to 2 keeps the worst-case peak
   within reach of a 16 GiB VM. Users with larger VMs or lighter
@@ -562,7 +562,7 @@ in-machine environment correct for the orchestrator + workers, and
 
 - **Per-worker cgroup v2 memory containment.** Each `claude -p`
   worker is now enrolled in its own child cgroup at
-  `/sys/fs/cgroup/pila-w-<sid>/` with `memory.max`,
+  `/sys/fs/cgroup/leerie-w-<sid>/` with `memory.max`,
   `memory.swap.max=0`, and `pids.max` set. When a worker's tool
   subtree (vitest pools, `tsc --noEmit`, `npm run build`'s
   webpack workers, etc.) overshoots its memory budget, the kernel
@@ -574,7 +574,7 @@ in-machine environment correct for the orchestrator + workers, and
   heavy Node toolchain processes simultaneously, blew through
   the 11 GiB Colima VM, took out sshd, and surfaced as
   `FATA[NNNN] exit status 255` on the Mac launcher with no
-  orchestrator-side diagnostic. Pila's own RSS sat at 36.8 MiB
+  orchestrator-side diagnostic. Leerie's own RSS sat at 36.8 MiB
   through the whole event (no orchestrator leak); the cascade
   was purely due to all processes sharing one container memcg.
   Mechanism is purely cgroup v2 file-permission delegation — no
@@ -585,8 +585,8 @@ in-machine environment correct for the orchestrator + workers, and
   orchestrator's `_cgroup_probe` verifies delegation at startup
   and falls back to uncapped behavior with one warn-line if
   unavailable (older launcher, kernel < 5.x). New CLI knob
-  `--worker-memory-max SIZE` (also `PILA_WORKER_MEMORY_MAX` env
-  and `worker_memory_max` in `pila.toml`); when unset, auto-
+  `--worker-memory-max SIZE` (also `LEERIE_WORKER_MEMORY_MAX` env
+  and `worker_memory_max` in `leerie.toml`); when unset, auto-
   derives a per-worker cap from `/proc/meminfo` by splitting VM
   RAM across `max_parallel + 1` slots, clamped to ≤ 4 GiB.
   Suffixes K/M/G/T accepted. New telemetry field
@@ -616,7 +616,7 @@ in-machine environment correct for the orchestrator + workers, and
 
 ### Added
 
-- **Orchestrator memory-leak telemetry: `.pila/runs/<id>/memory.ndjson`.**
+- **Orchestrator memory-leak telemetry: `.leerie/runs/<id>/memory.ndjson`.**
   After three OOM cascades across different parallel-run combinations,
   we narrowed the diagnostic question to "is the orchestrator itself
   leaking, or is a 2+ GB peak just the natural shape of a heavy 24-
@@ -647,7 +647,7 @@ in-machine environment correct for the orchestrator + workers, and
   The auto-sizing fix that landed earlier in this release raised the
   Colima VM's RAM but didn't add swap — with `Swap: 0B` the kernel's
   OOM killer fires immediately when RAM is exhausted, with no
-  breathing room for transient spikes. Under pila's parallel-
+  breathing room for transient spikes. Under leerie's parallel-
   implementer workload (concurrent `claude -p` plus Vitest workers
   spiking to 2 GB RSS each plus `tsc`/`pnpm` toolchain overhead) we
   observed the OOM killer hitting the host-side `nerdctl` /
@@ -656,7 +656,7 @@ in-machine environment correct for the orchestrator + workers, and
   with no orchestrator diagnostic. The installer now writes an
   idempotent `provision:` block to `~/.colima/default/colima.yaml`
   on fresh installs (no existing config) — the block uses sentinel
-  markers (`# pila:swap-provision-v1 BEGIN/END`) so re-runs are
+  markers (`# leerie:swap-provision-v1 BEGIN/END`) so re-runs are
   no-ops. The provision script `fallocate`s `/var/swapfile`,
   `mkswap`s it, `swapon`s it, and sets `vm.swappiness=10` so the
   kernel uses swap only under real pressure (default 60 is too
@@ -674,7 +674,7 @@ in-machine environment correct for the orchestrator + workers, and
 
 - **Installer auto-sizes the Colima VM to half the host's CPU/RAM
   instead of using Colima's 2-CPU / 2-GB defaults.** The 2/2 defaults
-  were not enough for parallel pila runs — concurrent `claude -p`
+  were not enough for parallel leerie runs — concurrent `claude -p`
   workers (~300 MB each) plus toolchain processes (`tsc`, `vitest`,
   etc.) blew through 2 GB in minutes, triggering a kernel OOM in the
   Colima VM. The OOM killer hit the host-side `nerdctl` daemons (not
@@ -691,12 +691,12 @@ in-machine environment correct for the orchestrator + workers, and
   the bounds rationale.
 
 - **Per-container Claude config isolation eliminates the silent-hang
-  race.** Concurrent pila containers used to share a single host
+  race.** Concurrent leerie containers used to share a single host
   `~/.claude.json` via bind mount, which exposed the well-documented
   `claude-code` corruption race (anthropics/claude-code issues #28847,
   #29217, #29395, #40226 — all open). When the file went missing
   mid-rewrite, the CLI entered a "recovery loop with no backoff" —
-  `claude -p` never exited, pila's existing retry path never fired,
+  `claude -p` never exited, leerie's existing retry path never fired,
   and the worker hung silently until the 90-min hard kill. The
   launcher now stages a per-run scratch dir on the host with a
   private copy of `~/.claude.json` (with `projects[]` stripped),
@@ -724,7 +724,7 @@ in-machine environment correct for the orchestrator + workers, and
   verbosity. Stderr activity also refreshes the watchdog clock, so a
   worker that emits only stderr (recovery-loop scenarios) doesn't
   falsely trip the idle watchdog. `stderr_chunks` is still populated
-  for the existing exit-time `WorkerError` message at `pila.py:4195`.
+  for the existing exit-time `WorkerError` message at `leerie.py:4195`.
 
 - **Provisioning no longer mutates the host's repo.** Phase 1½ used
   to execute `pnpm install` / `pip install` / etc. against
@@ -742,16 +742,16 @@ in-machine environment correct for the orchestrator + workers, and
   injected into implementer and conformer prompts as a
   `PROVISION_RECIPE:` advisory block.
 - **pnpm store cache mount was inert.** The launcher exported
-  `PNPM_STORE_PATH=/home/pila/.cache/pila/pnpm-store`, but that
+  `PNPM_STORE_PATH=/home/leerie/.cache/leerie/pnpm-store`, but that
   env var does not exist in pnpm — pnpm reads `npm_config_store_dir`
   (env), `store-dir` (`.npmrc`), or `--store-dir` (CLI). pnpm
   silently fell back to its default
-  (`/home/pila/.local/share/pnpm/store`), which was NOT
+  (`/home/leerie/.local/share/pnpm/store`), which was NOT
   bind-mounted, so every container run paid full registry cost on
   every package. Fixed by setting `npm_config_store_dir` instead.
-  The host cache (`~/.cache/pila/pnpm-store`) now warms across
+  The host cache (`~/.cache/leerie/pnpm-store`) now warms across
   runs as intended.
-- **`mise install` and `.pila-setup.sh` no longer hang silently.**
+- **`mise install` and `.leerie-setup.sh` no longer hang silently.**
   Both ran through `run_proc` which buffered stdout/stderr until
   the process exited — on a first-run Python 3.12 / Ruby 3.2 / Rust
   install that meant the user could stare at one log line for
@@ -766,16 +766,16 @@ in-machine environment correct for the orchestrator + workers, and
 
 ### Fixed
 
-- **`/home/pila` is now writable by the runtime user inside the
-  container.** Observed images had `/home/pila` owned by `root:root`
-  (despite `useradd -m -u $HOST_UID -g $HOST_GID pila` having run),
-  which meant the runtime `pila` user couldn't create any new dotfile
+- **`/home/leerie` is now writable by the runtime user inside the
+  container.** Observed images had `/home/leerie` owned by `root:root`
+  (despite `useradd -m -u $HOST_UID -g $HOST_GID leerie` having run),
+  which meant the runtime `leerie` user couldn't create any new dotfile
   under its own `$HOME`. The visible failure was `gpg: Fatal: can't
-  create directory '/home/pila/.gnupg': Permission denied` during
+  create directory '/home/leerie/.gnupg': Permission denied` during
   `phase 1½` when mise tried to verify a Node download. The
-  Dockerfile now explicitly `chown pila:${HOST_GID} /home/pila`,
-  pre-creates `/home/pila/.gnupg` at mode 0700 (which GPG requires),
-  and chowns it to the pila user. Other dotfile-writing tools (npm,
+  Dockerfile now explicitly `chown leerie:${HOST_GID} /home/leerie`,
+  pre-creates `/home/leerie/.gnupg` at mode 0700 (which GPG requires),
+  and chowns it to the leerie user. Other dotfile-writing tools (npm,
   ssh known_hosts, cargo, etc.) also benefit. Version bumped to
   0.2.1 to force a rebuild of the cached image (the launcher's
   image-presence check would otherwise skip the rebuild).
@@ -789,7 +789,7 @@ in-machine environment correct for the orchestrator + workers, and
   states live in host processes (Keychain, ssh-agent under launchd,
   gh's local token store) that don't cross the Lima/Colima VM boundary
   cleanly on macOS. The container's job is the LLM work + deterministic
-  integration into `pila/runs/<run-id>`; the host's job is everything
+  integration into `leerie/runs/<run-id>`; the host's job is everything
   network-y, using its own working auth. Side effects: the macOS-only
   "SSH agent forwarding is not available" note is gone (irrelevant
   now); `gh auth status` runs as a host preflight before the container
@@ -810,32 +810,32 @@ in-machine environment correct for the orchestrator + workers, and
   macOS; distro-appropriate `apt-get`/`dnf`/`pacman` + pinned upstream
   nerdctl binary on Linux. A new shared helper at
   `scripts/runtime-install.sh` defines the install functions; both
-  `install.sh` and the `pila` launcher source it (DRY). Opt-out via
-  `--no-runtime-install` (CLI) or `PILA_NO_RUNTIME_INSTALL=1` (env) —
+  `install.sh` and the `leerie` launcher source it (DRY). Opt-out via
+  `--no-runtime-install` (CLI) or `LEERIE_NO_RUNTIME_INSTALL=1` (env) —
   same flag/env as the installer. TTY-guarded: when stdin is not a
   terminal (Claude Code plugin mode), the launcher prints a clear
   "run from a terminal once" message instead of hanging on a sudo
   prompt. `print_install_hint` gains a brew-detection branch on macOS
   so users without Homebrew get the right two-step path
-  (install brew → re-run pila).
+  (install brew → re-run leerie).
 
 ### Added
 
 - **Per-repo dependency provisioning — Phase 1½** (DESIGN §6½). The
   orchestrator now installs each target repo's dependencies (and
   selects the right runtime versions) inside the container before any
-  worker runs. Five layered steps: (1) optional `.pila-setup.sh` hook
+  worker runs. Five layered steps: (1) optional `.leerie-setup.sh` hook
   for user-space tooling install (additional `mise install
   <lang>@<version>` for languages beyond the LTS bake, CLI tools into
   `~/.local/bin`, pre-populated fixtures) — runs as the non-root
-  `pila` user, so root-level system packages need a forked Dockerfile;
+  `leerie` user, so root-level system packages need a forked Dockerfile;
   (2) **`mise`** resolves runtime versions
   from `.nvmrc` / `.python-version` / `.tool-versions` /
   `rust-toolchain.toml` (image-set
   `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS` flips the opt-in), with
   `.go-version` synthesized from `go.mod` via
   `MISE_OVERRIDE_CONFIG_FILENAMES` — and because that env var REPLACES
-  rather than merges discovery, pila copies any idiomatic-file pins
+  rather than merges discovery, leerie copies any idiomatic-file pins
   forward into the synthesized override so polyglot repos (e.g. Go +
   `.nvmrc`) don't silently drop their non-Go pins; (3) a deterministic
   **lockfile-detection table** emits install commands (pnpm > yarn >
@@ -862,18 +862,18 @@ in-machine environment correct for the orchestrator + workers, and
   `pip` cache, `GOMODCACHE`, and the whole `CARGO_HOME`. Concurrency
   safety verdicts and the pip warm-once-then-replay pattern that
   sidesteps pypa/pip#9034 are documented in IMPLEMENTATION §6½.
-- **`.pila-setup.sh`** at the repo root is the user-space escape
+- **`.leerie-setup.sh`** at the repo root is the user-space escape
   hatch the language layer can't install — `mise install
   <lang>@<version>` for additional runtimes, CLI tools under
-  `~/.local/bin`, fixture pre-population. Runs as the non-root `pila`
+  `~/.local/bin`, fixture pre-population. Runs as the non-root `leerie`
   user once per fresh run before mise; idempotent via state. Root-
   level system packages (anything needing `apt-get install` or
   writes to `/usr/*`) are out of scope: the container intentionally
-  ships no sudo. Workaround: maintain a fork of the pila Dockerfile
+  ships no sudo. Workaround: maintain a fork of the leerie Dockerfile
   and override `IMAGE_TAG`.
 - **New `provision` worker type** (defaults to Opus). Independently
-  overridable via `--model-provision` / `PILA_MODEL_PROVISION` /
-  `model_provision` in `pila.toml` like every other worker.
+  overridable via `--model-provision` / `LEERIE_MODEL_PROVISION` /
+  `model_provision` in `leerie.toml` like every other worker.
 
 ### Fixed
 
@@ -926,7 +926,7 @@ in-machine environment correct for the orchestrator + workers, and
   When multiple in-flight runs exist in the same repo, the previous
   error message listed only `run_id  (started <iso-timestamp>)` — no
   hint which run was alive. Each row now includes `status=<derived>`
-  (from the same `_derive_run_status` `pila --list` uses) and
+  (from the same `_derive_run_status` `leerie --list` uses) and
   `last-activity=<age>` (humanized state.json mtime: e.g. `12s ago`,
   `2h05m ago`, `1d4h ago`). Zero new shell-outs — both signals come
   from data already in scope. The disambiguation stays a hint, not
@@ -934,16 +934,16 @@ in-machine environment correct for the orchestrator + workers, and
 
 ### Changed
 
-- **Pila now runs inside a container per run.** Cleanup of `claude -p`
+- **Leerie now runs inside a container per run.** Cleanup of `claude -p`
   workers + every test runner / build / dev server they spawned is now
   a Linux PID-namespace teardown rather than a heuristic PPID-walk in
   Python. Ctrl-C reliably reaps everything; SIGKILL or hard crashes do
   too (cgroup release is a kernel guarantee, not a Python signal
   handler). New host requirement: a container runtime — Colima on
   macOS, containerd + nerdctl natively on Linux. Setup per OS:
-  `docs/INSTALL.md`. The orchestrator code (`orchestrator/pila.py`)
+  `docs/INSTALL.md`. The orchestrator code (`orchestrator/leerie.py`)
   is unchanged; the container/process-isolation work lives in the new
-  `pila` launcher, `Dockerfile`, and `scripts/container-entry.sh`.
+  `leerie` launcher, `Dockerfile`, and `scripts/container-entry.sh`.
   See DESIGN.md §6 *Worker subtree termination* and IMPLEMENTATION.md
   §0.5 *Container shape* for the architecture and code surface.
 
@@ -954,7 +954,7 @@ in-machine environment correct for the orchestrator + workers, and
   Fedora/RHEL via `dnf`, Arch via `pacman`) for `containerd`, then
   downloads the pinned `nerdctl` v2.3.1 binary from upstream (arch-aware
   amd64/arm64), then `sudo systemctl enable --now containerd`. Pass
-  `--no-runtime-install` (or `PILA_NO_RUNTIME_INSTALL=1`) to keep the
+  `--no-runtime-install` (or `LEERIE_NO_RUNTIME_INSTALL=1`) to keep the
   pre-rollout behavior: detect the runtime, print the manual install
   hint, and exit 1. Unknown distros fall back to the hint regardless.
   Existing Docker Desktop / podman installs coexist with Colima/nerdctl
@@ -963,7 +963,7 @@ in-machine environment correct for the orchestrator + workers, and
 - **Default-mode runs now require the `gh` CLI on the host.** The
   container image installs `gh`, but auth state at `~/.config/gh/` is
   bind-mounted from the host. Run `gh auth login` on the host once
-  before running pila, or pass `--no-push` to skip the finalize PR
+  before running leerie, or pass `--no-push` to skip the finalize PR
   step. `git push` for HTTPS remotes uses bind-mounted
   `~/.git-credentials`; for SSH remotes it uses bind-mounted `~/.ssh`.
   *macOS caveat*: SSH agent forwarding is not available on Colima —
@@ -975,11 +975,11 @@ in-machine environment correct for the orchestrator + workers, and
   agent socket mounted normally. The launcher detects `Darwin` and
   skips the mount with a one-line note pointing at this workaround.
 
-- **Plugin mode (`/pila` from inside Claude Code) and terminal mode
+- **Plugin mode (`/leerie` from inside Claude Code) and terminal mode
   share one container model.** The launcher detects `[ -t 0 ]` and
   passes `-it` (terminal) or `-i` only (plugin/no-TTY). Plugin mode
   reuses the existing `EXIT_NEEDS_ANSWERS=10` clarification dance
-  (write `.pila/pending-questions.json`, exit 10; the plugin agent
+  (write `.leerie/pending-questions.json`, exit 10; the plugin agent
   reads the file through the `/work` bind mount, asks the user in
   chat, re-runs with `--answers`). No new mechanism — the container
   is transparent.
@@ -999,33 +999,33 @@ in-machine environment correct for the orchestrator + workers, and
   is ≈ 1 classifier + 2 planners + 1 reconciler + 18 implementers +
   ~18 conformers + a few continuations / integrators ≈ 45–55 workers
   worst-case; the new default leaves margin without inviting runaway
-  cost. `PILA_MAX_WORKERS` env var and `max_workers` in
-  `pila.toml` are new escape hatches (same precedence as
+  cost. `LEERIE_MAX_WORKERS` env var and `max_workers` in
+  `leerie.toml` are new escape hatches (same precedence as
   `--confidence-rounds`: CLI > env > TOML > default).
 - **Protected-path scope narrowed.** The diff-scope check that gates
   implementers and conformers previously rejected any write under
-  `.claude/` wholesale. It now protects only `.pila/`, `.git/`,
+  `.claude/` wholesale. It now protects only `.leerie/`, `.git/`,
   and top-level `.claude/` files (`settings.json`,
   `settings.local.json`); the three documented Claude Code
   user-deliverable subtrees (`.claude/agents/`, `.claude/commands/`,
-  `.claude/skills/`) are exempt. Pila's own self-healing skill
+  `.claude/skills/`) are exempt. Leerie's own self-healing skill
   instructs downstream consumers to write subagent files at
   `.claude/agents/<name>.md`; the over-broad protection previously
   blocked the very pattern the skill teaches. DESIGN.md §9,
   IMPLEMENTATION.md, and `prompts/conformer.md` are updated to match.
 - **`--no-clarify` is now `--clarify`; no-questions is the new
-  default.** The flag's polarity is inverted: by default pila runs
+  default.** The flag's polarity is inverted: by default leerie runs
   without surfacing intent questions to the user. The classifier's
   codebase→research filter still runs and the implementer applies the
   same filter before any mid-execution decision — "no questions" never
   means "skip the rigor." Pass `--clarify` (or set
-  `PILA_CLARIFY=true` / `clarify = true` in `pila.toml`) to
+  `LEERIE_CLARIFY=true` / `clarify = true` in `leerie.toml`) to
   opt into surfacing the questions that survive the filter.
 - **Clarification filter is DRY-ed across the prompts.** The wording
   shown to workers now lives in a single shared fragment
   (`prompts/_clarification_filter.md`), included into
   `prompts/classifier.md` and `prompts/implementer.md` at load time
-  by a new `load_prompt()` helper in `orchestrator/pila.py`.
+  by a new `load_prompt()` helper in `orchestrator/leerie.py`.
   Previously the same filter was restated three times and could
   drift. Worker-facing text now also pushes back explicitly on the
   base model's training prior to ask questions liberally — ~90% of
@@ -1033,7 +1033,7 @@ in-machine environment correct for the orchestrator + workers, and
 
 ### Added
 
-- **Rate-limit-aware hard exit with optional auto-resume.** Pila now
+- **Rate-limit-aware hard exit with optional auto-resume.** Leerie now
   detects the Claude Code subscription session-limit message
   (`"You've hit your session limit · resets <time> (<tz>)"`) in worker
   output, and the protocol-level `rate_limit_event` whose `status`
@@ -1050,11 +1050,11 @@ in-machine environment correct for the orchestrator + workers, and
   (it persists via state.json's `worker_count`) so a run that
   repeatedly hits the rate-limit still respects the user's cap. When
   the parse fails (malformed
-  time, unknown timezone, future format change), pila exits with code
+  time, unknown timezone, future format change), leerie exits with code
   75 and prints the manual resume command — never a wrong-time sleep.
   CLI-only overrides on the original launch (`--model`,
   `--max-workers`, etc.) are *not* propagated across the re-exec; set
-  them via env (`PILA_*`) or `pila.toml` if you want them to survive.
+  them via env (`LEERIE_*`) or `leerie.toml` if you want them to survive.
   Empirical anchor: the verbatim message text matched identically
   across three independent runs in May 2026, and the broad
   `"rate-limit"` pattern false-matches legitimate worker text
@@ -1071,7 +1071,7 @@ in-machine environment correct for the orchestrator + workers, and
   case (line 2350) which shares both substrings stays terminal.
 - **Cross-planner file-overlap warning at plan-validation time.** When
   two planners both list the same path in `files_likely_touched`,
-  pila now logs a warning right after reconciliation (before the
+  leerie now logs a warning right after reconciliation (before the
   scheduler builds the DAG) instead of waiting for the integrator to
   crash mid-wave. Empirically (n=3 historical runs) the signal is
   clean: the one successful run had zero overlaps; both failed runs
@@ -1081,17 +1081,17 @@ in-machine environment correct for the orchestrator + workers, and
   resolution (extending the reconciler's action vocabulary to handle
   file-claim conflicts the same way it handles capability-tag
   vocabulary drift) is tracked as follow-up work.
-- `PILA_MAX_WORKERS` env var and `max_workers` key in
-  `pila.toml` resolve through the new `resolve_max_workers()`
+- `LEERIE_MAX_WORKERS` env var and `max_workers` key in
+  `leerie.toml` resolve through the new `resolve_max_workers()`
   helper, mirroring `resolve_confidence_rounds()`'s precedence.
   `--max-workers` argparse type is now `_positive_int` (was `int`):
   bad values (0, -1, "nope") are rejected at parse time with a clean
   argparse error instead of falling through to a downstream default.
 - `is_protected_path(path)` module-level helper in
-  `orchestrator/pila.py` is the new single source of truth for
+  `orchestrator/leerie.py` is the new single source of truth for
   what the diff-scope check rejects. `check_diff_scope()` and
   documentation reference it; the previous inline tuple is gone.
-- `PILA_CLARIFY` env var and `clarify` key in `pila.toml`
+- `LEERIE_CLARIFY` env var and `clarify` key in `leerie.toml`
   (same precedence as `--source-of-truth`: CLI > env > file > default
   `False`). New helper `_resolve_bool_pref` factors the resolution
   shape shared with `--no-push` to keep them from drifting.
@@ -1099,16 +1099,16 @@ in-machine environment correct for the orchestrator + workers, and
 ### Removed
 
 - **The `uv`-based Python provisioning install path is gone.** The host
-  no longer needs Python. The `pila` launcher is now a portable bash
+  no longer needs Python. The `leerie` launcher is now a portable bash
   script that shells out to `nerdctl run`. The `scripts/install.sh`
   runtime preflight on macOS checks for `colima` and on Linux checks
   for `nerdctl`; it no longer installs `uv` or provisions Python 3.12.
   Existing users upgrading: there is no migration — install the
   container runtime per `docs/INSTALL.md` and re-run the installer.
 
-- **All legacy / backwards-compat code paths.** Pila now has **no
+- **All legacy / backwards-compat code paths.** Leerie now has **no
   migration path from prior versions** — start fresh. Specifically:
-  the `cleanup.sh --legacy` mode and the `.pila/state.json`
+  the `cleanup.sh --legacy` mode and the `.leerie/state.json`
   detection guard in `main()` (which together migrated installations
   off the pre-per-run layout) are deleted; the `validate_resume_state`
   check that rejected pre-inversion `no_clarify` state files is
@@ -1120,8 +1120,8 @@ in-machine environment correct for the orchestrator + workers, and
   (`codebase` / `research` / `both` / `ask`) collapses to three.
   Default is now `both` (codebase first; research as fallback) — the
   preference is never surfaced as an interactive question, because
-  setting `--source-of-truth` / `PILA_SOURCE_OF_TRUTH` /
-  `source_of_truth` in `pila.toml` already expresses an explicit
+  setting `--source-of-truth` / `LEERIE_SOURCE_OF_TRUTH` /
+  `source_of_truth` in `leerie.toml` already expresses an explicit
   intent, and an unset preference implicitly accepts `both`.
   `gather_answers` no longer prompts for source-of-truth or emits the
   `source_of_truth` / `source_of_truth_hint` fields in
@@ -1146,9 +1146,9 @@ in-machine environment correct for the orchestrator + workers, and
 - **Finalize no longer merges the run branch into the working branch
   locally.** Phase 6 now verifies the run branch is non-empty, pushes it
   to `origin`, and opens a PR via `gh pr create --base <working-branch>
-  --head pila/runs/<run-id>`. The working branch is **not** modified
+  --head leerie/runs/<run-id>`. The working branch is **not** modified
   locally; the PR is the proposed integration. Previously, a successful
-  run landed a `pila: integrate completed run into <working-branch>`
+  run landed a `leerie: integrate completed run into <working-branch>`
   merge commit on the working branch *and* opened a PR with the same
   base, duplicating the same change in two places. `--no-push` still
   skips the push + PR step (the run branch is left local-only; the
@@ -1160,11 +1160,11 @@ in-machine environment correct for the orchestrator + workers, and
 - **Per-subtask branches are auto-deleted at finalize.** A new
   `cleanup.sh --subtask-branches` flag (mutually exclusive with
   `--branches`) is now invoked from `phase_finalize` after push+PR. It
-  deletes every `pila/subtasks/<run-id>/*` branch and keeps the
-  run branch `pila/runs/<run-id>` (the PR head must outlive the
+  deletes every `leerie/subtasks/<run-id>/*` branch and keeps the
+  run branch `leerie/runs/<run-id>` (the PR head must outlive the
   orchestrator). The per-subtask commits remain reachable from the run
   branch's `--no-ff` merge graph; the per-worker audit trail is now
-  `git log pila/runs/<run-id> --graph`. Previously every successful
+  `git log leerie/runs/<run-id> --graph`. Previously every successful
   run left ~17–20 orphan subtask branches that the user had to delete
   by hand.
 
@@ -1179,8 +1179,8 @@ in-machine environment correct for the orchestrator + workers, and
   Opus is materially more expensive per token than Sonnet; a typical
   run is meaningfully more expensive than before. To restore the
   pre-0.3 all-sonnet behavior in one knob, set `--model sonnet`,
-  `PILA_MODEL=sonnet`, or `model = sonnet` in `pila.toml`.
-  Per-worker overrides (`--model-<worker>`, `PILA_MODEL_<WORKER>`,
+  `LEERIE_MODEL=sonnet`, or `model = sonnet` in `leerie.toml`.
+  Per-worker overrides (`--model-<worker>`, `LEERIE_MODEL_<WORKER>`,
   `model_<worker>`) let you dial individual workers independently.
 
 - `validate_checkpoint()` rejects a wider set of placeholder tokens.
@@ -1207,7 +1207,7 @@ in-machine environment correct for the orchestrator + workers, and
   silently saw EOF, the script exited 0 without doing anything, and the
   orchestrator continued past it. Every successful run was leaving its
   full set of subtask worktrees on disk under
-  `.pila/runs/<run-id>/worktrees/` despite the "cleanup ran" log
+  `.leerie/runs/<run-id>/worktrees/` despite the "cleanup ran" log
   line. A defense-in-depth pin in `phase_finalize` now asserts the
   invocation includes the run id.
 
@@ -1225,24 +1225,24 @@ in-machine environment correct for the orchestrator + workers, and
   enforcement functions.
 - Per-worker model selection. Default `sonnet`; override with `--model`
   (sets all five workers) or `--model-<worker>` (per-worker; values:
-  `sonnet` / `opus` / `haiku`). Env equivalents `PILA_MODEL` and
-  `PILA_MODEL_<WORKER>`; TOML keys `model` and `model_<worker>` in
-  `pila.toml`. Resolution order, highest first: per-worker CLI →
+  `sonnet` / `opus` / `haiku`). Env equivalents `LEERIE_MODEL` and
+  `LEERIE_MODEL_<WORKER>`; TOML keys `model` and `model_<worker>` in
+  `leerie.toml`. Resolution order, highest first: per-worker CLI →
   global CLI → per-worker env → global env → per-worker TOML → global
   TOML → default. Invalid values rejected at startup. Models are
   re-resolved on `--resume` (not persisted in state).
 - `--source-of-truth` CLI flag for one-off overrides of the
-  `PILA_SOURCE_OF_TRUTH` env var and `pila.toml`.
+  `LEERIE_SOURCE_OF_TRUTH` env var and `leerie.toml`.
 
 ### Changed
 
 - Source-of-truth resolution precedence flipped: env var now beats
-  `pila.toml` (and the new `--source-of-truth` flag beats both).
-  CLI/env are session-scoped knobs; `pila.toml` is the committed
+  `leerie.toml` (and the new `--source-of-truth` flag beats both).
+  CLI/env are session-scoped knobs; `leerie.toml` is the committed
   repo default.
 
-[Unreleased]: https://github.com/enricai/pila/compare/v0.2.6...HEAD
-[0.2.6]: https://github.com/enricai/pila/releases/tag/v0.2.6
-[0.2.5]: https://github.com/enricai/pila/releases/tag/v0.2.5
-[0.2.1]: https://github.com/enricai/pila/releases/tag/v0.2.1
-[0.2.0]: https://github.com/enricai/pila/releases/tag/v0.2.0
+[Unreleased]: https://github.com/enricai/leerie/compare/v0.2.6...HEAD
+[0.2.6]: https://github.com/enricai/leerie/releases/tag/v0.2.6
+[0.2.5]: https://github.com/enricai/leerie/releases/tag/v0.2.5
+[0.2.1]: https://github.com/enricai/leerie/releases/tag/v0.2.1
+[0.2.0]: https://github.com/enricai/leerie/releases/tag/v0.2.0

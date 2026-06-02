@@ -1,6 +1,6 @@
 """Tests for scripts/remote/seed-auth.sh.
 
-seed-auth.sh is sourced (not exec'd) by the pila launcher's RUNTIME=fly
+seed-auth.sh is sourced (not exec'd) by the leerie launcher's RUNTIME=fly
 branch after provision_machine() returns.  These tests exercise the script's
 bash logic in isolation via subprocess, with flyctl stubbed out so no real
 Fly.io calls are made.
@@ -38,22 +38,22 @@ def test_seed_auth_sh_is_executable():
 
 
 def test_seed_auth_fails_without_machine_id(tmp_path):
-    """seed_auth returns 1 when PILA_MACHINE_ID is unset."""
+    """seed_auth returns 1 when LEERIE_MACHINE_ID is unset."""
     stage = tmp_path / "stage"
     stage.mkdir()
     result = _run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
-        env={"PILA_MACHINE_ID": "", "STAGE": str(stage)},
+        env={"LEERIE_MACHINE_ID": "", "STAGE": str(stage)},
     )
     assert result.returncode != 0
-    assert "PILA_MACHINE_ID" in result.stderr
+    assert "LEERIE_MACHINE_ID" in result.stderr
 
 
 def test_seed_auth_fails_without_stage(tmp_path):
     """seed_auth returns 1 when STAGE is unset."""
     result = _run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
-        env={"PILA_MACHINE_ID": "test-machine-001", "STAGE": ""},
+        env={"LEERIE_MACHINE_ID": "test-machine-001", "STAGE": ""},
     )
     assert result.returncode != 0
     assert "STAGE" in result.stderr
@@ -76,7 +76,7 @@ def test_seed_auth_fails_without_credentials_or_token(tmp_path):
     result = _run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
-            "PILA_MACHINE_ID": "test-machine-001",
+            "LEERIE_MACHINE_ID": "test-machine-001",
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -112,7 +112,7 @@ def test_seed_auth_fails_without_git_identity(tmp_path):
     result = _run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
-            "PILA_MACHINE_ID": "test-machine-001",
+            "LEERIE_MACHINE_ID": "test-machine-001",
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -148,7 +148,7 @@ def test_seed_auth_succeeds_with_credentials_file(tmp_path):
     result = _run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
-            "PILA_MACHINE_ID": "test-machine-001",
+            "LEERIE_MACHINE_ID": "test-machine-001",
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -185,7 +185,7 @@ def test_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
     result = _run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
-            "PILA_MACHINE_ID": "test-machine-001",
+            "LEERIE_MACHINE_ID": "test-machine-001",
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "my-oauth-token",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -218,7 +218,7 @@ def test_seed_auth_tar_failure_returns_nonzero(tmp_path):
     result = _run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
-            "PILA_MACHINE_ID": "test-machine-001",
+            "LEERIE_MACHINE_ID": "test-machine-001",
             "STAGE": str(stage),
             "CLAUDE_CODE_OAUTH_TOKEN": "",
             "PATH": f"{tmp_path}:/usr/bin:/bin",

@@ -169,9 +169,9 @@ def _write_ndjson(path: Path, records: list[dict]) -> None:
             f.write(json.dumps(r) + "\n")
 
 
-def _make_state(pila, run_dir: Path):
+def _make_state(leerie, run_dir: Path):
     """Minimal State-like object for tests (no live I/O)."""
-    st = pila.State.__new__(pila.State)
+    st = leerie.State.__new__(leerie.State)
     st.run_id = "e2e-test-run"
     st.run_dir = run_dir
     st.path = run_dir / "state.json"
@@ -197,7 +197,7 @@ def _make_judge_invoke():
     _ID_PASS[:8] == "passrec0", _ID_FAIL_A[:8] == "failreca", _ID_FAIL_B[:8]
     == "failrecb" — all distinct, so the sid uniquely identifies the record.
     """
-    async def fake_invoke(cmd, cwd, timeout, sid, pila_dir, verbosity,
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
                           progress=None, **_kw):
         if _ID_PASS[:8] in sid:
             return _JUDGE_PASS_ENVELOPE
@@ -223,7 +223,7 @@ def _make_heal_judge_invoke(n_baseline_calls: int = 2):
     """
     call_counter = [0]
 
-    async def fake_invoke(cmd, cwd, timeout, sid, pila_dir, verbosity,
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
                           progress=None, **_kw):
         call_counter[0] += 1
         # First n_baseline_calls are the unpatched baseline — all fail.
@@ -249,7 +249,7 @@ def _request_patch_stub(hs, iter_n: int):
 class TestHealPipelineE2E:
     """Full pipeline: calls.ndjson → phase_judge → phase_heal → artefacts."""
 
-    def _run(self, pila, tmp_path: Path):
+    def _run(self, leerie, tmp_path: Path):
         """Execute the pipeline and return (run_dir, judge_dir, heal_dir, records)."""
         run_dir = tmp_path / "run"
         judge_dir = tmp_path / "judge-results"
@@ -257,14 +257,14 @@ class TestHealPipelineE2E:
 
         records = _make_capture_records()
         _write_ndjson(run_dir / "calls.ndjson", records)
-        st = _make_state(pila, run_dir)
+        st = _make_state(leerie, run_dir)
         return run_dir, judge_dir, heal_dir, records, st
 
-    def test_calls_ndjson_written_with_3_records(self, pila, tmp_path,
+    def test_calls_ndjson_written_with_3_records(self, leerie, tmp_path,
                                                   monkeypatch):
         """Fixture NDJSON has 3 records, each valid JSON with required fields."""
         run_dir, judge_dir, heal_dir, records, st = self._run(
-            pila, tmp_path)
+            leerie, tmp_path)
         capture_path = run_dir / "calls.ndjson"
         assert capture_path.exists(), "calls.ndjson not written"
         lines = [l for l in capture_path.read_text().splitlines() if l.strip()]
@@ -275,16 +275,16 @@ class TestHealPipelineE2E:
                           "response_content", "success"):
                 assert field in rec, f"Record missing field: {field}"
 
-    def test_phase_judge_produces_index_with_3_entries(self, pila, tmp_path,
+    def test_phase_judge_produces_index_with_3_entries(self, leerie, tmp_path,
                                                         monkeypatch):
         """phase_judge writes INDEX.json listing all 3 call_ids."""
         run_dir, judge_dir, heal_dir, records, st = self._run(
-            pila, tmp_path)
-        monkeypatch.setattr(pila, "_invoke",
+            leerie, tmp_path)
+        monkeypatch.setattr(leerie, "_invoke",
                             _make_judge_invoke())
 
         result = asyncio.run(
-            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
+            leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
         )
 
         assert result["judged"] == 3, (
@@ -297,16 +297,16 @@ class TestHealPipelineE2E:
         expected_ids = {r["call_id"] for r in records}
         assert judged_ids == expected_ids
 
-    def test_phase_judge_marks_correct_pass_fail(self, pila, tmp_path,
+    def test_phase_judge_marks_correct_pass_fail(self, leerie, tmp_path,
                                                   monkeypatch):
         """INDEX.json has passed=True for the first record, False for the others."""
         run_dir, judge_dir, heal_dir, records, st = self._run(
-            pila, tmp_path)
-        monkeypatch.setattr(pila, "_invoke",
+            leerie, tmp_path)
+        monkeypatch.setattr(leerie, "_invoke",
                             _make_judge_invoke())
 
         asyncio.run(
-            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
+            leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
         )
 
         index = json.loads((judge_dir / "INDEX.json").read_text())
@@ -318,16 +318,16 @@ class TestHealPipelineE2E:
         assert by_id[records[2]["call_id"]]["passed"] is False, (
             "Third record should be marked failed")
 
-    def test_phase_judge_verdict_files_exist(self, pila, tmp_path,
+    def test_phase_judge_verdict_files_exist(self, leerie, tmp_path,
                                               monkeypatch):
         """One <call_id>.json verdict file per record is written."""
         run_dir, judge_dir, heal_dir, records, st = self._run(
-            pila, tmp_path)
-        monkeypatch.setattr(pila, "_invoke",
+            leerie, tmp_path)
+        monkeypatch.setattr(leerie, "_invoke",
                             _make_judge_invoke())
 
         asyncio.run(
-            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
+            leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
         )
 
         for rec in records:
@@ -338,7 +338,7 @@ class TestHealPipelineE2E:
             assert "dimensions" in verdict
             assert "rationale" in verdict
 
-    def test_phase_heal_state_json_pass_rate_05(self, pila, tmp_path,
+    def test_phase_heal_state_json_pass_rate_05(self, leerie, tmp_path,
                                                   monkeypatch):
         """After phase_heal, state.json best_so_far.pass_rate == 0.5.
 
@@ -346,7 +346,7 @@ class TestHealPipelineE2E:
         _ID_FAIL_A to pass while _ID_FAIL_B stays failing → pass_rate = 0.5.
         """
         run_dir, judge_dir, heal_dir, records, st = self._run(
-            pila, tmp_path)
+            leerie, tmp_path)
 
         # Only the 2 failing records go to phase_heal.
         failing = [r for r in records if not r["success"]]
@@ -355,8 +355,8 @@ class TestHealPipelineE2E:
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(pila, "replay_capture", fake_replay)
-        monkeypatch.setattr(pila, "_invoke",
+        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 
         # Config: enough iterations to record ≥1 history entry but
@@ -369,7 +369,7 @@ class TestHealPipelineE2E:
         }
 
         verdict = asyncio.run(
-            pila.phase_heal(
+            leerie.phase_heal(
                 _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )
@@ -384,20 +384,20 @@ class TestHealPipelineE2E:
         assert abs(best.get("pass_rate", -1) - 0.5) < 1e-9, (
             f"Expected best_so_far.pass_rate=0.5, got {best.get('pass_rate')}")
 
-    def test_phase_heal_history_has_at_least_one_iteration(self, pila,
+    def test_phase_heal_history_has_at_least_one_iteration(self, leerie,
                                                              tmp_path,
                                                              monkeypatch):
         """After phase_heal, state.json history has ≥1 iteration record."""
         run_dir, judge_dir, heal_dir, records, st = self._run(
-            pila, tmp_path)
+            leerie, tmp_path)
 
         failing = [r for r in records if not r["success"]]
 
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(pila, "replay_capture", fake_replay)
-        monkeypatch.setattr(pila, "_invoke",
+        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 
         config = {
@@ -408,7 +408,7 @@ class TestHealPipelineE2E:
         }
 
         asyncio.run(
-            pila.phase_heal(
+            leerie.phase_heal(
                 _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )
@@ -419,22 +419,22 @@ class TestHealPipelineE2E:
         assert len(state.get("history", [])) >= 1, (
             f"Expected ≥1 history entry, got: {state.get('history')}")
 
-    def test_phase_heal_no_regressions(self, pila, tmp_path, monkeypatch):
+    def test_phase_heal_no_regressions(self, leerie, tmp_path, monkeypatch):
         """best_so_far.pass_rate must be >= baseline average pass_rate.
 
         Since the patch flips one record to pass (0.5 overall) and the baseline
         all fail (0.0 average), there are no regressions.
         """
         run_dir, judge_dir, heal_dir, records, st = self._run(
-            pila, tmp_path)
+            leerie, tmp_path)
 
         failing = [r for r in records if not r["success"]]
 
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(pila, "replay_capture", fake_replay)
-        monkeypatch.setattr(pila, "_invoke",
+        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 
         config = {
@@ -445,7 +445,7 @@ class TestHealPipelineE2E:
         }
 
         asyncio.run(
-            pila.phase_heal(
+            leerie.phase_heal(
                 _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )
@@ -464,19 +464,19 @@ class TestHealPipelineE2E:
             f"Regression detected: best_so_far.pass_rate={best_rate} "
             f"< baseline_avg={baseline_avg}")
 
-    def test_phase_heal_report_written_with_patch_text(self, pila, tmp_path,
+    def test_phase_heal_report_written_with_patch_text(self, leerie, tmp_path,
                                                          monkeypatch):
         """healing-<call_type>.md is written and contains the best patch text."""
         run_dir, judge_dir, heal_dir, records, st = self._run(
-            pila, tmp_path)
+            leerie, tmp_path)
 
         failing = [r for r in records if not r["success"]]
 
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(pila, "replay_capture", fake_replay)
-        monkeypatch.setattr(pila, "_invoke",
+        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 
         config = {
@@ -487,7 +487,7 @@ class TestHealPipelineE2E:
         }
 
         asyncio.run(
-            pila.phase_heal(
+            leerie.phase_heal(
                 _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )
@@ -502,7 +502,7 @@ class TestHealPipelineE2E:
         assert "PATCHED_CONTENT_iter" in content, (
             f"Best patch text not in report:\n{content}")
 
-    def test_all_four_artefacts_exist(self, pila, tmp_path, monkeypatch):
+    def test_all_four_artefacts_exist(self, leerie, tmp_path, monkeypatch):
         """Full pipeline check: all 4 artefact types exist with expected fields.
 
         Artefacts:
@@ -513,13 +513,13 @@ class TestHealPipelineE2E:
           4. healing/<call_type>/healing-<call_type>.md — markdown report
         """
         run_dir, judge_dir, heal_dir, records, st = self._run(
-            pila, tmp_path)
+            leerie, tmp_path)
 
         # Phase judge
-        monkeypatch.setattr(pila, "_invoke",
+        monkeypatch.setattr(leerie, "_invoke",
                             _make_judge_invoke())
         asyncio.run(
-            pila.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
+            leerie.phase_judge(run_dir, judge_dir, _CAPS, st, _MODELS, _EFFORTS)
         )
         monkeypatch.undo()
 
@@ -532,8 +532,8 @@ class TestHealPipelineE2E:
         async def fake_replay(record, *, override_system_prompt=None, cwd=None):
             return (_REPLAY_ENVELOPE, {"categories": ["bug-fixing"]})
 
-        monkeypatch.setattr(pila, "replay_capture", fake_replay)
-        monkeypatch.setattr(pila, "_invoke",
+        monkeypatch.setattr(leerie, "replay_capture", fake_replay)
+        monkeypatch.setattr(leerie, "_invoke",
                             _make_heal_judge_invoke())
 
         config = {
@@ -544,7 +544,7 @@ class TestHealPipelineE2E:
         }
 
         asyncio.run(
-            pila.phase_heal(
+            leerie.phase_heal(
                 _CALL_TYPE, failing, heal_dir, _CAPS, st, _MODELS, _EFFORTS,
                 _request_patch_stub, n=1, config=config,
             )

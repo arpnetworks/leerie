@@ -1,4 +1,4 @@
-# Pila — Design Document
+# Leerie — Design Document
 
 > Deterministic, headless task orchestrator for Claude Code. Classifies an
 > engineering task, decomposes it into granular subtasks, schedules them into
@@ -20,7 +20,7 @@ document defines what *should* be true and the code is the defect.
 
 ## 1. Purpose
 
-Given one task description, Pila drives it to a validated, integrated result
+Given one task description, Leerie drives it to a validated, integrated result
 without further human input — except where input is genuinely impossible to
 derive. Every loop is bounded, every decision is made from the codebase or from
 research, and state is kept on disk so a run is observable and resumable.
@@ -58,7 +58,7 @@ the CLI as a dependency. The other uses an agent library whose calls return
 typed objects — less brittle, because there is no marshalling of CLI strings
 and stdout — but it authenticates against the metered API rather than the
 subscription. Running on the subscription rather than the API was a hard
-requirement, so Pila takes the CLI-subprocess form. The brittleness that
+requirement, so Leerie takes the CLI-subprocess form. The brittleness that
 choice accepts (parsing process output rather than typed objects) is contained
 by two later mechanisms: worktree isolation limits the blast radius of a
 misbehaving worker, and every worker result is validated against a schema
@@ -92,7 +92,7 @@ Orchestrator (deterministic — owns all control flow, caps, state)
 ```
 
 **Why classification precedes clarification.** Phase 1 runs before Phase 0
-because Pila cannot know what to ask until it knows what kind of task this
+because Leerie cannot know what to ask until it knows what kind of task this
 is — the set of questions worth asking is a function of the classification.
 Phase 0 is skipped entirely for fully-specified tasks.
 
@@ -120,7 +120,7 @@ happens. Each worker's stream of tool calls, text, and intermediate
 results is read line-by-line, written verbatim to a per-worker log file,
 and summarized inline at a user-controllable verbosity level. The
 default level shows one-line summary per worker event; the user can dial
-down to pila's pre-streaming terse output (`-q`) or up to raw event
+down to leerie's pre-streaming terse output (`-q`) or up to raw event
 payloads (`-vv`). Errors emit at every level. The per-worker file is
 the ground-truth audit trail; the inline view is the live feed.
 
@@ -243,7 +243,7 @@ It is reconciled by the orchestrator with three mechanisms:
   structural signals (planner-declared `depends_on` orientation;
   `files_likely_touched` overlap), and respawns the worker once with the
   cycle data, the recommendation, and a bounded set of acceptable
-  operations. The model never has to detect cycles itself; pila does that
+  operations. The model never has to detect cycles itself; leerie does that
   in Python and hands the model concrete structural feedback. If the
   second attempt still cycles, the run aborts with the SCC and the
   offending mutations named — never a silent bad ordering.
@@ -344,7 +344,7 @@ the dependency is satisfied in the filesystem the dependent subtask starts from.
 
 ### Isolation
 
-Parallel workers that write to a shared directory race. Pila gives each
+Parallel workers that write to a shared directory race. Leerie gives each
 implementer its own git worktree — an isolated checkout backed by the same
 repository. Parallel writes land in separate working directories and never
 collide. This is what makes "a wave of parallel implementers" safe even when
@@ -363,8 +363,8 @@ three inputs known by the end of Phase 1:
   precision).
 
 The result looks like `feat-add-telemetry-skills-a3f7c2`. It is the same
-string in three places: the run branch name (`pila/runs/<run-id>`), the
-per-run state directory (`.pila/runs/<run-id>/`), and the title of the
+string in three places: the run branch name (`leerie/runs/<run-id>`), the
+per-run state directory (`.leerie/runs/<run-id>/`), and the title of the
 PR opened at finalize. A user looking at any of the three can grep for the
 others.
 
@@ -376,18 +376,18 @@ is no shared "staging" namespace that two runs could collide on.
 ### The run branch as an integration buffer
 
 Integration does not happen on the user's working branch. Each run has its
-own **run branch** (`pila/runs/<run-id>`) that receives every subtask's
+own **run branch** (`leerie/runs/<run-id>`) that receives every subtask's
 work; the user's branch is untouched until the run finishes and succeeds. A
 failed or messy integration therefore never lands on the branch the user
 cares about. Multiple runs in the same repository each have their own run
 branch and integrate independently.
 
-Subtask branches live under a sibling namespace: `pila/subtasks/<run-id>/<sid>`.
+Subtask branches live under a sibling namespace: `leerie/subtasks/<run-id>/<sid>`.
 The run-branch and subtask-branch prefixes are deliberately disjoint
-(`pila/runs/…` vs. `pila/subtasks/…`) because git's loose ref store
+(`leerie/runs/…` vs. `leerie/subtasks/…`) because git's loose ref store
 cannot hold both a ref AT a path and a ref UNDER that same path
-simultaneously — `pila/<run-id>` as a leaf ref and
-`pila/<run-id>/<sid>` as a child ref would collide on the first
+simultaneously — `leerie/<run-id>` as a leaf ref and
+`leerie/<run-id>/<sid>` as a child ref would collide on the first
 `git worktree add`. Sibling prefixes make the collision structurally
 impossible.
 
@@ -418,7 +418,7 @@ depends on.
 When more than one run is in flight in the same repository, `--resume`
 needs to know *which* run to resume. The orchestrator auto-picks when
 exactly one run exists, and requires an explicit `--run-id` otherwise; the
-discovery scans `.pila/runs/*/state.json`. Resume never guesses across
+discovery scans `.leerie/runs/*/state.json`. Resume never guesses across
 multiple runs.
 
 ### Why merge, not cherry-pick
@@ -461,7 +461,7 @@ markers (`<<<<<<<`). A merge that left markers behind aborts the
 run. There is no LLM-level wave validator beyond that: per-subtask
 quality is the implementer's confidence gate (§8); whether the
 integrated tree is *behaviorally* correct is a question the
-conformance phase touches and the human PR review confirms. Pila
+conformance phase touches and the human PR review confirms. Leerie
 does not re-run subtask criteria at the wave boundary — that role
 belonged to an earlier wave-level validator that was removed when the
 criteria file became informational (§8, §9).
@@ -488,7 +488,7 @@ The final step turns the completed run branch into a reviewable artifact
 and never touches the user's working branch.
 
 **The run branch is the integration artifact.** Every wave's work is
-already integrated on `pila/runs/<run-id>`. Pila does not merge
+already integrated on `leerie/runs/<run-id>`. Leerie does not merge
 the run branch into the working branch locally — that would duplicate the
 same change in two places (a local commit and a PR) and put the working
 branch in a state the user did not request. The working branch is the same
@@ -497,7 +497,7 @@ change that.
 
 **Push and PR happen on the host, after the container exits.** The
 container's job is the LLM work plus the deterministic integration
-of every wave into `pila/runs/<run-id>`. Once integration is done,
+of every wave into `leerie/runs/<run-id>`. Once integration is done,
 the container exits cleanly and the launcher takes over: it reads
 `run.json`'s `finished_at` sentinel, then runs `git push` and
 `gh pr create` on the host.
@@ -523,20 +523,20 @@ mid-run), the launcher does not push — nothing changed on disk that the
 user didn't already see in the worker logs.
 
 **Remote runs** (Fly.io `--runtime fly`) face the same auth boundary from
-the other direction: the run branch and `.pila/runs/<run-id>/` state live
+the other direction: the run branch and `.leerie/runs/<run-id>/` state live
 on the Fly Machine's filesystem, not on the host. The launcher resolves
 this with a **stream-back** step before the host-side finalize runs:
 
 1. The orchestrator inside the Machine writes `finished_at` to `run.json`
    and exits 0, exactly as in local mode.
 2. The launcher calls `scripts/remote/fetch-branch.sh`, which:
-   - discovers the completed run-id by scanning `.pila/runs/*/run.json` on
+   - discovers the completed run-id by scanning `.leerie/runs/*/run.json` on
      the Machine for a `finished_at`-bearing, unpushed entry;
-   - creates a `git bundle` of `pila/runs/<run-id>` on the Machine and
+   - creates a `git bundle` of `leerie/runs/<run-id>` on the Machine and
      pipes it to the host, where `git fetch` materialises the branch in the
      host's local repo;
-   - tars `.pila/runs/<run-id>/` on the Machine and extracts it under
-     `$USER_REPO/.pila/runs/` on the host.
+   - tars `.leerie/runs/<run-id>/` on the Machine and extracts it under
+     `$USER_REPO/.leerie/runs/` on the host.
 3. The existing host-side finalize block (push + `gh pr create`) then runs
    unchanged with the host's own auth — it finds `run.json` (now on the
    host) and the run branch (now in the host repo) just as it would after a
@@ -570,7 +570,7 @@ subtask, so they already describe the work in domain language. A
 diff-stat, dirstat, and sampled hunks from the heaviest-changed files
 (capped to keep the prompt within budget) supplement the log.
 Subtask titles from the planner are passed through verbatim. The
-launcher prepends `pila: ` to the worker's title so pila-opened PRs
+launcher prepends `leerie: ` to the worker's title so leerie-opened PRs
 stay easy to spot in lists.
 
 The worker writes its output to `run.json` (`pr_title`, `pr_body`,
@@ -581,14 +581,14 @@ The host launcher reads those fields with `jq` and passes them to
 error, schema mismatch, timeout, worker budget exhausted, oversized
 payload) is logged and swallowed; the launcher falls back to a
 deterministic body composed from `state.json` fields (the shape
-documented by `compose_pr_body` in `orchestrator/pila.py`).
+documented by `compose_pr_body` in `orchestrator/leerie.py`).
 Generating a richer body must never block finalize success.
 
 When the target repo has multiple templates inside a
 `PULL_REQUEST_TEMPLATE/` directory, the alphabetically first `.md`
-wins by default. `--pr-template <name>` (also `PILA_PR_TEMPLATE`,
-`pr_template` in `pila.toml`) overrides the choice. A selector that
-does not match an existing template is **not fatal** — pila logs a
+wins by default. `--pr-template <name>` (also `LEERIE_PR_TEMPLATE`,
+`pr_template` in `leerie.toml`) overrides the choice. A selector that
+does not match an existing template is **not fatal** — leerie logs a
 warning and falls back to the alphabetical default rather than
 blocking finalize over a cosmetic preference.
 
@@ -617,21 +617,21 @@ create` command to retry. The principle is that the user always knows
 exactly what state things are in and exactly which branch holds the work
 to be resolved.
 
-**Why push by default.** When pila is invoked in CI or any unattended
+**Why push by default.** When leerie is invoked in CI or any unattended
 context, a successful run that leaves work only on a local branch is a
 silent failure mode — the work exists but the user has no signal that it
 needs to be reviewed. Defaulting to push + PR turns every run into a
-reviewable artifact. `--no-push` exists for users running pila offline
+reviewable artifact. `--no-push` exists for users running leerie offline
 or in repositories without a GitHub remote.
 
 **Branch cleanup at finalize.** After the push + PR (or after the run
 completes under `--no-push`), the orchestrator deletes the per-subtask
-branches `pila/subtasks/<run-id>/*` automatically. They were the
+branches `leerie/subtasks/<run-id>/*` automatically. They were the
 mechanism by which parallel implementers committed in isolation; once
 their work has been merged into the run branch their individual commit
 histories are still reachable from the run branch's `--no-ff` merges, so
 the named refs are pure clutter. The **run branch** itself
-(`pila/runs/<run-id>`) is *kept* — it is the PR head, and deleting it
+(`leerie/runs/<run-id>`) is *kept* — it is the PR head, and deleting it
 locally before the PR is merged would dangle the PR base reference. The
 per-run state directory (`state.json`, `run.json`, logs, criteria,
 checkpoints) is also kept as an audit trail. A user who wants to
@@ -652,13 +652,13 @@ resumable via `--resume --run-id <id>` after any abnormal exit.
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
 
-- Worktrees under `.pila/runs/<run-id>/worktrees/` are removed and
+- Worktrees under `.leerie/runs/<run-id>/worktrees/` are removed and
   `git worktree prune` clears stale metadata. Worktrees are
   disposable — `scripts/new-worktree.sh` re-creates them idempotently
   on `--resume` from the deterministic branch names.
-- State.json, the run branch (`pila/runs/<run-id>`), and per-subtask
-  branches (`pila/subtasks/<run-id>/*`) all survive. Implementer
-  checkpoints under `.pila/runs/<run-id>/checkpoints/` survive too,
+- State.json, the run branch (`leerie/runs/<run-id>`), and per-subtask
+  branches (`leerie/subtasks/<run-id>/*`) all survive. Implementer
+  checkpoints under `.leerie/runs/<run-id>/checkpoints/` survive too,
   so in-flight subtasks resume from where they left off.
 
 **Worker subtree termination — kernel-enforced via the container
@@ -674,7 +674,7 @@ survivors as orphans of init. POSIX gives no in-OS guarantee that
 ad-hoc lineage tracking can be made airtight against a tree that
 intentionally detaches.
 
-Pila therefore makes cleanup a **property of the runtime boundary,
+Leerie therefore makes cleanup a **property of the runtime boundary,
 not a property of the orchestrator's signal handling**. The
 orchestrator and every worker it spawns run inside a single
 container (containerd-managed: on Linux native, on macOS via a
@@ -687,7 +687,7 @@ container runtime rely on. There is no possible survivor: a process
 that detached into its own session, a daemon that double-forked,
 a vitest pool worker that reparented to init — all of them are
 inside the namespace and all of them get reaped by the kernel,
-not by any code pila wrote.
+not by any code leerie wrote.
 
 The contract reads identically to before — every exit path
 (Ctrl-C, SIGTERM, SIGHUP, WorkerError, RateLimitedExit, any
@@ -709,7 +709,7 @@ survivor when the orchestrator exits.
 
 The container boundary holds across both invocation modes:
 
-- **Terminal mode** — the user runs `pila "task"` from a shell.
+- **Terminal mode** — the user runs `leerie "task"` from a shell.
   The launcher gives the container a controlling TTY (`-it`). The
   orchestrator's `log()` lines stream live; clarification questions
   use `input()`. Ctrl-C in the user's terminal delivers SIGINT to
@@ -719,10 +719,10 @@ The container boundary holds across both invocation modes:
   launcher passes `-i` only. Inside the container,
   `sys.stdin.isatty()` returns False, so the orchestrator's existing
   no-TTY clarification path activates: it writes
-  `.pila/pending-questions.json` (visible on the host via the
+  `.leerie/pending-questions.json` (visible on the host via the
   `/work` bind mount) and exits with `EXIT_NEEDS_ANSWERS=10`. The
   plugin agent reads the file, asks the user in chat, writes
-  `.pila/answers.json`, and re-runs the container with `--answers`.
+  `.leerie/answers.json`, and re-runs the container with `--answers`.
   Same exit codes, same file passing, same kernel teardown
   guarantee. The container is transparent to the plugin's existing
   exit-10 dance.
@@ -741,18 +741,18 @@ forking webpack workers) overshoots the container's available RAM,
 the kernel's OOM killer fires inside the container's single memcg.
 The victim it picks is whichever process in that memcg has the
 largest `oom_score`, which can land on `sshd` / `lima-guestagent` /
-the pila orchestrator itself — collapsing infrastructure that the
+the leerie orchestrator itself — collapsing infrastructure that the
 launcher relies on for SSH-tunnel survival to the macOS host. The
 observed pattern on an undersized 11 GiB Colima VM with 4
 concurrent implementers was: vitest worker (1.85 GiB anon-rss) →
 OOM-killer fires → `agetty` → `journald` → `sshd` (Mac launcher
 sees `exit status 255`) → `lima-guestagent` → only then the
-offending Node process. Pila's own RSS sat at 36.8 MiB throughout,
+offending Node process. Leerie's own RSS sat at 36.8 MiB throughout,
 so the orchestrator wasn't leaking; the cascade was caused by all
 processes sharing one memcg.
 
 Each `claude -p` worker is therefore enrolled in its own child
-cgroup at `/sys/fs/cgroup/pila-w-<sid>/` with `memory.max` set to
+cgroup at `/sys/fs/cgroup/leerie-w-<sid>/` with `memory.max` set to
 `caps["worker_memory_max_bytes"]` (default: VM RAM split across
 `max_parallel + 1` slots, clamped to ≤ 4 GiB) and `pids.max` set
 to `caps["worker_pids_max"]` (default 256). When the worker
@@ -774,9 +774,9 @@ kernel < 5.x, custom container shape). The teardown path uses
 subtree process that survived the existing `_terminate_proc_tree`
 proc-walk — a backstop, not the primary cleanup. See
 IMPLEMENTATION.md §"Caps" for the resolution surface and
-`_cgroup_*` in `orchestrator/pila.py` for the call sites.
+`_cgroup_*` in `orchestrator/leerie.py` for the call sites.
 
-Earlier versions of pila gave Ctrl-C an explicit "throw this away"
+Earlier versions of leerie gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made
 accidental Ctrl-C catastrophic — and it conflated user intent ("stop
 this run") with run lifecycle ("nuke the artifacts"). The two are
@@ -789,7 +789,7 @@ hit (delivered as assistant-text content in the verbatim format
 `"You've hit your session limit · resets <time> (<tz>)"`, or as a
 `rate_limit_event` whose `status` field reports a terminal value
 — anything outside the known-allowed set
-`{"allowed", "allowed_warning"}`), pila raises
+`{"allowed", "allowed_warning"}`), leerie raises
 `RateLimitedExit(reset_at, raw)`.
 The exception propagates through the existing asyncio cancellation
 chain — `_invoke`'s `BaseException` guard terminates the in-flight
@@ -802,14 +802,14 @@ subtree termination — kernel-enforced via the container boundary"
 above). Then:
 
 - If `reset_at` was parsed cleanly from the literal Claude Code
-  message format, pila runs the worktree-only cleanup, sleeps until
+  message format, leerie runs the worktree-only cleanup, sleeps until
   the reset moment + a small margin, then `os.execvp`'s the launcher
   with `--resume --run-id <id>` to start a fresh orchestrator
   process. The `--max-workers` budget persists across the re-exec —
   `worker_count` lives in state.json — so a run that repeatedly hits
   the rate-limit still respects the user's cap.
 - If the reset clause didn't parse (malformed time, unknown
-  timezone, or Anthropic changed the message format), pila runs
+  timezone, or Anthropic changed the message format), leerie runs
   the worktree-only cleanup, prints the literal message and the
   manual resume command, and exits with code 75 (`EX_TEMPFAIL`).
 
@@ -842,18 +842,18 @@ entirely inside the Fly Machine; the launcher's host-side role after
 provisioning is purely **to stream the orchestrator log back for the
 user's eyes**. Binding the orchestrator's *life* to that streaming
 channel — which is what a foreground `flyctl ssh console -C "python3
-pila.py"` would do — means a closed laptop, a dropped WiFi connection,
+leerie.py"` would do — means a closed laptop, a dropped WiFi connection,
 or an accidental Ctrl-C kills a run that the laptop wasn't doing any
 work for.
 
-Pila therefore starts the orchestrator **detached** on the Fly Machine.
+Leerie therefore starts the orchestrator **detached** on the Fly Machine.
 The launcher pipes a small Python wrapper script via stdin to
 `flyctl ssh console --pty=false -C "python3 -"`; the wrapper does
-`subprocess.Popen(..., start_new_session=True, user="pila",
-group=<pila gid>, env={HOME=/home/pila, USER=pila, PATH=mise+bin},
+`subprocess.Popen(..., start_new_session=True, user="leerie",
+group=<leerie gid>, env={HOME=/home/leerie, USER=leerie, PATH=mise+bin},
 cwd="/work")` and records the resulting PID in `orchestrator.pid`.
 `start_new_session=True` is the portable equivalent of
-`setsid nohup`; running as the pila user with explicit env is
+`setsid nohup`; running as the leerie user with explicit env is
 required because the ssh-console session lands as root with
 `HOME=/root` by default (claude would look for credentials in the
 wrong place otherwise). The ssh-console call returns immediately. A
@@ -865,7 +865,7 @@ dropping) breaks the tail, not the orchestrator.
 
 This matches the prior-art mental model from comparable tools
 (`fly machine` itself, Claude Code's `/bg` + `claude agents`, kubectl,
-tmux): **sessions are the unit of management, not terminals**. Pila's
+tmux): **sessions are the unit of management, not terminals**. Leerie's
 session is the run; the local terminal is just one of many ways to
 observe it.
 
@@ -881,7 +881,7 @@ explicit value and skips auto-generation.
 **Remote pause-on-failure (Fly.io).** Local mode reaps the container's
 PID namespace on every exit (success or failure) because the host
 filesystem holds the durable record. Remote mode has the same durable
-record (the run branch and `.pila/runs/<run-id>/`, both of which the
+record (the run branch and `.leerie/runs/<run-id>/`, both of which the
 stream-back finalize already understands) but the Fly Machine is *not*
 free — keeping it alive after failure has a real per-second cost, and
 destroying it after failure throws away the in-machine filesystem state
@@ -906,7 +906,7 @@ finishes, not when the orchestrator finishes. The reclassified table:
 | `130` / `143` | host-side SIGINT / SIGTERM | **detach: leave machine alone, print reattach hints** |
 | any other non-zero | worker/orchestrator failure | **pause: stop machine, write sidecar, notify** |
 
-The Ctrl-C row is the load-bearing change. Earlier versions of pila
+The Ctrl-C row is the load-bearing change. Earlier versions of leerie
 treated rc=130 as "user cancelled, destroy the machine" — but with the
 detach, rc=130 only means "user stopped watching." The orchestrator on
 the machine has not been signalled and is still running. Destroying it
@@ -914,8 +914,8 @@ on Ctrl-C would be exactly the behavior the detach was introduced to
 prevent. The launcher therefore prints a small banner listing the
 reattach, pause, and destroy commands and exits without touching the
 machine. The user can then come back hours or days later and either
-`pila --attach --tail` to watch progress, `pila --stop` to pause
-cleanly, or `pila --kill` to explicitly destroy.
+`leerie --attach --tail` to watch progress, `leerie --stop` to pause
+cleanly, or `leerie --kill` to explicitly destroy.
 
 The decision lives in the launcher (`scripts/remote/provision.sh`'s
 EXIT trap), not the orchestrator. Per §6 *Worker subtree termination*
@@ -925,7 +925,7 @@ exit codes through the runtime-appropriate teardown.
 
 `flyctl machine stop` (not destroy) on the pause branch preserves the
 machine's filesystem on its Fly volume; the orchestrator's own state is
-already in `.pila/runs/<run-id>/run.json` on that volume, the run
+already in `.leerie/runs/<run-id>/run.json` on that volume, the run
 branch holds the committed work, and `flyctl machine start` brings the
 machine back from disk without losing anything. Memory state is not
 preserved — `remote-task-system.md` lines 89–99 explicitly retract the
@@ -938,17 +938,17 @@ Six sidecar fields on `run.json` capture remote lifecycle state:
   `flyctl machine run` succeeds, so a launcher that crashes before
   classifying still leaves a recoverable pointer to the machine.
 - `paused_at` — ISO timestamp written either by the EXIT trap on the
-  pause-on-failure branch or by an explicit `pila --stop <run-id>`.
+  pause-on-failure branch or by an explicit `leerie --stop <run-id>`.
 - `pause_reason` — short tag (`worker-error`, `orchestrator-exception`,
   `finalize-failed`, `user-requested`).
 - `killed_at` — ISO timestamp written by an explicit
-  `pila --kill <run-id>`. Marks the run as terminated by user request;
+  `leerie --kill <run-id>`. Marks the run as terminated by user request;
   the machine has been destroyed and the run is no longer resumable.
 - `sync_failed_at` — ISO timestamp written when the clean-exit branch
   of `decide_teardown` ran `fetch_branch` and it failed. The machine
   is left RUNNING (not stopped — see below); the user recovers by
-  running `pila --finalize <id>` (retry sync + push) or
-  `pila --kill <id>` (destroy after manually salvaging work).
+  running `leerie --finalize <id>` (retry sync + push) or
+  `leerie --kill <id>` (destroy after manually salvaging work).
 - `sync_fail_reason` — short tag accompanying `sync_failed_at`
   (`sync-failed-on-clean-exit`).
 
@@ -962,26 +962,26 @@ orchestrator's `_validate_run_json` enforces all invariants.
 
 **Sync-before-destroy (load-bearing — the "never lose work"
 contract).** The clean-exit branch (rc=0/10/75) does NOT destroy
-the machine first and hope the user runs `pila --finalize` later.
+the machine first and hope the user runs `leerie --finalize` later.
 That ordering is wrong: the orchestrator's committed work and the
-`.pila/runs/<id>/` state directory live ONLY on the machine until
+`.leerie/runs/<id>/` state directory live ONLY on the machine until
 they are streamed back. Destroying the machine while the user has
 no host-side copy throws the work away unrecoverably.
 
 Instead, `decide_teardown` sources `fetch-branch.sh` and runs
 `fetch_branch` (git bundle of the run branch + tar of
-`.pila/runs/<id>/`) BEFORE calling `destroy_machine`. Only on
+`.leerie/runs/<id>/`) BEFORE calling `destroy_machine`. Only on
 confirmed sync success does it destroy. On any sync failure
 (network blip, bundle creation failure, etc.), the machine is
 LEFT RUNNING — not stopped — and a multi-line WARNING points the
 user at three recovery commands:
 
-  1. `pila --finalize <run-id>`  (retry sync + push)
-  2. `pila --attach <run-id>`    (manual inspection)
-  3. `pila --kill <run-id>`      (destroy AFTER user confirms
+  1. `leerie --finalize <run-id>`  (retry sync + push)
+  2. `leerie --attach <run-id>`    (manual inspection)
+  3. `leerie --kill <run-id>`      (destroy AFTER user confirms
                                   work is safely on host)
 
-The user owns the machine in this state. pila does NOT auto-
+The user owns the machine in this state. leerie does NOT auto-
 destroy after a successful manual finalize either — the user must
 explicitly `--kill`. The reclassified table (line 893+) already
 documented the "destroy *after* stream-back" intent; this is the
@@ -992,13 +992,13 @@ remote run lifecycle, each doing exactly one thing:
 
 | Verb | Effect |
 |---|---|
-| `pila "task" --runtime fly` | Provision machine, detach orchestrator, tail log |
-| `pila --attach <run-id> --tail` | Reattach to a running or paused run's log |
-| `pila --stop <run-id>` | Clean pause (`flyctl machine stop`); resumable |
-| `pila --resume --run-id <id> --runtime fly` | Wake a paused machine, re-seed dirty edits, continue |
-| `pila --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
+| `leerie "task" --runtime fly` | Provision machine, detach orchestrator, tail log |
+| `leerie --attach <run-id> --tail` | Reattach to a running or paused run's log |
+| `leerie --stop <run-id>` | Clean pause (`flyctl machine stop`); resumable |
+| `leerie --resume --run-id <id> --runtime fly` | Wake a paused machine, re-seed dirty edits, continue |
+| `leerie --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
 
-Plus `pila --list` (unified across local and remote, with `--status
+Plus `leerie --list` (unified across local and remote, with `--status
 <state>` filtering — `--list-paused` becomes a deprecated alias for
 `--list --status paused-remote`).
 
@@ -1012,11 +1012,11 @@ this terminal-side activity") and destruction needs its own verb.
 
 **Interactive attach over PTY in remote mode.** The attach channel
 is the §6 isolation boundary's terminal-side surface — not a new
-privileged channel. `pila --attach <run-id>` `exec`s
+privileged channel. `leerie --attach <run-id>` `exec`s
 `flyctl ssh console` against the run's Fly Machine, which proxies
 through Fly's hallpass + WireGuard mesh and gives the user a real
-PTY at `/work`. `pila --attach <run-id> --tail` is the same channel
-but runs `tail -F /work/.pila/runs/<run-id>/orchestrator.log` instead
+PTY at `/work`. `leerie --attach <run-id> --tail` is the same channel
+but runs `tail -F /work/.leerie/runs/<run-id>/orchestrator.log` instead
 of a shell — this is the canonical way to watch a detached run's
 progress after the initial launcher exits or after a deliberate
 Ctrl-C detach. No sshd in the image, no key management, no public
@@ -1037,27 +1037,27 @@ concern"). The same mechanism serves four roles:
    the pause-on-failure path is reachable via exactly the same
    command. No second mechanism is needed.
 4. **The detached-run reattach surface** — after a Ctrl-C detach or
-   a closed-laptop disconnect, `pila --attach <run-id> --tail` picks
+   a closed-laptop disconnect, `leerie --attach <run-id> --tail` picks
    up the orchestrator log stream where it left off. The orchestrator
    never noticed; only the local view paused.
 
 State contract: `scripts/remote/provision.sh` writes a PID-keyed
-record at `$USER_REPO/.pila/remote/$$.json` immediately after
+record at `$USER_REPO/.leerie/remote/$$.json` immediately after
 provisioning, removes it in `destroy_machine`, and lets the launcher
-rename it to `$USER_REPO/.pila/runs/<run-id>/fly-machine.json` after
-the run-id becomes known (via fetch-branch.sh). `pila --attach`
+rename it to `$USER_REPO/.leerie/runs/<run-id>/fly-machine.json` after
+the run-id becomes known (via fetch-branch.sh). `leerie --attach`
 resolves the machine via either path. Multiple concurrent remote
 runs in the same repo are disambiguated by passing a run-id.
 
-Local mode has no attach today — `pila --attach` errors with
+Local mode has no attach today — `leerie --attach` errors with
 "attach is remote-only" until a parallel `scripts/local/attach.sh`
 wrapping `nerdctl exec -it <name> bash` is added.
 
 **Mid-run re-seed (remote mode).** `remote-task-system.md` line 50
 specifies "a second rsync of current laptop state into the task,
-user-triggered." pila realises this as two surfaces sharing one
-mechanism: an explicit `pila --re-seed <run-id>` subcommand and an
-implicit auto-re-seed step inside `pila --resume --run-id <id>
+user-triggered." leerie realises this as two surfaces sharing one
+mechanism: an explicit `leerie --re-seed <run-id>` subcommand and an
+implicit auto-re-seed step inside `leerie --resume --run-id <id>
 --runtime fly`. Both wake the machine if stopped, run a safety
 check, and call the same `seed_repo_dirty` helper used by the fresh-
 provision path.
@@ -1067,7 +1067,7 @@ laptop state" = host commits plus host dirty edits):
 
 1. `flyctl machine start` (if stopped) + `wait_for_started`.
 2. Refuse re-seed when `/work` on the machine has uncommitted
-   tracked changes outside `.pila/` — those represent in-flight
+   tracked changes outside `.leerie/` — those represent in-flight
    worker edits that haven't yet been committed to a per-subtask
    branch, and silently clobbering them produces a wrong PR.
    `--force` bypasses.
@@ -1078,12 +1078,12 @@ laptop state" = host commits plus host dirty edits):
    (never re-cloned, which would obliterate the run branch).
 
 The dirty set is computed on the host where worktree paths
-(`.pila/runs/<run-id>/worktrees/...`) structurally cannot appear,
+(`.leerie/runs/<run-id>/worktrees/...`) structurally cannot appear,
 because worktrees live only on the machine. A defensive filter
-excludes `.git/*`, `.pila/*`, and `.pila/runs/*/worktrees/*` paths
+excludes `.git/*`, `.leerie/*`, and `.leerie/runs/*/worktrees/*` paths
 before handing the file list to rsync's `--files-from=-` — protects
 against a future change that lets host-side paths name worktree files
-or surfaces host-side `.pila/` run state to the machine.
+or surfaces host-side `.leerie/` run state to the machine.
 
 The repo-local `.claude/` directory is force-included in the dirty
 set even when `.gitignore` excludes it (the common case). Workers
@@ -1132,20 +1132,20 @@ own worktree against shared package-manager caches.
 The orchestrator addresses both with a dedicated phase between
 classification and planning, layered top-to-bottom by determinism:
 
-1. **`.pila-setup.sh` hook.** Optional, repo-owned. If the repo
+1. **`.leerie-setup.sh` hook.** Optional, repo-owned. If the repo
    needs user-space tooling the language layer can't install — a
    language version mise supports beyond the LTS bake (Ruby, Java,
    Rust), an additional CLI tool installed under `~/.local/bin`,
    pre-populated fixtures the workers need — the repo commits a
    script that handles it. The orchestrator execs it inside the
-   container as the non-root `pila` user (the image deliberately
+   container as the non-root `leerie` user (the image deliberately
    does not ship `sudo`). Repo author controls trust; the script
    runs in the same container that runs the workers.
 
    System packages requiring root (apt-get-installable libraries,
    anything writing to `/usr/*` or `/etc/*`) are out of scope for
    the hook — the container's unprivileged user model can't satisfy
-   them. A repo with that need maintains a fork of the pila
+   them. A repo with that need maintains a fork of the leerie
    Dockerfile that installs the package at image-build time and
    overrides `IMAGE_TAG`.
 2. **Runtime version resolution.** The orchestrator delegates to
@@ -1198,9 +1198,9 @@ classification and planning, layered top-to-bottom by determinism:
    This shape has three benefits over an orchestrator-driven
    install: (a) the host's checked-out source tree and tracked
    dep artifacts (`node_modules/`, `.venv/`, `target/`, etc.) are
-   never written to by pila's install path — `.pila-setup.sh`
-   (user-opt-in) and the `.pila/` coordination directory are the
-   only paths pila ever modifies under the host repo; (b) no work
+   never written to by leerie's install path — `.leerie-setup.sh`
+   (user-opt-in) and the `.leerie/` coordination directory are the
+   only paths leerie ever modifies under the host repo; (b) no work
    is wasted on worktrees whose subtasks don't need built deps;
    (c) the same `claude -p` event-streaming the workers use for
    everything else makes install progress visible to the user,
@@ -1208,7 +1208,7 @@ classification and planning, layered top-to-bottom by determinism:
 
 ### The §12 carve-out
 
-Step 4 is the only place in pila where an LLM-generated artifact
+Step 4 is the only place in leerie where an LLM-generated artifact
 gets persisted and shown to other workers as authoritative content.
 The central principle of §12 is that prompts are advisory and code
 enforces; an LLM-generated install plan that the orchestrator
@@ -1289,7 +1289,7 @@ a measurement. Models are systematically overconfident and will state high
 confidence on a wrong root cause without hesitation. Looping on that number
 just loops on the same vibe.
 
-Pila keeps the loop and the high-confidence bar but **anchors the score to
+Leerie keeps the loop and the high-confidence bar but **anchors the score to
 evidence**. Before an implementer writes any code it must clear a set of
 domain-specific *evidence gates*, and each gate must carry a concrete artifact
 — a file-and-line citation, a reproduction, a measurement, a cited research
@@ -1354,7 +1354,7 @@ schedule: there is no decomposition to feed phase 3, no work to execute
 in phase 5, no run branch to integrate or push in phase 6. The
 orchestrator records `no_work_required=true` in state.json with each
 domain's `confidence.basis` quoted, writes `finished_at`, skips phases
-3–6, and exits 0. The run renders as `done-local` in `pila --list` (no
+3–6, and exits 0. The run renders as `done-local` in `leerie --list` (no
 push, no PR — there is no commit to propose). A mixed outcome (some
 ready+empty, some ready+nonempty) proceeds normally; the empty domains
 simply contribute nothing. The all-blocked case still dies — a blocker
@@ -1400,7 +1400,7 @@ is what the confidence gate at §8 is for.
 
 The implementer may update the file freely as its understanding
 evolves. There is no lock. This is a reversal of an earlier discipline
-in pila that locked the criteria file by sha256 hash on first write
+in leerie that locked the criteria file by sha256 hash on first write
 and used a worker-initiated `criteria_revision_proposal` channel to
 thread any later edits through orchestrator approval. The lock was
 introduced to guard against a stuck model lowering its own bar to
@@ -1467,14 +1467,14 @@ Two further disciplines apply, and they sit at the §12 axis:
   advisory removes that incentive while still surfacing the residual to the
   human and to telemetry.
 - **No backsliding.** The conformer can add commits but must not write to
-  protected paths. The diff-scope check — no writes to `.pila/`,
+  protected paths. The diff-scope check — no writes to `.leerie/`,
   `.git/`, or `.claude/` *except for the user-deliverable subtrees*
   `.claude/agents/`, `.claude/commands/`, and `.claude/skills/` — is
   re-run against the conformer's commits, on the same protected paths
   and with the same terminality as it ran against the implementer's
   commits. The `.claude/` carve-out exists because those three subtrees
   are the documented Claude Code customization locations: refusing to
-  write them would make pila unable to produce a subagent or
+  write them would make leerie unable to produce a subagent or
   slash-command as a legitimate deliverable, even though `.claude/`
   top-level files (`settings.json`, `settings.local.json`) are
   coordination and must stay protected. (Earlier iterations of this
@@ -1502,7 +1502,7 @@ process to make a running worker compact itself, and a worker has no reliable
 view of its own context percentage. An external monitor can *observe* context
 occupancy but has no way to *act* on it.
 
-Pila replaces compaction with **orchestrator-driven fresh-context handoff**,
+Leerie replaces compaction with **orchestrator-driven fresh-context handoff**,
 which achieves compaction's actual goal — bounded context with preserved
 progress — without depending on a channel that does not exist:
 
@@ -1545,12 +1545,12 @@ worktree. A worktree is disposable — it is removed at cleanup — so a checkpo
 stored inside it would vanish exactly when a successor worker needs to read it.
 Coordination state must outlive the worktree that produced it.
 
-Coordination state is **per-run**, rooted at `.pila/runs/<run-id>/`.
+Coordination state is **per-run**, rooted at `.leerie/runs/<run-id>/`.
 State, plan, criteria, checkpoints, logs, the worktrees themselves, and the
 PR-result sidecar all live under that directory. Two runs in the same
 repository share no coordination state — each has its own subtree, and
 neither can clobber the other's `state.json`, log files, or worktrees by
-collision. The parent `.pila/` is otherwise empty of run data; it only
+collision. The parent `.leerie/` is otherwise empty of run data; it only
 hosts the `runs/` directory.
 
 ---
@@ -1583,17 +1583,17 @@ time. DESIGN.md (this section) is the architectural specification; the
 prompt fragment is the directly-loaded text. They must stay in agreement
 under CLAUDE.md's three-layer rule.
 
-By default pila does not surface intent questions to the user at all.
+By default leerie does not surface intent questions to the user at all.
 Workers run the filter, treat anything that survives as a forced best-effort
-decision, and document it. Pass `--clarify` (or set `PILA_CLARIFY=true`
-/ `clarify = true` in `pila.toml`) to opt into surfacing the surviving
+decision, and document it. Pass `--clarify` (or set `LEERIE_CLARIFY=true`
+/ `clarify = true` in `leerie.toml`) to opt into surfacing the surviving
 questions — interactively if a TTY is attached, otherwise via
 `pending-questions.json` and the standard deferred-resume flow. The
 no-questions default reflects that most intent questions are closable by
 deeper investigation, and that an LLM's instinct to ask is something the
 system has to push back against, not ride.
 
-When a feature task's request leaves the source of truth ambiguous, pila
+When a feature task's request leaves the source of truth ambiguous, leerie
 resolves it from a preference: `codebase` (build from existing patterns only),
 `research` (build from researched best-practice standards), or `both` (codebase
 first; research only where the codebase is insufficient). The preference is
@@ -1618,7 +1618,7 @@ reconciler does not try to wire it as a graph edge. Without that channel,
 `both` tends to produce phantom `requires` that abort the run — narrowing
 to `source_of_truth = codebase` was historically the only escape hatch.
 
-When Pila runs under `--clarify` in a context where it cannot block for
+When Leerie runs under `--clarify` in a context where it cannot block for
 an answer, the clarification step is non-blocking: it records the questions,
 exits with a distinct status, and lets the surrounding layer collect answers
 and resume.
@@ -1634,7 +1634,7 @@ problem to a decision point neither the codebase nor research can resolve
 with a deprecated client, when both choices exist as patterns elsewhere in
 the codebase and the task description does not say.
 
-Pila treats this as the same kind of question as a Phase-1 clarification,
+Leerie treats this as the same kind of question as a Phase-1 clarification,
 not as a different category. The filter is identical: investigate the
 codebase first; treat research as the second-line resolver; ask the user
 only what neither can settle. The only difference is *when* the question
@@ -1720,7 +1720,7 @@ catalogued in `IMPLEMENTATION.md`.
 One enforcement point — the mechanical "judgment workers (classifier, planner,
 reconciler, provision) cannot mutate state because they run in the real repo
 cwd without `--dangerously-skip-permissions`" guarantee — has an explicit
-opt-out: `pila --dangerously-skip-permissions`. The flag is named identically
+opt-out: `leerie --dangerously-skip-permissions`. The flag is named identically
 to the underlying Claude Code CLI flag, on purpose: choosing it means the user
 understands they are removing a guardrail, not merely changing a setting. When
 set, every worker is invoked with `--dangerously-skip-permissions`, including
@@ -1737,7 +1737,7 @@ invocation, not a softening of the contract.
 ## 13. Caps and escalation
 
 Every loop in the system has a hard bound. Nothing spins forever; when a bound
-is reached, Pila escalates rather than looping. But the bounds are of **two
+is reached, Leerie escalates rather than looping. But the bounds are of **two
 different kinds**, and the difference is itself a design point — it is the §12
 principle applied to caps.
 
@@ -1771,7 +1771,7 @@ hard backstop is the worker's overall turn limit, which the orchestrator does
 control.
 
 The evidence-gate bound is exposed to users as `--confidence-rounds` (also
-`PILA_CONFIDENCE_ROUNDS` and `pila.toml`); the orchestrator passes the
+`LEERIE_CONFIDENCE_ROUNDS` and `leerie.toml`); the orchestrator passes the
 resolved value into each worker's prompt. The user-visible knob is real — the
 worker reads it — but the worker is what counts iterations against it, so the
 guarantee is still prompt-governed in the sense above. Surfacing the knob
@@ -1817,7 +1817,7 @@ the *principle* — correctable-mistake versus broken-worker — is the design.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every LLM call in Pila passes through one of the seven worker types in
+Every LLM call in Leerie passes through one of the seven worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `provision`,
 `implementer`, `integrator`, or `conformer`. Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
@@ -1878,7 +1878,7 @@ worker in the system (§7).
 Each run's telemetry lives at:
 
 ```
-.pila/runs/<run-id>/calls.ndjson
+.leerie/runs/<run-id>/calls.ndjson
 ```
 
 One file per run. The file is opened for append at run start and written to
@@ -1945,7 +1945,7 @@ what the architecture can guarantee.
   suppressed. A narrower "auto-approve edits only" mode was considered and
   rejected: it still prompts on shell commands, which would stall an unattended
   run the first time a worker needs to run one. The blast radius is bounded by
-  worktree isolation, not eliminated. Pila should be run on repositories the
+  worktree isolation, not eliminated. Leerie should be run on repositories the
   user trusts, ideally inside a container, and the run branch reviewed
   before it is relied on.
 - **A worker that exhausts its turn limit without checkpointing loses its
@@ -1979,7 +1979,7 @@ what the architecture can guarantee.
   clone are explicitly supported via the per-run state and branch design.
   Multiple clones running concurrently are also fine — they are independent
   by construction — but the per-run namespacing applies only within one
-  clone; pila does nothing to coordinate across clones (it has no need
+  clone; leerie does nothing to coordinate across clones (it has no need
   to).
 - **Push assumes a remote named `origin`.** Finalize pushes to `origin` and
   opens the PR against the same remote's GitHub repo. A fork pattern where
@@ -1991,7 +1991,7 @@ what the architecture can guarantee.
 - **System-wide worker concurrency scales with run count.** Each run obeys
   its own `max_parallel` cap; with N concurrent runs the total active
   worker count can be N × max_parallel. The blast radius is bounded per
-  run but not globally; users running many concurrent pila invocations
+  run but not globally; users running many concurrent leerie invocations
   should be aware of the headless-usage cost implication.
 
 ---
@@ -2000,7 +2000,7 @@ what the architecture can guarantee.
 
 A design document should be honest about how much of the system has been
 *demonstrated* to work, as opposed to *reasoned* to work. The distinction is
-the first thing anyone running Pila needs.
+the first thing anyone running Leerie needs.
 
 **Demonstrated.** The deterministic scaffolding has been exercised. The git
 worktree mechanics — branch setup, per-subtask worktrees, wave-to-wave
@@ -2020,7 +2020,7 @@ by test; the worker behavior is the unverified surface.
 
 Two parts of the surface described in this document are *new* and have not
 yet been exercised end-to-end: the per-run namespacing (run-id derivation,
-`.pila/runs/<run-id>/` layout, parallel-run coexistence, multi-run
+`.leerie/runs/<run-id>/` layout, parallel-run coexistence, multi-run
 resume), and the push-and-PR finalization step (`gh pr create`, run.json
 sidecar with `pushed_at`/`pr_url`/error fields, `--no-push` and
 `--no-verify`). The single-run, local-finalize design described in earlier
@@ -2037,7 +2037,7 @@ end-to-end requires the local-mode finalize to be exercised first;
 stacking new features on an unproven foundation is the failure mode
 this section is meant to surface.
 
-**Recommended first step.** Run Pila once on a throwaway repository with a
+**Recommended first step.** Run Leerie once on a throwaway repository with a
 small, fully-specified task before trusting it on real work.
 
 ---

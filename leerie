@@ -1,32 +1,32 @@
 #!/usr/bin/env bash
-# pila — entry point for the Pila orchestrator.
-# After install: `pila "your task description"` from any git repo.
-# Direct git-clone: `/path/to/pila/pila "your task description"`,
+# leerie — entry point for the Leerie orchestrator.
+# After install: `leerie "your task description"` from any git repo.
+# Direct git-clone: `/path/to/leerie/leerie "your task description"`,
 # or symlink this file onto your PATH manually.
 #
-# pila runs inside a container — see docs/IMPLEMENTATION.md §0.5
+# leerie runs inside a container — see docs/IMPLEMENTATION.md §0.5
 # "Container shape" and docs/DESIGN.md §6. This launcher:
 #   1. Resolves its own location (walking symlinks).
 #   2. Fast path: `--version` answers without a container so the installer's
 #      smoke test runs the moment the symlink is in place.
 #   3. Per-OS preflight: verifies a working container runtime.
-#   4. Builds the pila image once per version, reuses thereafter.
+#   4. Builds the leerie image once per version, reuses thereafter.
 #   5. Translates --inspect-dir paths into bind-mounts.
 #   6. Execs nerdctl run with the full mount table, adapting TTY flags
 #      ([-it] vs [-i]) to whether the launcher itself has a TTY.
 set -euo pipefail
 
 # --- resolve symlinks ----------------------------------------------------
-# The curl|bash installer symlinks this script into ~/.local/bin/pila, but
+# The curl|bash installer symlinks this script into ~/.local/bin/leerie, but
 # the Dockerfile + orchestrator source live alongside the real launcher under
-# $PILA_HOME (default ~/.pila). readlink -f isn't portable to BSD/macOS, so
+# $LEERIE_HOME (default ~/.leerie). readlink -f isn't portable to BSD/macOS, so
 # walk by hand. (Same loop as the pre-container launcher — contract preserved.)
 SRC="${BASH_SOURCE[0]}"
 hops=0
 while [ -L "$SRC" ]; do
   hops=$((hops + 1))
   if [ "$hops" -gt 20 ]; then
-    echo "pila: refusing to resolve symlink chain deeper than 20 hops at $SRC" >&2
+    echo "leerie: refusing to resolve symlink chain deeper than 20 hops at $SRC" >&2
     exit 1
   fi
   TARGET="$(readlink "$SRC")"
@@ -35,18 +35,18 @@ while [ -L "$SRC" ]; do
     *)  SRC="$(cd -P "$(dirname "$SRC")" && pwd)/$TARGET" ;;
   esac
 done
-PILA_REPO="$(cd -P "$(dirname "$SRC")" && pwd)"
+LEERIE_REPO="$(cd -P "$(dirname "$SRC")" && pwd)"
 USER_REPO="$(pwd -P)"
 
-# Image tag = pila:<version>. Version comes from plugin.json (single source of
-# truth — same one `pila --version` reads). The launcher only needs the value
+# Image tag = leerie:<version>. Version comes from plugin.json (single source of
+# truth — same one `leerie --version` reads). The launcher only needs the value
 # for tagging, so a minimal extractor avoids needing python/jq at this stage.
-PILA_VERSION="$(awk -F'"' '/"version"/ {print $4; exit}' \
-                  "$PILA_REPO/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
-IMAGE_TAG="pila:$PILA_VERSION"
+LEERIE_VERSION="$(awk -F'"' '/"version"/ {print $4; exit}' \
+                  "$LEERIE_REPO/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
+IMAGE_TAG="leerie:$LEERIE_VERSION"
 
 # --- fast paths that don't need the container ----------------------------
-# `pila --version` should answer immediately without spinning up a container
+# `leerie --version` should answer immediately without spinning up a container
 # — used by the installer's end-to-end smoke test and by anyone who just
 # wants to check what's installed.
 #
@@ -119,7 +119,7 @@ with open(sidecar, "w") as f:
 
 case "${1:-}" in
   --version)
-    echo "pila $PILA_VERSION"
+    echo "leerie $LEERIE_VERSION"
     exit 0
     ;;
   --attach)
@@ -130,7 +130,7 @@ case "${1:-}" in
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
-    exec "$PILA_REPO/scripts/remote/attach.sh" "$@"
+    exec "$LEERIE_REPO/scripts/remote/attach.sh" "$@"
     ;;
   --re-seed)
     # Fast-path: re-rsync the host's working tree into a paused/running
@@ -144,27 +144,27 @@ case "${1:-}" in
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --force) _re_seed_force=1; shift ;;
-        --*) echo "pila: unknown --re-seed flag: $1" >&2; exit 1 ;;
+        --*) echo "leerie: unknown --re-seed flag: $1" >&2; exit 1 ;;
         *)
           if [ -z "$_re_seed_run_id" ]; then _re_seed_run_id="$1"; shift
-          else echo "pila: unexpected --re-seed arg: $1" >&2; exit 1
+          else echo "leerie: unexpected --re-seed arg: $1" >&2; exit 1
           fi
           ;;
       esac
     done
     if [ -z "$_re_seed_run_id" ]; then
-      echo "pila: --re-seed requires a <run-id>" >&2
-      echo "  Usage: pila --re-seed <run-id> [--force]" >&2
+      echo "leerie: --re-seed requires a <run-id>" >&2
+      echo "  Usage: leerie --re-seed <run-id> [--force]" >&2
       exit 1
     fi
-    export PILA_RUN_ID="$_re_seed_run_id"
-    [ "$_re_seed_force" = "1" ] && export PILA_RE_SEED_FORCE=1
+    export LEERIE_RUN_ID="$_re_seed_run_id"
+    [ "$_re_seed_force" = "1" ] && export LEERIE_RE_SEED_FORCE=1
     # shellcheck disable=SC1091
-    . "$PILA_REPO/scripts/remote/provision.sh"
+    . "$LEERIE_REPO/scripts/remote/provision.sh"
     # shellcheck disable=SC1091
-    . "$PILA_REPO/scripts/remote/seed-repo.sh"
+    . "$LEERIE_REPO/scripts/remote/seed-repo.sh"
     # shellcheck disable=SC1091
-    . "$PILA_REPO/scripts/remote/re-seed.sh"
+    . "$LEERIE_REPO/scripts/remote/re-seed.sh"
     re_seed
     exit $?
     ;;
@@ -177,44 +177,44 @@ case "${1:-}" in
     export USER_REPO
     _stop_run_id="${1:-}"
     if [ -z "$_stop_run_id" ]; then
-      echo "pila: --stop requires a <run-id>" >&2
-      echo "  Usage: pila --stop <run-id>" >&2
+      echo "leerie: --stop requires a <run-id>" >&2
+      echo "  Usage: leerie --stop <run-id>" >&2
       exit 1
     fi
-    _stop_run_dir="$USER_REPO/.pila/runs/$_stop_run_id"
+    _stop_run_dir="$USER_REPO/.leerie/runs/$_stop_run_id"
     if [ ! -d "$_stop_run_dir" ]; then
-      echo "pila: --stop: no run dir at $_stop_run_dir" >&2
-      echo "  Check 'pila --list' for active runs." >&2
+      echo "leerie: --stop: no run dir at $_stop_run_dir" >&2
+      echo "  Check 'leerie --list' for active runs." >&2
       exit 1
     fi
-    # Source provision.sh FIRST — it resets PILA_MACHINE_ID="" at
+    # Source provision.sh FIRST — it resets LEERIE_MACHINE_ID="" at
     # load time (intended for provision_machine's create flow). Sourcing
-    # after setting PILA_MACHINE_ID would clobber our resolver result.
-    FLY_APP="${PILA_FLY_APP:-pila}"
+    # after setting LEERIE_MACHINE_ID would clobber our resolver result.
+    FLY_APP="${LEERIE_FLY_APP:-leerie}"
     export FLY_APP
-    export PILA_RUN_ID="$_stop_run_id"
+    export LEERIE_RUN_ID="$_stop_run_id"
     # shellcheck disable=SC1091
-    . "$PILA_REPO/scripts/remote/provision.sh"
+    . "$LEERIE_REPO/scripts/remote/provision.sh"
     require_flyctl || exit 1
     # Try fly-machine.json first (in-flight bootstrap case), then
     # run.json — matches scripts/remote/attach.sh's resolution order.
-    PILA_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_stop_run_dir")"
-    if [ -z "$PILA_MACHINE_ID" ]; then
-      echo "pila: --stop: $_stop_run_id has no fly_machine_id (was it a local run?)" >&2
+    LEERIE_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_stop_run_dir")"
+    if [ -z "$LEERIE_MACHINE_ID" ]; then
+      echo "leerie: --stop: $_stop_run_id has no fly_machine_id (was it a local run?)" >&2
       exit 1
     fi
-    export PILA_MACHINE_ID
+    export LEERIE_MACHINE_ID
     # Bootstrap a minimal run.json if only fly-machine.json exists, so
     # update_run_json has a file to merge paused_at into.
     _ensure_run_json "$_stop_run_dir" || true
     _stop_sidecar="$_stop_run_dir/run.json"
-    echo "[pila] --stop: pausing machine $PILA_MACHINE_ID (run $PILA_RUN_ID)" >&2
+    echo "[leerie] --stop: pausing machine $LEERIE_MACHINE_ID (run $LEERIE_RUN_ID)" >&2
     stop_machine
     update_run_json "$_stop_sidecar" \
       paused_at "$(iso_now)" \
       pause_reason "user-requested" \
-      fly_machine_id "$PILA_MACHINE_ID" || true
-    echo "[pila] --stop: paused. Resume via: pila --resume --run-id $PILA_RUN_ID --runtime fly" >&2
+      fly_machine_id "$LEERIE_MACHINE_ID" || true
+    echo "[leerie] --stop: paused. Resume via: leerie --resume --run-id $LEERIE_RUN_ID --runtime fly" >&2
     exit 0
     ;;
   --kill)
@@ -235,23 +235,23 @@ case "${1:-}" in
         --machine-id=*) _kill_machine_id="${1#--machine-id=}"; shift ;;
         --app) _kill_app="$2"; shift 2 ;;
         --app=*) _kill_app="${1#--app=}"; shift ;;
-        --*) echo "pila: unknown --kill flag: $1" >&2; exit 1 ;;
+        --*) echo "leerie: unknown --kill flag: $1" >&2; exit 1 ;;
         *)
           if [ -z "$_kill_run_id" ]; then _kill_run_id="$1"; shift
-          else echo "pila: unexpected --kill arg: $1" >&2; exit 1
+          else echo "leerie: unexpected --kill arg: $1" >&2; exit 1
           fi
           ;;
       esac
     done
-    [ -n "${PILA_FORCE_KILL:-}" ] && _kill_force=1
-    FLY_APP="${_kill_app:-${PILA_FLY_APP:-pila}}"
+    [ -n "${LEERIE_FORCE_KILL:-}" ] && _kill_force=1
+    FLY_APP="${_kill_app:-${LEERIE_FLY_APP:-leerie}}"
     export FLY_APP
     _kill_run_dir=""
     _kill_sidecar=""
     if [ -n "$_kill_run_id" ]; then
-      _kill_run_dir="$USER_REPO/.pila/runs/$_kill_run_id"
+      _kill_run_dir="$USER_REPO/.leerie/runs/$_kill_run_id"
       if [ ! -d "$_kill_run_dir" ] && [ -z "$_kill_machine_id" ]; then
-        echo "pila: --kill: no run dir at $_kill_run_dir" >&2
+        echo "leerie: --kill: no run dir at $_kill_run_dir" >&2
         echo "  Pass --machine-id <id> to destroy an orphan machine without a sidecar." >&2
         exit 1
       fi
@@ -262,9 +262,9 @@ case "${1:-}" in
       fi
     fi
     if [ -z "$_kill_machine_id" ]; then
-      echo "pila: --kill: no fly_machine_id found." >&2
-      echo "  Usage: pila --kill <run-id> [--force]" >&2
-      echo "  Orphan: pila --kill --machine-id <id> [--app <app>]" >&2
+      echo "leerie: --kill: no fly_machine_id found." >&2
+      echo "  Usage: leerie --kill <run-id> [--force]" >&2
+      echo "  Orphan: leerie --kill --machine-id <id> [--app <app>]" >&2
       exit 1
     fi
     if [ "$_kill_force" != "1" ]; then
@@ -282,23 +282,23 @@ case "${1:-}" in
         "$_kill_machine_id" "$_kill_prompt_target" "$_kill_prompt_label" >&2
       read -r _kill_confirm
       if [ "$_kill_confirm" != "$_kill_prompt_target" ]; then
-        echo "pila: --kill: confirmation mismatch; aborted." >&2
+        echo "leerie: --kill: confirmation mismatch; aborted." >&2
         exit 1
       fi
     fi
-    # Source provision.sh BEFORE setting PILA_MACHINE_ID — it resets
-    # PILA_MACHINE_ID="" at load time, which would clobber our value.
+    # Source provision.sh BEFORE setting LEERIE_MACHINE_ID — it resets
+    # LEERIE_MACHINE_ID="" at load time, which would clobber our value.
     # shellcheck disable=SC1091
-    . "$PILA_REPO/scripts/remote/provision.sh"
+    . "$LEERIE_REPO/scripts/remote/provision.sh"
     require_flyctl || exit 1
-    PILA_MACHINE_ID="$_kill_machine_id"
-    export PILA_MACHINE_ID
-    echo "[pila] --kill: destroying machine $PILA_MACHINE_ID" >&2
+    LEERIE_MACHINE_ID="$_kill_machine_id"
+    export LEERIE_MACHINE_ID
+    echo "[leerie] --kill: destroying machine $LEERIE_MACHINE_ID" >&2
     destroy_machine
     # Bootstrap run.json from fly-machine.json if needed (in-flight
     # kill before classify) so killed_at + fly_machine_id are recorded
     # host-side for forensics. Note: a bootstrap-id killed run does NOT
-    # appear in `pila --list` because `discover_runs` requires
+    # appear in `leerie --list` because `discover_runs` requires
     # state.json (which only the orchestrator writes); the run.json
     # written here is for audit-trail purposes only. Non-bootstrap kills
     # already have state.json from a prior fetch_branch or local run,
@@ -312,7 +312,7 @@ case "${1:-}" in
           fly_machine_id "$_kill_machine_id" || true
       fi
     fi
-    echo "[pila] --kill: destroyed. Run is no longer resumable." >&2
+    echo "[leerie] --kill: destroyed. Run is no longer resumable." >&2
     exit 0
     ;;
   --finalize)
@@ -326,13 +326,13 @@ case "${1:-}" in
     export USER_REPO
     _fin_run_id="${1:-}"
     if [ -z "$_fin_run_id" ]; then
-      echo "pila: --finalize requires a <run-id>" >&2
-      echo "  Usage: pila --finalize <run-id>" >&2
+      echo "leerie: --finalize requires a <run-id>" >&2
+      echo "  Usage: leerie --finalize <run-id>" >&2
       exit 1
     fi
-    _fin_run_dir="$USER_REPO/.pila/runs/$_fin_run_id"
+    _fin_run_dir="$USER_REPO/.leerie/runs/$_fin_run_id"
     if [ ! -d "$_fin_run_dir" ]; then
-      echo "pila: --finalize: no run dir at $_fin_run_dir" >&2
+      echo "leerie: --finalize: no run dir at $_fin_run_dir" >&2
       exit 1
     fi
     # Short-circuit if already finalized (only possible once run.json
@@ -348,12 +348,12 @@ except Exception:
     pass
 ' "$_fin_sidecar")"
       if [ -n "$_already" ]; then
-        echo "[pila] --finalize: run $_fin_run_id is already pushed; nothing to do." >&2
+        echo "[leerie] --finalize: run $_fin_run_id is already pushed; nothing to do." >&2
         exit 0
       fi
     fi
-    FLY_APP="${PILA_FLY_APP:-pila}"
-    export FLY_APP PILA_RUN_ID="$_fin_run_id"
+    FLY_APP="${LEERIE_FLY_APP:-leerie}"
+    export FLY_APP LEERIE_RUN_ID="$_fin_run_id"
     # Detect "already synced" — the auto-sync path in decide_teardown's
     # rc=0 branch may have already pulled the branch + state to the
     # host BEFORE destroying the machine. In that case, run.json has
@@ -387,37 +387,37 @@ except Exception:
     fi
 
     if [ "$_already_synced" = "true" ]; then
-      echo "[pila] --finalize: run already synced to host; skipping fetch_branch" >&2
+      echo "[leerie] --finalize: run already synced to host; skipping fetch_branch" >&2
       _fetched_run_id="$_fin_run_id"
       _fetched_run_dir="$_fin_run_dir"
     else
-      # Source provision.sh BEFORE setting PILA_MACHINE_ID — provision.sh
-      # resets PILA_MACHINE_ID="" at load time and would clobber our value.
+      # Source provision.sh BEFORE setting LEERIE_MACHINE_ID — provision.sh
+      # resets LEERIE_MACHINE_ID="" at load time and would clobber our value.
       # shellcheck disable=SC1091
-      . "$PILA_REPO/scripts/remote/provision.sh"
+      . "$LEERIE_REPO/scripts/remote/provision.sh"
       # shellcheck disable=SC1091
-      . "$PILA_REPO/scripts/remote/fetch-branch.sh"
+      . "$LEERIE_REPO/scripts/remote/fetch-branch.sh"
       require_flyctl || exit 1
       # Try fly-machine.json first (in-flight bootstrap case), then
       # run.json — matches scripts/remote/attach.sh's resolution order.
-      PILA_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_fin_run_dir")"
-      if [ -z "$PILA_MACHINE_ID" ]; then
-        echo "pila: --finalize: $_fin_run_id has no fly_machine_id and is not already synced" >&2
+      LEERIE_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_fin_run_dir")"
+      if [ -z "$LEERIE_MACHINE_ID" ]; then
+        echo "leerie: --finalize: $_fin_run_id has no fly_machine_id and is not already synced" >&2
         exit 1
       fi
-      export PILA_MACHINE_ID
-      echo "[pila] --finalize: streaming completed run from machine $PILA_MACHINE_ID" >&2
+      export LEERIE_MACHINE_ID
+      echo "[leerie] --finalize: streaming completed run from machine $LEERIE_MACHINE_ID" >&2
       if ! fetch_branch; then
-        echo "pila: error: fetch_branch failed" >&2
+        echo "leerie: error: fetch_branch failed" >&2
         exit 1
       fi
-      # fetch_branch sets PILA_REMOTE_RUN_ID to the discovered final run-id
+      # fetch_branch sets LEERIE_REMOTE_RUN_ID to the discovered final run-id
       # (which may differ from $_fin_run_id if the user passed a bootstrap
       # id). Use the discovered id to locate the run dir host-side.
-      _fetched_run_id="${PILA_REMOTE_RUN_ID:-$_fin_run_id}"
-      _fetched_run_dir="$USER_REPO/.pila/runs/$_fetched_run_id"
+      _fetched_run_id="${LEERIE_REMOTE_RUN_ID:-$_fin_run_id}"
+      _fetched_run_dir="$USER_REPO/.leerie/runs/$_fetched_run_id"
       if [ ! -d "$_fetched_run_dir" ]; then
-        echo "pila: error: fetch_branch succeeded but $_fetched_run_dir missing" >&2
+        echo "leerie: error: fetch_branch succeeded but $_fetched_run_dir missing" >&2
         exit 1
       fi
     fi
@@ -449,7 +449,7 @@ except Exception:
       # the bootstrap-id dir (if --finalize was called with a bootstrap
       # id) or the final-id dir (post-rename).
       _host_intent=""
-      for _candidate in "$USER_REPO/.pila/runs/$_fin_run_id" "$_fetched_run_dir"; do
+      for _candidate in "$USER_REPO/.leerie/runs/$_fin_run_id" "$_fetched_run_dir"; do
         if [ -f "$_candidate/fly-machine.json" ]; then
           _host_intent="$(python3 -c '
 import json, sys
@@ -463,7 +463,7 @@ except Exception:
         fi
       done
       if [ "$_host_intent" = "true" ]; then
-        echo "[pila] finalize: host_no_push was set at launch — skipping push" >&2
+        echo "[leerie] finalize: host_no_push was set at launch — skipping push" >&2
         _FINALIZE_NO_PUSH=true
       fi
       # Clear the in-Fly orchestrator's mechanism-flag no_push so
@@ -486,7 +486,7 @@ PY
       fi
     fi
     # shellcheck disable=SC1091
-    . "$PILA_REPO/scripts/host-finalize.sh"
+    . "$LEERIE_REPO/scripts/host-finalize.sh"
     host_finalize "$_fetched_run_dir"
     exit $?
     ;;
@@ -501,12 +501,12 @@ print_install_hint() {
       if ! command -v brew >/dev/null 2>&1; then
         cat >&2 <<'EOF'
 
-You need Homebrew first (pila uses brew to install Colima):
+You need Homebrew first (leerie uses brew to install Colima):
   /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
 
 Or see https://brew.sh/ for alternatives.
 
-After installing Homebrew, re-run pila — it will auto-install Colima.
+After installing Homebrew, re-run leerie — it will auto-install Colima.
 EOF
       else
         cat >&2 <<'EOF'
@@ -514,7 +514,7 @@ EOF
 Install on macOS:
   brew install colima
   colima start --runtime containerd --mount-type virtiofs
-  # nerdctl shim is auto-installed by pila on first run; or manually:
+  # nerdctl shim is auto-installed by leerie on first run; or manually:
   #   colima nerdctl install
 
 (brew install nerdctl does NOT work on macOS — the nerdctl binary requires
@@ -540,14 +540,14 @@ See docs/INSTALL.md for rootless mode and other distros.
 EOF
       ;;
     *)
-      echo "pila: unsupported OS: $OS (need macOS or Linux)" >&2
+      echo "leerie: unsupported OS: $OS (need macOS or Linux)" >&2
       ;;
   esac
 }
 
 require() {
   command -v "$1" >/dev/null 2>&1 || {
-    echo "pila: missing required command: $1" >&2
+    echo "leerie: missing required command: $1" >&2
     print_install_hint
     exit 1
   }
@@ -555,11 +555,11 @@ require() {
 
 # --- runtime auto-install opt-out --------------------------------------
 # Same flag/env shape as scripts/install.sh: --no-runtime-install on the
-# CLI or PILA_NO_RUNTIME_INSTALL=1 in the env disables auto-install. We
+# CLI or LEERIE_NO_RUNTIME_INSTALL=1 in the env disables auto-install. We
 # don't shift the flag off $@ — the orchestrator's argparse rejects
 # unknown flags, so we just consume it before the orchestrator sees it
 # (in the REWRITTEN_ARGS pass-through below).
-case "${PILA_NO_RUNTIME_INSTALL:-}" in
+case "${LEERIE_NO_RUNTIME_INSTALL:-}" in
   1|true|TRUE|yes|YES) NO_RUNTIME_INSTALL=true ;;
   *)                   NO_RUNTIME_INSTALL=false ;;
 esac
@@ -570,10 +570,10 @@ for arg in "$@"; do
 done
 
 # --- remote image auto-publish opt-out ---------------------------------
-# Same shape: --no-auto-publish on the CLI or PILA_NO_AUTO_PUBLISH=1 in the
+# Same shape: --no-auto-publish on the CLI or LEERIE_NO_AUTO_PUBLISH=1 in the
 # env disables ensure_image() for the remote (Fly) path. The orchestrator
 # never sees this flag — it's consumed in REWRITTEN_ARGS below.
-case "${PILA_NO_AUTO_PUBLISH:-}" in
+case "${LEERIE_NO_AUTO_PUBLISH:-}" in
   1|true|TRUE|yes|YES) NO_AUTO_PUBLISH=true ;;
   *)                   NO_AUTO_PUBLISH=false ;;
 esac
@@ -586,7 +586,7 @@ done
 # --- local-build opt-in (most users should leave this off) ---------------
 # Default: ensure_image() invokes build-push.sh in its remote-builder mode
 # (Fly's infra builds + pushes; no host Docker daemon required).
-# --local-build on the CLI or PILA_LOCAL_BUILD=1 in the env forces the
+# --local-build on the CLI or LEERIE_LOCAL_BUILD=1 in the env forces the
 # legacy local-build path (nerdctl/docker build + push). The local path
 # only works on hosts with a working Docker daemon authenticated to
 # registry.fly.io (Docker Desktop + `flyctl auth docker`, OR Linux with
@@ -594,7 +594,7 @@ done
 # because nerdctl cannot reach macOS Keychain (where Docker Desktop's
 # `credsStore: desktop` helper stores the registry credential).
 # The orchestrator never sees this flag — consumed by REWRITTEN_ARGS below.
-case "${PILA_LOCAL_BUILD:-}" in
+case "${LEERIE_LOCAL_BUILD:-}" in
   1|true|TRUE|yes|YES) LOCAL_BUILD=true ;;
   *)                   LOCAL_BUILD=false ;;
 esac
@@ -624,39 +624,39 @@ done
 # remote provision step can write fly_machine_id to the sidecar
 # (DESIGN §6 Remote pause-on-failure). We don't shift the arg off $@ —
 # it's still forwarded via REWRITTEN_ARGS to the orchestrator's argparse.
-PILA_RUN_ID=""
+LEERIE_RUN_ID=""
 _prev=""
 for arg in "$@"; do
   if [ "$_prev" = "--run-id" ]; then
-    PILA_RUN_ID="$arg"
+    LEERIE_RUN_ID="$arg"
   fi
   case "$arg" in
-    --run-id=*) PILA_RUN_ID="${arg#--run-id=}" ;;
+    --run-id=*) LEERIE_RUN_ID="${arg#--run-id=}" ;;
   esac
   _prev="$arg"
 done
-export PILA_RUN_ID
+export LEERIE_RUN_ID
 
 # --- runtime-mode knob ---------------------------------------------------
-# Resolves RUNTIME=local|fly. Precedence: CLI --runtime > PILA_RUNTIME env
-# > pila.toml `runtime` key > default `local`. Mirrors the orchestrator's
-# resolve_runtime() (pila.py) so the launcher routes correctly before the
+# Resolves RUNTIME=local|fly. Precedence: CLI --runtime > LEERIE_RUNTIME env
+# > leerie.toml `runtime` key > default `local`. Mirrors the orchestrator's
+# resolve_runtime() (leerie.py) so the launcher routes correctly before the
 # container starts.
 #
-# Backward-compat aliases: --remote / PILA_REMOTE / pila.toml `remote=true`
+# Backward-compat aliases: --remote / LEERIE_REMOTE / leerie.toml `remote=true`
 # map to RUNTIME=fly. The --remote flag is consumed here and not forwarded;
 # --runtime is NOT consumed — it flows through REWRITTEN_ARGS to the
 # orchestrator's own argparse.
 RUNTIME=local
 # Precedence (lowest → highest): default → legacy-toml → canonical-toml →
 # legacy-env → canonical-env → CLI.  TOML is resolved first so env overrides it.
-if [ -f "$USER_REPO/pila.toml" ]; then
+if [ -f "$USER_REPO/leerie.toml" ]; then
   # legacy: remote = true
   toml_remote="$(awk '/^[[:space:]]*remote[[:space:]]*=/ {
                         gsub(/^[[:space:]]*remote[[:space:]]*=[[:space:]]*/, "", $0);
                         gsub(/^"|"$/, "", $0);
                         print; exit
-                      }' "$USER_REPO/pila.toml" 2>/dev/null || true)"
+                      }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
   case "${toml_remote:-}" in
     1|true|TRUE|yes|YES) RUNTIME=fly ;;
   esac
@@ -665,26 +665,26 @@ if [ -f "$USER_REPO/pila.toml" ]; then
                          gsub(/^[[:space:]]*runtime[[:space:]]*=[[:space:]]*/, "", $0);
                          gsub(/^"|"$/, "", $0);
                          print; exit
-                       }' "$USER_REPO/pila.toml" 2>/dev/null || true)"
+                       }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
   case "${toml_runtime:-}" in
     local|fly) RUNTIME="${toml_runtime}" ;;
     "")        : ;;
     *)
-      echo "pila: pila.toml: runtime=${toml_runtime} is not one of local|fly" >&2
+      echo "leerie: leerie.toml: runtime=${toml_runtime} is not one of local|fly" >&2
       exit 1
       ;;
   esac
 fi
 # env alias (legacy) — overrides TOML
-case "${PILA_REMOTE:-}" in
+case "${LEERIE_REMOTE:-}" in
   1|true|TRUE|yes|YES) RUNTIME=fly ;;
 esac
 # env (canonical) — overrides TOML and legacy env alias
-case "${PILA_RUNTIME:-}" in
-  local|fly) RUNTIME="${PILA_RUNTIME}" ;;
+case "${LEERIE_RUNTIME:-}" in
+  local|fly) RUNTIME="${LEERIE_RUNTIME}" ;;
   "")        : ;;
   *)
-    echo "pila: PILA_RUNTIME=${PILA_RUNTIME} is not one of local|fly" >&2
+    echo "leerie: LEERIE_RUNTIME=${LEERIE_RUNTIME} is not one of local|fly" >&2
     exit 1
     ;;
 esac
@@ -697,7 +697,7 @@ for arg in "$@"; do
     --runtime=local)    RUNTIME=local ;;
     --runtime=fly)      RUNTIME=fly ;;
     --runtime=*)
-      echo "pila: --runtime=${arg#--runtime=} is not one of local|fly" >&2
+      echo "leerie: --runtime=${arg#--runtime=} is not one of local|fly" >&2
       exit 1
       ;;
   esac
@@ -709,7 +709,7 @@ for arg in "$@"; do
     case "$arg" in
       local|fly) RUNTIME="$arg" ;;
       *)
-        echo "pila: --runtime $arg is not one of local|fly" >&2
+        echo "leerie: --runtime $arg is not one of local|fly" >&2
         exit 1
         ;;
     esac
@@ -728,12 +728,12 @@ REMOTE=false
 # in the launcher (the launcher has no --dry-run flag — that's install.sh).
 DRY_RUN=false
 
-# Source the shared runtime-install helpers. PILA_REPO points at the
-# pila install directory (where scripts/ lives) — already resolved at
+# Source the shared runtime-install helpers. LEERIE_REPO points at the
+# leerie install directory (where scripts/ lives) — already resolved at
 # the top of this script via the symlink walk.
-if [ -f "$PILA_REPO/scripts/runtime-install.sh" ]; then
+if [ -f "$LEERIE_REPO/scripts/runtime-install.sh" ]; then
   # shellcheck disable=SC1091
-  . "$PILA_REPO/scripts/runtime-install.sh"
+  . "$LEERIE_REPO/scripts/runtime-install.sh"
 fi
 
 # Colima/containerd preflight is only needed for local nerdctl invocations.
@@ -746,21 +746,21 @@ case "$OS" in
     # hang. Mirror the pattern at line ~135 (nerdctl-shim install).
     if ! command -v colima >/dev/null 2>&1; then
       if [ "$NO_RUNTIME_INSTALL" = "true" ]; then
-        echo "pila: Colima is missing (auto-install skipped via --no-runtime-install)." >&2
+        echo "leerie: Colima is missing (auto-install skipped via --no-runtime-install)." >&2
         print_install_hint
         exit 1
       fi
       if [ -t 0 ]; then
-        echo "[pila] Colima is missing — installing now (one-time; may prompt for sudo)..." >&2
+        echo "[leerie] Colima is missing — installing now (one-time; may prompt for sudo)..." >&2
         if ! runtime_install_macos; then
           print_install_hint
           exit 1
         fi
       else
-        echo "pila: Colima is not installed and we have no terminal to" >&2
-        echo "  prompt for sudo / brew install. Run pila once from a" >&2
+        echo "leerie: Colima is not installed and we have no terminal to" >&2
+        echo "  prompt for sudo / brew install. Run leerie once from a" >&2
         echo "  terminal so the one-time install can complete:" >&2
-        echo "    pila --version" >&2
+        echo "    leerie --version" >&2
         echo "  Or install Colima manually:" >&2
         echo "    brew install colima" >&2
         exit 1
@@ -769,7 +769,7 @@ case "$OS" in
     # Don't auto-start Colima — if the user has an existing setup with
     # dockerd we'd clobber their preference. Give a clear hint instead.
     if ! colima status >/dev/null 2>&1; then
-      echo "pila: Colima VM is not running." >&2
+      echo "leerie: Colima VM is not running." >&2
       echo "  Start it with:  colima start --runtime containerd --mount-type virtiofs" >&2
       exit 1
     fi
@@ -780,20 +780,20 @@ case "$OS" in
     # with a clear hint instead of hanging.
     if ! command -v nerdctl >/dev/null 2>&1; then
       if [ -t 0 ]; then
-        echo "[pila] installing host-side nerdctl shim (one-time; may prompt for sudo)..." >&2
+        echo "[leerie] installing host-side nerdctl shim (one-time; may prompt for sudo)..." >&2
         if ! colima nerdctl install >&2; then
-          echo "pila: failed to install nerdctl shim — run 'colima nerdctl install' manually" >&2
+          echo "leerie: failed to install nerdctl shim — run 'colima nerdctl install' manually" >&2
           exit 1
         fi
       else
-        echo "pila: nerdctl shim is not installed and we have no terminal to run sudo." >&2
-        echo "  Run this once from a terminal, then re-invoke /pila:" >&2
+        echo "leerie: nerdctl shim is not installed and we have no terminal to run sudo." >&2
+        echo "  Run this once from a terminal, then re-invoke /leerie:" >&2
         echo "    colima nerdctl install" >&2
         exit 1
       fi
     fi
     if ! nerdctl info >/dev/null 2>&1; then
-      echo "pila: nerdctl cannot reach the container runtime." >&2
+      echo "leerie: nerdctl cannot reach the container runtime." >&2
       echo "  Ensure Colima was started with --runtime containerd:" >&2
       echo "    colima stop && colima start --runtime containerd --mount-type virtiofs" >&2
       exit 1
@@ -806,7 +806,7 @@ case "$OS" in
       case "$1" in
         "$USER_HOME_PREFIX"|"$USER_HOME_PREFIX"/*) return 0 ;;
         *)
-          echo "pila: warning — '$1' is outside $USER_HOME_PREFIX" >&2
+          echo "leerie: warning — '$1' is outside $USER_HOME_PREFIX" >&2
           echo "  and may appear empty in the container. Add it to Colima's" >&2
           echo "  mount list: edit ~/.colima/default/colima.yaml's 'mounts:'" >&2
           echo "  section, then 'colima restart'." >&2
@@ -815,40 +815,40 @@ case "$OS" in
       esac
     }
     check_under_home "$USER_REPO" || true
-    check_under_home "$PILA_REPO" || true
+    check_under_home "$LEERIE_REPO" || true
     ;;
   Linux)
     # Auto-install nerdctl + containerd if missing, with a TTY guard.
     # `sudo apt-get install` etc. would hang in plugin mode without TTY.
     if ! command -v nerdctl >/dev/null 2>&1; then
       if [ "$NO_RUNTIME_INSTALL" = "true" ]; then
-        echo "pila: nerdctl is missing (auto-install skipped via --no-runtime-install)." >&2
+        echo "leerie: nerdctl is missing (auto-install skipped via --no-runtime-install)." >&2
         print_install_hint
         exit 1
       fi
       if [ -t 0 ]; then
-        echo "[pila] nerdctl is missing — installing containerd + nerdctl (one-time; may prompt for sudo)..." >&2
+        echo "[leerie] nerdctl is missing — installing containerd + nerdctl (one-time; may prompt for sudo)..." >&2
         if ! runtime_install_linux; then
           print_install_hint
           exit 1
         fi
       else
-        echo "pila: nerdctl is not installed and we have no terminal to" >&2
-        echo "  prompt for sudo. Run pila once from a terminal so the" >&2
+        echo "leerie: nerdctl is not installed and we have no terminal to" >&2
+        echo "  prompt for sudo. Run leerie once from a terminal so the" >&2
         echo "  one-time install can complete:" >&2
-        echo "    pila --version" >&2
+        echo "    leerie --version" >&2
         exit 1
       fi
     fi
     if ! nerdctl info >/dev/null 2>&1; then
-      echo "pila: nerdctl cannot reach containerd." >&2
+      echo "leerie: nerdctl cannot reach containerd." >&2
       echo "  Ensure containerd is running:  systemctl status containerd" >&2
       echo "  For rootless mode see docs/INSTALL.md." >&2
       exit 1
     fi
     ;;
   *)
-    echo "pila: unsupported OS: $OS" >&2
+    echo "leerie: unsupported OS: $OS" >&2
     print_install_hint
     exit 1
     ;;
@@ -870,13 +870,13 @@ for arg in "$@"; do
     --no-push) NO_PUSH=true ;;
   esac
 done
-case "${PILA_NO_PUSH:-}" in
+case "${LEERIE_NO_PUSH:-}" in
   1|true|TRUE|yes|YES) NO_PUSH=true ;;
 esac
 
-# 1. cwd is a git repo (orchestrator's old check at pila.py:7652).
+# 1. cwd is a git repo (orchestrator's old check at leerie.py:7652).
 if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  echo "pila: error: not inside a git repository" >&2
+  echo "leerie: error: not inside a git repository" >&2
   exit 1
 fi
 
@@ -889,7 +889,7 @@ fi
 #    catching anything the post-push failure path doesn't handle.
 if [ "$NO_PUSH" = "false" ]; then
   if ! git remote get-url origin >/dev/null 2>&1; then
-    echo "pila: error: this repository has no \`origin\` remote — finalize cannot" >&2
+    echo "leerie: error: this repository has no \`origin\` remote — finalize cannot" >&2
     echo "  push without one. Add one with \`git remote add origin <url>\` or pass" >&2
     echo "  \`--no-push\`." >&2
     exit 1
@@ -900,7 +900,7 @@ fi
 #    state.json. Hard-fail on macOS (brew install jq) and Linux (distro
 #    package manager); we use jq for the body composition + state writes.
 if [ "$NO_PUSH" = "false" ] && ! command -v jq >/dev/null 2>&1; then
-  echo "pila: error: \`jq\` not found on PATH." >&2
+  echo "leerie: error: \`jq\` not found on PATH." >&2
   case "$OS" in
     Darwin) echo "  Install with: brew install jq" >&2 ;;
     Linux)  echo "  Install with your distro package manager (apt install jq / dnf install jq / pacman -S jq)." >&2 ;;
@@ -911,21 +911,21 @@ fi
 
 # --- build image if not present (one-time, ~60-120s) --------------------
 if ! nerdctl image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
-  echo "[pila] building container image (one-time; ~60-120s)..." >&2
+  echo "[leerie] building container image (one-time; ~60-120s)..." >&2
   nerdctl build \
     --build-arg HOST_UID="$(id -u)" \
     --build-arg HOST_GID="$(id -g)" \
     -t "$IMAGE_TAG" \
-    "$PILA_REPO"
+    "$LEERIE_REPO"
 fi
 
 # --- translate --inspect-dir paths into bind-mounts ---------------------
 # Each --inspect-dir path points at a host-absolute directory the
 # inspect-bucket workers need read access to (--add-dir under the hood).
 # Bind-mount each one read-only at /inspect/<basename> and rewrite the arg
-# so the in-container view matches. Paths from PILA_INSPECT_DIRS (colon-sep)
-# and pila.toml's inspect_dirs (comma-sep) need the same treatment — we
-# resolve them on the host and emit --inspect-dir CLI flags. PILA_INSPECT_DIRS
+# so the in-container view matches. Paths from LEERIE_INSPECT_DIRS (colon-sep)
+# and leerie.toml's inspect_dirs (comma-sep) need the same treatment — we
+# resolve them on the host and emit --inspect-dir CLI flags. LEERIE_INSPECT_DIRS
 # is cleared inside the container so resolve_inspect_dirs() picks up only
 # our rewritten CLI flags.
 INSPECT_MOUNTS=()
@@ -942,7 +942,7 @@ collect_inspect_path() {
     *)     expanded="$host_path" ;;
   esac
   resolved="$(cd -P "$expanded" 2>/dev/null && pwd)" || {
-    echo "pila: --inspect-dir path not found: $host_path" >&2
+    echo "leerie: --inspect-dir path not found: $host_path" >&2
     exit 1
   }
   # If the path is inside $USER_REPO it's already visible at /work/<sub>,
@@ -955,7 +955,7 @@ collect_inspect_path() {
       # SC2295). Paths typically lack glob metachars, but the cost of
       # defensiveness is one quote-pair.
       local rel="${resolved#"$user_repo_resolved"}"
-      echo "pila: --inspect-dir '$host_path' is inside the repo; skipping redundant mount" >&2
+      echo "leerie: --inspect-dir '$host_path' is inside the repo; skipping redundant mount" >&2
       REWRITTEN_ARGS+=(--inspect-dir "/work${rel}")
       return 0
       ;;
@@ -978,24 +978,24 @@ collect_inspect_path() {
   REWRITTEN_ARGS+=(--inspect-dir "$mount_target")
 }
 
-# Pre-pass: PILA_INSPECT_DIRS env (colon-separated).
-if [ -n "${PILA_INSPECT_DIRS:-}" ]; then
+# Pre-pass: LEERIE_INSPECT_DIRS env (colon-separated).
+if [ -n "${LEERIE_INSPECT_DIRS:-}" ]; then
   OIFS="$IFS"; IFS=":"
-  for p in $PILA_INSPECT_DIRS; do
+  for p in $LEERIE_INSPECT_DIRS; do
     [ -z "$p" ] || collect_inspect_path "$p"
   done
   IFS="$OIFS"
 fi
-# Pre-pass: pila.toml inspect_dirs key (comma-separated).
+# Pre-pass: leerie.toml inspect_dirs key (comma-separated).
 # The orchestrator's resolve_inspect_dirs() precedence is CLI > env > TOML,
 # so once we emit --inspect-dir CLI flags here, the in-container TOML pass
 # is bypassed. Best-effort parse: awk-grep the simple key=value form.
-if [ -f "$USER_REPO/pila.toml" ]; then
+if [ -f "$USER_REPO/leerie.toml" ]; then
   toml_dirs="$(awk -F= '/^[[:space:]]*inspect_dirs[[:space:]]*=/ {
                           gsub(/^[[:space:]]*inspect_dirs[[:space:]]*=[[:space:]]*/, "", $0);
                           gsub(/^"|"$/, "", $0);
                           print; exit
-                        }' "$USER_REPO/pila.toml" 2>/dev/null || true)"
+                        }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
   if [ -n "$toml_dirs" ]; then
     OIFS="$IFS"; IFS=","
     for p in $toml_dirs; do
@@ -1007,7 +1007,7 @@ if [ -f "$USER_REPO/pila.toml" ]; then
   fi
 fi
 # Main pass: rewrite --inspect-dir in $@. The orchestrator's argparse
-# declares only --inspect-dir (no -i alias — see pila.py:6079), so we
+# declares only --inspect-dir (no -i alias — see leerie.py:6079), so we
 # intercept exactly that one form and let everything else flow through.
 prev_was_inspect=false
 for arg in "$@"; do
@@ -1062,24 +1062,24 @@ done
 AUTH_MOUNTS=()
 
 if [ ! -d "$HOME/.claude" ]; then
-  echo "pila: $HOME/.claude not found — run \`claude\` at least once first" >&2
+  echo "leerie: $HOME/.claude not found — run \`claude\` at least once first" >&2
   exit 1
 fi
 if [ ! -f "$HOME/.claude.json" ]; then
-  echo "pila: $HOME/.claude.json not found — run \`claude\` at least once first" >&2
+  echo "leerie: $HOME/.claude.json not found — run \`claude\` at least once first" >&2
   exit 1
 fi
 
-# Scratch dir lives under ~/.cache/pila/ (not $TMPDIR) so Colima's
+# Scratch dir lives under ~/.cache/leerie/ (not $TMPDIR) so Colima's
 # default mount config auto-shares it on macOS — $TMPDIR resolves to
 # /var/folders/... on Darwin, which is outside the /Users/$USER share
 # Colima exposes by default, and the bind mount would silently appear
 # empty inside the container. Linux is unaffected (any host path is
-# nerdctl-mountable) but the ~/.cache/pila/ home keeps the launcher
+# nerdctl-mountable) but the ~/.cache/leerie/ home keeps the launcher
 # uniform across platforms and matches the existing cache-dir
 # convention used for mise / pnpm / pip / go / cargo (see below).
-mkdir -p "$HOME/.cache/pila"
-STAGE="$(mktemp -d "$HOME/.cache/pila/cfg-XXXXXX")"
+mkdir -p "$HOME/.cache/leerie"
+STAGE="$(mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX")"
 
 # -- .claude.json: copy with projects[] stripped. --
 # The projects[] block stores prior-session per-project state
@@ -1114,7 +1114,7 @@ CLAUDE_SKIP=(
   chrome            # Chrome integration state
   ralph-state       # plugin state from prior sessions
   .last-cleanup     # cleanup marker (regenerates)
-  # ~400 MB host npm install of the CLI; the pila image installs
+  # ~400 MB host npm install of the CLI; the leerie image installs
   # @anthropic-ai/claude-code globally via the Dockerfile, so this is
   # pure dead weight on the wire to Fly. Local nerdctl runs bind-mount
   # the host $HOME/.claude so they pick up the local install regardless.
@@ -1147,7 +1147,7 @@ fi
 # overwrite the credentials file.
 #
 # `security find-generic-password -w` succeeds silently when the
-# caller is in the user's login session (which `./pila` always is);
+# caller is in the user's login session (which `./leerie` always is);
 # outside that (SSH-without-tty, daemons) it would prompt or fail.
 # Best-effort: if extraction fails, fall back to the legacy
 # CLAUDE_CODE_OAUTH_TOKEN env-var bridge so workers still authenticate.
@@ -1161,7 +1161,7 @@ if [ "$OS" = "Darwin" ]; then
     if [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
       AUTH_MOUNTS+=(-e "CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_CODE_OAUTH_TOKEN")
     else
-      echo "pila: note — could not extract Claude credentials from Keychain." >&2
+      echo "leerie: note — could not extract Claude credentials from Keychain." >&2
       echo "  Export CLAUDE_CODE_OAUTH_TOKEN in your shell, or grant the launcher" >&2
       echo "  Keychain access (the prompt that pops up the first time)." >&2
     fi
@@ -1224,22 +1224,22 @@ fi
 # -- Mount each staged file/dir at its default in-container path. --
 # Files mount as files; dirs mount as dirs. The container sees the
 # normal default paths — no env-var redirection needed.
-AUTH_MOUNTS+=(-v "$STAGE/.claude.json:/home/pila/.claude.json")
-AUTH_MOUNTS+=(-v "$STAGE/.claude:/home/pila/.claude")
+AUTH_MOUNTS+=(-v "$STAGE/.claude.json:/home/leerie/.claude.json")
+AUTH_MOUNTS+=(-v "$STAGE/.claude:/home/leerie/.claude")
 for relpath in .gitconfig .gitconfig.local .gitignore \
                .gitignore_global .git-credentials .netrc; do
   if [ -e "$STAGE/$relpath" ]; then
-    AUTH_MOUNTS+=(-v "$STAGE/$relpath:/home/pila/$relpath")
+    AUTH_MOUNTS+=(-v "$STAGE/$relpath:/home/leerie/$relpath")
   fi
 done
 if [ -d "$STAGE/.config/git" ]; then
-  AUTH_MOUNTS+=(-v "$STAGE/.config/git:/home/pila/.config/git")
+  AUTH_MOUNTS+=(-v "$STAGE/.config/git:/home/leerie/.config/git")
 fi
 if [ -d "$STAGE/.ssh" ]; then
-  AUTH_MOUNTS+=(-v "$STAGE/.ssh:/home/pila/.ssh")
+  AUTH_MOUNTS+=(-v "$STAGE/.ssh:/home/leerie/.ssh")
 fi
 if [ -d "$STAGE/.gnupg" ]; then
-  AUTH_MOUNTS+=(-v "$STAGE/.gnupg:/home/pila/.gnupg")
+  AUTH_MOUNTS+=(-v "$STAGE/.gnupg:/home/leerie/.gnupg")
 fi
 
 # Best-effort host cleanup. Container is --rm; its writes inside the
@@ -1247,7 +1247,7 @@ fi
 trap 'rm -rf "$STAGE"' EXIT
 
 # --- finalize-phase auth is host-side now -------------------------------
-# Previous versions of pila bind-mounted ~/.config/gh, ~/.git-credentials,
+# Previous versions of leerie bind-mounted ~/.config/gh, ~/.git-credentials,
 # ~/.ssh, and $SSH_AUTH_SOCK into the container so finalize could push
 # and open a PR. After DESIGN §6 *Finalization* moved that step to the
 # host launcher (post-container-exit), those mounts are no longer
@@ -1256,35 +1256,35 @@ trap 'rm -rf "$STAGE"' EXIT
 
 # --- per-repo dependency caches (DESIGN §6½, IMPLEMENTATION §0.5) -------
 # Five host-side cache dirs survive across runs so:
-#   - mise doesn't re-install Node 20.11.0 every time the user runs pila
+#   - mise doesn't re-install Node 20.11.0 every time the user runs leerie
 #     against a repo with .nvmrc: 20.11.0,
 #   - pnpm / pip / Go / Cargo installs hit warm caches.
-# Created lazily (mkdir -p) on every pila invocation — cheap on existing
+# Created lazily (mkdir -p) on every leerie invocation — cheap on existing
 # dirs, free of failure modes on first run.
 # Concurrency-safety per cache is documented in IMPLEMENTATION §0.5;
 # pip's pattern (warm once serially in phase_provision, hit cached
 # wheels in parallel from worktree replays) is documented in DESIGN §6½.
-mkdir -p "$HOME/.cache/pila/mise-data" \
-         "$HOME/.cache/pila/pnpm-store" \
-         "$HOME/.cache/pila/pip" \
-         "$HOME/.cache/pila/go-mod" \
-         "$HOME/.cache/pila/cargo"
+mkdir -p "$HOME/.cache/leerie/mise-data" \
+         "$HOME/.cache/leerie/pnpm-store" \
+         "$HOME/.cache/leerie/pip" \
+         "$HOME/.cache/leerie/go-mod" \
+         "$HOME/.cache/leerie/cargo"
 
 CACHE_MOUNTS=(
-  -v "$HOME/.cache/pila/mise-data:/home/pila/.local/share/mise"
-  -v "$HOME/.cache/pila/pnpm-store:/home/pila/.cache/pila/pnpm-store"
-  -v "$HOME/.cache/pila/pip:/home/pila/.cache/pila/pip"
-  -v "$HOME/.cache/pila/go-mod:/home/pila/.cache/pila/go-mod"
-  -v "$HOME/.cache/pila/cargo:/home/pila/.cache/pila/cargo"
+  -v "$HOME/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
+  -v "$HOME/.cache/leerie/pnpm-store:/home/leerie/.cache/leerie/pnpm-store"
+  -v "$HOME/.cache/leerie/pip:/home/leerie/.cache/leerie/pip"
+  -v "$HOME/.cache/leerie/go-mod:/home/leerie/.cache/leerie/go-mod"
+  -v "$HOME/.cache/leerie/cargo:/home/leerie/.cache/leerie/cargo"
   # pnpm reads its store path from `npm_config_store_dir` (or `store-dir`
   # in .npmrc, or `--store-dir` CLI). There is no `PNPM_STORE_PATH`; a
   # prior version of this file set that and pnpm silently ignored it,
   # falling back to ~/.local/share/pnpm/store inside the container —
   # which is NOT bind-mounted, so every run paid full registry cost.
-  -e "npm_config_store_dir=/home/pila/.cache/pila/pnpm-store"
-  -e "PIP_CACHE_DIR=/home/pila/.cache/pila/pip"
-  -e "GOMODCACHE=/home/pila/.cache/pila/go-mod"
-  -e "CARGO_HOME=/home/pila/.cache/pila/cargo"
+  -e "npm_config_store_dir=/home/leerie/.cache/leerie/pnpm-store"
+  -e "PIP_CACHE_DIR=/home/leerie/.cache/leerie/pip"
+  -e "GOMODCACHE=/home/leerie/.cache/leerie/go-mod"
+  -e "CARGO_HOME=/home/leerie/.cache/leerie/cargo"
 )
 # MISE_DATA_DIR / MISE_SYSTEM_DATA_DIR are baked into the image as ENV
 # (Dockerfile) so the resolver and mount target are stable across
@@ -1296,18 +1296,18 @@ CACHE_MOUNTS=(
 # does not pay the version-lookup cost.
 resolve_fly_image_tag() {
   local fly_app region version tag
-  fly_app="${PILA_FLY_APP:-pila}"
+  fly_app="${LEERIE_FLY_APP:-leerie}"
   region="${FLY_REGION:-iad}"
-  version="$PILA_VERSION"
+  version="$LEERIE_VERSION"
   tag="registry.fly.io/$fly_app:$version"
   # Allow the caller to override the full tag via env.
-  echo "${PILA_FLY_IMAGE:-$tag}"
+  echo "${LEERIE_FLY_IMAGE:-$tag}"
 }
 
 # --- remote: ensure published image -------------------------------------
 # Closes the operator-step gap where the first remote run fails because
 # the registry tag wasn't built/pushed yet. Strategy: cache positive hits
-# in ~/.cache/pila/published-tags.txt; on miss, invoke build-push.sh
+# in ~/.cache/leerie/published-tags.txt; on miss, invoke build-push.sh
 # --push (which is idempotent at the registry — pushing an already-
 # present manifest just no-ops the layers). The cache is a *positive*
 # list only, so a manual `flyctl image` deletion is self-healing.
@@ -1316,17 +1316,17 @@ resolve_fly_image_tag() {
 # publishes themselves and accepts the manifest-not-found failure mode).
 ensure_image() {
   local tag="$1" cache_dir cache_file
-  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/pila"
+  cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/leerie"
   cache_file="$cache_dir/published-tags.txt"
   if [ -f "$cache_file" ] && grep -Fxq "$tag" "$cache_file" 2>/dev/null; then
     return 0
   fi
-  local build_push="$PILA_REPO/scripts/remote/build-push.sh"
+  local build_push="$LEERIE_REPO/scripts/remote/build-push.sh"
   if [ ! -x "$build_push" ]; then
-    echo "pila: error: $build_push not found or not executable" >&2
+    echo "leerie: error: $build_push not found or not executable" >&2
     return 1
   fi
-  local fly_app="${PILA_FLY_APP:-pila}"
+  local fly_app="${LEERIE_FLY_APP:-leerie}"
 
   # Auto-create the Fly app if missing. flyctl apps list returns a JSON
   # array; check for a Name match. The remote builder and registry push
@@ -1341,25 +1341,25 @@ try:
 except Exception:
     sys.exit(1)
 ' "$fly_app"; then
-    echo "[pila] remote: Fly app '$fly_app' does not exist — creating it" >&2
+    echo "[leerie] remote: Fly app '$fly_app' does not exist — creating it" >&2
     if ! flyctl apps create "$fly_app" 2>&1; then
-      echo "pila: error: flyctl apps create $fly_app failed" >&2
+      echo "leerie: error: flyctl apps create $fly_app failed" >&2
       echo "  Create it manually: flyctl apps create $fly_app" >&2
       return 1
     fi
   fi
 
   # Forward --local-build to build-push.sh when the launcher was invoked
-  # with --local-build or PILA_LOCAL_BUILD=1. Default is remote builder
+  # with --local-build or LEERIE_LOCAL_BUILD=1. Default is remote builder
   # (no host Docker daemon required).
   local build_args=(--app "$fly_app" --push)
   if [ "${LOCAL_BUILD:-false}" = "true" ]; then
     build_args+=(--local-build)
   fi
 
-  echo "[pila] remote: ensuring image $tag is published (cache miss)" >&2
+  echo "[leerie] remote: ensuring image $tag is published (cache miss)" >&2
   if ! "$build_push" "${build_args[@]}"; then
-    echo "pila: error: build-push.sh failed; remote run cannot proceed" >&2
+    echo "leerie: error: build-push.sh failed; remote run cannot proceed" >&2
     return 1
   fi
   mkdir -p "$cache_dir"
@@ -1381,19 +1381,19 @@ if [ "$RUNTIME" = "fly" ]; then
   # authenticate and commit. seed-repo.sh tar-pipes a git-aware payload to /work
   # via `flyctl ssh console -C "tar -xC /work"` — `git ls-files` honors
   # .gitignore + `.git/` verbatim + force-include the repo's .claude/ + always
-  # skip .pila/. No in-machine `git clone` (the machine deliberately has no
+  # skip .leerie/. No in-machine `git clone` (the machine deliberately has no
   # GitHub credentials). Orchestration inside the machine follows after both
   # seedings succeed.
-  echo "[pila] remote: starting Fly.io machine (--runtime fly / PILA_RUNTIME=fly / pila.toml runtime=fly)" >&2
+  echo "[leerie] remote: starting Fly.io machine (--runtime fly / LEERIE_RUNTIME=fly / leerie.toml runtime=fly)" >&2
 
   # Preflight: ensure flyctl is on PATH and authenticated. require_flyctl
   # in lib.sh handles auto-install on first --runtime fly use (parallels
   # the local-runtime auto-install in scripts/install.sh). Respects
-  # --no-runtime-install / PILA_NO_RUNTIME_INSTALL=1 (falls back to
+  # --no-runtime-install / LEERIE_NO_RUNTIME_INSTALL=1 (falls back to
   # hint+exit). Must run before ensure_image (which uses flyctl to push)
   # and before any other remote script is sourced.
   # shellcheck disable=SC1091
-  . "$PILA_REPO/scripts/remote/lib.sh"
+  . "$LEERIE_REPO/scripts/remote/lib.sh"
   if ! require_flyctl; then
     exit 1
   fi
@@ -1407,19 +1407,19 @@ if [ "$RUNTIME" = "fly" ]; then
   # end of phase_classify (State.rename_to). The launcher's tail wrapper
   # handles the rename by polling for the final id afterwards. See DESIGN
   # §6 *Detached orchestrator (remote mode)*.
-  if [ -z "$PILA_RUN_ID" ]; then
-    PILA_RUN_ID="_bootstrap-$(python3 -c "import secrets; print(secrets.token_hex(3))")"
-    export PILA_RUN_ID
+  if [ -z "$LEERIE_RUN_ID" ]; then
+    LEERIE_RUN_ID="_bootstrap-$(python3 -c "import secrets; print(secrets.token_hex(3))")"
+    export LEERIE_RUN_ID
     # Append --run-id to REWRITTEN_ARGS so the orchestrator inside the
     # machine uses the same id (matches the --resume --run-id plumbing).
-    REWRITTEN_ARGS+=("--run-id" "$PILA_RUN_ID")
+    REWRITTEN_ARGS+=("--run-id" "$LEERIE_RUN_ID")
   fi
 
   FLY_IMAGE_TAG="$(resolve_fly_image_tag)"
   export FLY_IMAGE_TAG
 
   # Ensure the image is published before flyctl machine run attempts to pull
-  # it. Skipped if --no-auto-publish / PILA_NO_AUTO_PUBLISH=1 — the operator
+  # it. Skipped if --no-auto-publish / LEERIE_NO_AUTO_PUBLISH=1 — the operator
   # is responsible for the build-push in that mode.
   if [ "$NO_AUTO_PUBLISH" != "true" ]; then
     if ! ensure_image "$FLY_IMAGE_TAG"; then
@@ -1427,25 +1427,25 @@ if [ "$RUNTIME" = "fly" ]; then
     fi
   fi
 
-  PROVISION_SCRIPT="$PILA_REPO/scripts/remote/provision.sh"
-  RESUME_SCRIPT="$PILA_REPO/scripts/remote/resume-machine.sh"
-  SEED_AUTH_SCRIPT="$PILA_REPO/scripts/remote/seed-auth.sh"
-  SEED_SCRIPT="$PILA_REPO/scripts/remote/seed-repo.sh"
-  FETCH_SCRIPT="$PILA_REPO/scripts/remote/fetch-branch.sh"
+  PROVISION_SCRIPT="$LEERIE_REPO/scripts/remote/provision.sh"
+  RESUME_SCRIPT="$LEERIE_REPO/scripts/remote/resume-machine.sh"
+  SEED_AUTH_SCRIPT="$LEERIE_REPO/scripts/remote/seed-auth.sh"
+  SEED_SCRIPT="$LEERIE_REPO/scripts/remote/seed-repo.sh"
+  FETCH_SCRIPT="$LEERIE_REPO/scripts/remote/fetch-branch.sh"
   if [ ! -f "$PROVISION_SCRIPT" ]; then
-    echo "pila: error: $PROVISION_SCRIPT not found" >&2
+    echo "leerie: error: $PROVISION_SCRIPT not found" >&2
     container_rc=1
   elif [ ! -f "$RESUME_SCRIPT" ]; then
-    echo "pila: error: $RESUME_SCRIPT not found" >&2
+    echo "leerie: error: $RESUME_SCRIPT not found" >&2
     container_rc=1
   elif [ ! -f "$SEED_AUTH_SCRIPT" ]; then
-    echo "pila: error: $SEED_AUTH_SCRIPT not found" >&2
+    echo "leerie: error: $SEED_AUTH_SCRIPT not found" >&2
     container_rc=1
   elif [ ! -f "$SEED_SCRIPT" ]; then
-    echo "pila: error: $SEED_SCRIPT not found" >&2
+    echo "leerie: error: $SEED_SCRIPT not found" >&2
     container_rc=1
   elif [ ! -f "$FETCH_SCRIPT" ]; then
-    echo "pila: error: $FETCH_SCRIPT not found" >&2
+    echo "leerie: error: $FETCH_SCRIPT not found" >&2
     container_rc=1
   else
     # shellcheck disable=SC1090
@@ -1463,8 +1463,8 @@ if [ "$RUNTIME" = "fly" ]; then
     # sidecar has paused_at set, resume the existing Fly Machine instead
     # of provisioning a new one. (DESIGN §6 Remote pause-on-failure.)
     _paused_mid=""
-    if [ -n "$PILA_RUN_ID" ]; then
-      _sidecar="$USER_REPO/.pila/runs/$PILA_RUN_ID/run.json"
+    if [ -n "$LEERIE_RUN_ID" ]; then
+      _sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
       if [ -f "$_sidecar" ]; then
         _paused_mid="$(python3 -c "
 import json,sys
@@ -1489,38 +1489,38 @@ except Exception:
       _provisioned=true
     fi
 
-    # E1: when resuming a bootstrap-id paused via `pila --stop`, the
+    # E1: when resuming a bootstrap-id paused via `leerie --stop`, the
     # orchestrator on the machine has already renamed its run dir to
     # the final id via State.rename_to. Resuming with --run-id
     # _bootstrap-XXX would die in resolve_run_id (which skips
     # `_bootstrap-*` dirs). The orchestrator wrote the final id back to
-    # /work/.pila/launcher-<bootstrap>.runid before renaming — read it
-    # over SSH, then rewrite PILA_RUN_ID and the --run-id element of
+    # /work/.leerie/launcher-<bootstrap>.runid before renaming — read it
+    # over SSH, then rewrite LEERIE_RUN_ID and the --run-id element of
     # REWRITTEN_ARGS before the orchestrator is exec'd. Migrate the
     # host-side run dir (D2 created `_bootstrap-XXX/run.json`) to the
-    # final id so `pila --list` and subsequent verbs find the run by
+    # final id so `leerie --list` and subsequent verbs find the run by
     # its real name.
     if [ "$_resumed" = "true" ] && \
-       [ -n "$PILA_RUN_ID" ] && \
-       [[ "$PILA_RUN_ID" == _bootstrap-* ]]; then
-      _bootstrap_pid="$PILA_RUN_ID"
+       [ -n "$LEERIE_RUN_ID" ] && \
+       [[ "$LEERIE_RUN_ID" == _bootstrap-* ]]; then
+      _bootstrap_pid="$LEERIE_RUN_ID"
       _final_id="$(flyctl ssh console --app "$FLY_APP" \
-                     --machine "$PILA_MACHINE_ID" --pty=false \
-                     -C "cat /work/.pila/launcher-${_bootstrap_pid}.runid" \
+                     --machine "$LEERIE_MACHINE_ID" --pty=false \
+                     -C "cat /work/.leerie/launcher-${_bootstrap_pid}.runid" \
                      2>/dev/null | head -1 | tr -d '[:space:]' || true)"
       if [ -n "$_final_id" ] && [ "$_final_id" != "$_bootstrap_pid" ]; then
-        echo "[pila] remote: bootstrap id ${_bootstrap_pid} promoted to ${_final_id} on machine — rewriting PILA_RUN_ID" >&2
+        echo "[leerie] remote: bootstrap id ${_bootstrap_pid} promoted to ${_final_id} on machine — rewriting LEERIE_RUN_ID" >&2
         # Migrate host-side run dir if needed.
-        _host_boot_dir="$USER_REPO/.pila/runs/${_bootstrap_pid}"
-        _host_final_dir="$USER_REPO/.pila/runs/${_final_id}"
+        _host_boot_dir="$USER_REPO/.leerie/runs/${_bootstrap_pid}"
+        _host_final_dir="$USER_REPO/.leerie/runs/${_final_id}"
         if [ -d "$_host_boot_dir" ] && [ ! -d "$_host_final_dir" ]; then
           mv "$_host_boot_dir" "$_host_final_dir" 2>/dev/null || true
         fi
-        # Rewrite PILA_RUN_ID and any `--run-id <bootstrap>` element in
+        # Rewrite LEERIE_RUN_ID and any `--run-id <bootstrap>` element in
         # REWRITTEN_ARGS (the user typed `--resume --run-id <bootstrap>`,
         # the loop at line ~920 passed it through).
-        PILA_RUN_ID="$_final_id"
-        export PILA_RUN_ID
+        LEERIE_RUN_ID="$_final_id"
+        export LEERIE_RUN_ID
         _rewritten_count="${#REWRITTEN_ARGS[@]}"
         _i=0
         while [ "$_i" -lt "$_rewritten_count" ]; do
@@ -1544,7 +1544,7 @@ except Exception:
       export USER_REPO
       _seed_ok=true
       if ! seed_auth; then
-        echo "pila: error: seed_auth failed — aborting remote run" >&2
+        echo "leerie: error: seed_auth failed — aborting remote run" >&2
         container_rc=1
         _seed_ok=false
       elif [ "$_resumed" = "true" ]; then
@@ -1552,16 +1552,16 @@ except Exception:
         # delta unless --no-re-seed was passed. (Phase 4 auto-re-seed.)
         if [ "$NO_RE_SEED" != "true" ]; then
           # shellcheck disable=SC1091
-          . "$PILA_REPO/scripts/remote/re-seed.sh"
-          [ "$RE_SEED_FORCE" = "true" ] && export PILA_RE_SEED_FORCE=1
+          . "$LEERIE_REPO/scripts/remote/re-seed.sh"
+          [ "$RE_SEED_FORCE" = "true" ] && export LEERIE_RE_SEED_FORCE=1
           if ! re_seed; then
-            echo "pila: error: re_seed failed — aborting remote run" >&2
+            echo "leerie: error: re_seed failed — aborting remote run" >&2
             container_rc=1
             _seed_ok=false
           fi
         fi
       elif ! seed_repo; then
-        echo "pila: error: repo seeding failed for machine $PILA_MACHINE_ID" >&2
+        echo "leerie: error: repo seeding failed for machine $LEERIE_MACHINE_ID" >&2
         container_rc=1
         _seed_ok=false
       fi
@@ -1574,7 +1574,7 @@ except Exception:
         # REWRITTEN_ARGS, so the path is known before the orchestrator
         # produces any output. DESIGN §6 *Detached orchestrator (remote
         # mode)*.
-        echo "[pila] remote: machine $PILA_MACHINE_ID seeded — starting orchestrator (detached)" >&2
+        echo "[leerie] remote: machine $LEERIE_MACHINE_ID seeded — starting orchestrator (detached)" >&2
 
         # Detached-launch wrapper. Uses a python3 heredoc instead of
         # `sh -c "...setsid nohup..."` for three reasons:
@@ -1597,34 +1597,34 @@ except Exception:
         _launch_argv_json="$(python3 -c '
 import json, sys
 print(json.dumps(sys.argv[1:]))
-' "$PILA_RUN_ID" "${REWRITTEN_ARGS[@]}")"
+' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}")"
         _launch_script="$(cat <<PY
 import os, pwd, subprocess
 argv = ${_launch_argv_json}
 run_id = argv[0]
 orch_args = argv[1:]
-run_dir = "/work/.pila/runs/" + run_id
+run_dir = "/work/.leerie/runs/" + run_id
 os.makedirs(run_dir, exist_ok=True)
-# Make /work/.pila, /work/.pila/runs, and the run dir itself writable
-# by pila — os.makedirs created them as root (this wrapper runs as
-# root via ssh-console). The orchestrator runs as pila and may need
+# Make /work/.leerie, /work/.leerie/runs, and the run dir itself writable
+# by leerie — os.makedirs created them as root (this wrapper runs as
+# root via ssh-console). The orchestrator runs as leerie and may need
 # to create sibling run dirs (bootstrap → final id rename, etc).
-pila_pw = pwd.getpwnam("pila")
-for d in ("/work/.pila", "/work/.pila/runs", run_dir):
+leerie_pw = pwd.getpwnam("leerie")
+for d in ("/work/.leerie", "/work/.leerie/runs", run_dir):
     try:
-        os.chown(d, pila_pw.pw_uid, pila_pw.pw_gid)
+        os.chown(d, leerie_pw.pw_uid, leerie_pw.pw_gid)
     except OSError:
         pass
 log_path = run_dir + "/orchestrator.log"
 pid_path = run_dir + "/orchestrator.pid"
 # Build the env from scratch — ssh-console sets HOME=/root which would
-# point claude at the wrong credentials dir. Pin HOME=/home/pila and
+# point claude at the wrong credentials dir. Pin HOME=/home/leerie and
 # leave PATH alone (the image's PATH includes mise + Claude Code CLI
 # under /usr/local/share/mise/installs/node/lts-current/bin).
 child_env = dict(os.environ)
-child_env["HOME"] = "/home/pila"
-child_env["USER"] = "pila"
-child_env["LOGNAME"] = "pila"
+child_env["HOME"] = "/home/leerie"
+child_env["USER"] = "leerie"
+child_env["LOGNAME"] = "leerie"
 # Ensure the launcher's PATH includes the mise-managed claude binary.
 # (The Dockerfile installs claude into the mise-managed node prefix;
 # fly's hallpass ssh session inherits a minimal PATH that may not
@@ -1634,7 +1634,7 @@ if extra_path not in child_env.get("PATH", ""):
     child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
 with open(log_path, "ab") as log_f:
     p = subprocess.Popen(
-        ["python3", "/opt/pila-image/orchestrator/pila.py", "--no-push", *orch_args],
+        ["python3", "/opt/leerie-image/orchestrator/leerie.py", "--no-push", *orch_args],
         stdin=subprocess.DEVNULL,
         stdout=log_f,
         stderr=log_f,
@@ -1642,14 +1642,14 @@ with open(log_path, "ab") as log_f:
         # cwd=/work so the orchestrator's os.getcwd() returns /work
         # regardless of the launching shell's (possibly stale) cwd.
         cwd="/work",
-        # Run as the pila user — the Fly image's USER pila line only
+        # Run as the leerie user — the Fly image's USER leerie line only
         # applies to the entrypoint; ssh-console sessions land as root,
         # and any process we spawn here inherits root unless we set
-        # this explicitly. The orchestrator needs to run as pila so
-        # claude finds creds at /home/pila/.claude/.credentials.json
-        # and so files it creates are owned by pila (not root).
-        user="pila",
-        group=pila_pw.pw_gid,
+        # this explicitly. The orchestrator needs to run as leerie so
+        # claude finds creds at /home/leerie/.claude/.credentials.json
+        # and so files it creates are owned by leerie (not root).
+        user="leerie",
+        group=leerie_pw.pw_gid,
         env=child_env,
     )
 with open(pid_path, "w") as pid_f:
@@ -1657,10 +1657,10 @@ with open(pid_path, "w") as pid_f:
 PY
 )"
         if ! printf '%s' "$_launch_script" \
-             | flyctl ssh console --app "$FLY_APP" --machine "$PILA_MACHINE_ID" \
+             | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
                  --pty=false -C "python3 -"
         then
-          echo "pila: error: failed to start detached orchestrator on machine $PILA_MACHINE_ID" >&2
+          echo "leerie: error: failed to start detached orchestrator on machine $LEERIE_MACHINE_ID" >&2
           container_rc=1
         else
           # Phase 3: promote the PID-keyed attach pointer to a run-keyed
@@ -1668,9 +1668,9 @@ PY
           # orchestrator will rename the run dir at classify time; the
           # launcher's tail wrapper handles the rename via the handover
           # file the orchestrator writes (see DESIGN §6).
-          _pid_record="$USER_REPO/.pila/remote/$$.json"
-          mkdir -p "$USER_REPO/.pila/runs/$PILA_RUN_ID" 2>/dev/null || true
-          _run_record="$USER_REPO/.pila/runs/$PILA_RUN_ID/fly-machine.json"
+          _pid_record="$USER_REPO/.leerie/remote/$$.json"
+          mkdir -p "$USER_REPO/.leerie/runs/$LEERIE_RUN_ID" 2>/dev/null || true
+          _run_record="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/fly-machine.json"
           if [ -f "$_pid_record" ]; then
             cp "$_pid_record" "$_run_record" 2>/dev/null || true
           fi
@@ -1679,12 +1679,12 @@ PY
           # separate exec session; its death (Ctrl-C, broken pipe, laptop
           # closing) does NOT propagate to the orchestrator. After the
           # orchestrator's State.rename_to promotes the bootstrap dir, it
-          # writes the final run-id to /work/.pila/launcher-<bootstrap>.runid;
+          # writes the final run-id to /work/.leerie/launcher-<bootstrap>.runid;
           # the wrapper script reads that, re-tails the new path, and on
           # orchestrator-pid exit prints a finalize hint and ends.
-          echo "[pila] remote: tailing orchestrator log (Ctrl-C to detach — orchestrator keeps running)" >&2
+          echo "[leerie] remote: tailing orchestrator log (Ctrl-C to detach — orchestrator keeps running)" >&2
 
-          # The remote tail wrapper is shared with `pila --attach --tail`
+          # The remote tail wrapper is shared with `leerie --attach --tail`
           # via render_tail_wrapper in scripts/remote/lib.sh (already
           # sourced above). It handles the `_bootstrap-<6hex>` →
           # final-id rename transparently and prints the finalize hint
@@ -1692,14 +1692,14 @@ PY
           _tail_script="$(render_tail_wrapper)"
 
           # Prepend an env-var assignment to the wrapper script so the
-          # run-id reaches the wrapper via $PILA_TAIL_RUN_ID. Current
+          # run-id reaches the wrapper via $LEERIE_TAIL_RUN_ID. Current
           # flyctl transports (ssh console -C, and the deprecated
           # machine exec form) both pass the remote command as a
           # single string, not as argv after `--`. The wrapper's
-          # `${PILA_TAIL_RUN_ID:-$1}` fallback consults the env var
+          # `${LEERIE_TAIL_RUN_ID:-$1}` fallback consults the env var
           # first; the env-var prefix below makes that the source of
           # truth.
-          _tail_invocation="PILA_TAIL_RUN_ID='$PILA_RUN_ID'; export PILA_TAIL_RUN_ID
+          _tail_invocation="LEERIE_TAIL_RUN_ID='$LEERIE_RUN_ID'; export LEERIE_TAIL_RUN_ID
 $_tail_script"
           orch_rc=0
           # ssh console -C takes the command as a single string and
@@ -1707,17 +1707,17 @@ $_tail_script"
           # preamble) to `sh -s` so quoting is wholly host-side.
           printf '%s' "$_tail_invocation" \
             | flyctl ssh console --app "$FLY_APP" \
-                --machine "$PILA_MACHINE_ID" --pty=false \
+                --machine "$LEERIE_MACHINE_ID" --pty=false \
                 -C "sh -s" \
             || orch_rc=$?
 
           # On a clean tail exit (the orchestrator's pid disappeared), we
           # cannot read the orchestrator's true exit code — it ran detached.
-          # The decide_teardown trap classifies based on PILA_REMOTE_EXIT_RC
+          # The decide_teardown trap classifies based on LEERIE_REMOTE_EXIT_RC
           # which here reflects the TAIL's exit, not the orchestrator's.
           # Per the reclassified table (DESIGN §6), tail-exit cleanly
           # (rc=0 from the wrapper) is treated as "user can finalize"; the
-          # launcher does NOT call fetch_branch from here — `pila --finalize`
+          # launcher does NOT call fetch_branch from here — `leerie --finalize`
           # does that. See *Detached run finalization* in IMPLEMENTATION.md.
           container_rc=$orch_rc
         fi
@@ -1726,40 +1726,40 @@ $_tail_script"
       container_rc=1
     fi
     # The EXIT trap registered in provision.sh (decide_teardown) reads
-    # PILA_REMOTE_EXIT_RC to classify the orchestrator's exit code.
+    # LEERIE_REMOTE_EXIT_RC to classify the orchestrator's exit code.
     # Pause-worthy: any non-zero other than EXIT_NEEDS_ANSWERS=10,
     # EX_TEMPFAIL=75 (rate-limit), SIGINT=130, SIGTERM=143.
     # (DESIGN §6 Remote pause-on-failure.)
-    export PILA_REMOTE_EXIT_RC="$container_rc"
+    export LEERIE_REMOTE_EXIT_RC="$container_rc"
   fi
 else
   # --- local container execution path ----------------------------------
-  # --rm: container is removed on exit. Worktrees + .pila/ state persist on
+  # --rm: container is removed on exit. Worktrees + .leerie/ state persist on
   #       the host filesystem via the /work bind mount, so --resume still works.
   # Mount-table rationale lives in docs/IMPLEMENTATION.md §0.5.
   #
   # TTY flags adapt to whether the launcher itself has a controlling terminal:
   #   Terminal mode (real pty on stdin) → -it. The container gets a
-  #     controlling TTY; pila's log() lines stream live and the user can
+  #     controlling TTY; leerie's log() lines stream live and the user can
   #     answer `--clarify` prompts interactively via input().
   #   Plugin mode (Claude Code's Bash tool: no TTY) → -i only.
-  #     Inside the container, sys.stdin.isatty() returns False, so pila's
+  #     Inside the container, sys.stdin.isatty() returns False, so leerie's
   #     gather_answers and mid-execution clarification paths trigger the
-  #     existing EXIT_NEEDS_ANSWERS=10 flow: write .pila/pending-questions.json
+  #     existing EXIT_NEEDS_ANSWERS=10 flow: write .leerie/pending-questions.json
   #     (visible on the host via the /work bind mount), exit 10. The plugin
-  #     agent reads the file, asks the user in chat, writes .pila/answers.json,
+  #     agent reads the file, asks the user in chat, writes .leerie/answers.json,
   #     re-runs the container with --answers.
   # Ctrl-C (terminal) or harness cancellation (plugin) → SIGINT to container
   # PID 1 → orchestrator exits → kernel reaps the PID namespace (DESIGN §6
   # *Worker subtree termination*). The cleanup guarantee is identical in
   # both modes.
   # Require BOTH stdin and stdout to be TTYs before asking nerdctl for `-t`.
-  # Stdin alone is not enough: piping pila's output (e.g. `pila ... | tee log`)
+  # Stdin alone is not enough: piping leerie's output (e.g. `leerie ... | tee log`)
   # leaves stdin a TTY but redirects stdout through a pipe, and nerdctl rejects
   # `-t` against a non-console stdout with "provided file is not a console"
   # before the orchestrator gets a chance to run. Plugin mode (Bash tool: no
   # TTY on stdin) still collapses to `-i`, preserving the EXIT_NEEDS_ANSWERS=10
-  # file-passing contract documented in commands/pila.md.
+  # file-passing contract documented in commands/leerie.md.
   TTY_FLAGS="-i"
   [ -t 0 ] && [ -t 1 ] && TTY_FLAGS="-it"
 
@@ -1779,11 +1779,11 @@ else
   # uncapped behavior with one warn log line.
   nerdctl run \
     --rm $TTY_FLAGS \
-    --name "pila-$(date +%s)-$$" \
-    -e PILA_INSPECT_DIRS= \
+    --name "leerie-$(date +%s)-$$" \
+    -e LEERIE_INSPECT_DIRS= \
     --mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared \
     -v "$USER_REPO:/work" \
-    -v "$PILA_REPO:/opt/pila-image:ro" \
+    -v "$LEERIE_REPO:/opt/leerie-image:ro" \
     ${AUTH_MOUNTS[@]+"${AUTH_MOUNTS[@]}"} \
     ${CACHE_MOUNTS[@]+"${CACHE_MOUNTS[@]}"} \
     ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \
@@ -1793,7 +1793,7 @@ fi
 
 # --- host-side finalize (push + PR) -------------------------------------
 # DESIGN §6 *Finalization*: the container's phase_finalize writes
-# `finished_at` to .pila/runs/<run-id>/run.json and exits 0. The
+# `finished_at` to .leerie/runs/<run-id>/run.json and exits 0. The
 # launcher takes over from here, doing `git push` + `gh pr create` on
 # the HOST so the host's working auth state (gh token, ssh-agent,
 # Keychain) is what authenticates — no in-container forwarding required.
@@ -1802,18 +1802,18 @@ fi
 #   - container exited non-zero (run failed; nothing to push)
 #   - --no-push set (the user explicitly opted out)
 #   - the structured-exit code (EXIT_NEEDS_ANSWERS=10) — the launcher's
-#     plugin re-runs pila with --answers after the user responds.
+#     plugin re-runs leerie with --answers after the user responds.
 if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
   exit "$container_rc"
 fi
 
-# Locate the most-recent run dir under .pila/runs/ that has a run.json
+# Locate the most-recent run dir under .leerie/runs/ that has a run.json
 # with finished_at set. The orchestrator writes run.json at finalize.
 # `find` + sort isn't portable with -printf; iterate and pick newest.
 LATEST_RUN_DIR=""
 LATEST_RUN_MTIME=0
-if [ -d "$USER_REPO/.pila/runs" ]; then
-  for run_json in "$USER_REPO"/.pila/runs/*/run.json; do
+if [ -d "$USER_REPO/.leerie/runs" ]; then
+  for run_json in "$USER_REPO"/.leerie/runs/*/run.json; do
     [ -f "$run_json" ] || continue
     # finished_at must be present and non-null.
     if [ "$(jq -r '.finished_at // ""' "$run_json")" = "" ]; then
@@ -1847,8 +1847,8 @@ for arg in "$@"; do
 done
 export NO_VERIFY_PUSH
 
-# Push + PR creation are shared with the `pila --finalize <run-id>`
+# Push + PR creation are shared with the `leerie --finalize <run-id>`
 # fast-path; both source scripts/host-finalize.sh and call host_finalize.
 # shellcheck disable=SC1091
-. "$PILA_REPO/scripts/host-finalize.sh"
+. "$LEERIE_REPO/scripts/host-finalize.sh"
 host_finalize "$LATEST_RUN_DIR" || exit $?

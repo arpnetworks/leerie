@@ -18,22 +18,22 @@ import pytest
 
 # ----- cap rename ------------------------------------------------------------
 
-def test_subtask_continuations_default(pila):
+def test_subtask_continuations_default(leerie):
     """The unified per-subtask re-spawn budget — consumed by BOTH
     context-exhaustion handoffs and DESIGN §11 clarifications — is 3."""
-    assert pila.DEFAULT_CAPS["subtask_continuations"] == 3
+    assert leerie.DEFAULT_CAPS["subtask_continuations"] == 3
 
 
-def test_handoff_continuations_removed(pila):
+def test_handoff_continuations_removed(leerie):
     """The old separate cap name must not survive the rename — a
     consumer that reads it would silently get a KeyError at runtime."""
-    assert "handoff_continuations" not in pila.DEFAULT_CAPS
+    assert "handoff_continuations" not in leerie.DEFAULT_CAPS
 
 
 # ----- schema: status enum + clarification_question field --------------------
 
-def test_status_enum_includes_needs_clarification(pila):
-    impl = pila.SCHEMAS["implementer"]
+def test_status_enum_includes_needs_clarification(leerie):
+    impl = leerie.SCHEMAS["implementer"]
     enum = impl["properties"]["status"]["enum"]
     assert "needs-clarification" in enum
     # Existing enum values must still be present — the rename was
@@ -42,11 +42,11 @@ def test_status_enum_includes_needs_clarification(pila):
         assert expected in enum
 
 
-def test_clarification_question_field_shape(pila):
+def test_clarification_question_field_shape(leerie):
     """The clarification_question field, when present, must require all
     three sub-fields. The schema requirement is the structural defense
     against a worker shipping a half-formed question."""
-    impl = pila.SCHEMAS["implementer"]
+    impl = leerie.SCHEMAS["implementer"]
     cq = impl["properties"]["clarification_question"]
     # nullable
     assert "null" in cq["type"]
@@ -97,58 +97,58 @@ def _write_valid_checkpoint(tmp_path: Path) -> Path:
     return p
 
 
-def test_validate_result_passes_well_formed_clarification(pila, tmp_path):
+def test_validate_result_passes_well_formed_clarification(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
-    assert pila.validate_result(res) is None
+    assert leerie.validate_result(res) is None
 
 
-def test_validate_result_rejects_missing_clarification_question(pila, tmp_path):
+def test_validate_result_rejects_missing_clarification_question(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["clarification_question"] = None
-    err = pila.validate_result(res)
+    err = leerie.validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "clarification_question" in err[1]
     assert "DESIGN §11" in err[1]
 
 
-def test_validate_result_rejects_empty_question_field(pila, tmp_path):
+def test_validate_result_rejects_empty_question_field(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["clarification_question"]["question"] = ""
-    err = pila.validate_result(res)
+    err = leerie.validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "question" in err[1]
 
 
-def test_validate_result_rejects_empty_why_underivable(pila, tmp_path):
+def test_validate_result_rejects_empty_why_underivable(leerie, tmp_path):
     """`why_underivable` is the gate against the worker drifting toward
     'ask instead of research' (DESIGN §11). An empty value means the
     worker didn't justify the question — terminal."""
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["clarification_question"]["why_underivable"] = "   "
-    err = pila.validate_result(res)
+    err = leerie.validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "why_underivable" in err[1]
 
 
-def test_validate_result_rejects_missing_checkpoint_path(pila, tmp_path):
+def test_validate_result_rejects_missing_checkpoint_path(leerie, tmp_path):
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["checkpoint_path"] = None
-    err = pila.validate_result(res)
+    err = leerie.validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "checkpoint_path" in err[1]
     assert "work-in-progress must survive" in err[1]
 
 
-def test_validate_result_rejects_nonexistent_checkpoint_file(pila, tmp_path):
+def test_validate_result_rejects_nonexistent_checkpoint_file(leerie, tmp_path):
     """`needs-clarification` with a missing checkpoint is `"broken"`,
     not `"empty_handoff"` — a worker that asks a question with no
     work-in-progress to return to is lying about its own status. Only
@@ -156,19 +156,19 @@ def test_validate_result_rejects_nonexistent_checkpoint_file(pila, tmp_path):
     (see test_incomplete_handoff_with_nonexistent_checkpoint_returns_error
     in test_validate_result.py)."""
     res = _good_clarification_result(str(tmp_path / "ghost.md"))
-    err = pila.validate_result(res)
+    err = leerie.validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "does not exist" in err[1]
 
 
-def test_validate_result_rejects_empty_question_id(pila, tmp_path):
+def test_validate_result_rejects_empty_question_id(leerie, tmp_path):
     """Question id is the key for the answer in state.json. Empty id
     means the answer cannot be routed back — terminal."""
     cp = _write_valid_checkpoint(tmp_path)
     res = _good_clarification_result(str(cp))
     res["clarification_question"]["id"] = ""
-    err = pila.validate_result(res)
+    err = leerie.validate_result(res)
     assert err is not None
     assert err[0] == "broken"
     assert "id" in err[1]
@@ -176,9 +176,9 @@ def test_validate_result_rejects_empty_question_id(pila, tmp_path):
 
 # ----- existing invariants still hold (regression guard) ---------------------
 
-def test_incomplete_handoff_still_requires_checkpoint(pila):
+def test_incomplete_handoff_still_requires_checkpoint(leerie):
     """The cap rename did not affect this invariant; pin it."""
-    err = pila.validate_result({
+    err = leerie.validate_result({
         "subtask_id": "x", "status": "incomplete-handoff",
         "checkpoint_path": None,
     })
@@ -187,8 +187,8 @@ def test_incomplete_handoff_still_requires_checkpoint(pila):
     assert "incomplete-handoff" in err[1]
 
 
-def test_blocked_still_requires_blocker(pila):
-    err = pila.validate_result({
+def test_blocked_still_requires_blocker(leerie):
+    err = leerie.validate_result({
         "subtask_id": "x", "status": "blocked", "blocker": "",
     })
     assert err is not None

@@ -29,22 +29,22 @@ NONE_ENTRY = {"kind": "none", "command": [], "working_dir": ".",
               "timeout_s": 0}
 
 
-def test_empty_recipe_returns_none(pila):
-    assert pila._format_provision_recipe_section(
+def test_empty_recipe_returns_none(leerie):
+    assert leerie._format_provision_recipe_section(
         [], audience="implementer") is None
 
 
-def test_all_none_recipe_returns_none(pila):
+def test_all_none_recipe_returns_none(leerie):
     """Docs-only recipes only carry a `kind: none` entry; workers
     should see no injected section."""
-    assert pila._format_provision_recipe_section(
+    assert leerie._format_provision_recipe_section(
         [NONE_ENTRY], audience="implementer") is None
-    assert pila._format_provision_recipe_section(
+    assert leerie._format_provision_recipe_section(
         [NONE_ENTRY], audience="conformer") is None
 
 
-def test_implementer_audience_renders_advisory_framing(pila):
-    out = pila._format_provision_recipe_section(
+def test_implementer_audience_renders_advisory_framing(leerie):
+    out = leerie._format_provision_recipe_section(
         [PNPM_INSTALL], audience="implementer")
     assert out is not None
     assert "PROVISION_RECIPE:" in out
@@ -55,8 +55,8 @@ def test_implementer_audience_renders_advisory_framing(pila):
     assert "(cwd: ., timeout: 1800s)" in out
 
 
-def test_conformer_audience_emphasizes_pre_build_install(pila):
-    out = pila._format_provision_recipe_section(
+def test_conformer_audience_emphasizes_pre_build_install(leerie):
+    out = leerie._format_provision_recipe_section(
         [PNPM_INSTALL], audience="conformer")
     assert out is not None
     assert "PROVISION_RECIPE:" in out
@@ -65,10 +65,10 @@ def test_conformer_audience_emphasizes_pre_build_install(pila):
     assert "ensure deps and any required build artifacts" in out
 
 
-def test_polyglot_recipe_renders_every_install_entry(pila):
+def test_polyglot_recipe_renders_every_install_entry(leerie):
     """A polyglot repo (e.g. Rails-with-frontend, Go-with-Node) emits
     multiple install entries. All non-`none` entries must appear."""
-    out = pila._format_provision_recipe_section(
+    out = leerie._format_provision_recipe_section(
         [PNPM_INSTALL, GO_DOWNLOAD], audience="implementer")
     assert out is not None
     assert "pnpm install --frozen-lockfile" in out
@@ -78,10 +78,10 @@ def test_polyglot_recipe_renders_every_install_entry(pila):
     assert "2. go mod download" in out
 
 
-def test_none_entries_are_skipped_in_mixed_recipe(pila):
+def test_none_entries_are_skipped_in_mixed_recipe(leerie):
     """A recipe with a `none` entry alongside real installs renders
     only the real installs (and renumbers them)."""
-    out = pila._format_provision_recipe_section(
+    out = leerie._format_provision_recipe_section(
         [NONE_ENTRY, PNPM_INSTALL], audience="implementer")
     assert out is not None
     assert "1. pnpm install --frozen-lockfile" in out
@@ -90,9 +90,9 @@ def test_none_entries_are_skipped_in_mixed_recipe(pila):
         assert "none" not in line.lower() or "PROVISION_RECIPE" in line
 
 
-def test_unknown_audience_raises(pila):
+def test_unknown_audience_raises(leerie):
     """Defensive check — a typo in the call site shouldn't silently
     fall back to a default framing."""
     with pytest.raises(ValueError, match="unknown audience"):
-        pila._format_provision_recipe_section(
+        leerie._format_provision_recipe_section(
             [PNPM_INSTALL], audience="planner")

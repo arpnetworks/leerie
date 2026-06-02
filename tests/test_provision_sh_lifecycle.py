@@ -1,6 +1,6 @@
 """Tests for scripts/remote/provision.sh.
 
-provision.sh is sourced (not exec'd) by the pila launcher's REMOTE=true
+provision.sh is sourced (not exec'd) by the leerie launcher's REMOTE=true
 branch.  These tests exercise the script's bash logic in isolation via
 subprocess, with flyctl stubbed out so no real Fly.io calls are made.
 """
@@ -52,7 +52,7 @@ def test_provision_machine_fails_when_flyctl_missing():
     result = _run_bash(
         f"source {PROVISION_SH}; provision_machine",
         env={
-            "FLY_IMAGE_TAG": "registry.fly.io/pila:test",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
             "PATH": "/usr/bin:/bin",  # no flyctl here
         },
     )
@@ -61,9 +61,9 @@ def test_provision_machine_fails_when_flyctl_missing():
 
 
 def test_destroy_machine_noop_when_no_machine_id():
-    """destroy_machine is idempotent: returns 0 when PILA_MACHINE_ID is empty."""
+    """destroy_machine is idempotent: returns 0 when LEERIE_MACHINE_ID is empty."""
     result = _run_bash(
-        f"source {PROVISION_SH}; PILA_MACHINE_ID=''; destroy_machine; echo 'ok'",
+        f"source {PROVISION_SH}; LEERIE_MACHINE_ID=''; destroy_machine; echo 'ok'",
     )
     assert result.returncode == 0
     assert "ok" in result.stdout
@@ -83,7 +83,7 @@ def test_provision_machine_fails_when_flyctl_unauthenticated(tmp_path):
     result = _run_bash(
         f"source {PROVISION_SH}; provision_machine",
         env={
-            "FLY_IMAGE_TAG": "registry.fly.io/pila:test",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )
@@ -92,7 +92,7 @@ def test_provision_machine_fails_when_flyctl_unauthenticated(tmp_path):
 
 
 def test_provision_machine_exports_machine_id_on_success(tmp_path):
-    """provision_machine exports PILA_MACHINE_ID on successful create + started."""
+    """provision_machine exports LEERIE_MACHINE_ID on successful create + started."""
     # Stub flyctl: auth succeeds, machine run returns text containing
     # "Machine ID: <id>" (the real flyctl format — `flyctl machine run`
     # does NOT support --json), status returns JSON started.
@@ -115,9 +115,9 @@ def test_provision_machine_exports_machine_id_on_success(tmp_path):
     fake_flyctl.chmod(0o755)
 
     result = _run_bash(
-        f"source {PROVISION_SH}; provision_machine && echo \"machine=$PILA_MACHINE_ID\"",
+        f"source {PROVISION_SH}; provision_machine && echo \"machine=$LEERIE_MACHINE_ID\"",
         env={
-            "FLY_IMAGE_TAG": "registry.fly.io/pila:test",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )
@@ -149,7 +149,7 @@ def test_destroy_machine_called_on_exit_trap(tmp_path):
     result = _run_bash(
         f"( source {PROVISION_SH}; provision_machine )",
         env={
-            "FLY_IMAGE_TAG": "registry.fly.io/pila:test",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
         },
     )

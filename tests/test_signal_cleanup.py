@@ -21,32 +21,32 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PILA_PY = REPO_ROOT / "orchestrator" / "pila.py"
+LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 
 # --- InterruptedBySignal --------------------------------------------------
 
-def test_interrupted_by_signal_is_base_exception(pila):
+def test_interrupted_by_signal_is_base_exception(leerie):
     """Must subclass BaseException (not Exception) so the broad
     `except Exception` handlers inside orchestrate() don't swallow it."""
-    assert issubclass(pila.InterruptedBySignal, BaseException)
-    assert not issubclass(pila.InterruptedBySignal, Exception)
+    assert issubclass(leerie.InterruptedBySignal, BaseException)
+    assert not issubclass(leerie.InterruptedBySignal, Exception)
 
 
 # --- _install_signal_handlers --------------------------------------------
 
-def test_install_signal_handlers_registers_sigterm(pila, monkeypatch):
+def test_install_signal_handlers_registers_sigterm(leerie, monkeypatch):
     """SIGTERM gets a custom handler installed."""
     installed: dict = {}
 
     def fake_signal(signum, handler):
         installed[signum] = handler
-    monkeypatch.setattr(pila.signal, "signal", fake_signal)
-    pila._install_signal_handlers()
+    monkeypatch.setattr(leerie.signal, "signal", fake_signal)
+    leerie._install_signal_handlers()
     assert _signal.SIGTERM in installed
 
 
-def test_install_signal_handlers_registers_sighup_on_posix(pila, monkeypatch):
+def test_install_signal_handlers_registers_sighup_on_posix(leerie, monkeypatch):
     """SIGHUP gets a handler too, when available."""
     if not hasattr(_signal, "SIGHUP"):
         pytest.skip("SIGHUP not available on this platform")
@@ -54,12 +54,12 @@ def test_install_signal_handlers_registers_sighup_on_posix(pila, monkeypatch):
 
     def fake_signal(signum, handler):
         installed[signum] = handler
-    monkeypatch.setattr(pila.signal, "signal", fake_signal)
-    pila._install_signal_handlers()
+    monkeypatch.setattr(leerie.signal, "signal", fake_signal)
+    leerie._install_signal_handlers()
     assert _signal.SIGHUP in installed
 
 
-def test_install_signal_handlers_does_not_touch_sigint(pila, monkeypatch):
+def test_install_signal_handlers_does_not_touch_sigint(leerie, monkeypatch):
     """SIGINT must keep Python's default (KeyboardInterrupt) — not
     intercepted by InterruptedBySignal. main() handles KeyboardInterrupt
     separately for the full-purge path."""
@@ -67,22 +67,22 @@ def test_install_signal_handlers_does_not_touch_sigint(pila, monkeypatch):
 
     def fake_signal(signum, handler):
         installed[signum] = handler
-    monkeypatch.setattr(pila.signal, "signal", fake_signal)
-    pila._install_signal_handlers()
+    monkeypatch.setattr(leerie.signal, "signal", fake_signal)
+    leerie._install_signal_handlers()
     assert _signal.SIGINT not in installed
 
 
-def test_signal_handler_raises_interrupted_by_signal(pila, monkeypatch):
+def test_signal_handler_raises_interrupted_by_signal(leerie, monkeypatch):
     """When the installed SIGTERM handler is invoked, it raises
     InterruptedBySignal — that's what bubbles up to main()."""
     handlers: dict = {}
 
     def fake_signal(signum, handler):
         handlers[signum] = handler
-    monkeypatch.setattr(pila.signal, "signal", fake_signal)
-    pila._install_signal_handlers()
+    monkeypatch.setattr(leerie.signal, "signal", fake_signal)
+    leerie._install_signal_handlers()
     handler = handlers[_signal.SIGTERM]
-    with pytest.raises(pila.InterruptedBySignal):
+    with pytest.raises(leerie.InterruptedBySignal):
         handler(_signal.SIGTERM, None)
 
 
@@ -96,13 +96,13 @@ class _FakeState:
         self.run_dir = run_dir
 
 
-def test_cleanup_handles_none_state_gracefully(pila):
+def test_cleanup_handles_none_state_gracefully(leerie):
     """Defensive: cleanup early-returns on a None state rather than
     raising. Used when main() bails before constructing State."""
-    pila._cleanup_on_abnormal_exit(None, full_purge=False)  # must not raise
+    leerie._cleanup_on_abnormal_exit(None, full_purge=False)  # must not raise
 
 
-def test_cleanup_removes_worktrees_dir(pila, tmp_path, monkeypatch):
+def test_cleanup_removes_worktrees_dir(leerie, tmp_path, monkeypatch):
     """_cleanup_on_abnormal_exit calls `git worktree remove --force` for
     each subdir of run_dir/worktrees/. Test by stubbing subprocess.run
     and confirming the calls."""
@@ -116,9 +116,9 @@ def test_cleanup_removes_worktrees_dir(pila, tmp_path, monkeypatch):
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         return subprocess.CompletedProcess(cmd, 0, "", "")
-    monkeypatch.setattr(pila.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
 
-    pila._cleanup_on_abnormal_exit(st, full_purge=False)
+    leerie._cleanup_on_abnormal_exit(st, full_purge=False)
 
     # Two worktree-remove calls + one prune.
     remove_calls = [c for c in calls if c[:3] == ["git", "worktree", "remove"]]
@@ -126,7 +126,7 @@ def test_cleanup_removes_worktrees_dir(pila, tmp_path, monkeypatch):
     assert any(c for c in calls if c == ["git", "worktree", "prune"])
 
 
-def test_cleanup_full_purge_deletes_run_dir(pila, tmp_path, monkeypatch):
+def test_cleanup_full_purge_deletes_run_dir(leerie, tmp_path, monkeypatch):
     """With full_purge=True, the run_dir is removed via shutil.rmtree."""
     run_id = "feat-x-aaa111"
     run_dir = tmp_path / "runs" / run_id
@@ -134,17 +134,17 @@ def test_cleanup_full_purge_deletes_run_dir(pila, tmp_path, monkeypatch):
     (run_dir / "state.json").write_text("{}")
     st = _FakeState(run_id, run_dir)
 
-    monkeypatch.setattr(pila.subprocess, "run",
+    monkeypatch.setattr(leerie.subprocess, "run",
                         lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", ""))
 
     assert run_dir.exists()
-    pila._cleanup_on_abnormal_exit(st, full_purge=True)
+    leerie._cleanup_on_abnormal_exit(st, full_purge=True)
     assert not run_dir.exists(), (
         "full_purge=True must remove the run_dir entirely"
     )
 
 
-def test_cleanup_rm_rf_fallback_when_git_leaves_dir(pila, tmp_path,
+def test_cleanup_rm_rf_fallback_when_git_leaves_dir(leerie, tmp_path,
                                                     monkeypatch):
     """When `git worktree remove` returns nonzero (or zero) but does NOT
     actually delete the directory — e.g. git already pruned the worktree
@@ -170,10 +170,10 @@ def test_cleanup_rm_rf_fallback_when_git_leaves_dir(pila, tmp_path,
     # nonzero because the worktree isn't tracked).
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1, "", "fatal: not a worktree")
-    monkeypatch.setattr(pila.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
 
     assert wt_a.exists()
-    pila._cleanup_on_abnormal_exit(st, full_purge=False)
+    leerie._cleanup_on_abnormal_exit(st, full_purge=False)
     assert not wt_a.exists(), (
         "cleanup must rm -rf the worktree dir when git worktree remove "
         "leaves it behind, otherwise --resume's new-worktree.sh will "
@@ -182,7 +182,7 @@ def test_cleanup_rm_rf_fallback_when_git_leaves_dir(pila, tmp_path,
     )
 
 
-def test_cleanup_rm_rf_fallback_after_timeout(pila, tmp_path, monkeypatch):
+def test_cleanup_rm_rf_fallback_after_timeout(leerie, tmp_path, monkeypatch):
     """Mirror of the above for the timeout case: subprocess.TimeoutExpired
     is raised mid-removal, but the directory survives (with partial
     contents). Cleanup must still fall back to rm -rf so the surviving
@@ -199,16 +199,16 @@ def test_cleanup_rm_rf_fallback_after_timeout(pila, tmp_path, monkeypatch):
         if cmd[:3] == ["git", "worktree", "remove"]:
             raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
         return subprocess.CompletedProcess(cmd, 0, "", "")
-    monkeypatch.setattr(pila.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
 
-    pila._cleanup_on_abnormal_exit(st, full_purge=False)
+    leerie._cleanup_on_abnormal_exit(st, full_purge=False)
     assert not wt_a.exists(), (
         "cleanup must rm -rf after a TimeoutExpired so the surviving "
         "dir doesn't persist across runs."
     )
 
 
-def test_cleanup_rm_rf_skips_when_path_escapes_sandbox(pila, tmp_path,
+def test_cleanup_rm_rf_skips_when_path_escapes_sandbox(leerie, tmp_path,
                                                       monkeypatch):
     """Belt-and-suspenders: the rm -rf fallback must verify the
     resolved path lies within the worktrees dir before deleting. If a
@@ -230,9 +230,9 @@ def test_cleanup_rm_rf_skips_when_path_escapes_sandbox(pila, tmp_path,
 
     def fake_run(cmd, **kwargs):
         return subprocess.CompletedProcess(cmd, 1, "", "")
-    monkeypatch.setattr(pila.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
 
-    pila._cleanup_on_abnormal_exit(st, full_purge=False)
+    leerie._cleanup_on_abnormal_exit(st, full_purge=False)
     # The symlink itself may or may not survive (resolve depends on
     # what counts as a directory iteration), but the OUTSIDE target
     # must survive — that's the load-bearing invariant.
@@ -241,7 +241,7 @@ def test_cleanup_rm_rf_skips_when_path_escapes_sandbox(pila, tmp_path,
     assert (outside / "important.txt").read_text() == "do not delete"
 
 
-def test_cleanup_no_purge_preserves_run_dir(pila, tmp_path, monkeypatch):
+def test_cleanup_no_purge_preserves_run_dir(leerie, tmp_path, monkeypatch):
     """full_purge=False leaves the run_dir intact (worktrees may be
     removed, but state.json and the dir itself survive)."""
     run_id = "feat-x-aaa111"
@@ -250,15 +250,15 @@ def test_cleanup_no_purge_preserves_run_dir(pila, tmp_path, monkeypatch):
     (run_dir / "state.json").write_text("{}")
     st = _FakeState(run_id, run_dir)
 
-    monkeypatch.setattr(pila.subprocess, "run",
+    monkeypatch.setattr(leerie.subprocess, "run",
                         lambda *a, **kw: subprocess.CompletedProcess(a[0], 0, "", ""))
 
-    pila._cleanup_on_abnormal_exit(st, full_purge=False)
+    leerie._cleanup_on_abnormal_exit(st, full_purge=False)
     assert run_dir.exists(), "full_purge=False must preserve the run_dir"
     assert (run_dir / "state.json").exists(), "state.json must survive non-purge cleanup"
 
 
-def test_cleanup_full_purge_deletes_branches(pila, tmp_path, monkeypatch):
+def test_cleanup_full_purge_deletes_branches(leerie, tmp_path, monkeypatch):
     """full_purge=True invokes `git for-each-ref` to enumerate branches
     and `git branch -D` to delete each one."""
     run_id = "feat-x-aaa111"
@@ -267,28 +267,28 @@ def test_cleanup_full_purge_deletes_branches(pila, tmp_path, monkeypatch):
     st = _FakeState(run_id, run_dir)
 
     branches_to_delete = [
-        f"pila/runs/{run_id}",
-        f"pila/subtasks/{run_id}/feat-001",
+        f"leerie/runs/{run_id}",
+        f"leerie/subtasks/{run_id}/feat-001",
     ]
     calls: list[list[str]] = []
 
     def fake_run(cmd, **kwargs):
         calls.append(list(cmd))
         if cmd[:2] == ["git", "for-each-ref"]:
-            # The cleanup walks two globs: refs/heads/pila/runs/<id>
-            # (the run branch, exact match) and refs/heads/pila/subtasks/<id>/
+            # The cleanup walks two globs: refs/heads/leerie/runs/<id>
+            # (the run branch, exact match) and refs/heads/leerie/subtasks/<id>/
             # (the subtask-branch prefix). Distinguish by the runs/ vs subtasks/
             # segment so each glob returns the matching branch.
             glob = cmd[3]
-            if glob == f"refs/heads/pila/runs/{run_id}":
-                return subprocess.CompletedProcess(cmd, 0, f"pila/runs/{run_id}\n", "")
-            if glob == f"refs/heads/pila/subtasks/{run_id}/":
-                return subprocess.CompletedProcess(cmd, 0, f"pila/subtasks/{run_id}/feat-001\n", "")
+            if glob == f"refs/heads/leerie/runs/{run_id}":
+                return subprocess.CompletedProcess(cmd, 0, f"leerie/runs/{run_id}\n", "")
+            if glob == f"refs/heads/leerie/subtasks/{run_id}/":
+                return subprocess.CompletedProcess(cmd, 0, f"leerie/subtasks/{run_id}/feat-001\n", "")
             return subprocess.CompletedProcess(cmd, 0, "", "")
         return subprocess.CompletedProcess(cmd, 0, "", "")
-    monkeypatch.setattr(pila.subprocess, "run", fake_run)
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
 
-    pila._cleanup_on_abnormal_exit(st, full_purge=True)
+    leerie._cleanup_on_abnormal_exit(st, full_purge=True)
 
     delete_calls = [c for c in calls if c[:3] == ["git", "branch", "-D"]]
     assert len(delete_calls) == 2, f"expected 2 branch deletes, got {delete_calls}"
@@ -297,8 +297,8 @@ def test_cleanup_full_purge_deletes_branches(pila, tmp_path, monkeypatch):
 # --- main() try/except/finally pinning -----------------------------------
 
 def _main_body() -> str:
-    """Extract main()'s body from pila.py source."""
-    src = PILA_PY.read_text()
+    """Extract main()'s body from leerie.py source."""
+    src = LEERIE_PY.read_text()
     m = re.search(
         r"^def main\(\) -> None:\n(.*?)(?=^(?:def |class |if __name__))",
         src, re.DOTALL | re.MULTILINE,
@@ -438,11 +438,11 @@ def test_main_system_exit_not_treated_as_unhandled():
 # subprocesses outlive the worker and reparent to PID 1).
 
 def test_every_subprocess_spawn_uses_start_new_session():
-    """Static: every `asyncio.create_subprocess_exec` in pila.py must
+    """Static: every `asyncio.create_subprocess_exec` in leerie.py must
     pass `start_new_session=True` so the worker is isolated into its own
     POSIX session. This is required so that on cleanup, `os.killpg(proc.pid)`
     does not accidentally signal the orchestrator's own process group."""
-    src = PILA_PY.read_text()
+    src = LEERIE_PY.read_text()
     # Find every create_subprocess_exec(...) call. Match across lines
     # via DOTALL; bound on the closing `)` at the natural call indent.
     calls = re.findall(
@@ -450,7 +450,7 @@ def test_every_subprocess_spawn_uses_start_new_session():
         src, re.DOTALL,
     )
     assert calls, ("expected at least one create_subprocess_exec call "
-                   "in pila.py")
+                   "in leerie.py")
     for i, body in enumerate(calls):
         assert "start_new_session=True" in body, (
             f"create_subprocess_exec call #{i + 1} is missing "
@@ -462,9 +462,9 @@ def test_every_subprocess_spawn_uses_start_new_session():
         )
 
 
-def test_no_bare_proc_kill_outside_terminate_proc_tree(pila):
+def test_no_bare_proc_kill_outside_terminate_proc_tree(leerie):
     """Static: `proc.kill()` (which kills only the direct child PID)
-    must not appear anywhere in pila.py. Every subprocess-cleanup path
+    must not appear anywhere in leerie.py. Every subprocess-cleanup path
     must instead route through `_terminate_proc_tree`, which combines
     `killpg` on the leader's group with a PPID walk to reach detached
     descendants (Claude Code's Bash tool runs in its own POSIX session,
@@ -473,12 +473,12 @@ def test_no_bare_proc_kill_outside_terminate_proc_tree(pila):
     A regression that puts `proc.kill()` back into `run_proc` or
     `_invoke`'s exception handlers would silently re-leak the
     detached descendants. This test pins that against drift."""
-    src = PILA_PY.read_text()
+    src = LEERIE_PY.read_text()
     # Locate _terminate_proc_tree's body so we can exclude it from
     # the scan (defensive — the current implementation doesn't call
     # proc.kill() either, but we don't want this test to lock the
     # helper's internal mechanism).
-    helper_src = inspect.getsource(pila._terminate_proc_tree)
+    helper_src = inspect.getsource(leerie._terminate_proc_tree)
     src_outside_helper = src.replace(helper_src, "")
     matches = re.findall(r"\bproc\.kill\(\)", src_outside_helper)
     assert not matches, (
@@ -495,13 +495,13 @@ def test_run_proc_and_invoke_exception_handlers_call_terminate_proc_tree():
     """Static: both subprocess wrappers' `except` blocks must invoke
     `_terminate_proc_tree`. Source-pin to catch the case where someone
     refactors and accidentally drops one of the four handlers."""
-    src = PILA_PY.read_text()
+    src = LEERIE_PY.read_text()
     # `run_proc`: from its def to the matching `return subprocess.CompletedProcess`
     m_run = re.search(
         r"async def run_proc\(.*?\n    return subprocess\.CompletedProcess",
         src, re.DOTALL,
     )
-    assert m_run, "could not locate run_proc body in pila.py"
+    assert m_run, "could not locate run_proc body in leerie.py"
     run_proc_body = m_run.group(0)
     # `_invoke` is a top-level `async def`. Bound on the next top-level
     # def (also flush-left) so we don't bleed into _capture_call or
@@ -510,7 +510,7 @@ def test_run_proc_and_invoke_exception_handlers_call_terminate_proc_tree():
         r"\nasync def _invoke\(.*?\n(?=async def |def )",
         src, re.DOTALL,
     )
-    assert m_inv, "could not locate _invoke body in pila.py"
+    assert m_inv, "could not locate _invoke body in leerie.py"
     invoke_body = m_inv.group(0)
 
     for label, body in [("run_proc", run_proc_body), ("_invoke", invoke_body)]:
@@ -547,7 +547,7 @@ def test_run_proc_and_invoke_exception_handlers_call_terminate_proc_tree():
     reason="start_new_session is a no-op on Windows; the POSIX "
            "process-group semantics this test exercises don't apply.",
 )
-def test_terminate_proc_tree_reaps_grandchildren(pila):
+def test_terminate_proc_tree_reaps_grandchildren(leerie):
     """Behavioral: spawn a subprocess with start_new_session=True that
     itself launches a long-running grandchild, then call
     _terminate_proc_tree and assert the grandchild is gone.
@@ -587,7 +587,7 @@ def test_terminate_proc_tree_reaps_grandchildren(pila):
         assert _pid_alive(grandchild_pid), "grandchild never started"
 
         try:
-            await pila._terminate_proc_tree(proc)
+            await leerie._terminate_proc_tree(proc)
         finally:
             # Safety net: if the helper somehow didn't reap the
             # grandchild, do it ourselves so a failing test doesn't
@@ -640,8 +640,8 @@ def _pid_alive(pid: int) -> bool:
     os.name == "nt",
     reason="PPID walk + start_new_session semantics are POSIX-only.",
 )
-def test_terminate_proc_tree_reaps_detached_session_grandchildren(pila):
-    """Pila's worker (`claude -p`) spawns the Claude Code Bash tool via
+def test_terminate_proc_tree_reaps_detached_session_grandchildren(leerie):
+    """Leerie's worker (`claude -p`) spawns the Claude Code Bash tool via
     `spawn({detached: true})`, which puts the Bash tool subprocess into a
     NEW POSIX session — its PGID == its own PID, distinct from the
     worker's PGID. `os.killpg(worker_pgid)` does NOT reach it.
@@ -657,7 +657,7 @@ def test_terminate_proc_tree_reaps_detached_session_grandchildren(pila):
     import time
 
     # Mimic Claude Code's spawn({detached: true}) by having the worker
-    # spawn its child with start_new_session=True. Pila wouldn't use
+    # spawn its child with start_new_session=True. Leerie wouldn't use
     # this pattern for its own subprocesses, but `claude -p` does, and
     # `_terminate_proc_tree` must handle it.
     WORKER_PYTHON = (
@@ -680,7 +680,7 @@ def test_terminate_proc_tree_reaps_detached_session_grandchildren(pila):
         # Wait for the detached bash + its sleeps to appear
         for _ in range(40):
             await asyncio.sleep(0.1)
-            descs = pila._enumerate_descendants(proc.pid)
+            descs = leerie._enumerate_descendants(proc.pid)
             if len(descs) >= 3:  # bash + 2 sleeps
                 break
         else:
@@ -719,7 +719,7 @@ def test_terminate_proc_tree_reaps_detached_session_grandchildren(pila):
         # Run the fix. All descendants must die — including the ones in
         # the detached session that killpg(worker_pgid) cannot reach.
         try:
-            await pila._terminate_proc_tree(proc)
+            await leerie._terminate_proc_tree(proc)
         finally:
             # Safety net so a broken helper doesn't leak a 5-minute sleep
             for d in descs:
@@ -752,7 +752,7 @@ def test_terminate_proc_tree_reaps_detached_session_grandchildren(pila):
     os.name == "nt",
     reason="POSIX-only test.",
 )
-def test_descendant_tracker_reaps_orphaned_backgrounded_subprocess(pila):
+def test_descendant_tracker_reaps_orphaned_backgrounded_subprocess(leerie):
     """Even on a clean leader exit, Claude Code's `run_in_background:
     true` Bash tool calls leak — the backgrounded subprocesses are spawned
     in detached POSIX sessions and reparent to PID 1 the moment their
@@ -779,7 +779,7 @@ def test_descendant_tracker_reaps_orphaned_backgrounded_subprocess(pila):
             stderr=asyncio.subprocess.PIPE,
             start_new_session=True,
         )
-        tracker = pila._DescendantTracker(proc.pid)
+        tracker = leerie._DescendantTracker(proc.pid)
         tracker.start()
         # Read the sleep PID off stdout
         line = await proc.stdout.readline()
@@ -819,7 +819,7 @@ def test_descendant_tracker_reaps_orphaned_backgrounded_subprocess(pila):
     os.name == "nt",
     reason="POSIX-only test.",
 )
-def test_enumerate_descendants_returns_indirect_children(pila):
+def test_enumerate_descendants_returns_indirect_children(leerie):
     """`_enumerate_descendants(root_pid)` must walk transitively, not just
     list direct children. Spawn a 3-deep chain and assert all 3 are
     found."""
@@ -837,7 +837,7 @@ def test_enumerate_descendants_returns_indirect_children(pila):
     import time
     time.sleep(1.5)
     try:
-        descs = pila._enumerate_descendants(leader.pid)
+        descs = leerie._enumerate_descendants(leader.pid)
         # Should find: inner bash (level 1), sleep (level 2)
         assert len(descs) >= 2, (
             f"_enumerate_descendants found only {len(descs)} descendants "
@@ -850,23 +850,23 @@ def test_enumerate_descendants_returns_indirect_children(pila):
         leader.wait()
 
 
-def test_enumerate_descendants_returns_empty_for_nonexistent_pid(pila):
+def test_enumerate_descendants_returns_empty_for_nonexistent_pid(leerie):
     """Sanity: a sentinel PID with no children returns empty set."""
-    assert pila._enumerate_descendants(999_999_999) == set()
+    assert leerie._enumerate_descendants(999_999_999) == set()
 
 
 @pytest.mark.skipif(
     os.name == "nt",
     reason="POSIX-only test.",
 )
-def test_descendant_tracker_is_safe_on_nonexistent_pid(pila):
+def test_descendant_tracker_is_safe_on_nonexistent_pid(leerie):
     """`_DescendantTracker(sentinel_pid).stop_and_reap()` must not raise —
     used in `_invoke`'s success path and must be idempotent even when the
     leader has no descendants at all."""
     import asyncio
 
     async def _run():
-        tracker = pila._DescendantTracker(999_999_999)
+        tracker = leerie._DescendantTracker(999_999_999)
         tracker.start()
         await asyncio.sleep(0.1)  # one poll cycle
         leaked = await tracker.stop_and_reap()
@@ -882,7 +882,7 @@ def test_descendant_tracker_is_safe_on_nonexistent_pid(pila):
     os.name == "nt",
     reason="POSIX-only test.",
 )
-def test_descendant_tracker_records_descendants_during_lifetime(pila):
+def test_descendant_tracker_records_descendants_during_lifetime(leerie):
     """Verify the tracker actually accumulates PIDs across multiple poll
     cycles, not just at start or stop. This guards against a regression
     where the poll loop is broken (e.g. caught CancelledError too eagerly)
@@ -897,7 +897,7 @@ def test_descendant_tracker_records_descendants_during_lifetime(pila):
             stderr=asyncio.subprocess.DEVNULL,
             start_new_session=True,
         )
-        tracker = pila._DescendantTracker(leader.pid)
+        tracker = leerie._DescendantTracker(leader.pid)
         tracker.start()
         # Wait for at least 2 poll cycles to catch the sleep
         await asyncio.sleep(1.5)

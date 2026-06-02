@@ -76,7 +76,7 @@ def _blocked_plan(domain: str, gap: dict | None = None) -> dict:
     }
 
 
-def test_all_blocked_dies_with_informative_message(pila, capsys):
+def test_all_blocked_dies_with_informative_message(leerie, capsys):
     """When every planner blocked, schedule() dies citing each blocked
     domain and pointing the user at the configurable knob and the gap
     field — not the generic 'no subtasks' message."""
@@ -85,7 +85,7 @@ def test_all_blocked_dies_with_informative_message(pila, capsys):
         _blocked_plan("bug-fixing"),
     ]
     with pytest.raises(SystemExit) as exc:
-        pila.schedule(plans)
+        leerie.schedule(plans)
     assert exc.value.code != 0
     err = capsys.readouterr().err
     # Specific blocked domains are named so the user knows which planners
@@ -97,7 +97,7 @@ def test_all_blocked_dies_with_informative_message(pila, capsys):
     assert "gap_to_close" in err
 
 
-def test_partial_block_emits_warning_and_proceeds(pila, capsys):
+def test_partial_block_emits_warning_and_proceeds(leerie, capsys):
     """When some planners block but at least one produced subtasks,
     schedule() must succeed AND log a WARNING naming the blocked
     domain(s). Silent loss of a domain is the footgun this test guards
@@ -106,7 +106,7 @@ def test_partial_block_emits_warning_and_proceeds(pila, capsys):
         _ready_plan("feature-implementation", _good_subtask("feat-001")),
         _blocked_plan("bug-fixing"),
     ]
-    subtasks, waves = pila.schedule(plans)
+    subtasks, waves = leerie.schedule(plans)
     # Scheduling proceeded with the ready domain's subtasks.
     assert "feat-001" in subtasks
     assert any("feat-001" in wave for wave in waves)
@@ -117,20 +117,20 @@ def test_partial_block_emits_warning_and_proceeds(pila, capsys):
     assert "bug-fixing" in out
 
 
-def test_all_ready_no_warning(pila, capsys):
+def test_all_ready_no_warning(leerie, capsys):
     """No blocked planners → no WARNING line. Sanity check that the
     warning fires only on the partial-block path, not unconditionally."""
     plans = [
         _ready_plan("feature-implementation", _good_subtask("feat-001")),
         _ready_plan("testing", _good_subtask("test-001")),
     ]
-    subtasks, _waves = pila.schedule(plans)
+    subtasks, _waves = leerie.schedule(plans)
     assert set(subtasks.keys()) == {"feat-001", "test-001"}
     out = capsys.readouterr().out
     assert "WARNING" not in out
 
 
-def test_blocked_domain_without_subtasks_does_not_contribute_provides(pila):
+def test_blocked_domain_without_subtasks_does_not_contribute_provides(leerie):
     """Sanity: a blocked planner has subtasks=[], so it provides nothing.
     A ready sibling that requires a capability the blocked planner would
     have provided will fail validate_plan (tested separately); schedule()
@@ -143,14 +143,14 @@ def test_blocked_domain_without_subtasks_does_not_contribute_provides(pila):
         _ready_plan("feature-implementation", _good_subtask("feat-001")),
         _blocked_plan("refactoring"),
     ]
-    subtasks, _waves = pila.schedule(plans)
+    subtasks, _waves = leerie.schedule(plans)
     # Only the ready domain's subtask is in the merged map.
     assert list(subtasks.keys()) == ["feat-001"]
 
 
 # ----- detect_no_work (DESIGN §8 cleared-but-empty terminal state) ---------
 
-def test_detect_no_work_all_ready_empty(pila):
+def test_detect_no_work_all_ready_empty(leerie):
     """All planners returned status=ready with no subtasks → returns
     a {domain: basis} map quoting each planner's confidence.basis.
 
@@ -161,14 +161,14 @@ def test_detect_no_work_all_ready_empty(pila):
         _ready_plan("bug-fixing", basis="HEAD already ships the fix"),
         _ready_plan("testing", basis="regression test already exists"),
     ]
-    out = pila.detect_no_work(plans)
+    out = leerie.detect_no_work(plans)
     assert out == {
         "bug-fixing": "HEAD already ships the fix",
         "testing": "regression test already exists",
     }
 
 
-def test_detect_no_work_returns_none_when_any_subtasks(pila):
+def test_detect_no_work_returns_none_when_any_subtasks(leerie):
     """If any planner produced subtasks, that's a normal run — return
     None so schedule() proceeds. An empty-but-ready sibling simply
     contributes zero subtasks to the merged plan, which is fine."""
@@ -177,10 +177,10 @@ def test_detect_no_work_returns_none_when_any_subtasks(pila):
         _ready_plan("feature-implementation",
                     _good_subtask("feat-001"), basis="one subtask"),
     ]
-    assert pila.detect_no_work(plans) is None
+    assert leerie.detect_no_work(plans) is None
 
 
-def test_detect_no_work_returns_none_when_any_blocked(pila):
+def test_detect_no_work_returns_none_when_any_blocked(leerie):
     """An empty-ready + blocked mix is NOT a no-work outcome — a
     blocker is a gate failure the user must see. Return None so
     schedule()'s existing all-blocked die() path can fire."""
@@ -188,17 +188,17 @@ def test_detect_no_work_returns_none_when_any_blocked(pila):
         _ready_plan("bug-fixing", basis="nothing to fix"),
         _blocked_plan("testing"),
     ]
-    assert pila.detect_no_work(plans) is None
+    assert leerie.detect_no_work(plans) is None
     # And the existing all-blocked die() still fires for the
     # blocked-only case (regression guard that detect_no_work didn't
     # accidentally swallow the blocked path).
     blocked_only = [_blocked_plan("bug-fixing"), _blocked_plan("testing")]
-    assert pila.detect_no_work(blocked_only) is None
+    assert leerie.detect_no_work(blocked_only) is None
     with pytest.raises(SystemExit):
-        pila.schedule(blocked_only)
+        leerie.schedule(blocked_only)
 
 
-def test_detect_no_work_basis_missing_falls_back(pila):
+def test_detect_no_work_basis_missing_falls_back(leerie):
     """A ready-empty plan missing confidence.basis (or with a
     malformed confidence block) must still produce an entry in the
     output map — falling back to a placeholder string rather than
@@ -206,7 +206,7 @@ def test_detect_no_work_basis_missing_falls_back(pila):
     job is to surface reasoning, not re-validate the schema."""
     # Missing confidence entirely.
     plans_a = [{"domain": "bug-fixing", "status": "ready", "subtasks": []}]
-    out_a = pila.detect_no_work(plans_a)
+    out_a = leerie.detect_no_work(plans_a)
     assert out_a is not None
     assert "bug-fixing" in out_a
     assert out_a["bug-fixing"]  # non-empty placeholder
@@ -217,7 +217,7 @@ def test_detect_no_work_basis_missing_falls_back(pila):
         "subtasks": [],
         "confidence": {"basis": "   "},  # whitespace only
     }]
-    out_b = pila.detect_no_work(plans_b)
+    out_b = leerie.detect_no_work(plans_b)
     assert out_b is not None
     assert out_b["testing"]  # non-empty placeholder
     plans_c = [{
@@ -226,16 +226,16 @@ def test_detect_no_work_basis_missing_falls_back(pila):
         "subtasks": [],
         "confidence": None,  # malformed
     }]
-    out_c = pila.detect_no_work(plans_c)
+    out_c = leerie.detect_no_work(plans_c)
     assert out_c is not None
     assert out_c["configuration-build"]
 
 
-def test_detect_no_work_empty_plans_returns_none(pila):
+def test_detect_no_work_empty_plans_returns_none(leerie):
     """No plans at all → return None. (Defensive; the orchestrator
     won't reach phase 3 with an empty plans list, but the helper
     shouldn't crash if it ever does.)"""
-    assert pila.detect_no_work([]) is None
+    assert leerie.detect_no_work([]) is None
 
 
 # ----- source-text coupling: pin the call site -----------------------------
@@ -252,12 +252,12 @@ def test_orchestrate_calls_detect_no_work_between_reconcile_and_schedule():
     pattern."""
     from pathlib import Path
     body = (Path(__file__).resolve().parent.parent
-            / "orchestrator" / "pila.py").read_text()
+            / "orchestrator" / "leerie.py").read_text()
     # Restrict to the _run_phases body the way the other coupling
     # tests do — find the function and bound by the next top-level
     # def.
     start = body.find("async def _run_phases(")
-    assert start >= 0, "_run_phases function not found in pila.py"
+    assert start >= 0, "_run_phases function not found in leerie.py"
     rest = body[start:]
     end = rest.find("\nasync def ", 1)
     if end < 0:
@@ -286,7 +286,7 @@ def test_orchestrate_calls_detect_no_work_between_reconcile_and_schedule():
     return_idx = fn.find("return", detect_idx)
     assert finish_idx > detect_idx, (
         "_run_phases must call _finish_no_work_run() to record the "
-        "no-work outcome and write finished_at — otherwise pila --list "
+        "no-work outcome and write finished_at — otherwise leerie --list "
         "won't show the run as done-local.")
     assert return_idx > detect_idx, (
         "_run_phases must return after _finish_no_work_run() so "
@@ -308,7 +308,7 @@ def test_orchestrate_resume_guard_for_no_work_required():
     test_orchestrate_call_sites.py."""
     from pathlib import Path
     body = (Path(__file__).resolve().parent.parent
-            / "orchestrator" / "pila.py").read_text()
+            / "orchestrator" / "leerie.py").read_text()
     start = body.find("async def _run_phases(")
     assert start >= 0
     rest = body[start:]
