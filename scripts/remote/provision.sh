@@ -51,11 +51,17 @@ FLY_APP="${LEERIE_FLY_APP:-leerie}"
 FLY_REGION="${FLY_REGION:-iad}"
 FLY_VM_CPUS="${FLY_VM_CPUS:-4}"
 FLY_VM_MEMORY="${FLY_VM_MEMORY:-8192}"
-# Opt-in: per-machine Fly volume mounted at /home/leerie. UNSET by default
-# — when blank, no volume is created and the `flyctl machine run` argv is
+# Opt-in: per-machine Fly volume mounted at /work. UNSET by default —
+# when blank, no volume is created and the `flyctl machine run` argv is
 # byte-for-byte today's. Setting to a positive integer N creates a Fly
-# volume sized at N GB and adds --volume "<id>:/home/leerie" to the run
-# argv. Volume is destroyed alongside the machine in destroy_machine.
+# volume sized at N GB and adds --volume "<id>:/work" to the run argv.
+# Volume is destroyed alongside the machine in destroy_machine.
+#
+# Mount target is /work because that's where the durable workload
+# lives: the seeded repo, .leerie/runs/<id>/ state, and per-subtask
+# worktrees that dominate disk growth. The caches and .claude auth
+# bundle under /home/leerie don't grow N-wide per worker and are
+# refreshed by seed_auth on every resume — they stay on the rootfs.
 # (DESIGN §6 *Remote disk policy*, IMPLEMENTATION §2.)
 FLY_VM_DISK_GB="${FLY_VM_DISK_GB:-}"
 
@@ -507,7 +513,7 @@ provision_machine() {
   # surprises.
   local _vol_args=()
   if [ -n "$LEERIE_VOLUME_ID" ]; then
-    _vol_args=(--volume "${LEERIE_VOLUME_ID}:/home/leerie")
+    _vol_args=(--volume "${LEERIE_VOLUME_ID}:/work")
   fi
   # ${arr[@]+"${arr[@]}"} is the bash idiom to expand an array safely
   # under `set -u`: when the array is empty (no volume), the +word

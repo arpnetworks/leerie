@@ -997,16 +997,34 @@ the machine's filesystem by the time a pause fires.
 
 **Disk durability is conditional on `FLY_VM_DISK_GB`.** When the env
 var is set, `provision.sh` creates a per-machine Fly volume mounted at
-`/home/leerie` and the pause-on-failure contract above is unconditional
-— the volume survives `machine stop` and reattaches on `machine start`,
-indefinitely. When `FLY_VM_DISK_GB` is **unset** (the default), the
-machine runs on its ephemeral rootfs disk with no volume. A short
-`machine stop` window preserves the rootfs and `start` resumes
-normally; but a sufficiently long stop, or any Fly-side reclamation,
-discards the rootfs and the run dir with it. Users running anything
-they intend to pause-and-resume across a long window should set
-`FLY_VM_DISK_GB`. The same env var doubles as the recovery for runs
-that hit ENOSPC mid-execution.
+`/work` and the pause-on-failure contract above is unconditional — the
+volume survives `machine stop` and reattaches on `machine start`,
+indefinitely. The mount target is `/work` because that's where the
+durable workload lives: the seeded repo, the run-state tree under
+`.leerie/runs/<run-id>/`, and the per-subtask worktrees that dominate
+the run's disk footprint. The caches under `/home/leerie/.cache/...`
+and the auth bundle at `/home/leerie/.claude` are bounded in size and
+intentionally left on the rootfs — they are not the durability
+contract's concern. `seed_auth` re-runs unconditionally on every
+resume, so the auth bundle is refreshed from the host's `$STAGE`
+regardless of whether the rootfs survived the pause window. The
+workload-vs-cache separation is empirical, not absolute: a heavy
+pnpm-store or cargo registry can still hit the rootfs cap on
+unusually large monorepos. The historical ENOSPC mode was per-
+subtask worktree accumulation, not cache growth, so prioritizing
+worktrees on the volume is the right default; runs that
+empirically exhaust caches should size `FLY_VM_DISK_GB` higher and
+treat the spillover as a rootfs problem to solve separately. When
+`FLY_VM_DISK_GB` is **unset** (the default), the machine runs on its
+ephemeral rootfs disk with no volume. A short `machine stop` window
+preserves the rootfs and `start` resumes normally; but a sufficiently
+long stop, or any Fly-side reclamation, discards the rootfs and the
+run dir with it. Users running anything they intend to pause-and-
+resume across a long window should set `FLY_VM_DISK_GB`. The same env
+var doubles as the recovery for runs that hit ENOSPC mid-execution —
+historically ENOSPC was reached by per-worker worktree accumulation on
+the rootfs's hard cap (2,000 IOPS / 8 MiB/s), which the volume both
+relieves and accelerates.
 
 Six sidecar fields on `run.json` capture remote lifecycle state:
 

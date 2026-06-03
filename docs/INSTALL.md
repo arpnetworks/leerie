@@ -277,13 +277,15 @@ local container runtime (Colima on macOS, containerd on Linux) is
 only needed for the default `local` runtime.
 
 **Disk sizing.** By default Fly Machines run on the platform's default
-ephemeral rootfs. If a run errors out with `ENOSPC: no space left on
-device` (typically during parallel waves when many `claude -p` workers
-accumulate session-env state at once) or if you need to pause a run
-and resume it days later, set `FLY_VM_DISK_GB` (or pass
-`--fly-disk-gb N`, or put `fly_disk_gb = N` in `leerie.toml`). That
-provisions a per-machine Fly volume sized at N GB and mounts it at
-`/home/leerie`:
+ephemeral rootfs (capped at 2,000 IOPS / 8 MiB/s). If a run errors out
+with `ENOSPC: no space left on device` (typically during parallel
+waves when many `claude -p` workers accumulate session-env state and
+per-subtask worktrees at once) or if you need to pause a run and
+resume it days later, set `FLY_VM_DISK_GB` (or pass `--fly-disk-gb N`,
+or put `fly_disk_gb = N` in `leerie.toml`). That provisions a per-
+machine Fly volume sized at N GB and mounts it at `/work` — the path
+that holds the seeded repo, `.leerie/runs/<id>/` state, and the per-
+subtask worktrees that dominate disk growth:
 
 ```bash
 FLY_VM_DISK_GB=30 leerie 'task' --runtime fly

@@ -11,6 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`FLY_VM_DISK_GB` now actually absorbs run-time disk growth.** The
+  opt-in Fly volume previously mounted at `/home/leerie`, which only
+  ever holds bounded caches (`.cache/leerie/{pnpm,pip,go-mod,cargo}`,
+  `.local/share/mise`) and the staged `.claude` auth bundle. The
+  dominant growth source — the seeded repo at `/work`, the per-run
+  state under `/work/.leerie/runs/<id>/`, and the N-wide parallel
+  worktree fan-out under `/work/.leerie/runs/<id>/worktrees/<sid>/` —
+  was on the ephemeral rootfs and capped at Fly's 8 GiB rootfs default
+  (and 2,000 IOPS / 8 MiB/s throughput). Grafana panels showed the
+  symptom directly: rootfs climbing into multi-GiB during a run while
+  the `/home/leerie` volume sat flat near 0. The volume now mounts at
+  `/work` instead — durability and ENOSPC headroom land on the path
+  that actually grows, and the workload picks up the volume's higher
+  per-machine throughput tier (4k–32k IOPS depending on machine class)
+  as a free side-effect. Caches and the auth bundle revert to rootfs;
+  `seed_auth` re-runs on every resume so the auth bundle is refreshed
+  regardless of pause length. See DESIGN.md §6 *Remote disk policy*.
+
 - **`leerie --resume --runtime fly` no longer silently provisions a
   duplicate Fly machine for bootstrap-id runs.** The launcher's
   resume dispatch looked the run-id up only in

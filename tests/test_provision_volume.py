@@ -9,7 +9,7 @@ things via flyctl-stub interception:
       byte-for-byte identical to today's behavior.
 
   (b) SET: `flyctl volumes create ... --size N` runs first, the volume
-      ID is captured, and `flyctl machine run --volume <id>:/home/leerie`
+      ID is captured, and `flyctl machine run --volume <id>:/work`
       runs after. volume_id ends up in the persisted run.json.
 
 The stub flyctl records every invocation into a log file so the test
@@ -177,7 +177,7 @@ def test_no_volume_when_disk_gb_unset(tmp_path):
 
 def test_volume_created_when_disk_gb_set(tmp_path):
     """With FLY_VM_DISK_GB=30, volume-create runs first with --size 30,
-    machine-run gets --volume "<id>:/home/leerie", and run.json
+    machine-run gets --volume "<id>:/work", and run.json
     captures the volume_id."""
     stub, log = _make_recording_flyctl(tmp_path)
     run_id = "feat-test-002"
@@ -223,7 +223,7 @@ def test_volume_created_when_disk_gb_set(tmp_path):
     mr = machine_runs[0]
     assert "--volume" in mr, mr
     vol_arg = mr[mr.index("--volume") + 1]
-    assert vol_arg == "vol_abcdef0123456789:/home/leerie", vol_arg
+    assert vol_arg == "vol_abcdef0123456789:/work", vol_arg
     # Ordering: volumes-create must precede machine-run.
     vc_idx = non_auth.index(vc)
     mr_idx = non_auth.index(mr)

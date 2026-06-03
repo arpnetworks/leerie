@@ -18,34 +18,23 @@ set -e
 ulimit -c 0
 cd /work
 
-# Idempotent /home/leerie subtree population. On the Fly path, when
-# FLY_VM_DISK_GB is set in provision.sh a per-machine Fly volume is
-# mounted at /home/leerie — and the mount masks the Dockerfile's baked
-# layout (the COPY layer becomes invisible underneath the fresh
-# volume). Re-create the standard subtree here so workers find their
-# expected cache directories regardless of whether they're running on
-# the bare rootfs (no volume) or on a freshly-attached Fly volume.
-# `mkdir -p` and `chown -R` are no-ops on already-populated trees, so
-# the local nerdctl path (which never sees this code mid-runtime,
-# because container-entry runs once at startup) is unaffected.
+# Idempotent /work ownership fix. On the Fly path, when FLY_VM_DISK_GB
+# is set in provision.sh a per-machine Fly volume is mounted at /work
+# — and the mount masks the Dockerfile's baked `chown leerie:` layer
+# (the volume root is owned by root:root on first attach). The
+# orchestrator runs as leerie, so without this chown it would fail to
+# write into its own working dir on the first volume-backed boot.
+# Trailing-colon form (`chown leerie:`) matches seed-repo.sh and
+# seed-auth.sh — it resolves to leerie's primary group by GID, which
+# survives the Dockerfile's `groupadd -g $HOST_GID leerie` being
+# skipped when the base image already has a group at that GID (so no
+# group literally named "leerie" exists). On the no-volume and local
+# nerdctl paths the chown is a no-op (rootfs /work is already leerie-
+# owned from the Dockerfile, and the local bind-mount preserves host
+# ownership).
 # (DESIGN §6 *Remote disk policy*; IMPLEMENTATION §0.5 *Container shape*.)
 if getent passwd leerie >/dev/null 2>&1; then
-  mkdir -p \
-    /home/leerie/.local/share/mise \
-    /home/leerie/.cache/leerie/pnpm-store \
-    /home/leerie/.cache/leerie/pip \
-    /home/leerie/.cache/leerie/go-mod \
-    /home/leerie/.cache/leerie/cargo \
-    /home/leerie/.claude \
-    2>/dev/null || true
-  chown -R leerie:leerie /home/leerie/.local /home/leerie/.cache /home/leerie/.claude 2>/dev/null || true
-  # .gnupg permissions matter to gpg (refuses to use a directory with
-  # group-readable permissions). Only chmod if it exists — we don't
-  # want to materialize one and trip a worker into thinking GPG is
-  # configured.
-  if [ -d /home/leerie/.gnupg ]; then
-    chmod 700 /home/leerie/.gnupg 2>/dev/null || true
-  fi
+  chown leerie: /work 2>/dev/null || true
 fi
 
 # When invoked with no args (remote/Fly path), idle as PID 1 so the
