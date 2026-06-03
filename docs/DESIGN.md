@@ -386,6 +386,39 @@ place but stays advisory — the judge handles the load-bearing case;
 the warning surfaces the deliberately-permissive same-file-different-
 surface cases.
 
+A single subtask can legitimately overlap with several siblings on
+different artifacts — e.g. one subtask creates a new config file
+*and* wires an existing config to it, each half colliding with a
+different sibling's narrower piece. The judge's protocol stays
+pairwise; the orchestrator walks the pairs into a coherent cluster
+decision via the **anchor-survivor rule**: when one subtask sid
+appears in two or more non-`unresolvable` collisions, it is the
+*anchor* of that cluster and survives every merge it participates
+in. The anchor is by construction the subtask whose surface
+overlaps with each of its partners, so absorbing each partner *into*
+the anchor matches what the judge described. Without this override
+the default lex-smaller survivor rule (a determinism device with
+no semantic content) would silently keep an arbitrary narrower
+subtask and discard the spec the judge actually identified as
+broader. The orchestrator also enforces one pathological pattern
+in this neighbourhood: a `drop_*` whose dropped sid is an anchor
+of another collision contradicts itself (asking to delete the
+subtask other collisions claim absorbs them) and `die()`s at plan
+time with both pairs surfaced.
+
+The anchor rule introduces one new invariant the orchestrator must
+preserve: **merge_feasibility carry-forward**. Each `merge_feasibility`
+statement is the load-bearing unified-intent record for the pair it
+came from (see the discipline above). When subtask X is absorbed by
+subtask Y in a merge, *every* `merge_feasibility` statement that has
+ever been appended to X's intent — including ones from prior merges
+where X was itself a survivor — must be preserved in Y's intent.
+Otherwise a cluster like `merge(B,D)` followed by `merge(A,B)`
+silently loses the mf statement from the first merge as B is
+absorbed into A. This is the same silent-data-loss class the
+per-pair merge-feasibility discipline exists to prevent, applied
+across the chain of absorptions rather than within a single pair.
+
 ### Why waves are sequential
 
 Each wave's worktrees are branched from the integrated result of all prior

@@ -187,14 +187,60 @@ For each candidate pair, ask in order:
    `auth-shell-adopted` both name the AuthShell extraction)?
 2. **Peer extractions, not consumer+producer?** If A says "create X"
    and B says "use X", they are NOT peers.
-3. **API conflict in the intents?** Read both intents literally. Run
+3. **Strict supersedure? (Run BEFORE the merge-feasibility checks.)**
+   Is one intent strictly broader than the other — i.e., does it
+   already do *everything* the other was planning? Phrasing like
+   *"X is a strict subset of Y"*, *"Y already does what X was
+   planning"*, *"Y is a strict superset"*, or *"X covers half of
+   what Y covers"* is **supersedure language**, not merge language.
+   The resolution **MUST be `drop_a` or `drop_b`** (drop the
+   narrower side), not `merge`. The merge-feasibility discipline
+   applies only when the two subtasks are *genuine peers with
+   overlapping-but-not-nested scopes* — neither one strictly
+   contains the other. If you find yourself writing "X is a subset
+   of Y" in `reason` while picking `merge`, stop: that is
+   `drop_a`/`drop_b`.
+4. **API conflict in the intents?** Read both intents literally. Run
    each merge-feasibility check above. If any fails → `unresolvable`.
    If none fails → consider `merge`.
-4. **Strict supersedure?** If one intent is strictly broader and
-   already does the work of the other, prefer `drop_*` over `merge`.
 5. **When uncertain, do not flag.** Under-flagging is recoverable —
    the integrator still acts as a backstop. Over-flagging blocks
    legitimate plans.
+
+## Shared endpoints across collisions
+
+It is legitimate to emit two `merge` collisions that *share one
+endpoint* when one subtask owns two distinct artifacts that each
+overlap with a different sibling subtask. Example: feat-002 creates
+`tsconfig.server.json` AND wires it into root `tsconfig.json`;
+config-001 creates `tsconfig.server.json`; config-002 wires root
+`tsconfig.json`. Three subtasks, two artifacts, one shared endpoint
+(feat-002). The right output is:
+
+- `merge(feat-002, config-001)` on `tsconfig.server.json`
+- `merge(feat-002, config-002)` on `tsconfig.json`
+
+The orchestrator will keep feat-002 (the shared endpoint, by
+construction the broader subtask) as the survivor of both merges and
+absorb each partner's intent. Do NOT downgrade these to
+`unresolvable` just because feat-002 appears twice — the pairwise
+protocol is designed for exactly this case.
+
+Do NOT emit two collisions sharing one endpoint when that endpoint
+is being *dropped* in one of them — the orchestrator will die() at
+plan time on the contradiction (a `drop_*` of an anchor of another
+`merge` is incoherent: the dropped subtask cannot also be the
+survivor of a merge). If the shared sid genuinely should be dropped,
+the other collision involving it must also be a `drop_*` or
+`unresolvable`.
+
+Connected-cluster shapes (e.g. emitting `merge(A, B)`, `merge(A, C)`,
+*and* `merge(B, C)` when all three target the same artifact) are
+allowed. The orchestrator's apply loop will collapse them to a single
+survivor and preserve every `merge_feasibility` statement via the
+absorbed-intent carry-forward invariant. Emit each pair you observe;
+do not preemptively downgrade to `unresolvable` solely because two of
+your candidate `merge`s share an endpoint.
 
 ## Worked example — `merge`
 

@@ -9764,6 +9764,31 @@ def _validate_unresolved_must_include(
 # a frankenstein spec.
 
 
+def _compute_overlap_anchors(collisions: list[dict]) -> set[str]:
+    """An *anchor* is a sid that appears in two or more non-
+    `unresolvable` collisions. By construction, the anchor is the
+    subtask whose surface overlaps with multiple sibling subtasks
+    on different artifacts (or with structurally compatible intents
+    on related artifacts) — i.e., it is the broader scope that
+    absorbs each partner. Returning the anchor set lets the apply
+    loop survive the anchor through every merge it appears in,
+    overriding the default lex-smaller survivor rule (which is a
+    determinism device with no semantic content — see
+    `_apply_overlap_merge`'s docstring on the lex rule).
+
+    Pure helper. `unresolvable` collisions are excluded because they
+    are surfaced separately and never mutate the plan, so they don't
+    establish an overlap claim."""
+    counts: dict[str, int] = {}
+    for c in collisions:
+        if c.get("resolution") == "unresolvable":
+            continue
+        for sid in (c.get("a_sid"), c.get("b_sid")):
+            if sid:
+                counts[sid] = counts.get(sid, 0) + 1
+    return {sid for sid, n in counts.items() if n >= 2}
+
+
 def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]) -> None:
     """Apply the merge-feasibility backstop and structural sanity checks
     on the judge's output, before any mutation. die()s on violation —
@@ -9814,6 +9839,55 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
                     "implementer spec. The right answer in this case is "
                     "resolution=unresolvable. Refine the task or re-run.")
 
+    # Anchor-set consistency check (DESIGN §5 anchor rule).
+    # An *anchor* is a sid that appears in two or more non-
+    # `unresolvable` collisions — the structural broader-scope subtask
+    # the apply loop will keep as the survivor of each merge it
+    # appears in. One judge emission involving anchors is pathological
+    # and must die() before any mutation:
+    #
+    # - drop-of-anchor: a `drop_*` whose `dropped_sid` is an anchor.
+    #   The judge would be asking to delete the same subtask other
+    #   collisions claim absorbs them — directly contradictory.
+    #
+    # (Earlier iterations of this audit also gated `merge`-between-
+    # two-anchors, but the apply loop's natural semantics — fall
+    # through to lex-smaller within the unified cluster, with
+    # `_apply_overlap_merge`'s `from_intent` preservation per the
+    # DESIGN §5 carry-forward invariant — handles every observed
+    # multi-anchor shape cleanly. The earlier check was over-
+    # aggressive and is removed.)
+    collisions = output.get("collisions", []) or []
+    anchors = _compute_overlap_anchors(collisions)
+    if anchors:
+        for c in collisions:
+            resolution = c.get("resolution")
+            a_sid = c.get("a_sid")
+            b_sid = c.get("b_sid")
+            artifact = c.get("artifact", "<unspecified>")
+            if resolution == "drop_a" and a_sid in anchors:
+                die(f"plan-overlap judge contradicts itself: it asks to "
+                    f"drop {a_sid!r} (collision with {b_sid!r}, artifact "
+                    f"{artifact!r}) but {a_sid!r} also anchors other "
+                    "merge/drop collisions in the same output. A drop "
+                    "of an anchor would delete the subtask other "
+                    "collisions claim absorbs them. Refine the task or "
+                    "re-run; if the cluster is genuine, the judge "
+                    "should emit `merge` (not `drop`) against the "
+                    "anchor and `unresolvable` if the cluster cannot "
+                    "be auto-resolved.")
+            if resolution == "drop_b" and b_sid in anchors:
+                die(f"plan-overlap judge contradicts itself: it asks to "
+                    f"drop {b_sid!r} (collision with {a_sid!r}, artifact "
+                    f"{artifact!r}) but {b_sid!r} also anchors other "
+                    "merge/drop collisions in the same output. A drop "
+                    "of an anchor would delete the subtask other "
+                    "collisions claim absorbs them. Refine the task or "
+                    "re-run; if the cluster is genuine, the judge "
+                    "should emit `merge` (not `drop`) against the "
+                    "anchor and `unresolvable` if the cluster cannot "
+                    "be auto-resolved.")
+
 
 def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
                         surviving_sid: str) -> None:
@@ -9845,6 +9919,15 @@ def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
     success_criteria_seed are NOT carried over: the judge said one
     intent supersedes the other, and the survivor's intent is the
     intent that wins. Only the capability-graph wiring is unioned."""
+    # Self-loop guard: if the caller asked to drop `X` in favor of `X`
+    # (e.g. an apply-loop rewrite collapsed both endpoints onto the
+    # same survivor), there is nothing to do. Continuing past this
+    # would happily filter the only copy out of `plans` in the removal
+    # loop below — the same silent-data-loss class the apply-loop
+    # rewrite is designed to prevent.
+    if dropped_sid == surviving_sid:
+        return
+
     by_id: dict[str, dict] = {}
     for plan in plans:
         for s in plan.get("subtasks", []):
@@ -9916,31 +9999,52 @@ def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
 
 
 def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
-                         artifact: str, merge_feasibility: str) -> str:
+                         artifact: str, merge_feasibility: str,
+                         survivor_hint: str | None = None) -> str:
     """Collapse `a_sid` and `b_sid` into one subtask. Returns the
-    surviving sid (the lexicographically smaller one, stable rule).
+    surviving sid.
+
+    Survivor selection:
+    - Default (no `survivor_hint`): the lexicographically smaller sid
+      wins. This is a *determinism* device — it ensures two judge
+      outputs that differ only in pair ordering produce identical
+      merged plans. It carries no semantic content.
+    - With `survivor_hint`: the named sid wins, overriding the lex
+      rule. Used by `_apply_overlap_collisions` for the anchor case:
+      when one sid appears in multiple non-`unresolvable` collisions,
+      it is the structural anchor of the cluster (by construction the
+      subtask that overlaps with every partner) and must survive each
+      merge so its partners are absorbed into it. The hint must equal
+      either `a_sid` or `b_sid`; passing any other value die()s.
 
     Field semantics — mirrors `_apply_reconciler_output`'s
     `merged_subtasks` apply step but uses the judge's
     `merge_feasibility` as the canonical unified intent rather than
     a free-form concatenation. The result is one subtask that:
 
-    - keeps the lexicographically smaller sid as `id` (stable across
-      re-runs).
-    - `title` becomes `"{a.title} + {b.title}"`.
-    - `intent` becomes `"{a.intent}\\n\\nMerged with {b.id} by "
-      "plan-overlap-judge:\\n{merge_feasibility}"` — the
-      `merge_feasibility` statement IS the unified spec the implementer
-      reads.
-    - `success_criteria_seed` becomes `"{a.criteria} AND {b.criteria}"`
-      (same shape as the reconciler's merge for symmetry).
+    - keeps the surviving sid as `id` (stable across re-runs).
+    - `title` becomes `"{survivor.title} + {dropped.title}"`.
+    - `intent` becomes the concatenation of the survivor's full
+      existing intent, the absorbed subtask's full existing intent
+      (under a `--- Absorbed intent from {dropped.id} ---` marker),
+      and a trailing `"Merged with {dropped.id} by plan-overlap-judge:
+      {merge_feasibility}"` note. Including the absorbed subtask's
+      intent is required by the DESIGN §5 *merge_feasibility
+      carry-forward* invariant: any `merge_feasibility` previously
+      appended to the absorbed subtask's intent (from an earlier
+      merge where it was the survivor) must survive into the new
+      merged subtask. The trailing note is the load-bearing record
+      of the current pair's unified spec, the same as before.
+    - `success_criteria_seed` becomes `"{survivor.criteria} AND "
+      "{dropped.criteria}"` (same shape as the reconciler's merge
+      for symmetry).
     - `files_likely_touched`, `provides`, `requires`, `depends_on`
       become the union (dedup, order-preserving), with self-references
       to either sid removed.
     - tag-based `requires` that the merged subtask itself now provides
       are dropped (would be a graph self-loop).
-    - `_merged_from` stamps `[b_sid, ...]` for traceability (mirrors
-      the reconciler).
+    - `_merged_from` stamps `[dropped_sid, ...]` for traceability
+      (mirrors the reconciler).
 
     Downstream subtasks whose `depends_on` referenced the dropped sid
     are rewritten to point at the survivor."""
@@ -9959,11 +10063,23 @@ def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
             "in the reconciled plan."
         )
 
-    # Stable surviving-sid rule: lexicographically smaller wins. Same
-    # ordering regardless of which arg was a_sid vs b_sid, so two
-    # judge outputs that differ only in pair ordering produce
-    # identical merged plans.
-    into_id, from_id = sorted([a_sid, b_sid])
+    if survivor_hint is not None and survivor_hint not in (a_sid, b_sid):
+        # Defensive die — the only legitimate callers pass an anchor
+        # sid that they themselves resolved from the collision pair.
+        die(
+            f"plan-overlap merge survivor_hint {survivor_hint!r} is "
+            f"neither endpoint of the pair ({a_sid!r}, {b_sid!r}). "
+            "This is an orchestrator logic bug; refine the task or "
+            "re-run."
+        )
+
+    # Survivor selection. With a hint, the named sid wins; otherwise
+    # the stable lex-smaller rule (determinism device).
+    if survivor_hint is not None:
+        into_id = survivor_hint
+        from_id = b_sid if survivor_hint == a_sid else a_sid
+    else:
+        into_id, from_id = sorted([a_sid, b_sid])
     into_s = by_id[into_id]
     from_s = by_id[from_id]
 
@@ -9975,13 +10091,24 @@ def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
     elif from_title:
         into_s["title"] = from_title
 
-    # intent: anchor on into's intent, append the judge's
-    # merge_feasibility as the unified-spec note. Quote the absorbed
-    # sid for traceability.
+    # intent: anchor on into's intent, then append the absorbed
+    # subtask's full intent (which may already contain prior
+    # `Merged with …` notes from earlier merges where `from_s` was
+    # itself a survivor — see DESIGN §5 "merge_feasibility
+    # carry-forward" invariant), then append the current pair's
+    # merge_feasibility as the unified-spec note. Without the
+    # from_intent block, any merge_feasibility from a prior
+    # absorption would be silently lost when this subtask is
+    # itself absorbed — the silent-data-loss class the
+    # merge-feasibility discipline exists to prevent, applied
+    # across an absorption chain rather than within a single pair.
     into_intent = into_s.get("intent") or ""
+    from_intent = from_s.get("intent") or ""
+    from_block = (f"\n\n--- Absorbed intent from {from_id} ---\n"
+                  f"{from_intent}") if from_intent else ""
     note = (f"\n\nMerged with {from_id} by plan-overlap-judge "
             f"(artifact: {artifact}):\n{merge_feasibility}")
-    into_s["intent"] = into_intent + note
+    into_s["intent"] = into_intent + from_block + note
 
     # success_criteria_seed: concatenation with AND (matches reconciler).
     into_scs = into_s.get("success_criteria_seed", "") or ""
@@ -10064,6 +10191,162 @@ def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
                 s["depends_on"] = new_deps
 
     return into_id
+
+
+def _apply_overlap_collisions(plans: list[dict],
+                              collisions: list[dict]) -> list[dict]:
+    """Apply a validated list of overlap-judge collisions to `plans`
+    in input order, returning the per-resolution audit trail.
+
+    Anchor-aware semantics: when a single sid appears in multiple
+    non-`unresolvable` collisions (an *anchor*, computed by
+    `_compute_overlap_anchors`), every merge it participates in
+    keeps it as the survivor. This overrides `_apply_overlap_merge`'s
+    default lex-smaller survivor rule for the cluster case. The
+    rationale is structural: the anchor is by construction the
+    subtask that overlaps with each of its partners, so absorbing
+    each partner *into* the anchor matches what the judge described
+    (every individual `merge_feasibility` statement is appended to
+    the anchor's intent). The pairwise judge output is the simple
+    protocol; Python walks the pairs into a coherent cluster
+    resolution (DESIGN §12 — logic enforced in code, not in the
+    prompt).
+
+    Callers must run `_validate_overlap_judge_output` first, which
+    catches the one pathological anchor case the apply loop cannot
+    resolve safely: a `drop_*` whose `dropped_sid` is an anchor —
+    the judge is contradicting itself (asking to delete the same
+    subtask other collisions claim absorbs them).
+
+    Merges between two anchors (legitimate within a single connected
+    cluster — e.g. a triangle of `merge(A,B), merge(A,C), merge(B,C)`)
+    fall through to the lex-smaller rule and are absorbed correctly
+    because `_apply_overlap_merge`'s intent assembly preserves the
+    absorbed subtask's full intent (DESIGN §5 merge_feasibility
+    carry-forward invariant). Pairs whose endpoints have already
+    collapsed to the same survivor (the redundant closing edge of
+    such a cluster) are recorded as `skipped_redundant` entries in
+    the returned audit trail.
+
+    No state writes — the apply semantics can be unit-tested without
+    standing up a worker or a State instance; the caller
+    (`phase_overlap_judge`) handles state persistence around it.
+    `log()` lines are emitted per resolution so a real run still
+    surfaces what changed. `unresolvable` entries are treated as
+    silent no-ops here — the caller is expected to have surfaced
+    and die()d on them before invoking this helper.
+    """
+    anchors = _compute_overlap_anchors(collisions)
+    applied: list[dict] = []
+    # Transitive-rewrite map: sid → its current survivor in `plans`.
+    # Populated as merges/drops execute. Used to rewrite an endpoint
+    # that an earlier resolution already absorbed (e.g. anchor A merged
+    # with B in pair 1, then a later collision references B — resolve
+    # B → A so the helper sees a live endpoint).
+    survivor_of: dict[str, str] = {}
+
+    def _resolve(sid: str) -> str:
+        """Transitively chase the survivor pointer until a fixed point
+        (or unmapped sid). Path-compresses as it walks."""
+        seen: list[str] = []
+        cur = sid
+        while cur in survivor_of and survivor_of[cur] != cur:
+            seen.append(cur)
+            cur = survivor_of[cur]
+        for s in seen:
+            survivor_of[s] = cur
+        return cur
+
+    for c in collisions:
+        raw_a = c["a_sid"]
+        raw_b = c["b_sid"]
+        a_sid = _resolve(raw_a)
+        b_sid = _resolve(raw_b)
+        artifact = c.get("artifact", "")
+        resolution = c["resolution"]
+
+        # Both endpoints rewrote to the same survivor — an earlier
+        # op already collapsed this exact pair (legitimately, in
+        # connected-cluster shapes like triangles and 4-cycles where
+        # the judge enumerates every pair of an artifact-overlap
+        # cluster). Re-applying would no-op the helpers' defensive
+        # die() or double-stamp `_merged_from`. Record the skip so
+        # the audit trail (`state.data["plan_overlap_applied"]`)
+        # reflects every collision the judge emitted, including the
+        # redundant ones.
+        if a_sid == b_sid:
+            applied.append({
+                "action": "skipped_redundant",
+                "artifact": artifact,
+                "collapsed_to": a_sid,
+                "original_a_sid": raw_a,
+                "original_b_sid": raw_b,
+                "merge_feasibility": c.get("merge_feasibility", ""),
+                "reason": c.get("reason", ""),
+            })
+            log(f"phase 2¾: collision {raw_a} ↔ {raw_b} "
+                f"already collapsed to {a_sid} via earlier "
+                f"resolution — skipped_redundant "
+                f"(artifact: {artifact})")
+            continue
+
+        if resolution == "merge":
+            mf = (c.get("merge_feasibility") or "").strip()
+            # _validate_overlap_judge_output enforces non-empty; the
+            # `or "<unset>"` is belt-and-suspenders against a logic bug.
+            # Anchor-survivor rule: if exactly one endpoint is in the
+            # anchor set, that endpoint wins regardless of lex order.
+            # If both are anchors (legitimate when the judge emits
+            # connecting pairs within a single broader cluster, e.g. a
+            # triangle), we fall through to lex-smaller within the
+            # cluster — semantics is preserved because the absorbed
+            # subtask's intent carries forward (DESIGN §5
+            # merge_feasibility carry-forward invariant). If neither
+            # is, hint stays None → lex-smaller rule applies.
+            survivor_hint: str | None = None
+            if a_sid in anchors and b_sid not in anchors:
+                survivor_hint = a_sid
+            elif b_sid in anchors and a_sid not in anchors:
+                survivor_hint = b_sid
+            surviving = _apply_overlap_merge(
+                plans, a_sid, b_sid, artifact, mf or "<unset>",
+                survivor_hint=survivor_hint)
+            dropped = b_sid if surviving == a_sid else a_sid
+            survivor_of[dropped] = surviving
+            applied.append({
+                "action": "merge", "artifact": artifact,
+                "surviving_sid": surviving, "dropped_sid": dropped,
+                "reason": c.get("reason", ""),
+            })
+            log(f"phase 2¾: merged {dropped} → {surviving} "
+                f"(artifact: {artifact})")
+        elif resolution == "drop_a":
+            _apply_overlap_drop(plans, dropped_sid=a_sid,
+                                surviving_sid=b_sid)
+            survivor_of[a_sid] = b_sid
+            applied.append({
+                "action": "drop_a", "artifact": artifact,
+                "surviving_sid": b_sid, "dropped_sid": a_sid,
+                "reason": c.get("reason", ""),
+            })
+            log(f"phase 2¾: dropped {a_sid}, kept {b_sid} "
+                f"(artifact: {artifact})")
+        elif resolution == "drop_b":
+            _apply_overlap_drop(plans, dropped_sid=b_sid,
+                                surviving_sid=a_sid)
+            survivor_of[b_sid] = a_sid
+            applied.append({
+                "action": "drop_b", "artifact": artifact,
+                "surviving_sid": a_sid, "dropped_sid": b_sid,
+                "reason": c.get("reason", ""),
+            })
+            log(f"phase 2¾: dropped {b_sid}, kept {a_sid} "
+                f"(artifact: {artifact})")
+        # resolution == "unresolvable" treated as silent no-op — the
+        # caller is expected to have surfaced and die()d on these
+        # before invoking this helper.
+
+    return applied
 
 
 async def phase_overlap_judge(plans: list[dict], task: str, st: State,
@@ -10210,55 +10493,19 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             "in .leerie/runs/<run-id>/subtasks/ and `--resume`."
         )
 
-    # Apply merges and drops in input order. Each op mutates `plans` in
-    # place; we track the applied-mutation summary for state audit.
-    applied: list[dict] = []
-    for c in collisions:
-        a_sid = c["a_sid"]
-        b_sid = c["b_sid"]
-        artifact = c.get("artifact", "")
-        resolution = c["resolution"]
-        if resolution == "merge":
-            mf = (c.get("merge_feasibility") or "").strip()
-            # _validate_overlap_judge_output enforces non-empty; the
-            # `or "<unset>"` is belt-and-suspenders against a logic bug.
-            surviving = _apply_overlap_merge(
-                plans, a_sid, b_sid, artifact, mf or "<unset>")
-            dropped = b_sid if surviving == a_sid else a_sid
-            applied.append({
-                "action": "merge", "artifact": artifact,
-                "surviving_sid": surviving, "dropped_sid": dropped,
-                "reason": c.get("reason", ""),
-            })
-            log(f"phase 2¾: merged {dropped} → {surviving} "
-                f"(artifact: {artifact})")
-        elif resolution == "drop_a":
-            _apply_overlap_drop(plans, dropped_sid=a_sid,
-                                surviving_sid=b_sid)
-            applied.append({
-                "action": "drop_a", "artifact": artifact,
-                "surviving_sid": b_sid, "dropped_sid": a_sid,
-                "reason": c.get("reason", ""),
-            })
-            log(f"phase 2¾: dropped {a_sid}, kept {b_sid} "
-                f"(artifact: {artifact})")
-        elif resolution == "drop_b":
-            _apply_overlap_drop(plans, dropped_sid=b_sid,
-                                surviving_sid=a_sid)
-            applied.append({
-                "action": "drop_b", "artifact": artifact,
-                "surviving_sid": a_sid, "dropped_sid": b_sid,
-                "reason": c.get("reason", ""),
-            })
-            log(f"phase 2¾: dropped {b_sid}, kept {a_sid} "
-                f"(artifact: {artifact})")
-        # resolution == "unresolvable" was already handled above.
+    # Apply merges and drops in input order via the pure helper.
+    applied = _apply_overlap_collisions(plans, collisions)
 
     st.data["plan_overlap_applied"] = applied
     st.save()
+    n_merge = sum(1 for a in applied if a['action'] == 'merge')
+    n_drop = sum(1 for a in applied if a['action'].startswith('drop'))
+    n_skip = sum(1 for a in applied if a['action'] == 'skipped_redundant')
+    parts = [f"{n_merge} merge", f"{n_drop} drop"]
+    if n_skip:
+        parts.append(f"{n_skip} skipped_redundant")
     log(f"phase 2¾: applied {len(applied)} resolution(s) "
-        f"({sum(1 for a in applied if a['action'] == 'merge')} merge, "
-        f"{sum(1 for a in applied if a['action'].startswith('drop'))} drop)")
+        f"({', '.join(parts)})")
     return plans
 
 

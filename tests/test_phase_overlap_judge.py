@@ -550,3 +550,576 @@ def test_apply_merge_then_drop_idempotence(leerie):
         leerie._apply_overlap_merge(
             plans, "feat-008", "refactor-001",
             artifact="X", merge_feasibility="Unified.")
+
+
+def test_apply_drop_self_loop_is_noop(leerie):
+    """If the apply-loop's survivor-rewrite collapses both endpoints
+    onto the same sid (transitive cluster of drops), calling
+    _apply_overlap_drop with dropped_sid == surviving_sid must leave
+    the plan untouched — not filter the sole surviving copy out."""
+    plans = _two_plans_basic()
+    before = copy.deepcopy(plans)
+    leerie._apply_overlap_drop(plans, dropped_sid="feat-008",
+                               surviving_sid="feat-008")
+    assert plans == before
+
+
+# --------------------------------------------------------------------- #
+# _compute_overlap_anchors — pure helper
+# --------------------------------------------------------------------- #
+
+def test_compute_anchors_empty_collisions(leerie):
+    assert leerie._compute_overlap_anchors([]) == set()
+
+
+def test_compute_anchors_no_shared_endpoints(leerie):
+    """Each sid appears in at most one collision → no anchors."""
+    collisions = [
+        {"a_sid": "A", "b_sid": "B", "resolution": "merge"},
+        {"a_sid": "C", "b_sid": "D", "resolution": "drop_a"},
+    ]
+    assert leerie._compute_overlap_anchors(collisions) == set()
+
+
+def test_compute_anchors_shared_endpoint(leerie):
+    """A sid appearing in 2+ non-unresolvable collisions is an anchor."""
+    collisions = [
+        {"a_sid": "feat-002", "b_sid": "config-001", "resolution": "merge"},
+        {"a_sid": "feat-002", "b_sid": "config-002", "resolution": "merge"},
+    ]
+    assert leerie._compute_overlap_anchors(collisions) == {"feat-002"}
+
+
+def test_compute_anchors_excludes_unresolvable(leerie):
+    """Unresolvable collisions don't establish overlap claims — they
+    surface separately and never mutate the plan."""
+    collisions = [
+        {"a_sid": "A", "b_sid": "B", "resolution": "merge"},
+        # A also appears in an unresolvable; that one doesn't count.
+        {"a_sid": "A", "b_sid": "C", "resolution": "unresolvable"},
+    ]
+    assert leerie._compute_overlap_anchors(collisions) == set()
+
+
+# --------------------------------------------------------------------- #
+# _validate_overlap_judge_output — anchor consistency checks
+# --------------------------------------------------------------------- #
+#
+# A drop of an anchor would delete the subtask other collisions claim
+# absorbs them. A merge between two anchors is a multi-way tangle the
+# pairwise protocol can't express. Both die() before any mutation.
+
+def test_validator_dies_on_drop_of_anchor_via_drop_a(leerie, capsys):
+    """drop_a(A, B) where A also appears as the anchor in merge(A, C)
+    must die — the judge is contradicting itself."""
+    by_id = _by_id([{"id": "A"}, {"id": "B"}, {"id": "C"}])
+    output = {"collisions": [
+        {"a_sid": "A", "b_sid": "B", "artifact": "X",
+         "resolution": "drop_a", "reason": "drop A"},
+        {"a_sid": "A", "b_sid": "C", "artifact": "Y",
+         "resolution": "merge", "reason": "merge",
+         "merge_feasibility": "ok"},
+    ]}
+    with pytest.raises(SystemExit):
+        leerie._validate_overlap_judge_output(output, by_id)
+    err = capsys.readouterr().err
+    assert "'A'" in err
+    assert "anchor" in err
+
+
+def test_validator_dies_on_drop_of_anchor_via_drop_b(leerie, capsys):
+    """Mirror of the above but the anchor appears as b_sid in a drop_b."""
+    by_id = _by_id([{"id": "A"}, {"id": "B"}, {"id": "C"}])
+    output = {"collisions": [
+        {"a_sid": "B", "b_sid": "A", "artifact": "X",
+         "resolution": "drop_b", "reason": "drop A"},
+        {"a_sid": "A", "b_sid": "C", "artifact": "Y",
+         "resolution": "merge", "reason": "merge",
+         "merge_feasibility": "ok"},
+    ]}
+    with pytest.raises(SystemExit):
+        leerie._validate_overlap_judge_output(output, by_id)
+
+
+def test_validator_passes_on_multi_anchor_merge(leerie):
+    """A `merge` between two anchors is no longer rejected at
+    validation time — the apply loop handles it via lex-smaller
+    within the unified cluster, and the absorbed subtask's intent
+    carries forward per the DESIGN §5 merge_feasibility carry-
+    forward invariant. This pins the removal of the earlier over-
+    aggressive both-endpoints-anchor check; the apply-time tests
+    `test_apply_collisions_triangle_resolves_to_one_survivor` and
+    `test_apply_collisions_4cycle_resolves_to_one_survivor` cover
+    the corresponding multi-anchor cluster behavior end-to-end."""
+    by_id = _by_id([{"id": "A"}, {"id": "B"}, {"id": "C"}, {"id": "D"}])
+    output = {"collisions": [
+        {"a_sid": "A", "b_sid": "C", "artifact": "X",
+         "resolution": "merge", "reason": "x",
+         "merge_feasibility": "ok"},
+        {"a_sid": "B", "b_sid": "D", "artifact": "Y",
+         "resolution": "merge", "reason": "x",
+         "merge_feasibility": "ok"},
+        {"a_sid": "A", "b_sid": "B", "artifact": "Z",
+         "resolution": "merge", "reason": "x",
+         "merge_feasibility": "ok"},
+    ]}
+    # Should not raise.
+    leerie._validate_overlap_judge_output(output, by_id)
+
+
+def test_validator_passes_on_clean_anchor_cluster(leerie):
+    """The summarizer-shape case: merge(A, B) and merge(A, C) where A
+    is the anchor, nothing else. Must validate cleanly so the apply
+    loop can run."""
+    by_id = _by_id([
+        {"id": "feat-002"}, {"id": "config-001"}, {"id": "config-002"},
+    ])
+    output = {"collisions": [
+        {"a_sid": "feat-002", "b_sid": "config-001",
+         "artifact": "tsconfig.server.json", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok"},
+        {"a_sid": "feat-002", "b_sid": "config-002",
+         "artifact": "tsconfig.json", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok"},
+    ]}
+    # Should not raise.
+    leerie._validate_overlap_judge_output(output, by_id)
+
+
+# --------------------------------------------------------------------- #
+# _apply_overlap_collisions — anchor-survivor rule
+# --------------------------------------------------------------------- #
+#
+# These pin the load-bearing fix for the summarizer-run crash. The judge
+# emitted merge(feat-002, config-001) and merge(feat-002, config-002) —
+# one subtask overlapping with two siblings on two different artifacts.
+# The anchor rule keeps feat-002 (the broader scope per the judge's own
+# `reason`) as the survivor of both merges, overriding the lex-smaller
+# default that would have kept the narrowest (config-001) instead.
+
+def _three_planner_cluster():
+    """Three plans, three subtasks (feat-002, config-001, config-002).
+    feat-002 is the broader scope; config-001 and config-002 each
+    cover half of what feat-002 covers."""
+    return [
+        {
+            "domain": "feature-implementation",
+            "subtasks": [
+                {"id": "feat-002", "title": "Author tsconfig.server.json",
+                 "intent": "feat: author the emitting backend tsconfig",
+                 "provides": ["server-build-target-ready"],
+                 "requires": [], "depends_on": [],
+                 "files_likely_touched": ["tsconfig.server.json",
+                                          "tsconfig.json"],
+                 "success_criteria_seed": "tsc -b emits dist/server.js"},
+            ],
+        },
+        {
+            "domain": "configuration-build",
+            "subtasks": [
+                {"id": "config-001", "title": "Add tsconfig.server.json",
+                 "intent": "config: add the emitting backend project",
+                 "provides": ["backend-emit-config"],
+                 "requires": [], "depends_on": [],
+                 "files_likely_touched": ["tsconfig.server.json"],
+                 "success_criteria_seed": "backend project emits to dist"},
+                {"id": "config-002", "title": "Wire backend into tsc -b",
+                 "intent": "config: reference backend project from root",
+                 "provides": ["backend-wired-into-tsc-b"],
+                 "requires": [], "depends_on": [],
+                 "files_likely_touched": ["tsconfig.json",
+                                          "tsconfig.app.json"],
+                 "success_criteria_seed": "pnpm build runs both projects"},
+            ],
+        },
+    ]
+
+
+def test_apply_collisions_anchor_survives_both_merges(leerie):
+    """The exact failure shape from the summarizer run: judge emits
+    merge(feat-002, config-001) and merge(feat-002, config-002).
+    feat-002 is the anchor (appears in 2 merges) and MUST survive
+    both — even though lex order would pick config-001."""
+    plans = _three_planner_cluster()
+    collisions = [
+        {"a_sid": "feat-002", "b_sid": "config-001",
+         "artifact": "tsconfig.server.json",
+         "resolution": "merge",
+         "reason": "config-001 is a strict subset of feat-002",
+         "merge_feasibility": "single emitting tsconfig satisfies both"},
+        {"a_sid": "feat-002", "b_sid": "config-002",
+         "artifact": "tsconfig.json (tsc -b wiring)",
+         "resolution": "merge",
+         "reason": "both rewire root tsconfig.json",
+         "merge_feasibility": "one wired tsconfig with backend reference"},
+    ]
+    applied = leerie._apply_overlap_collisions(plans, collisions)
+
+    # Anchor survives — NOT the lex-smaller config-001.
+    survivors = {s["id"] for plan in plans for s in plan["subtasks"]}
+    assert survivors == {"feat-002"}, (
+        f"expected anchor feat-002 to survive, got {survivors}")
+
+    survivor = next(s for plan in plans for s in plan["subtasks"]
+                    if s["id"] == "feat-002")
+    # Both merge_feasibility statements carried into intent — the
+    # discipline that distinguishes merge from frankenstein, applied
+    # twice as the anchor absorbs each partner.
+    assert "single emitting tsconfig satisfies both" in survivor["intent"]
+    assert "one wired tsconfig with backend reference" in survivor["intent"]
+    # provides is the union of all three subtasks.
+    assert set(survivor["provides"]) >= {
+        "server-build-target-ready", "backend-emit-config",
+        "backend-wired-into-tsc-b"}
+    # files_likely_touched is the union.
+    assert set(survivor["files_likely_touched"]) >= {
+        "tsconfig.server.json", "tsconfig.json", "tsconfig.app.json"}
+    # _merged_from records both absorbed sids.
+    merged_from = set(survivor.get("_merged_from") or [])
+    assert merged_from == {"config-001", "config-002"}
+
+    # applied audit trail records both as `merge`, no skips.
+    actions = [a["action"] for a in applied]
+    assert actions == ["merge", "merge"]
+
+
+def test_apply_collisions_no_anchor_uses_lex_smaller(leerie):
+    """Regression: when no shared endpoint exists, the lex-smaller
+    rule still drives the survivor (preserves determinism for the
+    common pairwise case)."""
+    plans = _three_planner_cluster()
+    # Add a 4th subtask so we can have two independent merges.
+    plans[0]["subtasks"].append({
+        "id": "feat-003", "title": "x", "intent": "x",
+        "provides": [], "requires": [], "depends_on": [],
+        "files_likely_touched": [],
+        "success_criteria_seed": "x",
+    })
+    collisions = [
+        # Pair 1: feat-002 ↔ config-001, no shared endpoint elsewhere.
+        {"a_sid": "feat-002", "b_sid": "config-001",
+         "artifact": "X", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok"},
+        # Pair 2: feat-003 ↔ config-002, also no shared endpoint.
+        {"a_sid": "feat-003", "b_sid": "config-002",
+         "artifact": "Y", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok"},
+    ]
+    leerie._apply_overlap_collisions(plans, collisions)
+
+    survivors = {s["id"] for plan in plans for s in plan["subtasks"]}
+    # Lex-smaller wins each pair: config-001 < feat-002, config-002 < feat-003.
+    assert survivors == {"config-001", "config-002"}
+
+
+def test_apply_collisions_anchor_preserves_unrelated_subtasks(leerie):
+    """A cluster touching {anchor, B, C} must not perturb sibling
+    subtasks outside the cluster. Pin the blast radius."""
+    plans = _three_planner_cluster()
+    # downstream subtask that depended on the anchor — its depends_on
+    # should remain pointed at the anchor (which survived).
+    plans[0]["subtasks"].append({
+        "id": "downstream-001", "title": "consume server build",
+        "intent": "x", "provides": [],
+        "requires": [{"tag": "server-build-target-ready",
+                      "extent": "in_plan"}],
+        "depends_on": ["feat-002"],
+        "files_likely_touched": ["src/server.ts"],
+        "success_criteria_seed": "dist/server.js exists",
+    })
+    # unrelated subtask in a third plan.
+    plans.append({
+        "domain": "dependency-migration",
+        "subtasks": [
+            {"id": "deps-001", "title": "unrelated work",
+             "intent": "x", "provides": ["unrelated"],
+             "requires": [], "depends_on": [],
+             "files_likely_touched": ["package.json"],
+             "success_criteria_seed": "prisma CLI installed"},
+        ],
+    })
+    collisions = [
+        {"a_sid": "feat-002", "b_sid": "config-001",
+         "artifact": "X", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok"},
+        {"a_sid": "feat-002", "b_sid": "config-002",
+         "artifact": "X", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok"},
+    ]
+    leerie._apply_overlap_collisions(plans, collisions)
+
+    deps_001 = next(
+        (s for plan in plans for s in plan["subtasks"]
+         if s["id"] == "deps-001"), None)
+    assert deps_001 is not None
+    assert deps_001["provides"] == ["unrelated"]
+    # downstream-001's depends_on remains pointing at the anchor.
+    downstream = next(s for plan in plans for s in plan["subtasks"]
+                      if s["id"] == "downstream-001")
+    assert downstream["depends_on"] == ["feat-002"]
+
+
+def test_apply_collisions_pair_ordering_independent_with_anchor(leerie):
+    """Calling with [merge(A,B), merge(A,C)] vs [merge(A,C), merge(A,B)]
+    must produce the same anchor-as-survivor outcome regardless of pair
+    ordering — A is the anchor in both inputs."""
+    cs1 = [
+        {"a_sid": "feat-002", "b_sid": "config-001",
+         "artifact": "X", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok1"},
+        {"a_sid": "feat-002", "b_sid": "config-002",
+         "artifact": "X", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok2"},
+    ]
+    cs2 = [
+        {"a_sid": "feat-002", "b_sid": "config-002",
+         "artifact": "X", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok2"},
+        {"a_sid": "feat-002", "b_sid": "config-001",
+         "artifact": "X", "resolution": "merge",
+         "reason": "x", "merge_feasibility": "ok1"},
+    ]
+    plans1 = _three_planner_cluster()
+    plans2 = _three_planner_cluster()
+    leerie._apply_overlap_collisions(plans1, cs1)
+    leerie._apply_overlap_collisions(plans2, cs2)
+    surv1 = {s["id"] for plan in plans1 for s in plan["subtasks"]}
+    surv2 = {s["id"] for plan in plans2 for s in plan["subtasks"]}
+    assert surv1 == surv2 == {"feat-002"}
+
+
+def test_apply_overlap_merge_survivor_hint_overrides_lex(leerie):
+    """Direct unit-test of the new survivor_hint parameter. Without
+    it, lex-smaller (refactor-001) wins; with hint=feat-008, the
+    larger-lex sid wins."""
+    plans = _two_plans_basic()
+    surv_lex = leerie._apply_overlap_merge(
+        plans, "feat-008", "refactor-001",
+        artifact="X", merge_feasibility="ok")
+    assert surv_lex == "feat-008"  # NOTE: lex-smaller of these two
+
+    # Reset and try with explicit hint pointing the other way.
+    plans = _two_plans_basic()
+    surv_hint = leerie._apply_overlap_merge(
+        plans, "feat-008", "refactor-001",
+        artifact="X", merge_feasibility="ok",
+        survivor_hint="refactor-001")
+    assert surv_hint == "refactor-001"
+
+
+def test_apply_overlap_merge_survivor_hint_must_be_endpoint(leerie):
+    """Passing a hint that isn't either endpoint dies — defensive
+    against orchestrator logic bugs that compute the wrong anchor."""
+    plans = _two_plans_basic()
+    with pytest.raises(SystemExit):
+        leerie._apply_overlap_merge(
+            plans, "feat-008", "refactor-001",
+            artifact="X", merge_feasibility="ok",
+            survivor_hint="ghost-999")
+
+
+# --------------------------------------------------------------------- #
+# DESIGN §5 merge_feasibility carry-forward invariant
+# --------------------------------------------------------------------- #
+#
+# Pin the load-bearing fix for Defect E from the audit: when a subtask
+# becomes the survivor of one merge and is later absorbed by another
+# merge, the `merge_feasibility` statement from the earlier merge must
+# survive in the final survivor's intent. Reproducible via REPL across
+# multiple collision shapes (E3 and E15 from the audit) and 3-of-6
+# orderings of the same tangle (E23) before the fix.
+
+def _four_subtask_plans():
+    return [{"domain": "d", "subtasks": [
+        {"id": "A", "title": "A-t", "intent": "A-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "A-c"},
+        {"id": "B", "title": "B-t", "intent": "B-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "B-c"},
+        {"id": "C", "title": "C-t", "intent": "C-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "C-c"},
+        {"id": "D", "title": "D-t", "intent": "D-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "D-c"},
+    ]}]
+
+
+def test_merge_feasibility_carry_forward_e15_shape(leerie):
+    """Reproduces audit experiment E15 / E23 perm 0 — a transitive
+    merge chain where one subtask first becomes a merge survivor and
+    is then itself absorbed. Pre-fix: the first merge's mf is silently
+    lost. Post-fix (DESIGN §5 carry-forward invariant): all three mfs
+    must survive in the final intent."""
+    plans = _four_subtask_plans()
+    collisions = [
+        # B absorbs D, gains mf_BD in its intent.
+        {"a_sid": "B", "b_sid": "D", "artifact": "F1",
+         "resolution": "merge", "merge_feasibility": "mf_BD",
+         "reason": "x"},
+        # A absorbs C, gains mf_CA in its intent.
+        {"a_sid": "C", "b_sid": "A", "artifact": "F2",
+         "resolution": "merge", "merge_feasibility": "mf_CA",
+         "reason": "x"},
+        # A absorbs B — B's intent must carry mf_BD forward into A.
+        {"a_sid": "A", "b_sid": "B", "artifact": "F3",
+         "resolution": "merge", "merge_feasibility": "mf_AB",
+         "reason": "x"},
+    ]
+    leerie._apply_overlap_collisions(plans, collisions)
+    survivors = [s["id"] for plan in plans for s in plan["subtasks"]]
+    assert survivors == ["A"], f"expected single survivor A, got {survivors}"
+    surv = next(s for plan in plans for s in plan["subtasks"])
+    # All three merge_feasibility statements MUST appear in the
+    # surviving intent — the carry-forward invariant.
+    for mf in ("mf_BD", "mf_CA", "mf_AB"):
+        assert mf in surv["intent"], (
+            f"merge_feasibility {mf!r} lost from final intent — "
+            f"DESIGN §5 carry-forward invariant violated.\n"
+            f"intent was: {surv['intent']!r}")
+
+
+def test_merge_feasibility_carry_forward_marker_in_intent(leerie):
+    """The intent assembly uses a `--- Absorbed intent from {sid} ---`
+    marker so the absorbed subtask's intent block is auditable and
+    distinguishable from the survivor's original intent. Pin the
+    marker so we don't accidentally regress to a format that loses
+    traceability."""
+    plans = _four_subtask_plans()
+    # Anchor set is computed once upfront from the full collision list:
+    # B appears in pairs 1+2 (= 2 collisions) → anchors = {B}.
+    # Pair 1: D non-anchor, B anchor → survivor_hint=B. B survives,
+    # D absorbed. B's intent now contains mf_BD.
+    # Pair 2: A non-anchor, B anchor → survivor_hint=B. B survives,
+    # A absorbed. B's intent contains the absorbed-A block AND the
+    # prior absorbed-D block (carried forward from pair 1 — DESIGN §5
+    # merge_feasibility carry-forward invariant).
+    collisions = [
+        {"a_sid": "B", "b_sid": "D", "artifact": "F1",
+         "resolution": "merge", "merge_feasibility": "mf_BD",
+         "reason": "x"},
+        {"a_sid": "A", "b_sid": "B", "artifact": "F2",
+         "resolution": "merge", "merge_feasibility": "mf_AB",
+         "reason": "x"},
+    ]
+    leerie._apply_overlap_collisions(plans, collisions)
+    survivors = {s["id"] for plan in plans for s in plan["subtasks"]}
+    # B survives (anchor); C survives (untouched); A and D absorbed.
+    assert survivors == {"B", "C"}, (
+        f"expected B (anchor) and C (untouched) to survive, got {survivors}")
+    surv = next(s for plan in plans for s in plan["subtasks"]
+                if s["id"] == "B")
+    # Pair 1 absorbed D into B → "Absorbed intent from D" marker.
+    # Pair 2 absorbed A into B → "Absorbed intent from A" marker.
+    assert "--- Absorbed intent from D ---" in surv["intent"]
+    assert "--- Absorbed intent from A ---" in surv["intent"]
+    # Both merge_feasibility statements preserved.
+    assert "mf_BD" in surv["intent"]
+    assert "mf_AB" in surv["intent"]
+
+
+# --------------------------------------------------------------------- #
+# Connected-cluster (multi-anchor) shapes — apply loop handles them
+# without the now-removed both-endpoints-anchor validator check
+# --------------------------------------------------------------------- #
+
+def test_apply_collisions_triangle_resolves_to_one_survivor(leerie):
+    """Audit experiment E2: `merge(A,B), merge(A,C), merge(B,C)` — all
+    three sids appear 2x → all in anchor set. The first two merges
+    collapse A/B/C onto A (lex-smaller). The third pair's endpoints
+    both resolve to A → recorded as `skipped_redundant`. No crash."""
+    plans = [{"domain": "d", "subtasks": [
+        {"id": "A", "title": "A-t", "intent": "A-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "A-c"},
+        {"id": "B", "title": "B-t", "intent": "B-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "B-c"},
+        {"id": "C", "title": "C-t", "intent": "C-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "C-c"},
+    ]}]
+    collisions = [
+        {"a_sid": "A", "b_sid": "B", "artifact": "X",
+         "resolution": "merge", "merge_feasibility": "mf_AB", "reason": "x"},
+        {"a_sid": "A", "b_sid": "C", "artifact": "Y",
+         "resolution": "merge", "merge_feasibility": "mf_AC", "reason": "x"},
+        {"a_sid": "B", "b_sid": "C", "artifact": "Z",
+         "resolution": "merge", "merge_feasibility": "mf_BC", "reason": "x"},
+    ]
+    applied = leerie._apply_overlap_collisions(plans, collisions)
+    survivors = [s["id"] for plan in plans for s in plan["subtasks"]]
+    assert survivors == ["A"]
+    actions = [a["action"] for a in applied]
+    assert actions == ["merge", "merge", "skipped_redundant"]
+    # The redundant entry must name the original sids and the survivor.
+    redundant = applied[2]
+    assert redundant["original_a_sid"] == "B"
+    assert redundant["original_b_sid"] == "C"
+    assert redundant["collapsed_to"] == "A"
+    assert redundant["merge_feasibility"] == "mf_BC"
+
+
+def test_apply_collisions_4cycle_resolves_to_one_survivor(leerie):
+    """Audit experiment E12: a 4-cycle `merge(A,B),(B,C),(C,D),(D,A)`
+    — every sid appears 2x. The first three merges collapse all four
+    onto A (lex-smaller). The fourth pair (D,A) resolves to (A,A) →
+    `skipped_redundant`. No validator die() because the both-endpoints-
+    anchor check has been removed."""
+    plans = _four_subtask_plans()
+    collisions = [
+        {"a_sid": "A", "b_sid": "B", "artifact": "X1",
+         "resolution": "merge", "merge_feasibility": "mf1", "reason": "x"},
+        {"a_sid": "B", "b_sid": "C", "artifact": "X2",
+         "resolution": "merge", "merge_feasibility": "mf2", "reason": "x"},
+        {"a_sid": "C", "b_sid": "D", "artifact": "X3",
+         "resolution": "merge", "merge_feasibility": "mf3", "reason": "x"},
+        {"a_sid": "D", "b_sid": "A", "artifact": "X4",
+         "resolution": "merge", "merge_feasibility": "mf4", "reason": "x"},
+    ]
+    # Validator must NOT die (regression pin on the removal of the
+    # both-endpoints-anchor check).
+    by_id = {s["id"]: s for plan in plans for s in plan["subtasks"]}
+    leerie._validate_overlap_judge_output({"collisions": collisions}, by_id)
+
+    applied = leerie._apply_overlap_collisions(plans, collisions)
+    survivors = [s["id"] for plan in plans for s in plan["subtasks"]]
+    assert survivors == ["A"]
+    actions = [a["action"] for a in applied]
+    assert actions == ["merge", "merge", "merge", "skipped_redundant"]
+
+
+# --------------------------------------------------------------------- #
+# Anchor as b_sid AND lex-largest — pin the survivor_hint behavior
+# --------------------------------------------------------------------- #
+
+def test_apply_collisions_anchor_b_sid_lex_largest(leerie):
+    """Audit experiment E14: anchor is b_sid in both pairs AND
+    lex-LARGEST. Without the anchor rule, lex-smaller would pick the
+    non-anchor partner. The anchor rule must win, otherwise the
+    summarizer-style structural intent is silently inverted."""
+    plans = [{"domain": "d", "subtasks": [
+        {"id": "a-small", "title": "a", "intent": "a-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "x"},
+        {"id": "b-small", "title": "b", "intent": "b-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "x"},
+        {"id": "z-anchor", "title": "z", "intent": "z-i", "provides": [],
+         "requires": [], "depends_on": [], "files_likely_touched": [],
+         "success_criteria_seed": "x"},
+    ]}]
+    collisions = [
+        {"a_sid": "a-small", "b_sid": "z-anchor", "artifact": "X",
+         "resolution": "merge", "merge_feasibility": "mf1", "reason": "x"},
+        {"a_sid": "b-small", "b_sid": "z-anchor", "artifact": "Y",
+         "resolution": "merge", "merge_feasibility": "mf2", "reason": "x"},
+    ]
+    leerie._apply_overlap_collisions(plans, collisions)
+    survivors = [s["id"] for plan in plans for s in plan["subtasks"]]
+    # Anchor wins even though z-anchor > a-small and z-anchor > b-small
+    # lexicographically.
+    assert survivors == ["z-anchor"], (
+        f"anchor rule must override lex when anchor is b_sid and "
+        f"lex-largest. Got survivors {survivors}.")
