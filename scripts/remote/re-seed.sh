@@ -114,7 +114,7 @@ except Exception:
       ;;
   esac
 
-  # --- Step 2: refuse if machine has dirty tracked files ------------------
+  # --- Step 2: refuse if machine has uncommitted edits to tracked files ----
   # Skip the safety check when --force is set. The check is one flyctl exec
   # (~1s); it catches the high-cost case where an implementer edited files
   # mid-task that the orchestrator hadn't committed to a per-subtask branch
@@ -124,11 +124,21 @@ except Exception:
     remote_dirty="$(flyctl ssh console --app "$fly_app" --machine "$mid" \
                       --pty=false -C "git -C /work status --porcelain" \
                       2>/dev/null || true)"
-    # Filter out .leerie/ paths (worker state lives there and is expected to change).
+    # Filter out:
+    #   - .leerie/ paths (worker state lives there and is expected to change)
+    #   - untracked entries (porcelain "??") — these are not tracked-file
+    #     edits the orchestrator might have failed to checkpoint. The rsync
+    #     this guard protects doesn't use --delete, and for any path where
+    #     both host and machine have the file the host's copy is source-of-
+    #     truth by design (the whole point of re-seed). Refusing on `??`
+    #     blocks every resume of any repo that has even one untracked file.
     remote_dirty="$(printf '%s\n' "$remote_dirty" \
-                      | awk 'length($0) > 0 && substr($0,4) !~ /^\.leerie\// { print }')"
+                      | awk 'length($0) > 0 \
+                             && substr($0,1,2) != "??" \
+                             && substr($0,4) !~ /^\.leerie\// \
+                             { print }')"
     if [ -n "$remote_dirty" ]; then
-      remote_log "re_seed: machine /work has uncommitted tracked changes:"
+      remote_log "re_seed: machine /work has uncommitted edits to tracked files:"
       printf '%s\n' "$remote_dirty" | head -10 >&2
       echo "" >&2
       echo "  These edits would be clobbered by re-seed." >&2
