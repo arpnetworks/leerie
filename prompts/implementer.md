@@ -171,6 +171,23 @@ and the subtask's `investigation_notes`. Commit your work to the branch with a
 clear message. Commit only code and project files — never the `.leerie/`
 directory.
 
+**Environmental issues are out of scope.** If `lint` / `typecheck` /
+`test` failures exist in files **outside your subtask's
+`files_likely_touched` list** — and outside the diff you just wrote
+— they are environmental: pre-existing technical debt or other-
+subtask noise that is not your responsibility. Record them *once* in
+your investigation notes ("noted N pre-existing lint errors in
+foo.ts, bar.ts; not in scope") and do not spend tool calls fixing
+them, `git stash`-ing to prove they're not your fault, or running
+auto-fixers that will touch them. Your scope is your
+`files_likely_touched` list plus the files your own diff changed.
+If an auto-fixer (`lint:fix`, `prettier --write`, etc.) touches files
+outside that scope as a side effect, `git checkout -- <path>` those
+files before committing — they belong to a separate refactor subtask,
+not yours. Every tool call you burn on environmental noise eats from
+the per-run worker budget and pushes the run closer to the budget-
+feasibility cap (DESIGN §13).
+
 ### 5. Self-check against your criteria (informational)
 
 Walk your criteria file and record what you observed for each item in

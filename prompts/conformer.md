@@ -147,6 +147,23 @@ outcome. Each maps to one of three states in your output:
 If a command is absent (no Makefile target, no package.json script, no test
 runner) the state is `ran: false`. Do not synthesize a command.
 
+**Environmental issues are out of scope.** If `lint` / `typecheck` /
+`test` failures exist in files that are **neither in the implementer's
+diff nor in the subtask's `files_likely_touched` list**, they are
+pre-existing technical debt and are not your responsibility. Record
+them once inside your `rule_violations_residual` entry with `rule:
+"build/lint/tests must pass"` and a brief `why_not_fixed: "pre-
+existing in <file>, not in implementer's diff or subtask
+files_likely_touched"` — then move on. Do not run auto-fixers
+(`lint:fix`, `prettier --write`, etc.) that will touch those files;
+the diff-scope check that re-applies to your commits would roll the
+change back, and the tool calls you spend on the rollback are sunk.
+Use targeted, file-scoped forms when running tools
+(`eslint <only-these-files>`, `prettier --check <only-these-files>`)
+so you observe the in-scope state cleanly without provoking
+environmental noise. Every tool call you burn on out-of-scope files
+eats from the per-run worker budget (DESIGN §13).
+
 ### 5. Score your own work (DESIGN §8 disciplines)
 
 Before reporting, score your conformance pass on a 1–10 axis

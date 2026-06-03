@@ -167,6 +167,24 @@ DEFAULT_CAPS = {
     # tying the run up overnight. See IMPLEMENTATION.md §3 *Auth/quota
     # backoff* and §6 caps row.
     "auth_retry_max_sec": 300,
+    # Per-subtask `claude -p` call multiplier consumed by
+    # `check_budget_feasibility()` (DESIGN §13 *Budget feasibility —
+    # fail fast at the cheapest moment*). Default 2.5 calibrated from
+    # six on-disk runs as of 2026-06-03: three completed runs cluster
+    # at 2.0–2.31 calls/subtask (1 implementer + ~1.3 conformer rounds);
+    # one died-mid-execution run logged 2.59 with prompts/{implementer,
+    # conformer}.md §"Environmental issues are out of scope" not yet
+    # in effect (lint-fighting inflator). 2.5 covers the worst observed
+    # real ratio. NOT a runtime gate — consumed by the planner-output
+    # feasibility preflight only, never by `bump_workers()`.
+    "subtask_call_estimate": 2.5,
+    # Multiplier applied to `total_estimate` inside
+    # `check_budget_feasibility()` before comparison to
+    # `max_total_workers`. With the default `subtask_call_estimate=2.5`,
+    # the guaranteed cap headroom is ~1.44× — comfortably absorbs the
+    # observed worst case while still flagging the truly-unwinnable
+    # 29-subtask runs that motivated the preflight.
+    "budget_safety_margin": 1.15,
 }
 
 # Every key the orchestrator writes to `st.data`. Canonical alongside the
@@ -181,6 +199,7 @@ STATE_FIELDS = (
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
     "skip_overlap_judge",
+    "skip_budget_check",
     "verbosity", "inspect_dirs",
     "integrator_warnings", "scope_warnings",
     "conformance",
@@ -316,6 +335,17 @@ INSPECT_DIRS_ENV = "LEERIE_INSPECT_DIRS"
 INSPECT_DIRS_FILE = "leerie.toml"
 
 EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
+# Emitted by `check_budget_feasibility()` (DESIGN §13 *Budget feasibility —
+# fail fast at the cheapest moment*) when the estimated remaining `claude -p`
+# calls plus the already-spent count exceeds `max_total_workers`. Distinct
+# from EXIT_NEEDS_ANSWERS=10 (deferred clarification) and from generic
+# `die()` exit code 1 so the Fly runtime's decide_teardown trap and
+# automation around it can route this case specifically. The error message
+# names a recommended `--max-workers` value. Not resumable: `--resume`
+# re-enters past schedule(), so the preflight has nothing to gate; a run
+# that died here re-runs from scratch with the recommended cap or a split
+# task.
+EXIT_BUDGET_INFEASIBLE = 11
 
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
 # --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
@@ -394,6 +424,19 @@ DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 # skip_overlap_judge in leerie.toml → False.
 SKIP_OVERLAP_JUDGE_ENV = "LEERIE_SKIP_OVERLAP_JUDGE"
 SKIP_OVERLAP_JUDGE_FILE = SOURCE_OF_TRUTH_FILE
+
+# --skip-budget-check bypass (DESIGN §13 *Budget feasibility — fail
+# fast at the cheapest moment*). Suppresses `check_budget_feasibility()`
+# in `_run_phases()` after `schedule()` returns. The runtime backstop in
+# `State.bump_workers()` still fires if the run actually exceeds
+# `max_total_workers` during execution; this flag only suppresses the
+# *early* die() that catches mathematically-unwinnable runs at the
+# planner/execute boundary. Use when the operator knows the conformer
+# phase will degrade heavily to advisory warnings or otherwise come in
+# under the estimate. Resolution order: --skip-budget-check CLI flag →
+# LEERIE_SKIP_BUDGET_CHECK env → skip_budget_check in leerie.toml → False.
+SKIP_BUDGET_CHECK_ENV = "LEERIE_SKIP_BUDGET_CHECK"
+SKIP_BUDGET_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 # --pr-template selector. When the target repo has multiple PR templates
 # in a PULL_REQUEST_TEMPLATE/ directory, pick this one by name (the
@@ -2815,6 +2858,28 @@ def resolve_skip_overlap_judge(repo_root: Path, cli_value: bool) -> bool:
         env_var=SKIP_OVERLAP_JUDGE_ENV,
         file_key="skip_overlap_judge",
         file_name=SKIP_OVERLAP_JUDGE_FILE)
+
+
+def resolve_skip_budget_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-budget-check preference. Order:
+    --skip-budget-check CLI flag (action='store_true') →
+    LEERIE_SKIP_BUDGET_CHECK env var →
+    skip_budget_check in leerie.toml → False.
+
+    When True, `check_budget_feasibility()` (DESIGN §13 *Budget
+    feasibility — fail fast at the cheapest moment*) is suppressed.
+    The runtime backstop in `State.bump_workers()` still fires if the
+    run exceeds `max_total_workers` during execution; this flag only
+    suppresses the *early* die() that catches mathematically-unwinnable
+    runs at the plan/execute boundary. Off by default; use only when
+    the operator knows the conformer phase will degrade heavily to
+    advisory warnings or the per-subtask ratio will come in well
+    under the default estimate."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_BUDGET_CHECK_ENV,
+        file_key="skip_budget_check",
+        file_name=SKIP_BUDGET_CHECK_FILE)
 
 
 def _positive_int(s: str) -> int:
@@ -10694,6 +10759,65 @@ def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
     return subtasks, waves
 
 
+def check_budget_feasibility(st: State, caps: dict,
+                             subtasks: dict,
+                             waves: list[list[str]]) -> None:
+    """Phase 3 pure-Python gate (DESIGN §13 *Budget feasibility — fail
+    fast at the cheapest moment*). Called once in `_run_phases()`
+    immediately after `schedule()` returns and before `write_plan()`
+    persists anything. Estimates the `claude -p` calls the run will
+    consume from here to finalize and `die()`s with
+    EXIT_BUDGET_INFEASIBLE when the estimate exceeds
+    `caps["max_total_workers"]`.
+
+    Skipped when `st.data["skip_budget_check"]` is True (the
+    `--skip-budget-check` opt-out). The runtime backstop in
+    `State.bump_workers()` remains as the load-bearing ultimate
+    enforcement either way.
+
+    The estimate adds the *remaining* call count to the
+    *already-spent* `worker_count` (which reflects every upstream
+    phase: classifier, provision, planners, reconciler, overlap
+    judge), so the only free variable is the per-subtask multiplier
+    — calibrated empirically and documented at
+    `DEFAULT_CAPS["subtask_call_estimate"]`."""
+    if st.data.get("skip_budget_check"):
+        return
+    cap = caps["max_total_workers"]
+    already_spent = st.data.get("worker_count", 0)
+    n_subtasks = len(subtasks)
+    n_waves = len(waves)
+    # 1 fixed: `pr_writer` (the only post-execute LLM call —
+    # finalize itself is shell scripts: `git push` + `gh pr create`).
+    # Everything else (classifier, planners, reconciler, overlap_judge,
+    # provision) has already spawned and been counted into
+    # `worker_count` by the time we get here.
+    remaining_estimate = (
+        n_subtasks * caps["subtask_call_estimate"]
+        + n_waves
+        + 1
+    )
+    total_estimate = already_spent + remaining_estimate
+    margin = caps["budget_safety_margin"]
+    if total_estimate * margin > cap:
+        recommended = int(total_estimate * margin) + 5
+        die(
+            f"budget infeasible: planner produced {n_subtasks} subtask(s) "
+            f"across {n_waves} wave(s); {already_spent} `claude -p` "
+            f"call(s) already spent on upstream phases (classifier / "
+            f"planner / reconciler / overlap-judge / provision); "
+            f"estimated {remaining_estimate:g} more needed "
+            f"(implementers + conformers + integrators + pr_writer). "
+            f"Total estimate {total_estimate:g} × safety margin {margin} "
+            f"= {total_estimate * margin:g} vs --max-workers {cap}. "
+            f"Re-run with --max-workers {recommended}, split the task "
+            f"into smaller scopes, or use --skip-budget-check to push "
+            f"through (the runtime backstop in State.bump_workers() will "
+            f"still fire if the estimate was correct).",
+            code=EXIT_BUDGET_INFEASIBLE,
+        )
+
+
 def write_plan(leerie_dir: Path, task: str, st: State,
                subtasks: dict, waves: list[list[str]]) -> None:
     """Persist the merged plan and per-subtask spec files the implementers read."""
@@ -12157,6 +12281,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["dangerously_skip_permissions"] = bool(
             args.dangerously_skip_permissions)
         st.data["skip_overlap_judge"] = bool(args.skip_overlap_judge)
+        st.data["skip_budget_check"] = bool(args.skip_budget_check)
         st.save()
         # Absorb --answers on resume too. The documented user flow for
         # a non-interactive deferred-question exit (Phase-1 or §11
@@ -12184,7 +12309,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "clarify": bool(args.clarify),
                    "dangerously_skip_permissions": bool(
                        args.dangerously_skip_permissions),
-                   "skip_overlap_judge": bool(args.skip_overlap_judge)}
+                   "skip_overlap_judge": bool(args.skip_overlap_judge),
+                   "skip_budget_check": bool(args.skip_budget_check)}
         st.save()
         await preflight(leerie_dir, verbosity=verbosity,
                         skip_smoke=args.skip_smoke,
@@ -12298,6 +12424,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["current_phase"] = "phase 3: scheduling"
         st.save()
         subtasks, waves = schedule(plans)
+        # Budget-feasibility preflight (DESIGN §13 *Budget feasibility —
+        # fail fast at the cheapest moment*). Runs after schedule() so we
+        # have the real wave count, before validate_plan / write_plan so
+        # no plan.json or subtask spec files get written for a run that
+        # is mathematically unwinnable. die()s with EXIT_BUDGET_INFEASIBLE
+        # and a recommended --max-workers; opt-out via --skip-budget-check.
+        check_budget_feasibility(st, caps, subtasks, waves)
         validate_plan(subtasks)
         write_plan(leerie_dir, task, st, subtasks, waves)
 
@@ -12428,6 +12561,17 @@ def main() -> None:
                          "affects runs where the worker would otherwise fire. "
                          f"Also {SKIP_OVERLAP_JUDGE_ENV} env or "
                          "skip_overlap_judge in leerie.toml. Default: off.")
+    ap.add_argument("--skip-budget-check", action="store_true",
+                    help="skip the post-schedule budget-feasibility preflight "
+                         "(DESIGN §13 Budget feasibility — fail fast at the "
+                         "cheapest moment). The runtime backstop in "
+                         "State.bump_workers() still fires if the run exceeds "
+                         "--max-workers during execution; this flag only "
+                         "suppresses the early die() that catches "
+                         "mathematically-unwinnable runs at the plan/execute "
+                         "boundary. "
+                         f"Also {SKIP_BUDGET_CHECK_ENV} env or "
+                         "skip_budget_check in leerie.toml. Default: off.")
     ap.add_argument("--source-of-truth", choices=SOURCE_OF_TRUTH_VALUES,
                     metavar="VALUE",
                     help=f"source-of-truth preference "
@@ -12697,6 +12841,14 @@ def main() -> None:
     # key; phase_overlap_judge reads it from there on entry.
     args.skip_overlap_judge = resolve_skip_overlap_judge(
         repo_root, args.skip_overlap_judge)
+
+    # Resolve --skip-budget-check (DESIGN §13 *Budget feasibility — fail
+    # fast at the cheapest moment*). Same precedence shape as the other
+    # skip flags. Re-attach to args so orchestrate() folds it into
+    # state.json under the canonical "skip_budget_check" key;
+    # check_budget_feasibility() reads it from there.
+    args.skip_budget_check = resolve_skip_budget_check(
+        repo_root, args.skip_budget_check)
 
     # Resolve --pr-template: free-form string (no enum). Re-attach to
     # args so phase_finalize sees the resolved value via

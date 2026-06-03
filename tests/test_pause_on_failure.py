@@ -147,6 +147,7 @@ def _decide_teardown_with_rc(
     rc: str,
     run_id: str = "test-run-001",
     fetch_branch_succeeds: bool = True,
+    export_remote_run_id: bool = False,
 ) -> tuple[subprocess.CompletedProcess, Path]:
     """Run decide_teardown with LEERIE_REMOTE_EXIT_RC=$rc.
 
@@ -182,15 +183,21 @@ def _decide_teardown_with_rc(
         f"LEERIE_MACHINE_ID=mach-test; "
         f"decide_teardown"
     )
-    result = _run_bash(
-        script,
-        env={
-            "PATH": f"{tmp_path}:/usr/bin:/bin",
-            "USER_REPO": str(user_repo),
-            "LEERIE_RUN_ID": run_id,
-            "LEERIE_REMOTE_EXIT_RC": rc,
-        },
-    )
+    env = {
+        "PATH": f"{tmp_path}:/usr/bin:/bin",
+        "USER_REPO": str(user_repo),
+        "LEERIE_RUN_ID": run_id,
+        "LEERIE_REMOTE_EXIT_RC": rc,
+    }
+    if export_remote_run_id:
+        # Needed when the test asserts on recovery-hint output: the
+        # provision.sh hint branches at line 264 only when the
+        # $USER_REPO/.leerie/runs/$LEERIE_REMOTE_RUN_ID dir resolves;
+        # absent this var, run_dir is empty and the trap silently
+        # destroys without printing the hint. Default off so the
+        # existing rc=0/10/75/130/143/1/2 tests stay byte-identical.
+        env["LEERIE_REMOTE_RUN_ID"] = run_id
+    result = _run_bash(script, env=env)
     return result, sidecar
 
 
@@ -211,6 +218,36 @@ def test_decide_teardown_rc10_destroys(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
     assert "machine destroy mach-test" in invocations
+
+
+def test_decide_teardown_rc11_destroys(tmp_path: Path):
+    """rc=11 (EXIT_BUDGET_INFEASIBLE, DESIGN §13 *Budget feasibility —
+    fail fast at the cheapest moment*) → destroy, not pause.
+
+    A budget-infeasible run is unrecoverable: --resume would die at
+    `_run_phases`'s resume guard (no `waves` field), and the run made
+    no commits to finalize. Routing rc=11 to the pause arm would leave
+    the user paying for a Fly volume indefinitely. The correct
+    disposition is the same as rc=0|10|75 (destroy after sync) and
+    the recovery hint must be the budget-specific 're-run with
+    --max-workers' variant, NOT the finalize hint that rc=10 uses."""
+    result, sidecar = _decide_teardown_with_rc(
+        tmp_path, "11", export_remote_run_id=True,
+    )
+    assert result.returncode == 0, result.stderr
+    invocations = (tmp_path / "flyctl.log").read_text()
+    assert "machine destroy mach-test" in invocations
+    assert "machine stop mach-test" not in invocations
+    data = json.loads(sidecar.read_text())
+    assert data.get("paused_at") is None
+    # Recovery hint coupling test: the rc=11 path must print the
+    # budget-specific message, not the rc=10 finalize hint that
+    # would mislead the user into running `leerie --finalize` on a
+    # run with nothing to push.
+    assert "budget preflight rejected the plan" in result.stderr
+    assert "re-run from the host with the recommended --max-workers" in result.stderr
+    # Negative coupling: must NOT print the rc=10-style finalize hint.
+    assert "to push and open a PR after the run completes" not in result.stderr
 
 
 def test_decide_teardown_rc75_destroys(tmp_path: Path):

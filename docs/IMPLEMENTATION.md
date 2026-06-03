@@ -918,6 +918,70 @@ same shape as `--no-push` resolution. When the flag is active, leerie
 emits a visible startup log line so every run shows the escape hatch
 is engaged.
 
+### Budget feasibility preflight
+
+`max_total_workers` (DESIGN §13 *Budget feasibility — fail fast at
+the cheapest moment*) is enforced two ways. The cheap, late check is
+`State.bump_workers()`, which raises `WorkerError` the moment the
+counter would exceed the cap mid-execution. The complementary *early*
+check is `check_budget_feasibility()`, called once in `_run_phases()`
+immediately after `schedule()` returns its `(subtasks, waves)` pair
+and before `write_plan()` persists anything. It estimates the
+remaining `claude -p` calls the run will consume:
+
+```
+estimated_remaining = (
+    len(subtasks) * caps["subtask_call_estimate"]   # impl + ~conformer per subtask
+    + len(waves)                                     # one integrator per wave
+    + 1                                              # pr_writer (finalize itself is shell)
+)
+total_estimate = st.data["worker_count"] + estimated_remaining
+if total_estimate * caps["budget_safety_margin"] > caps["max_total_workers"]:
+    die(... recommended --max-workers ..., code=EXIT_BUDGET_INFEASIBLE)
+```
+
+The estimate adds to `worker_count` (which already reflects every
+upstream phase: classifier, provision, planners, reconciler, overlap
+judge), so the only free variable is the per-subtask multiplier.
+Calibration corpus (six runs on disk as of 2026-06-03; three completed
+runs cluster at 2.0–2.31 calls/subtask, summarizer's lint-fighting
+inflator pushed it to 2.59 — see prompts/{implementer,conformer}.md
+§"Environmental issues are out of scope"). Default `2.5` is honest:
+covers the worst observed real ratio, and the explicit `1.15` safety
+multiplier on top means the guaranteed headroom against the cap is
+~1.44×.
+
+Resolution order for the opt-out (highest priority first):
+
+1. **`--skip-budget-check`** CLI flag (action=`store_true`).
+2. **`LEERIE_SKIP_BUDGET_CHECK`** environment variable
+   (`_parse_bool_envtoml`).
+3. **`leerie.toml` at the repo root** with `skip_budget_check = true`.
+4. **Default `False`.** The check runs.
+
+Skipped on `--resume`: the resume path enters `_run_phases` past
+`schedule()` (the `waves` field is loaded from `state.json`), so the
+preflight has nothing to gate. A run that died on the preflight is
+not resumable — `--resume` would re-fire the same check with the same
+inputs and die identically. The user re-runs with the recommended
+`--max-workers` value or splits the task.
+
+Exit code `EXIT_BUDGET_INFEASIBLE = 11` on `die()`, distinct from
+`EXIT_NEEDS_ANSWERS = 10` (deferred-clarification structured exit)
+and the generic `die()` error code 1. The Fly runtime's `decide_teardown`
+trap (`scripts/remote/provision.sh`) routes `11` through the same
+case-arm as `0|10|75` (genuine terminal exits): the trap calls
+`_try_fetch_branch_for_teardown` to pull whatever state landed on
+the machine back to the host, then takes the `_run_finished_at == ""`
+fallback (the run never reached finalize, so no `host_finalize` is
+attempted) and `destroy_machine` runs cleanly. A code-11-specific
+recovery hint is printed: "re-run with the recommended --max-workers
+value" — distinct from the code-10 hint which suggests `--finalize`,
+because a budget-infeasible run has no work to finalize and `--resume`
+would die at the resume guard (no `waves` field in `state.json`).
+This routing keeps the user from paying for a Fly volume indefinitely
+on a structurally-unrecoverable run.
+
 ### Runtime mode
 
 Controls which execution backend runs the per-subtask worker containers.
@@ -1723,6 +1787,7 @@ permissive same-file-different-surface class).
 ### Plan validation — `validate_plan` (after scheduling, before persisting the plan)
 | Check | Catches |
 |-------|---------|
+| **budget feasibility** — `check_budget_feasibility()` runs at the same layer as `validate_plan`, immediately after `schedule()` returns and before `write_plan()` persists. Estimates remaining `claude -p` calls (implementers + conformers + integrators per wave + finalize) added to `worker_count` already spent on upstream phases, multiplied by `budget_safety_margin`, compared to `max_total_workers`. | a planner output that is mathematically too large to fit the configured `--max-workers` cap. The pre-existing runtime backstop is `State.bump_workers()` which raises `WorkerError` partway through execution; this earlier check `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value at the cheapest possible moment (no implementer has spawned yet, only the integrated commits from upstream judgment phases are sunk). Opt-out via `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml`. See §"Budget feasibility preflight" above and DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*. |
 | ids match domain prefix (`bugfix-`, `feat-`, `refactor-`, `perf-`, `test-`, `deps-`, `config-`, `docs-`) | cross-domain collisions, audit ambiguity. The planner's user prompt receives the prefix directly as `ID_PREFIX = CATEGORY_ABBREV[domain] + "-"`, so the prompt cannot drift from the validator's allowlist — both derive from the same `CATEGORY_ABBREV` map (in `leerie.py`). |
 | no `size: large` subtasks | planner OR reconciler violated the sizing constraint. The error message names the actual author via the `_added_by_reconciler` flag — "planner must split it further" for planner-authored, "reconciler must split it further (size-retry exhausted)" for reconciler-added subtasks that survived the size-resolution retry loop. The reconciler path is exercised through the phase 2½ size gate first; this row is the post-merge backstop for the planner case and the exhaustion case. |
 | no empty `success_criteria_seed` | implementer has no criteria starting point |
@@ -1998,7 +2063,9 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | subtask continuations (re-spawns of an implementer for the same subtask — both context-exhaustion handoffs *and* mid-execution clarifications consume from the same budget) | 3 (`subtask_continuations`) | return `blocked`; fatal at wave boundary |
 | corrective retries of a *retryable* failure per subtask (`failed_retries`) | 1 | return `failed` |
 | orchestrator-level conformer rounds per subtask (`conformance_rounds`) | 2 | exit the conformance loop; any residuals become `conformance_warnings` on the subtask result — never `failed` / `blocked` (DESIGN §9 *Post-work conformance*) |
-| total worker invocations per run | 60 (`--max-workers`, also `LEERIE_MAX_WORKERS` env or `max_workers` in `leerie.toml`) | abort, state saved for `--resume` |
+| total worker invocations per run | 60 (`--max-workers`, also `LEERIE_MAX_WORKERS` env or `max_workers` in `leerie.toml`) | the cheap, runtime backstop in `State.bump_workers()`: raises `WorkerError`, abort, state saved for `--resume`. The complementary early check is `check_budget_feasibility()` at the plan/execute boundary (after `schedule()`, before `write_plan()`) — it estimates remaining `claude -p` calls from the planner output and `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value before any implementer spawns, so a run that is mathematically unwinnable fails at the cheapest moment rather than mid-wave. See DESIGN §13 *Budget feasibility — fail fast at the cheapest moment* and §"Budget feasibility preflight" above. |
+| per-subtask call-estimate (for the feasibility preflight) | 2.5 (`subtask_call_estimate`) | not a runtime gate; consumed by `check_budget_feasibility()` as the per-subtask multiplier in its remaining-call estimate. Default calibrated from successful runs at 2.0–2.31; the safety margin (next row) absorbs the lint-fighting inflator that pushes the ratio above 2.5 on environments-heavy repos. |
+| budget-preflight safety margin | 1.15 (`budget_safety_margin`) | not a runtime gate; consumed by `check_budget_feasibility()` as the multiplier on `total_estimate` before comparison to `max_total_workers`. With the default `subtask_call_estimate=2.5`, the guaranteed cap headroom is ~1.44×. |
 | concurrent workers within a wave | 2 (`--max-parallel`) | throughput throttle. Lowered from 4 in May 2026 because the subprocess fan-out *inside* each `claude -p` worker (Bash tool, the Task background-job pattern, toolchain children like vitest pools / webpack workers / tsc) is unbounded — the only orchestrator-side knob that bounds total in-flight memory load is the worker count. The cgroup containment above is the other half of the fix; together they keep an OOM contained to one worker's cgroup rather than cascading to sshd / lima-guestagent (the failure mode observed in May 2026). |
 | turns per `claude -p` call | per worker (below) | worker stops; implementer → `incomplete-handoff` |
 | per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) | worker killed; implementer → `incomplete-handoff` |
@@ -3434,6 +3501,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `clarify` | bool | whether asking the user is allowed for this run (resolved from `--clarify` / `LEERIE_CLARIFY` / `leerie.toml` / default `False`) |
 | `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / plan_overlap_judge / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). Resolved from `--skip-overlap-judge` / `LEERIE_SKIP_OVERLAP_JUDGE` / `leerie.toml` / default `False`. The cheap-skip on single-planner / <2-subtask runs is automatic and not gated by this field — this flag only affects runs where the worker would otherwise fire. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
+| `skip_budget_check` | bool | whether `check_budget_feasibility()` (DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*) is suppressed. Resolved from `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml` / default `False`. The runtime backstop in `State.bump_workers()` is independent of this field — it always fires when the counter actually exceeds `max_total_workers`; this flag only suppresses the *early* die() that catches mathematically-unwinnable runs at the plan/execute boundary. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state. On `--resume` the preflight is moot regardless — the resume path enters past `schedule()` so the check has nothing to gate |
 | `verbosity` | str | resolved verbosity level (`quiet` / `normal` / `stream` / `debug`); re-resolved fresh on every run, including `--resume`, so the user can dial up or down without editing state |
 | `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) via `--add-dir`. Resolved from `--inspect-dir` / `LEERIE_INSPECT_DIRS` / `inspect_dirs` in `leerie.toml`; re-resolved fresh on every run, including `--resume`, so the user can add or remove paths without editing state. Empty list when nothing is configured |
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |

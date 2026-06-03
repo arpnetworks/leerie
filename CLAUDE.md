@@ -225,6 +225,18 @@ export LEERIE_MAX_WORKERS=80
 # multi-planner runs (e.g., when you know the overlap is intentional):
 ./leerie "task" --skip-overlap-judge
 
+# Skip the planner-output budget-feasibility preflight (DESIGN §13
+# *Budget feasibility — fail fast at the cheapest moment*) — also
+# LEERIE_SKIP_BUDGET_CHECK=1 or `skip_budget_check = true` in
+# leerie.toml. The preflight die()s at plan-return time with a
+# recommended --max-workers when the planner produces more subtasks
+# than the budget can fit; the runtime backstop in
+# State.bump_workers() always fires regardless, so this flag only
+# suppresses the *early* die() — use when the operator knows the
+# conformer phase will degrade heavily to advisory warnings or the
+# per-subtask ratio will come in under the default 2.5 estimate:
+./leerie "task" --skip-budget-check
+
 # Waive §12 mechanical read-only enforcement on judgment workers
 # (use on repos where the planner needs pnpm/tsc/vitest visibility —
 # also LEERIE_DANGEROUSLY_SKIP_PERMISSIONS=1 or

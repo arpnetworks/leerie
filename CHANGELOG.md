@@ -9,6 +9,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Planner-output budget feasibility preflight (DESIGN §13 *Budget
+  feasibility — fail fast at the cheapest moment*).** A new pure-Python
+  gate `check_budget_feasibility()` runs immediately after `schedule()`
+  returns and before `write_plan()` persists. When the estimated
+  `claude -p` calls (per-subtask multiplier × subtask count + per-wave
+  integrator + 1 `pr_writer`, added to `worker_count` already spent on
+  upstream phases, multiplied by the safety margin) exceeds
+  `--max-workers`, the orchestrator `die()`s with a new exit code
+  `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value
+  — at the cheapest possible moment, before any implementer has
+  spawned. Closes the failure mode where a too-large plan was only
+  detected mid-execution by `State.bump_workers()` after $50+ of work
+  had been sunk.
+
+  Calibrated from six on-disk runs (three completed cluster at 2.0–2.31
+  calls/subtask; one died-mid-execution logged 2.59 with the
+  lint-fighting inflator). Default `subtask_call_estimate = 2.5`,
+  `budget_safety_margin = 1.15`. Backward-validated: the estimator
+  would have caught the 29-subtask summarizer run at its bootstrap
+  with a recommended `--max-workers 106`, and would have passed each
+  of the three observed successful runs at default cap 60. Opt-out via
+  `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` /
+  `skip_budget_check = true` in `leerie.toml`. Fly runtime's
+  `decide_teardown` trap routes exit 11 to destroy (not pause) and
+  prints a budget-specific recovery hint, so a structurally
+  unrecoverable run does not leave a paid-for Fly volume hanging.
+
+- **Implementer + conformer prompts gained an "environmental issues
+  are out of scope" subsection.** Documents the rule that pre-existing
+  `lint` / `typecheck` / `test` failures in files outside the subtask's
+  `files_likely_touched` list are environmental noise — record once
+  in evidence, do not spend tool calls fixing them, do not run
+  auto-fixers that will touch them, and revert any side-effect changes
+  from `lint:fix`/`prettier --write`. Lowers the per-subtask call
+  ratio (the inflator that pushed the dying summarizer run from a
+  baseline of 2.0–2.3 to 2.59), reducing wasted budget on
+  unrelated technical debt.
+
 ### Fixed
 
 - **`FLY_VM_DISK_GB` now actually absorbs run-time disk growth.** The

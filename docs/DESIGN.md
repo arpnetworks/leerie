@@ -2023,6 +2023,49 @@ with state saved, rather than carrying a broken subtask forward into
 integration. The specific failure-to-tier mapping is in `IMPLEMENTATION.md`;
 the *principle* — correctable-mistake versus broken-worker — is the design.
 
+### Budget feasibility — fail fast at the cheapest moment
+
+`max_total_workers` is a hard ceiling on the number of `claude -p`
+invocations a single run may spawn. The cheap, late check is
+`State.bump_workers()` — it raises `WorkerError` the moment the
+counter would exceed the cap. That check is necessary as a backstop,
+but it fires *during execution*, after some — sometimes most — of the
+run's compute has already been spent. A 29-subtask run with the
+default cap of 60 cannot finish; the late check discovers this around
+subtask 17, leaving the run branch with the first few waves' worth of
+integrated commits and the rest unrunnable.
+
+The corresponding *early* check belongs at the plan/execute boundary.
+By the time `schedule()` returns its `(subtasks, waves)` pair, every
+unknown that determines how much budget the rest of the run will
+consume is resolved: the final subtask count is fixed, the wave count
+is computed (deterministically, by Kahn's algorithm over the
+dependency graph — no LLM call), the planner-domain count is settled,
+and the upstream phases (classify, provision, plan, reconcile,
+overlap-judge) have already been billed into `worker_count`. A
+feasibility check at this point can estimate the remaining cost
+(implementer + conformer per subtask, integrator per wave, finalize)
+with no free variables beyond the per-subtask call multiplier, which
+is well-bounded empirically.
+
+The principle is the same one §12 enumerates: any guarantee that
+matters and can be checked mechanically lives in code. The runtime
+`WorkerError` will remain — a worker that goes wildly over its
+expected call count must still hit a wall — but it stops being the
+*primary* discovery mechanism for "this run was unwinnable from the
+start." Fail-fast at planner-output time saves the most compute (the
+implementers and conformers have not yet been spawned) and surfaces
+the actionable fix (a recommended `--max-workers` value, or a hint to
+split the task) at the moment the user can still trivially apply it.
+
+The estimate is intentionally conservative — it covers the worst
+observed per-subtask ratio plus a safety margin — and exposes a
+documented escape hatch (`--skip-budget-check`) for runs whose
+operator knows the conformer phase will degrade heavily to advisory
+warnings or otherwise come in under the estimate. The escape hatch
+matches the same precedence chain as `--skip-smoke` and
+`--skip-overlap-judge`: a deliberate opt-out, not a default.
+
 ---
 
 ## 14. Telemetry, judging, and self-healing

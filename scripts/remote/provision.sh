@@ -206,11 +206,21 @@ decide_teardown() {
     return 0
   fi
   case "$rc" in
-    0|10|75)
+    0|10|11|75)
       # Genuine terminal exits of the *run*:
       #   0   — orchestrator finished cleanly (the tail wrapper detected
       #         orchestrator-pid exit and printed the finalize hint).
       #   10  — EXIT_NEEDS_ANSWERS (plugin re-run).
+      #   11  — EXIT_BUDGET_INFEASIBLE (DESIGN §13 *Budget feasibility —
+      #         fail fast at the cheapest moment*). The orchestrator
+      #         die()d at check_budget_feasibility() with a recommended
+      #         --max-workers value, before any implementer spawned. The
+      #         run is unrecoverable (--resume would die at the guard
+      #         since waves was never written), so destroy the machine
+      #         like the other terminal exits and let the user re-run
+      #         with the recommended cap. Falls through to the
+      #         _run_finished_at == "" path below: skip host_finalize
+      #         (nothing committed), then destroy_machine cleanly.
       #   75  — EX_TEMPFAIL (rate-limit, parse-fail).
       #
       # SAFETY-CRITICAL: pull the run branch + state dir to the host
@@ -262,9 +272,19 @@ decide_teardown() {
           _run_finished_at="$(jq -r '.finished_at // ""' "$run_dir/run.json" 2>/dev/null || true)"
         fi
         if [ -n "$run_dir" ] && [ -d "$run_dir" ] && [ -z "$_run_finished_at" ]; then
-          remote_log "remote: run did not reach finalize (likely waiting for clarification); skipping auto-finalize"
-          if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
-            remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR after the run completes"
+          if [ "$rc" = "11" ]; then
+            # EXIT_BUDGET_INFEASIBLE: orchestrator dies pre-execute
+            # with a recommended --max-workers value in stderr (which
+            # the user already saw above this banner). --resume is not
+            # an option — the resume guard rejects (no waves field).
+            # The fix is to re-run with the cap raised.
+            remote_log "remote: budget preflight rejected the plan; see the recommended --max-workers value above"
+            remote_log "remote: re-run from the host with the recommended --max-workers value (or split the task into smaller scopes)"
+          else
+            remote_log "remote: run did not reach finalize (likely waiting for clarification); skipping auto-finalize"
+            if [ -n "${LEERIE_REMOTE_RUN_ID:-}" ]; then
+              remote_log "remote: run 'leerie --finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR after the run completes"
+            fi
           fi
           destroy_machine
         elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
