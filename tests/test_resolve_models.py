@@ -22,14 +22,15 @@ import argparse
 import pytest
 
 
-WORKERS = ("classifier", "planner", "reconciler", "provision",
-           "implementer", "integrator", "conformer")
+WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
+           "provision", "implementer", "integrator", "conformer")
 
 # The expected default per worker, with no overrides.
 DEFAULTS = {
     "classifier": "opus",
     "planner":    "opus",
     "reconciler": "opus",
+    "plan_overlap_judge": "opus",
     "provision":  "opus",
     "integrator": "opus",
     "implementer": "sonnet",

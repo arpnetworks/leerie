@@ -180,6 +180,7 @@ STATE_FIELDS = (
     "categories", "classifier_questions", "answers",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
+    "skip_overlap_judge",
     "verbosity", "inspect_dirs",
     "integrator_warnings", "scope_warnings",
     "conformance",
@@ -209,6 +210,17 @@ STATE_FIELDS = (
     # field from `dropped_subtasks` (off-tree soft drops, phase 3) so the
     # two causes stay separately auditable.
     "conditional_drops",
+    # plan_overlap_judge / plan_overlap_applied: set by phase_overlap_judge
+    # (DESIGN §5 *Cross-domain surface overlap*). plan_overlap_judge stores
+    # the full judge worker output (list of collisions with a_sid/b_sid/
+    # artifact/resolution/reason/merge_feasibility) for audit / replay
+    # debugging. plan_overlap_applied stores the post-apply mutation summary
+    # (each entry: {action: merge|drop_a|drop_b, surviving_sid, dropped_sid,
+    # artifact}). Both empty/absent when the phase short-circuits
+    # (single-planner runs, < 2 subtasks, --skip-overlap-judge) or when the
+    # judge returned `{collisions: []}`.
+    "plan_overlap_judge",
+    "plan_overlap_applied",
     # no_work_required / no_work_reasons: set by _finish_no_work_run when
     # every planner returns status="ready" with empty subtasks (DESIGN §8
     # *The cleared-but-empty terminal state*). The task is already
@@ -373,6 +385,16 @@ CLARIFY_FILE = SOURCE_OF_TRUTH_FILE
 DANGEROUS_SKIP_PERMS_ENV = "LEERIE_DANGEROUSLY_SKIP_PERMISSIONS"
 DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
 
+# --skip-overlap-judge bypass (DESIGN §5 *Cross-domain surface overlap*).
+# Skips the phase 2¾ `plan_overlap_judge` worker even on multi-planner
+# runs. The cheap-skip on single-planner runs is automatic and not
+# bypassable by this flag; this flag only suppresses the worker spawn
+# on the runs where it would otherwise fire. Resolution order:
+# --skip-overlap-judge CLI flag → LEERIE_SKIP_OVERLAP_JUDGE env →
+# skip_overlap_judge in leerie.toml → False.
+SKIP_OVERLAP_JUDGE_ENV = "LEERIE_SKIP_OVERLAP_JUDGE"
+SKIP_OVERLAP_JUDGE_FILE = SOURCE_OF_TRUTH_FILE
+
 # --pr-template selector. When the target repo has multiple PR templates
 # in a PULL_REQUEST_TEMPLATE/ directory, pick this one by name (the
 # basename, with or without .md). When unset, the alphabetically first
@@ -434,13 +456,14 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "classifier": "high",
     "planner": "high",
     "reconciler": "high",
+    "plan_overlap_judge": "high",
     "provision": "high",
     "integrator": "high",
     "pr_writer": "high",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
-WORKER_TYPES = ("classifier", "planner", "reconciler", "provision",
-                "implementer", "integrator", "conformer")
+WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
+                "provision", "implementer", "integrator", "conformer")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -1127,6 +1150,63 @@ SCHEMAS: dict[str, dict] = {
                         # validate_provision_recipe.
                         "working_dir": {"type": "string"},
                         "timeout_s": {"type": "integer", "minimum": 1},
+                    },
+                },
+            },
+        },
+    },
+    "plan_overlap_judge": {
+        # Output of the plan-overlap judge worker (DESIGN §5
+        # *Cross-domain surface overlap*). Spawned by `phase_overlap_judge`
+        # after `phase_reconcile` when 2+ planners contributed subtasks.
+        # The worker reads the full reconciled subtask list (title,
+        # intent, files_likely_touched, provides, requires, depends_on)
+        # and emits zero or more `collisions` — pairs of subtasks that
+        # would produce the same exported artifact with incompatible
+        # designs.
+        #
+        # Each collision carries one of four `resolution` values:
+        #   - merge: a single implementation can satisfy both subtasks'
+        #     success criteria. MUST carry a non-empty `merge_feasibility`
+        #     statement describing the unified API (enforced in code by
+        #     _validate_overlap_judge_output, per DESIGN §12 — the prompt
+        #     asks for it on every merge, and Python rejects a merge
+        #     without it). The orchestrator collapses the two subtasks
+        #     into one and uses `merge_feasibility` as the merged
+        #     subtask's unified intent.
+        #   - drop_a / drop_b: one subtask is strictly superseded by the
+        #     other. The orchestrator removes the dropped sid and
+        #     rewrites downstream `depends_on` references.
+        #   - unresolvable: the two intents are structurally
+        #     contradictory and no single artifact satisfies both. The
+        #     orchestrator dies at plan time with both sids + artifact +
+        #     reason; user revises the task or manually picks a side.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["collisions"],
+        "properties": {
+            "collisions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["a_sid", "b_sid", "artifact",
+                                 "resolution", "reason"],
+                    "properties": {
+                        "a_sid": {"type": "string"},
+                        "b_sid": {"type": "string"},
+                        "artifact": {"type": "string"},
+                        "resolution": {
+                            "type": "string",
+                            "enum": ["merge", "drop_a", "drop_b",
+                                     "unresolvable"],
+                        },
+                        "reason": {"type": "string"},
+                        # Required-when-merge is enforced in code (see
+                        # _validate_overlap_judge_output) rather than via
+                        # JSON Schema conditionals — keeps the schema
+                        # surface flat and the error message specific.
+                        "merge_feasibility": {"type": "string"},
                     },
                 },
             },
@@ -2715,6 +2795,26 @@ def resolve_dangerously_skip_permissions(
         env_var=DANGEROUS_SKIP_PERMS_ENV,
         file_key="dangerously_skip_permissions",
         file_name=DANGEROUS_SKIP_PERMS_FILE)
+
+
+def resolve_skip_overlap_judge(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-overlap-judge preference. Order:
+    --skip-overlap-judge CLI flag (action='store_true') →
+    LEERIE_SKIP_OVERLAP_JUDGE env var →
+    skip_overlap_judge in leerie.toml → False.
+
+    When True, `phase_overlap_judge` (DESIGN §5 *Cross-domain surface
+    overlap*) skips the worker spawn even on multi-planner runs that
+    would otherwise trigger it. The cheap-skip on single-planner / <2-
+    subtask runs is automatic and not gated by this flag — this flag
+    only affects the runs where the worker would actually fire. Off by
+    default; use only when you know the surface overlap is intentional
+    and you want to bypass the discipline."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_OVERLAP_JUDGE_ENV,
+        file_key="skip_overlap_judge",
+        file_name=SKIP_OVERLAP_JUDGE_FILE)
 
 
 def _positive_int(s: str) -> int:
@@ -9637,6 +9737,531 @@ def _validate_unresolved_must_include(
     return unaddressed
 
 
+# =========================================================================
+# phase 2¾: plan-overlap judge (DESIGN §5 *Cross-domain surface overlap*)
+# =========================================================================
+#
+# Parallel planners can independently produce subtasks that target the
+# same exported artifact (component / function / primitive) with
+# incompatible APIs. The reconciler doesn't catch this — its mandate is
+# `requires`-tag vocabulary drift, and the two colliding subtasks can
+# legitimately use different `provides` tags for the same artifact. The
+# collision then surfaces as an integrator merge-conflict mid-run, with
+# worker budget already spent across earlier waves.
+#
+# `phase_overlap_judge` runs one `plan_overlap_judge` worker between
+# reconcile and schedule to detect these collisions at plan time. The
+# judge emits zero or more `collisions`, each with one of four
+# resolutions: `merge` (one component satisfies both intents),
+# `drop_a` / `drop_b` (one intent supersedes), or `unresolvable`
+# (structural API contradiction; die at plan time).
+#
+# Per DESIGN §12, the Python apply step is load-bearing: the prompt
+# describes the discipline, the code enforces it. The merge-feasibility
+# backstop (`_validate_overlap_judge_output`) rejects any `merge`
+# without a non-empty `merge_feasibility` statement — that statement IS
+# the merged subtask's unified intent, so a missing one would produce
+# a frankenstein spec.
+
+
+def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]) -> None:
+    """Apply the merge-feasibility backstop and structural sanity checks
+    on the judge's output, before any mutation. die()s on violation —
+    callers are expected to have deep-copied `plans` if they need clean
+    reversion. Per DESIGN §12 (prompts advisory, code enforces): the
+    prompt asks for a concrete merge_feasibility statement whenever
+    `merge` is emitted; Python rejects a `merge` without one rather
+    than trusting the prompt was followed."""
+    seen_pairs: set[tuple[str, str]] = set()
+    for c in output.get("collisions", []) or []:
+        a_sid = c.get("a_sid")
+        b_sid = c.get("b_sid")
+        resolution = c.get("resolution")
+        if not a_sid or not b_sid:
+            die(f"plan-overlap judge emitted a collision with missing "
+                f"a_sid/b_sid: {c!r}. Schema should have caught this; "
+                "refine the task or re-run.")
+        if a_sid == b_sid:
+            die(f"plan-overlap judge emitted a collision where a_sid == "
+                f"b_sid == {a_sid!r}; a subtask cannot collide with "
+                "itself. Refine the task or re-run.")
+        if a_sid not in subtasks_by_id:
+            die(f"plan-overlap judge referenced unknown subtask "
+                f"{a_sid!r} (collision with {b_sid!r}); the judge sees "
+                "the reconciled plan, so an unknown id is a model "
+                "defect. Refine the task or re-run.")
+        if b_sid not in subtasks_by_id:
+            die(f"plan-overlap judge referenced unknown subtask "
+                f"{b_sid!r} (collision with {a_sid!r}); refine the task "
+                "or re-run.")
+        # Order-independent pair dedup — two collisions on the same pair
+        # with different resolutions would be incoherent.
+        pair = tuple(sorted([a_sid, b_sid]))
+        if pair in seen_pairs:
+            die(f"plan-overlap judge emitted two collisions for the "
+                f"same pair {pair!r}; the model must pick one "
+                "resolution. Refine the task or re-run.")
+        seen_pairs.add(pair)
+        if resolution == "merge":
+            mf = (c.get("merge_feasibility") or "").strip()
+            if not mf:
+                die(f"plan-overlap judge emitted resolution=merge for "
+                    f"{a_sid!r} ↔ {b_sid!r} (artifact: "
+                    f"{c.get('artifact', '<unspecified>')!r}) without a "
+                    "merge_feasibility statement. The prompt requires a "
+                    "concrete merge-feasibility check before merging; "
+                    "merging without it would produce a frankenstein "
+                    "implementer spec. The right answer in this case is "
+                    "resolution=unresolvable. Refine the task or re-run.")
+
+
+def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
+                        surviving_sid: str) -> None:
+    """Remove `dropped_sid` from its plan, union its `provides` tags
+    into `surviving_sid`, and rewrite downstream `depends_on`
+    references to point at `surviving_sid`. Mirrors the
+    `conditional_drops` apply step's removal logic in
+    `_apply_reconciler_output` — same in-place plan mutation pattern,
+    same downstream `depends_on` rewrite semantics.
+
+    Unlike conditional_drops (which prunes references rather than
+    rewriting them, because the dropped subtask's `provides` becomes a
+    fresh unresolved entry the reconciler retry handles), an
+    overlap-judge drop has a surviving partner producing the same
+    artifact. We union the dropped subtask's `provides` into the
+    survivor so downstream `requires` that matched the dropped
+    subtask's tags resolve cleanly against the survivor — without this
+    union, dropping `feat-008` (provides `auth-shell-adopted`) in
+    favor of `refactor-001` (provides `auth-shell-component`) would
+    orphan every `feat-011 requires auth-shell-adopted` edge into a
+    `validate_plan` error that doesn't trace back to the judge's drop.
+    `phase_overlap_judge` runs after the reconciler's unresolved-retry
+    loop, so leaving orphans for "the next pass" is not an option.
+
+    After the union, any `extent: in_plan` requires entry on the
+    survivor whose tag is now in its own provides becomes a graph
+    self-loop and is removed — mirrors the same self-loop cleanup in
+    `_apply_overlap_merge`. The dropped subtask's title / intent /
+    success_criteria_seed are NOT carried over: the judge said one
+    intent supersedes the other, and the survivor's intent is the
+    intent that wins. Only the capability-graph wiring is unioned."""
+    by_id: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            by_id[s["id"]] = s
+
+    # Silent no-op if either sid is missing — mirrors `renames` /
+    # `conditional_drops`. The validator catches truly unknown sids
+    # upstream; this guard makes the helper robust against being
+    # called twice (e.g., a retry path) without dying.
+    dropped = by_id.get(dropped_sid)
+    surviving = by_id.get(surviving_sid)
+    if dropped is None or surviving is None:
+        # Still rewrite depends_on references — they may point at the
+        # dropped sid even if the subtask itself is already gone.
+        for plan in plans:
+            for s in plan.get("subtasks", []):
+                deps = s.get("depends_on") or []
+                if dropped_sid in deps:
+                    new_deps: list[str] = []
+                    for dep in deps:
+                        dep = surviving_sid if dep == dropped_sid else dep
+                        if dep not in new_deps and dep != s.get("id"):
+                            new_deps.append(dep)
+                    s["depends_on"] = new_deps
+        # Still remove any stale subtask entry with the dropped id.
+        for plan in plans:
+            plan["subtasks"] = [
+                t for t in plan.get("subtasks", []) if t.get("id") != dropped_sid
+            ]
+        return
+
+    # Union dropped.provides into surviving.provides (dedup, order-
+    # preserving). This is the load-bearing fix: downstream `requires`
+    # entries that matched the dropped subtask's tags now resolve
+    # against the survivor.
+    surv_provides = surviving.setdefault("provides", [])
+    for tag in (dropped.get("provides") or []):
+        if tag not in surv_provides:
+            surv_provides.append(tag)
+
+    # Drop survivor's in_plan requires that are now self-loops (tag
+    # produced by the survivor's own provides post-union). External
+    # entries stay regardless (out-of-graph, not graph edges).
+    surviving["requires"] = [
+        entry for entry in (surviving.get("requires") or [])
+        if not (isinstance(entry, dict)
+                and entry.get("extent") == "in_plan"
+                and entry.get("tag") in surv_provides)
+    ]
+
+    # Remove the dropped subtask from its plan.
+    for plan in plans:
+        plan["subtasks"] = [
+            t for t in plan.get("subtasks", []) if t.get("id") != dropped_sid
+        ]
+
+    # Rewrite downstream depends_on references and drop the dropped sid
+    # from anywhere it appears as a predecessor.
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            deps = s.get("depends_on") or []
+            if dropped_sid in deps:
+                new_deps: list[str] = []
+                for dep in deps:
+                    dep = surviving_sid if dep == dropped_sid else dep
+                    if dep not in new_deps and dep != s.get("id"):
+                        new_deps.append(dep)
+                s["depends_on"] = new_deps
+
+
+def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
+                         artifact: str, merge_feasibility: str) -> str:
+    """Collapse `a_sid` and `b_sid` into one subtask. Returns the
+    surviving sid (the lexicographically smaller one, stable rule).
+
+    Field semantics — mirrors `_apply_reconciler_output`'s
+    `merged_subtasks` apply step but uses the judge's
+    `merge_feasibility` as the canonical unified intent rather than
+    a free-form concatenation. The result is one subtask that:
+
+    - keeps the lexicographically smaller sid as `id` (stable across
+      re-runs).
+    - `title` becomes `"{a.title} + {b.title}"`.
+    - `intent` becomes `"{a.intent}\\n\\nMerged with {b.id} by "
+      "plan-overlap-judge:\\n{merge_feasibility}"` — the
+      `merge_feasibility` statement IS the unified spec the implementer
+      reads.
+    - `success_criteria_seed` becomes `"{a.criteria} AND {b.criteria}"`
+      (same shape as the reconciler's merge for symmetry).
+    - `files_likely_touched`, `provides`, `requires`, `depends_on`
+      become the union (dedup, order-preserving), with self-references
+      to either sid removed.
+    - tag-based `requires` that the merged subtask itself now provides
+      are dropped (would be a graph self-loop).
+    - `_merged_from` stamps `[b_sid, ...]` for traceability (mirrors
+      the reconciler).
+
+    Downstream subtasks whose `depends_on` referenced the dropped sid
+    are rewritten to point at the survivor."""
+    by_id: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            by_id[s["id"]] = s
+
+    if a_sid not in by_id or b_sid not in by_id:
+        # _validate_overlap_judge_output should have caught this.
+        # Defensive die() in case the validator is bypassed somehow.
+        missing = [x for x in (a_sid, b_sid) if x not in by_id]
+        die(
+            "plan-overlap merge references non-existent subtask id(s): "
+            f"{', '.join(sorted(missing))}. Both endpoints must exist "
+            "in the reconciled plan."
+        )
+
+    # Stable surviving-sid rule: lexicographically smaller wins. Same
+    # ordering regardless of which arg was a_sid vs b_sid, so two
+    # judge outputs that differ only in pair ordering produce
+    # identical merged plans.
+    into_id, from_id = sorted([a_sid, b_sid])
+    into_s = by_id[into_id]
+    from_s = by_id[from_id]
+
+    # title: concatenation.
+    into_title = into_s.get("title") or ""
+    from_title = from_s.get("title") or ""
+    if into_title and from_title:
+        into_s["title"] = f"{into_title} + {from_title}"
+    elif from_title:
+        into_s["title"] = from_title
+
+    # intent: anchor on into's intent, append the judge's
+    # merge_feasibility as the unified-spec note. Quote the absorbed
+    # sid for traceability.
+    into_intent = into_s.get("intent") or ""
+    note = (f"\n\nMerged with {from_id} by plan-overlap-judge "
+            f"(artifact: {artifact}):\n{merge_feasibility}")
+    into_s["intent"] = into_intent + note
+
+    # success_criteria_seed: concatenation with AND (matches reconciler).
+    into_scs = into_s.get("success_criteria_seed", "") or ""
+    from_scs = from_s.get("success_criteria_seed", "") or ""
+    if into_scs and from_scs:
+        into_s["success_criteria_seed"] = f"{into_scs} AND {from_scs}"
+    elif from_scs:
+        into_s["success_criteria_seed"] = from_scs
+
+    # provides: union, dedup, order-preserving.
+    merged_provides = list(into_s.get("provides", []) or [])
+    for tag in (from_s.get("provides") or []):
+        if tag not in merged_provides:
+            merged_provides.append(tag)
+    into_s["provides"] = merged_provides
+
+    # requires: union, drop self-references (entries whose tag is now in
+    # the merged provides — would be a graph self-loop). External
+    # entries stay regardless (out-of-graph, surface as preconditions).
+    seen_req: set[tuple[str, str]] = set()
+    merged_requires = []
+    for entry in (list(into_s.get("requires", []) or [])
+                  + list(from_s.get("requires", []) or [])):
+        if not isinstance(entry, dict):
+            continue
+        tag = entry.get("tag", "")
+        extent = entry.get("extent", "")
+        key = (tag, extent)
+        if key in seen_req:
+            continue
+        seen_req.add(key)
+        if extent == "in_plan" and tag in merged_provides:
+            continue
+        merged_requires.append(entry)
+    into_s["requires"] = merged_requires
+
+    # depends_on: union minus self-references (would be a self-loop),
+    # dedup, order-preserving.
+    merged_deps: list[str] = []
+    for dep in (list(into_s.get("depends_on", []) or [])
+                + list(from_s.get("depends_on", []) or [])):
+        if dep == from_id or dep == into_id:
+            continue
+        if dep not in merged_deps:
+            merged_deps.append(dep)
+    into_s["depends_on"] = merged_deps
+
+    # files_likely_touched: union, order-preserving dedup.
+    merged_files: list[str] = []
+    for f in (list(into_s.get("files_likely_touched", []) or [])
+              + list(from_s.get("files_likely_touched", []) or [])):
+        if f not in merged_files:
+            merged_files.append(f)
+    into_s["files_likely_touched"] = merged_files
+
+    # _merged_from telemetry — append so a chain of merges is traceable.
+    merged_from = into_s.setdefault("_merged_from", [])
+    if from_id not in merged_from:
+        merged_from.append(from_id)
+    for prior in (from_s.get("_merged_from") or []):
+        if prior not in merged_from:
+            merged_from.append(prior)
+
+    # Remove `from` from its plan.
+    for plan in plans:
+        plan["subtasks"] = [
+            s for s in plan.get("subtasks", []) if s.get("id") != from_id
+        ]
+
+    # Rewrite downstream depends_on references: from → into.
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            deps = s.get("depends_on") or []
+            if from_id in deps:
+                new_deps: list[str] = []
+                for dep in deps:
+                    dep = into_id if dep == from_id else dep
+                    if dep not in new_deps and dep != s.get("id"):
+                        new_deps.append(dep)
+                s["depends_on"] = new_deps
+
+    return into_id
+
+
+async def phase_overlap_judge(plans: list[dict], task: str, st: State,
+                              caps: dict, models: dict[str, str],
+                              efforts: dict[str, str | None]) -> list[dict]:
+    """Phase 2¾: detect cross-planner surface-overlap collisions
+    (DESIGN §5 *Cross-domain surface overlap*).
+
+    Short-circuits when fewer than 2 planners contributed subtasks, or
+    when the total subtask count is < 2 — single-planner / trivial runs
+    cannot produce cross-planner surface collisions. Also short-circuits
+    when `--skip-overlap-judge` (or its env / TOML mirror) is set; that
+    knob lives on `st.data["skip_overlap_judge"]` and is checked here
+    rather than in the caller so the skip is uniformly auditable.
+
+    On a non-skipped run, spawns one `plan_overlap_judge` worker with
+    the full reconciled subtask list, validates the output via
+    `_validate_overlap_judge_output` (DESIGN §12 backstop on the
+    merge-feasibility discipline), then applies each collision
+    mechanically: `merge` collapses two subtasks into one via
+    `_apply_overlap_merge`; `drop_a` / `drop_b` removes the dropped
+    subtask via `_apply_overlap_drop`; `unresolvable` `die()`s at plan
+    time with both sids + artifact + reason. Persists the full judge
+    output to `st.data["plan_overlap_judge"]` and the mutation summary
+    to `st.data["plan_overlap_applied"]` for audit.
+
+    Returns the (possibly mutated) `plans` list, ready for `schedule()`.
+    """
+    # Cheap-skip conditions, in order of cost.
+    if st.data.get("skip_overlap_judge"):
+        log("phase 2¾: overlap-judge skipped (--skip-overlap-judge / "
+            "LEERIE_SKIP_OVERLAP_JUDGE / skip_overlap_judge=true)")
+        return plans
+
+    # Count planners that actually contributed subtasks, and total
+    # subtask count. The reconciler may have added a synthetic
+    # `_reconciler` plan; count it as a contributor since its subtasks
+    # can still collide with planner-authored ones.
+    contributing_domains: set[str] = set()
+    total_subtasks = 0
+    for plan in plans:
+        sts = plan.get("subtasks", []) or []
+        if sts:
+            contributing_domains.add(plan.get("domain", "<unknown>"))
+            total_subtasks += len(sts)
+    if len(contributing_domains) < 2:
+        log(f"phase 2¾: overlap-judge skipped "
+            f"(single contributing planner: "
+            f"{sorted(contributing_domains)!r})")
+        return plans
+    if total_subtasks < 2:
+        log(f"phase 2¾: overlap-judge skipped "
+            f"(< 2 subtasks total: {total_subtasks})")
+        return plans
+
+    log(f"phase 2¾: plan-overlap judge over "
+        f"{len(contributing_domains)} planner(s), {total_subtasks} subtask(s)")
+    st.data["current_phase"] = "phase 2¾: overlap-judge"
+    st.save()
+
+    # Build the judge's input. The worker sees every subtask's
+    # id/title/intent/scope_note/files_likely_touched/provides/requires/
+    # depends_on. `requires` is left as the planner-emitted object form
+    # since the judge may want to read `reason` text in addition to
+    # tag/extent.
+    subtask_views: list[dict] = []
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            subtask_views.append({
+                "id": s.get("id", ""),
+                "title": s.get("title", ""),
+                "intent": s.get("intent", ""),
+                "scope_note": s.get("scope_note", ""),
+                "files_likely_touched": list(
+                    s.get("files_likely_touched", []) or []),
+                "provides": list(s.get("provides", []) or []),
+                "requires": list(s.get("requires", []) or []),
+                "depends_on": list(s.get("depends_on", []) or []),
+            })
+    payload = {"task": task, "subtasks": subtask_views}
+
+    sys_prompt = load_prompt("plan_overlap_judge")
+    user_prompt = (
+        "JUDGE INPUT:\n" + json.dumps(payload, indent=2) +
+        "\n\nReturn only the JSON object per your schema. If no surface "
+        "collisions exist, return {\"collisions\": []}."
+    )
+
+    st.bump_workers(caps)
+    output = await claude_p(
+        user_prompt=user_prompt, system_prompt=sys_prompt,
+        schema_key="plan_overlap_judge", cwd=os.getcwd(),
+        allowed_tools=INSPECT_TOOLS, max_turns=30,
+        autonomous=False, caps=caps, st=st,
+        model=models["plan_overlap_judge"],
+        effort=efforts["plan_overlap_judge"],
+        sid="plan_overlap_judge",
+        add_dirs=st.data.get("inspect_dirs") or None,
+    )
+
+    # Persist the raw judge output for audit, even before applying —
+    # if a later die() fires (unresolvable, or _validate_overlap_judge_output),
+    # the user can inspect what the judge said.
+    st.data["plan_overlap_judge"] = output
+    st.save()
+
+    collisions = (output.get("collisions") or [])
+    if not collisions:
+        log("phase 2¾: no surface collisions found")
+        return plans
+
+    # Index subtasks by id once for the validator's id-existence check.
+    by_id: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            by_id[s["id"]] = s
+    _validate_overlap_judge_output(output, by_id)
+
+    # Surface unresolvable BEFORE mutating anything — same fail-closed
+    # discipline as phase_reconcile._check_unresolvable. The user gets
+    # the judge's diagnosis without phantom mutations on disk.
+    unresolvable = [c for c in collisions
+                    if c.get("resolution") == "unresolvable"]
+    if unresolvable:
+        bullets = "\n".join(
+            f"  • {c['a_sid']} ↔ {c['b_sid']} "
+            f"(artifact: {c.get('artifact', '<unspecified>')}): "
+            f"{c.get('reason', '<no reason>')}"
+            for c in unresolvable
+        )
+        die(
+            f"plan-overlap judge found {len(unresolvable)} unresolvable "
+            "surface collision(s) in the reconciled plan:\n"
+            f"{bullets}\n"
+            "Each collision is two planners producing the same exported "
+            "artifact with structurally incompatible APIs (DESIGN §5 "
+            "*Cross-domain surface overlap*). Auto-merging would produce "
+            "a frankenstein implementer spec the judge correctly "
+            "refused. To unblock:\n"
+            "  • Refine the task description to disambiguate the "
+            "disputed surface (name which API survives, or split it into "
+            "two distinct artifacts), and re-run.\n"
+            "  • Or manually delete one of the colliding subtask specs "
+            "in .leerie/runs/<run-id>/subtasks/ and `--resume`."
+        )
+
+    # Apply merges and drops in input order. Each op mutates `plans` in
+    # place; we track the applied-mutation summary for state audit.
+    applied: list[dict] = []
+    for c in collisions:
+        a_sid = c["a_sid"]
+        b_sid = c["b_sid"]
+        artifact = c.get("artifact", "")
+        resolution = c["resolution"]
+        if resolution == "merge":
+            mf = (c.get("merge_feasibility") or "").strip()
+            # _validate_overlap_judge_output enforces non-empty; the
+            # `or "<unset>"` is belt-and-suspenders against a logic bug.
+            surviving = _apply_overlap_merge(
+                plans, a_sid, b_sid, artifact, mf or "<unset>")
+            dropped = b_sid if surviving == a_sid else a_sid
+            applied.append({
+                "action": "merge", "artifact": artifact,
+                "surviving_sid": surviving, "dropped_sid": dropped,
+                "reason": c.get("reason", ""),
+            })
+            log(f"phase 2¾: merged {dropped} → {surviving} "
+                f"(artifact: {artifact})")
+        elif resolution == "drop_a":
+            _apply_overlap_drop(plans, dropped_sid=a_sid,
+                                surviving_sid=b_sid)
+            applied.append({
+                "action": "drop_a", "artifact": artifact,
+                "surviving_sid": b_sid, "dropped_sid": a_sid,
+                "reason": c.get("reason", ""),
+            })
+            log(f"phase 2¾: dropped {a_sid}, kept {b_sid} "
+                f"(artifact: {artifact})")
+        elif resolution == "drop_b":
+            _apply_overlap_drop(plans, dropped_sid=b_sid,
+                                surviving_sid=a_sid)
+            applied.append({
+                "action": "drop_b", "artifact": artifact,
+                "surviving_sid": a_sid, "dropped_sid": b_sid,
+                "reason": c.get("reason", ""),
+            })
+            log(f"phase 2¾: dropped {b_sid}, kept {a_sid} "
+                f"(artifact: {artifact})")
+        # resolution == "unresolvable" was already handled above.
+
+    st.data["plan_overlap_applied"] = applied
+    st.save()
+    log(f"phase 2¾: applied {len(applied)} resolution(s) "
+        f"({sum(1 for a in applied if a['action'] == 'merge')} merge, "
+        f"{sum(1 for a in applied if a['action'].startswith('drop'))} drop)")
+    return plans
+
+
 def _build_predecessor_graph(
     subtasks: dict[str, dict],
 ) -> tuple[dict[str, set[str]], dict[str, list[str]],
@@ -11284,6 +11909,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["clarify"] = bool(args.clarify)
         st.data["dangerously_skip_permissions"] = bool(
             args.dangerously_skip_permissions)
+        st.data["skip_overlap_judge"] = bool(args.skip_overlap_judge)
         st.save()
         # Absorb --answers on resume too. The documented user flow for
         # a non-interactive deferred-question exit (Phase-1 or §11
@@ -11310,7 +11936,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "inspect_dirs": list(getattr(args, "inspect_dirs", []) or []),
                    "clarify": bool(args.clarify),
                    "dangerously_skip_permissions": bool(
-                       args.dangerously_skip_permissions)}
+                       args.dangerously_skip_permissions),
+                   "skip_overlap_judge": bool(args.skip_overlap_judge)}
         st.save()
         await preflight(leerie_dir, verbosity=verbosity,
                         skip_smoke=args.skip_smoke,
@@ -11397,6 +12024,18 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         if no_work_map is not None:
             _finish_no_work_run(st, no_work_map)
             return
+        # Phase 2¾: detect cross-planner surface-overlap collisions
+        # (DESIGN §5 *Cross-domain surface overlap*). Two planners can
+        # independently produce subtasks for the same exported artifact
+        # with incompatible APIs; the reconciler doesn't look for this
+        # (its mandate is `requires`-tag vocabulary drift). The judge
+        # short-circuits on single-planner / <2-subtask runs; on multi-
+        # planner runs it emits zero or more collisions resolved as
+        # merge / drop_* (applied mechanically) or unresolvable (die at
+        # plan time, strictly better than the integrator design-
+        # conflict crash this exists to prevent).
+        plans = await phase_overlap_judge(
+            plans, task, st, caps, models, efforts)
         # Surface cross-planner file-claim overlaps. Warning only — the
         # reconciler handles capability-tag drift but not file-claim
         # conflicts (yet); empirically these correlate strongly with
@@ -11534,6 +12173,14 @@ def main() -> None:
     ap.add_argument("--skip-smoke", action="store_true",
                     help="skip the live claude -p smoke test during preflight. "
                          "Default: off (smoke test runs)")
+    ap.add_argument("--skip-overlap-judge", action="store_true",
+                    help="skip the phase 2¾ plan-overlap judge worker even on "
+                         "multi-planner runs (DESIGN §5 Cross-domain surface "
+                         "overlap). The cheap-skip on single-planner / "
+                         "<2-subtask runs is automatic; this flag only "
+                         "affects runs where the worker would otherwise fire. "
+                         f"Also {SKIP_OVERLAP_JUDGE_ENV} env or "
+                         "skip_overlap_judge in leerie.toml. Default: off.")
     ap.add_argument("--source-of-truth", choices=SOURCE_OF_TRUTH_VALUES,
                     metavar="VALUE",
                     help=f"source-of-truth preference "
@@ -11795,6 +12442,14 @@ def main() -> None:
         log("dangerously-skip-permissions: ON "
             "(judgment workers run with prompts disabled — "
             "§12 enforcement waived)")
+
+    # Resolve --skip-overlap-judge (DESIGN §5 *Cross-domain surface
+    # overlap*). Same precedence shape as --clarify /
+    # --dangerously-skip-permissions. Re-attach to args so orchestrate()
+    # folds it into state.json under the canonical "skip_overlap_judge"
+    # key; phase_overlap_judge reads it from there on entry.
+    args.skip_overlap_judge = resolve_skip_overlap_judge(
+        repo_root, args.skip_overlap_judge)
 
     # Resolve --pr-template: free-form string (no enum). Re-attach to
     # args so phase_finalize sees the resolved value via

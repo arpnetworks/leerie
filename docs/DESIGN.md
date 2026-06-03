@@ -340,6 +340,52 @@ coupling between their outputs is recovered globally by the scheduler, and
 vocabulary mismatches that would have produced silent missing-edges are
 caught by the reconciler before they reach the scheduler.
 
+### Cross-domain surface overlap
+
+The reconciler bridges *vocabulary* drift — two planners naming the same
+capability with different tags. There is a second class of drift the
+reconciler does not address: two planners independently proposing
+subtasks that produce **the same exported artifact** (the same component,
+the same exported function, the same primitive extraction) with
+**incompatible APIs**. Because the reconciler's mandate is unresolved
+`requires` tags, and because each planner can legitimately declare its
+own `provides` tag for the artifact (`auth-shell-component` and
+`auth-shell-adopted` describe the same `AuthShell` extraction), this
+class slips past every check between planning and integration. The
+collision then surfaces as an integrator merge-conflict mid-run, with
+worker budget already spent across earlier waves.
+
+A **plan-overlap judge** worker runs between reconcile and schedule
+specifically to catch this. It reads the full reconciled subtask list
+(title, intent, `files_likely_touched`, `provides`, `requires`) and
+emits zero or more `collisions`, each with one of four resolutions:
+`merge` (one component satisfies both intents), `drop_a`/`drop_b` (one
+intent is strictly superseded), or `unresolvable` (the intents are
+structurally contradictory and the run should die at plan time rather
+than crash at integration).
+
+The judge is biased toward escalation. Before emitting `merge`, it must
+verify the two intents are compositionally consistent — no required-
+vs-forbidden prop conflict, no structural body contradiction, no
+adoption-site contract conflict — and write a concrete
+`merge_feasibility` statement that the orchestrator carries forward as
+the merged subtask's unified intent. If no such statement can be
+written, the resolution must be `unresolvable`, not `merge`. The
+discipline is what distinguishes detection from silent auto-merging of
+two incompatible specs into a frankenstein implementer brief. The
+orchestrator enforces this in Python: a `merge` emission with empty
+`merge_feasibility` is a fatal error.
+
+The judge's recall on the test corpus was 100% (every observed surface
+collision flagged including the run that motivated this phase), with
+the merge-feasibility discipline correctly downgrading incompatible-API
+pairs to `drop_*` and `unresolvable`. Skip is automatic on single-
+planner runs; opt-out via `--skip-overlap-judge`. The complementary
+file-overlap warning (`warn_cross_planner_file_overlap`) remains in
+place but stays advisory — the judge handles the load-bearing case;
+the warning surfaces the deliberately-permissive same-file-different-
+surface cases.
+
 ### Why waves are sequential
 
 Each wave's worktrees are branched from the integrated result of all prior

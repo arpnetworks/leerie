@@ -217,6 +217,13 @@ export LEERIE_MAX_WORKERS=80
 # Skip the live `claude -p` smoke test during development:
 ./leerie "task" --skip-smoke
 
+# Skip the phase 2¾ plan-overlap judge (DESIGN §5 *Cross-domain surface
+# overlap*) — also LEERIE_SKIP_OVERLAP_JUDGE=1 or
+# `skip_overlap_judge = true` in leerie.toml. The judge is skipped
+# automatically on single-planner runs; use this flag to disable it on
+# multi-planner runs (e.g., when you know the overlap is intentional):
+./leerie "task" --skip-overlap-judge
+
 # Waive §12 mechanical read-only enforcement on judgment workers
 # (use on repos where the planner needs pnpm/tsc/vitest visibility —
 # also LEERIE_DANGEROUSLY_SKIP_PERMISSIONS=1 or
