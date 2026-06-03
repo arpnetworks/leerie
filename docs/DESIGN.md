@@ -995,6 +995,8 @@ committed work) plus `.leerie/runs/<run-id>/` (the orchestrator's own
 state) are the only durable record of a run, and both already live on
 the machine's filesystem by the time a pause fires.
 
+### Remote disk policy
+
 **Disk durability is conditional on `FLY_VM_DISK_GB`.** When the env
 var is set, `provision.sh` creates a per-machine Fly volume mounted at
 `/work` and the pause-on-failure contract above is unconditional — the
@@ -1022,9 +1024,11 @@ long stop, or any Fly-side reclamation, discards the rootfs and the
 run dir with it. Users running anything they intend to pause-and-
 resume across a long window should set `FLY_VM_DISK_GB`. The same env
 var doubles as the recovery for runs that hit ENOSPC mid-execution —
-historically ENOSPC was reached by per-worker worktree accumulation on
-the rootfs's hard cap (2,000 IOPS / 8 MiB/s), which the volume both
-relieves and accelerates.
+historically ENOSPC was reached by per-worker worktree accumulation
+exhausting the rootfs's ~8 GiB size cap, which the volume relieves
+directly. The rootfs's separate throughput cap (2,000 IOPS / 8 MiB/s)
+compounds the failure by slowing the spillover; the volume accelerates
+it as a side-effect since per-machine tiers run 4k–32k IOPS.
 
 Six sidecar fields on `run.json` capture remote lifecycle state:
 
