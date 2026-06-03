@@ -2626,6 +2626,11 @@ child_env = dict(os.environ)
 child_env["HOME"] = "/home/leerie"   # ssh-console default is /root
 child_env["USER"] = "leerie"
 child_env["LOGNAME"] = "leerie"
+# host-side $(basename "$USER_REPO") expansion — the heredoc is
+# unquoted so this becomes a literal basename in the script piped
+# to the Fly machine. Keeps orchestrator log() prefix consistent
+# with host-side remote_log() (else log() falls back to cwd=/work).
+child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
 if extra_path not in child_env.get("PATH", ""):
     child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
