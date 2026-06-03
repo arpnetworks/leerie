@@ -753,8 +753,9 @@ export LEERIE_RUNTIME=local               # or: fly
 leerie "task" --runtime fly
 
 # Choose the model. Without overrides: judgment workers (classifier,
-# planner, reconciler, provision, integrator) default to opus; acting
-# workers (implementer, conformer) default to sonnet. Use the env var
+# planner, reconciler, plan_overlap_judge, provision, integrator) default
+# to opus; acting workers (implementer, conformer) default to sonnet.
+# Use the env var
 # for a sticky preference, the CLI flag for a one-off, or leerie.toml
 # for the committed repo default. Per-worker overrides also exist —
 # see §2.
@@ -878,8 +879,9 @@ same shape as `--source-of-truth` resolution.
 ### Permission override (dangerous)
 
 By default, judgment workers (classifier, planner, reconciler,
-provision) run in the real repo cwd with a narrow Bash allowlist
-(`INSPECT_TOOLS`) and **without** `--dangerously-skip-permissions`.
+plan_overlap_judge, provision) run in the real repo cwd with a narrow
+Bash allowlist (`INSPECT_TOOLS`) and **without**
+`--dangerously-skip-permissions`.
 This mechanically prevents them from mutating state — the §12
 enforcement that a planner cannot run `pnpm run typecheck`,
 `tsc --noEmit`, or any other side-effecting subprocess. Acting workers
@@ -1256,17 +1258,19 @@ current model version).
 
 **Per-worker defaults: Opus for judgment, Sonnet for implementation, post-run analysis, and finalize-time composition.**
 Workers that exercise broad-context judgment (classify the task, decompose
-into subtasks, reconcile cross-domain coupling, resolve merge conflicts
-behaviorally, check criteria) default to Opus. The implementer, conformer,
-judge, heal, and pr_writer workers — which execute concrete tasks with high
-throughput requirements (implementer, conformer) or run as one-shot
-post-run / finalize calls (judge, heal, pr_writer) — default to Sonnet.
+into subtasks, reconcile cross-domain coupling, detect cross-planner surface
+overlap, resolve merge conflicts behaviorally, check criteria) default to
+Opus. The implementer, conformer, judge, heal, and pr_writer workers —
+which execute concrete tasks with high throughput requirements (implementer,
+conformer) or run as one-shot post-run / finalize calls (judge, heal,
+pr_writer) — default to Sonnet.
 
 | Worker       | Default | Why |
 |--------------|---------|-----|
 | classifier   | opus    | global judgment over the task description |
 | planner      | opus    | decomposition is the load-bearing judgment step |
 | reconciler   | opus    | cross-domain tag equivalence is judgment |
+| plan_overlap_judge | opus | surface-overlap detection over the reconciled plan is judgment (two planners independently extracting the same artifact with incompatible APIs — DESIGN §5 *Cross-domain surface overlap*) |
 | provision    | opus    | fallback when the deterministic lockfile-detection table returns empty (DESIGN §6½); reads README + configs to emit an install recipe — judgment over arbitrary repo shapes |
 | integrator   | opus    | behavioral conflict resolution; a wrong merge silently corrupts integrated state |
 | implementer  | sonnet  | concrete subtask execution; Sonnet's throughput is the right tradeoff |
@@ -1290,21 +1294,22 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Eleven worker types, each independently overridable:
+Twelve worker types, each independently overridable:
 
-| Worker       | env var                       | CLI flag                | TOML key            |
-|--------------|-------------------------------|-------------------------|---------------------|
-| (global)     | `LEERIE_MODEL`              | `--model`               | `model`             |
-| classifier   | `LEERIE_MODEL_CLASSIFIER`   | `--model-classifier`    | `model_classifier`  |
-| planner      | `LEERIE_MODEL_PLANNER`      | `--model-planner`       | `model_planner`     |
-| reconciler   | `LEERIE_MODEL_RECONCILER`   | `--model-reconciler`    | `model_reconciler`  |
-| provision    | `LEERIE_MODEL_PROVISION`    | `--model-provision`     | `model_provision`   |
-| implementer  | `LEERIE_MODEL_IMPLEMENTER`  | `--model-implementer`   | `model_implementer` |
-| integrator   | `LEERIE_MODEL_INTEGRATOR`   | `--model-integrator`    | `model_integrator`  |
-| conformer    | `LEERIE_MODEL_CONFORMER`    | `--model-conformer`     | `model_conformer`   |
-| judge        | `LEERIE_MODEL_JUDGE`        | `--judge-model`         | `model_judge`       |
-| heal         | `LEERIE_MODEL_HEAL`         | `--heal-model`          | `model_heal`        |
-| pr_writer    | `LEERIE_MODEL_PR_WRITER`    | `--pr-writer-model`     | `model_pr_writer`   |
+| Worker             | env var                           | CLI flag                     | TOML key                  |
+|--------------------|-----------------------------------|------------------------------|---------------------------|
+| (global)           | `LEERIE_MODEL`                  | `--model`                    | `model`                   |
+| classifier         | `LEERIE_MODEL_CLASSIFIER`       | `--model-classifier`         | `model_classifier`        |
+| planner            | `LEERIE_MODEL_PLANNER`          | `--model-planner`            | `model_planner`           |
+| reconciler         | `LEERIE_MODEL_RECONCILER`       | `--model-reconciler`         | `model_reconciler`        |
+| plan_overlap_judge | `LEERIE_MODEL_PLAN_OVERLAP_JUDGE`| `--model-plan_overlap_judge` | `model_plan_overlap_judge`|
+| provision          | `LEERIE_MODEL_PROVISION`        | `--model-provision`          | `model_provision`         |
+| implementer        | `LEERIE_MODEL_IMPLEMENTER`      | `--model-implementer`        | `model_implementer`       |
+| integrator         | `LEERIE_MODEL_INTEGRATOR`       | `--model-integrator`         | `model_integrator`        |
+| conformer          | `LEERIE_MODEL_CONFORMER`        | `--model-conformer`          | `model_conformer`         |
+| judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
+| heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
+| pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
 
 Note: `judge`, `heal`, and `pr_writer` use dedicated CLI flags
 (`--judge-model`, `--heal-model`, `--pr-writer-model`) rather than the
@@ -1342,9 +1347,10 @@ available; it does not eliminate run-to-run variance but does remove the
 "this run thought harder than that one" axis.
 
 **Per-worker defaults: `high` for judgment workers, unset for acting workers.**
-Judgment workers (classifier, planner, reconciler, provision, integrator)
-default to `high`. The acting workers (implementer, conformer) and post-run
-skill workers (judge, heal) default to *unset* — when no effort is resolved,
+Judgment workers (classifier, planner, reconciler, plan_overlap_judge,
+provision, integrator) default to `high`. The acting workers (implementer,
+conformer) and post-run skill workers (judge, heal) default to *unset* —
+when no effort is resolved,
 no `--effort` flag is passed and the worker inherits Claude's default. This
 keeps acting workers' reasoning bounded by their own evidence gates
 (DESIGN §8) rather than by a global dial.
@@ -1354,6 +1360,7 @@ keeps acting workers' reasoning bounded by their own evidence gates
 | classifier   | high    | category choice is judgment over the whole task |
 | planner      | high    | decomposition granularity is the load-bearing judgment step (DESIGN §8 planner gate) |
 | reconciler   | high    | cross-domain tag equivalence is judgment |
+| plan_overlap_judge | high | surface-overlap detection over the reconciled plan is judgment (DESIGN §5 *Cross-domain surface overlap*); merge-feasibility discipline rewards pinning reasoning depth |
 | provision    | high    | recipe synthesis over arbitrary repo shapes is judgment |
 | integrator   | high    | behavioral conflict resolution; a wrong merge corrupts state |
 | implementer  | unset   | bounded by §8 evidence gate; pinning would override the gate's adaptive depth |
@@ -1363,7 +1370,7 @@ keeps acting workers' reasoning bounded by their own evidence gates
 | pr_writer    | high    | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
-`EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the five judgment
+`EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the six judgment
 workers above and for the finalize-time `pr_writer` worker.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
@@ -1378,16 +1385,17 @@ model selection:
 7. **Per-worker default** from `EFFORT_DEFAULT_PER_WORKER`
 8. **Global default `EFFORT_DEFAULT`** (`None` — flag omitted)
 
-| Worker       | env var                       | CLI flag                | TOML key            |
-|--------------|-------------------------------|-------------------------|---------------------|
-| (global)     | `LEERIE_EFFORT`             | `--effort`              | `effort`            |
-| classifier   | `LEERIE_EFFORT_CLASSIFIER`  | `--effort-classifier`   | `effort_classifier` |
-| planner      | `LEERIE_EFFORT_PLANNER`     | `--effort-planner`      | `effort_planner`    |
-| reconciler   | `LEERIE_EFFORT_RECONCILER`  | `--effort-reconciler`   | `effort_reconciler` |
-| provision    | `LEERIE_EFFORT_PROVISION`   | `--effort-provision`    | `effort_provision`  |
-| implementer  | `LEERIE_EFFORT_IMPLEMENTER` | `--effort-implementer`  | `effort_implementer`|
-| integrator   | `LEERIE_EFFORT_INTEGRATOR`  | `--effort-integrator`   | `effort_integrator` |
-| conformer    | `LEERIE_EFFORT_CONFORMER`   | `--effort-conformer`    | `effort_conformer`  |
+| Worker             | env var                            | CLI flag                      | TOML key                   |
+|--------------------|------------------------------------|-------------------------------|----------------------------|
+| (global)           | `LEERIE_EFFORT`                  | `--effort`                    | `effort`                   |
+| classifier         | `LEERIE_EFFORT_CLASSIFIER`       | `--effort-classifier`         | `effort_classifier`        |
+| planner            | `LEERIE_EFFORT_PLANNER`          | `--effort-planner`            | `effort_planner`           |
+| reconciler         | `LEERIE_EFFORT_RECONCILER`       | `--effort-reconciler`         | `effort_reconciler`        |
+| plan_overlap_judge | `LEERIE_EFFORT_PLAN_OVERLAP_JUDGE`| `--effort-plan_overlap_judge` | `effort_plan_overlap_judge`|
+| provision          | `LEERIE_EFFORT_PROVISION`        | `--effort-provision`          | `effort_provision`         |
+| implementer        | `LEERIE_EFFORT_IMPLEMENTER`      | `--effort-implementer`        | `effort_implementer`       |
+| integrator         | `LEERIE_EFFORT_INTEGRATOR`       | `--effort-integrator`         | `effort_integrator`        |
+| conformer          | `LEERIE_EFFORT_CONFORMER`        | `--effort-conformer`          | `effort_conformer`         |
 
 An invalid value in env or file is rejected at startup via `die()`. CLI
 values are validated by argparse `choices=`. A worker that resolves to `None`
@@ -1420,11 +1428,11 @@ Each worker is one `claude -p` headless process. Flags used:
 | `-p` | non-interactive single-shot |
 | `--output-format stream-json --verbose` | streams one JSON event per stdout line as the worker runs; the final `result` event is the envelope (same shape as `--output-format json`'s single output — `cost`, `usage`, `terminal_reason`, `structured_output`). `_invoke` writes raw events to `.leerie/logs/<sid>.log` and emits per-event inline summaries gated by `state.json["verbosity"]` |
 | `--json-schema <inline>` | the payload schema; serialized inline as a JSON string — a file path is silently ignored (verified against Claude Code 2.1.143) |
-| `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/provision/implementer/integrator/conformer, plus the post-run / finalize workers pr_writer, judge, and patch_generator |
-| `--allowedTools` | tool allowlist; two buckets — **inspect** (`INSPECT_TOOLS`: read set + allowlisted `Bash(ls:*)` / `Bash(find:*)` / `Bash(cat:*)` / … for cross-cwd read-only inspection, **no Write/Edit**) for classifier, planner, reconciler, and provision; **acting** (`ACT_TOOLS`: read set + Bash/Write/Edit) for implementer, integrator, and conformer. The acting bucket keeps Bash unrestricted because its workers run with `--dangerously-skip-permissions`; the inspect bucket uses `Bash(<verb>:*)` prefix patterns to pre-approve specific read-only verbs at the CLI level — no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
+| `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/plan_overlap_judge/provision/implementer/integrator/conformer, plus the post-run / finalize workers pr_writer, judge, and patch_generator |
+| `--allowedTools` | tool allowlist; two buckets — **inspect** (`INSPECT_TOOLS`: read set + allowlisted `Bash(ls:*)` / `Bash(find:*)` / `Bash(cat:*)` / … for cross-cwd read-only inspection, **no Write/Edit**) for classifier, planner, reconciler, plan_overlap_judge, and provision; **acting** (`ACT_TOOLS`: read set + Bash/Write/Edit) for implementer, integrator, and conformer. The acting bucket keeps Bash unrestricted because its workers run with `--dangerously-skip-permissions`; the inspect bucket uses `Bash(<verb>:*)` prefix patterns to pre-approve specific read-only verbs at the CLI level — no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
 | `--max-turns` | per-worker turn cap (values in §6) |
 | `--model` | model alias for this worker — `sonnet` / `opus` / `haiku`. Value comes from per-worker resolution (see §2 *Model selection*) |
-| `--add-dir` | repeated per entry in `state.json["inspect_dirs"]` (forwarded by `claude_p`'s `add_dirs` param). Used only by inspect-bucket workers (classifier, planner, reconciler, provision) so their sandboxed Read/Grep/Glob and allowlisted Bash verbs can reach sibling repos referenced in the task. See §2 *Inspect directories* |
+| `--add-dir` | repeated per entry in `state.json["inspect_dirs"]` (forwarded by `claude_p`'s `add_dirs` param). Used only by inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) so their sandboxed Read/Grep/Glob and allowlisted Bash verbs can reach sibling repos referenced in the task. See §2 *Inspect directories* |
 | `--dangerously-skip-permissions` | acting workers (implementer, integrator, conformer) — suppresses all permission prompts for unattended Bash and file writes. **Not** applied to inspect workers — they run in the real repo cwd (no worktree isolation), so the blast-radius assumption that justifies skip-permissions doesn't hold. The `Bash(<verb>:*)` patterns in `INSPECT_TOOLS` pre-approve listed verbs at the CLI level; anything else (e.g. `rm`, redirect-to-file) falls through and is rejected in non-interactive mode |
 
 `claude_p()` is `async`; every caller awaits it. Internally it awaits
@@ -1484,9 +1492,9 @@ The classifier and the budget constant (`auth_retry_max_sec`) live in
   `settle_subtask` records a `conformer crashed` entry in
   `conformance_warnings` and the subtask still returns `complete` (DESIGN §9
   *Post-work conformance*: the phase is advisory and never fails the subtask).
-- **classifier, planner, reconciler, provision, integrator** — not caught
-  locally; propagates to `main()`, which aborts with state saved for
-  `--resume`.
+- **classifier, planner, reconciler, plan_overlap_judge, provision,
+  integrator** — not caught locally; propagates to `main()`, which
+  aborts with state saved for `--resume`.
 
 `claude_p()` logs a non-fatal warning when the envelope `terminal_reason` is not
 `"completed"` (e.g. `"max_turns"`).
@@ -3389,10 +3397,10 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation |
 | `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both`) |
 | `clarify` | bool | whether asking the user is allowed for this run (resolved from `--clarify` / `LEERIE_CLARIFY` / `leerie.toml` / default `False`) |
-| `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
+| `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / plan_overlap_judge / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). Resolved from `--skip-overlap-judge` / `LEERIE_SKIP_OVERLAP_JUDGE` / `leerie.toml` / default `False`. The cheap-skip on single-planner / <2-subtask runs is automatic and not gated by this field — this flag only affects runs where the worker would otherwise fire. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `verbosity` | str | resolved verbosity level (`quiet` / `normal` / `stream` / `debug`); re-resolved fresh on every run, including `--resume`, so the user can dial up or down without editing state |
-| `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler, provision) via `--add-dir`. Resolved from `--inspect-dir` / `LEERIE_INSPECT_DIRS` / `inspect_dirs` in `leerie.toml`; re-resolved fresh on every run, including `--resume`, so the user can add or remove paths without editing state. Empty list when nothing is configured |
+| `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) via `--add-dir`. Resolved from `--inspect-dir` / `LEERIE_INSPECT_DIRS` / `inspect_dirs` in `leerie.toml`; re-resolved fresh on every run, including `--resume`, so the user can add or remove paths without editing state. Empty list when nothing is configured |
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
 | `scope_warnings` | dict[str, dict] | oversized-diff warnings from `check_diff_scope` (non-fatal signal log) |
 | `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log) — keys are subtask ids, values are `{result, warnings}` where `result` is the last conformer payload (or null on crash) and `warnings` is the list of advisory strings produced across all conformance rounds. Populated only on subtasks whose implementer reached `status: "complete"`. See DESIGN §9 *Post-work conformance* |
@@ -3692,7 +3700,7 @@ enforcement functions:
 | `test_validate_plan.py` | `validate_plan()` (every rule in §5) |
 | `test_validate_result.py` | `validate_result()` (every status-branch invariant) |
 | `test_check_merge_committed.py` | `check_merge_committed()` (real-git fixtures) |
-| `test_inspect_tools.py` | `INSPECT_TOOLS` composition and the four inspect-callsite wirings (classifier, planner, reconciler, provision) — pins that the inspect bucket grants `Bash(<verb>:*)` patterns but never `Write`/`Edit` or bare `Bash`, the same DESIGN §12 enforcement applied to workers that don't get `--dangerously-skip-permissions` |
+| `test_inspect_tools.py` | `INSPECT_TOOLS` composition and the inspect-callsite wirings (classifier, planner, reconciler, plan_overlap_judge, provision) — pins that the inspect bucket grants `Bash(<verb>:*)` patterns but never `Write`/`Edit` or bare `Bash`, the same DESIGN §12 enforcement applied to workers that don't get `--dangerously-skip-permissions` |
 | `test_resolve_inspect_dirs.py` | `resolve_inspect_dirs()` precedence (CLI → env → TOML → `[]`), `~` expansion, dedup, and `STATE_FIELDS` membership |
 | `test_resolve_prompt.py` | `resolve_prompt()` — every `WORKER_TYPES` member returns a `("file", content, "prompts/<call_type>.md")` triple; parity/coupling test; unknown call_type raises |
 | `test_discover_rules_files.py`, `test_validate_conformance_result.py`, `test_run_conformance_phase.py`, `test_infer_build_lint_test.py` | the post-work conformance phase (DESIGN §9): rule-file discovery against the fixed capped allowlist, schema cross-field invariants including path-traversal rejection, the orchestrator-level loop covering clean / malformed / crashed / rolled-back / cap-exhausted paths, the commit-prefix observability check, the dirty-state warning before rollback, the worker-budget-exhausted advisory path, the outer `settle_subtask` contract (never escalates to `failed`/`blocked` even on `FileNotFoundError`), and `_infer_build_lint_test` across the supported package-manager families |

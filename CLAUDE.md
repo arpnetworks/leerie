@@ -185,19 +185,20 @@ export LEERIE_RUNTIME=local              # or: fly
 # …or commit a leerie.toml at the repo root with: runtime = fly
 
 # Choose the model. Without overrides: judgment workers (classifier,
-# planner, reconciler, provision, integrator) default to opus; acting
-# workers (implementer, conformer) default to sonnet. Per-worker
-# overrides exist via --model-<worker> / LEERIE_MODEL_<WORKER>. See
-# docs/IMPLEMENTATION.md §2 "Model selection" for the full table.
+# planner, reconciler, plan_overlap_judge, provision, integrator)
+# default to opus; acting workers (implementer, conformer) default to
+# sonnet. Per-worker overrides exist via --model-<worker> /
+# LEERIE_MODEL_<WORKER>. See docs/IMPLEMENTATION.md §2 "Model selection"
+# for the full table.
 export LEERIE_MODEL=sonnet               # or: opus, haiku
 ./leerie "task" --model opus
 ./leerie "task" --model-implementer opus --model-classifier haiku
 
 # Pin reasoning depth via `claude -p --effort`. Without overrides,
-# judgment workers (classifier, planner, reconciler, provision,
-# integrator) default to `high`; acting workers (implementer,
-# conformer) inherit Claude's default. Per-worker overrides exist via
-# --effort-<worker> / LEERIE_EFFORT_<WORKER>. See
+# judgment workers (classifier, planner, reconciler, plan_overlap_judge,
+# provision, integrator) default to `high`; acting workers
+# (implementer, conformer) inherit Claude's default. Per-worker
+# overrides exist via --effort-<worker> / LEERIE_EFFORT_<WORKER>. See
 # docs/IMPLEMENTATION.md §2 "Effort selection".
 export LEERIE_EFFORT=high                # low, medium, high, xhigh, max
 ./leerie "task" --effort max

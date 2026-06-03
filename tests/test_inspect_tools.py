@@ -1,5 +1,5 @@
 """Coupling tests for INSPECT_TOOLS — the tool bucket for classifier,
-planner, reconciler, and provision.
+planner, reconciler, plan_overlap_judge, and provision.
 
 These workers run in the real repo cwd (no worktree isolation), so they
 cannot use --dangerously-skip-permissions. INSPECT_TOOLS preserves the
@@ -126,6 +126,23 @@ def test_reconciler_call_site_uses_inspect_tools():
     body = src[start:end]
     assert "allowed_tools=INSPECT_TOOLS" in body, (
         "phase_reconcile must pass allowed_tools=INSPECT_TOOLS to claude_p"
+    )
+    assert "allowed_tools=ACT_TOOLS" not in body
+    assert "allowed_tools=RUN_TOOLS" not in body
+
+
+def test_overlap_judge_call_site_uses_inspect_tools():
+    """phase_overlap_judge (DESIGN §5 *Cross-domain surface overlap*)
+    runs in the real repo cwd like the other judgment workers, so it
+    must inherit the same INSPECT_TOOLS allowlist — no Write/Edit, only
+    allowlisted Bash verbs. A future edit swapping in ACT_TOOLS would
+    silently waive the §12 read-only contract for the overlap judge."""
+    src = LEERIE_PY.read_text()
+    start = src.index("async def phase_overlap_judge(")
+    end = src.index("\nasync def ", start + 1)
+    body = src[start:end]
+    assert "allowed_tools=INSPECT_TOOLS" in body, (
+        "phase_overlap_judge must pass allowed_tools=INSPECT_TOOLS to claude_p"
     )
     assert "allowed_tools=ACT_TOOLS" not in body
     assert "allowed_tools=RUN_TOOLS" not in body
