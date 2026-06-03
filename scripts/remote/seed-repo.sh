@@ -372,18 +372,31 @@ for line in sys.stdin.read().splitlines():
     sys.stdout.buffer.write(line.encode() + b"\x00")
 ' > "$file_list"
 
+  # Capture stderr to a temp file so we can replay it on failure. Without
+  # this the user sees only "rsync delta transfer failed (exit N)" with no
+  # actionable diagnostic; exit 23 in particular has many causes (vanished
+  # file, permission denied on the sender, missing path on the receiver,
+  # quota) and is impossible to debug from the bare rc alone.
+  local rsync_err
+  rsync_err="$(mktemp -t leerie-reseed-err.XXXXXX)"
   LEERIE_FLY_APP="$FLY_APP" rsync -a -H \
     --from0 --files-from="$file_list" \
     -e "$wrapper" \
     "$USER_REPO/" "$LEERIE_MACHINE_ID:/work/" \
-    >/dev/null 2>&1
+    >/dev/null 2>"$rsync_err"
   rsync_rc=$?
 
   if [ "$rsync_rc" -ne 0 ]; then
-    rm -f "$file_list" "$wrapper"
     remote_log "seed_repo: rsync delta transfer failed (exit $rsync_rc)"
+    if [ -s "$rsync_err" ]; then
+      while IFS= read -r _ln; do
+        remote_log "  rsync: $_ln"
+      done < "$rsync_err"
+    fi
+    rm -f "$file_list" "$wrapper" "$rsync_err"
     return 1
   fi
+  rm -f "$rsync_err"
 
   # Chown the freshly-rsync'd paths. Keep it broad — rsync may have
   # touched directories above the dirty files too.

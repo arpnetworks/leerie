@@ -1855,6 +1855,25 @@ if [ "$RUNTIME" = "fly" ]; then
       fi
     fi
 
+    # Promote the PID-keyed attach pointer to a run-keyed one as soon as
+    # the machine is up, BEFORE seed_auth/seed_repo can fail. If anything
+    # between here and the orchestrator-detach below errors out,
+    # decide_teardown pauses the machine and the user's resume command
+    # (`leerie --resume --run-id $LEERIE_RUN_ID --runtime fly`) needs this
+    # file to resolve fly_machine_id. provision_machine writes
+    # .leerie/remote/$$.json unconditionally on success (provision.sh:587-613);
+    # resume_machine doesn't (the prior launcher's file is gone — different $$ —
+    # but the run-keyed pointer survives from the original provision, so the
+    # `[ ! -f "$_run_record" ]` guard makes this a no-op on resume).
+    if [ "$_provisioned" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
+      _pid_record="$USER_REPO/.leerie/remote/$$.json"
+      mkdir -p "$USER_REPO/.leerie/runs/$LEERIE_RUN_ID" 2>/dev/null || true
+      _run_record="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/fly-machine.json"
+      if [ -f "$_pid_record" ] && [ ! -f "$_run_record" ]; then
+        cp "$_pid_record" "$_run_record" 2>/dev/null || true
+      fi
+    fi
+
     if [ "$_provisioned" = "true" ]; then
       # Machine is running and reachable. Seed Claude config + git identity
       # so `claude -p` workers can authenticate and commit, then seed the
@@ -2025,17 +2044,12 @@ PY
           remote_log "error: failed to start detached orchestrator on machine $LEERIE_MACHINE_ID"
           container_rc=1
         else
-          # Phase 3: promote the PID-keyed attach pointer to a run-keyed
-          # one immediately — we already know the (bootstrap) run-id. The
+          # The PID-keyed → run-keyed pointer promotion happened earlier
+          # (right after provision_machine succeeded), so the run dir
+          # already has fly-machine.json by the time we get here. The
           # orchestrator will rename the run dir at classify time; the
           # launcher's tail wrapper handles the rename via the handover
           # file the orchestrator writes (see DESIGN §6).
-          _pid_record="$USER_REPO/.leerie/remote/$$.json"
-          mkdir -p "$USER_REPO/.leerie/runs/$LEERIE_RUN_ID" 2>/dev/null || true
-          _run_record="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/fly-machine.json"
-          if [ -f "$_pid_record" ]; then
-            cp "$_pid_record" "$_run_record" 2>/dev/null || true
-          fi
 
           # Tail the orchestrator log for the user's terminal. This is a
           # separate exec session; its death (Ctrl-C, broken pipe, laptop
