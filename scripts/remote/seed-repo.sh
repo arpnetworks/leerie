@@ -349,13 +349,31 @@ seed_repo_dirty() {
 
   # Build NUL-delimited file list. Two sources concatenated:
   #   (a) git porcelain dirty set, filtered (drop .git/, .leerie/runs/
-  #       worktrees, blanks)
+  #       worktrees, editor-temp files, vanished entries, blanks)
   #   (b) repo-local .claude/ files (force-included even if gitignored)
   # The python filter applies to both; .claude/* entries from (b)
   # pass the filter trivially (no .git/ or worktree prefix).
   printf '%s\n%s\n' "$dirty_files" "$claude_files" \
-    | python3 -c '
-import sys
+    | USER_REPO="$USER_REPO" python3 -c '
+import os, re, sys
+
+# Editor-temp filename patterns — these are per-process editor state
+# (Emacs lock files, backups, Vim swap files) that should never be
+# shipped. Emacs locks in particular are dangling symlinks of the form
+# .#NAME -> user@host.pid:timestamp that vanish as buffers close;
+# letting them into the rsync file list produces "stat: No such file
+# or directory" failures (exit 23).
+_VIM_SWAP_RE = re.compile(r"^\..*\.sw[a-z]$")
+def _is_editor_temp(path: str) -> bool:
+    base = path.rsplit("/", 1)[-1]
+    return (
+        base.startswith(".#")          # Emacs lock
+        or base.endswith("~")          # backup
+        or bool(_VIM_SWAP_RE.match(base))  # Vim swap
+    )
+
+repo_root = os.environ.get("USER_REPO", "")
+
 for line in sys.stdin.read().splitlines():
     if not line:
         continue
@@ -368,6 +386,15 @@ for line in sys.stdin.read().splitlines():
         continue
     # Defensive: drop worktree paths if they ever surface.
     if "/.leerie/runs/" in line and "/worktrees/" in line:
+        continue
+    if _is_editor_temp(line):
+        continue
+    # Drop entries that vanished between `git status` and now (Emacs
+    # closing a buffer, a build tool cleaning a temp file, etc).
+    # lexists() is True for a symlink whose target is missing — we
+    # want to ship those (rsync -a preserves the link, target irrelevant
+    # on the sender). It is False only when the path itself is gone.
+    if repo_root and not os.path.lexists(os.path.join(repo_root, line)):
         continue
     sys.stdout.buffer.write(line.encode() + b"\x00")
 ' > "$file_list"
