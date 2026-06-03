@@ -781,6 +781,49 @@ done
 export LEERIE_RUN_ID
 export IS_RESUME
 
+# --- extract the task positional (for bootstrap-stage resume) -----------
+# The orchestrator's argparse takes a single optional positional `task`.
+# On a remote-mode bootstrap-stage resume, the in-machine orchestrator
+# has no state.json (classify never ran), and the launcher strips
+# --resume so the orchestrator routes to the fresh-launch branch. That
+# branch requires a task. The user's original `leerie "<task>"` is gone
+# from the resume invocation's argv, so we persist it at first-launch
+# (a few sections down) and read it back here on subsequent bootstrap
+# resumes. This block only extracts what the user typed THIS time.
+#
+# Walk $@ skipping flag values for any --flag that takes one. The
+# orchestrator's --model-<W> and --effort-<W> per-worker overrides
+# also take values; cover them with a prefix match.
+LEERIE_TASK_ARG=""
+_prev=""
+_value_flags=" --run-id --answers --pr-template --max-workers \
+--max-parallel --confidence-rounds --worker-memory-max \
+--source-of-truth --runtime --inspect-dir --model --effort \
+--judge-model --heal-model --pr-writer-model --heal-max-rounds \
+--heal-success-threshold --verbosity --telemetry-dir --judge-dir \
+--heal-dir --phase --host-no-push --status "
+for arg in "$@"; do
+  # Skip if this arg is the value of a previous value-taking flag.
+  if [ -n "$_prev" ]; then
+    case "$_value_flags" in
+      *" $_prev "*) _prev=""; continue ;;
+    esac
+    case "$_prev" in
+      --model-*|--effort-*) _prev=""; continue ;;
+    esac
+  fi
+  # Skip any --flag (with or without =value).
+  case "$arg" in
+    --*) _prev="$arg"; continue ;;
+  esac
+  # First non-flag, non-value positional is the task.
+  if [ -z "$LEERIE_TASK_ARG" ]; then
+    LEERIE_TASK_ARG="$arg"
+  fi
+  _prev=""
+done
+export LEERIE_TASK_ARG
+
 # --- runtime-mode knob ---------------------------------------------------
 # Resolves RUNTIME=local|fly. Precedence: CLI --runtime > LEERIE_RUNTIME env
 # > leerie.toml `runtime` key > default `local`. Mirrors the orchestrator's
@@ -1872,6 +1915,16 @@ if [ "$RUNTIME" = "fly" ]; then
       if [ -f "$_pid_record" ] && [ ! -f "$_run_record" ]; then
         cp "$_pid_record" "$_run_record" 2>/dev/null || true
       fi
+      # Persist the task argument so a bootstrap-stage resume can recover
+      # it. The in-machine orchestrator's --resume requires state.json,
+      # which is never written for failures before classify. The launcher
+      # strips --resume on bootstrap-stage resumes (routing to the fresh-
+      # launch branch), but that branch needs a task argument. Without
+      # this file the user has to retype the task on every retry.
+      _task_record="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/task.txt"
+      if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$_task_record" ]; then
+        printf '%s' "$LEERIE_TASK_ARG" > "$_task_record" 2>/dev/null || true
+      fi
     fi
 
     if [ "$_provisioned" = "true" ]; then
@@ -1969,6 +2022,18 @@ if [ "$RUNTIME" = "fly" ]; then
             [ "$_a" = "--resume" ] || _filtered+=("$_a")
           done
           REWRITTEN_ARGS=(${_filtered[@]+"${_filtered[@]}"})
+          # If the user didn't retype the task on this resume, recover it
+          # from the persisted task.txt written at first-launch. The
+          # orchestrator's fresh-launch branch (which we routed to by
+          # stripping --resume) requires a task argument.
+          _task_record="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/task.txt"
+          if [ -z "$LEERIE_TASK_ARG" ] && [ -f "$_task_record" ]; then
+            _restored_task="$(cat "$_task_record" 2>/dev/null || true)"
+            if [ -n "$_restored_task" ]; then
+              REWRITTEN_ARGS+=("$_restored_task")
+              remote_log "remote: recovered task from $_task_record"
+            fi
+          fi
         fi
 
         _launch_argv_json="$(python3 -c '
