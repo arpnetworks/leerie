@@ -1962,6 +1962,14 @@ child_env = dict(os.environ)
 child_env["HOME"] = "/home/leerie"
 child_env["USER"] = "leerie"
 child_env["LOGNAME"] = "leerie"
+# Carry the host repo's basename so the orchestrator's log() prefix
+# (Path(USER_REPO).name) matches the host-side remote_log() prefix.
+# Without this the orchestrator's cwd=/work falls back to basename
+# "work" and the [leerie] [<repo>] contract breaks mid-stream once
+# the launcher starts tailing this process's stdout. The host bash
+# heredoc is unquoted (<<PY), so basename runs host-side and the
+# resulting literal is baked into the script piped to the Fly machine.
+child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 # Ensure the launcher's PATH includes the mise-managed claude binary.
 # (The Dockerfile installs claude into the mise-managed node prefix;
 # fly's hallpass ssh session inherits a minimal PATH that may not
