@@ -1950,6 +1950,27 @@ if [ "$RUNTIME" = "fly" ]; then
         # JSON literal embedded into the source, then piped to
         # `python3 -` on the machine — python reads its program from
         # stdin, no remote-shell argv quoting in play.
+
+        # Strip --resume from REWRITTEN_ARGS when the run is still in the
+        # bootstrap window. `--resume` on the host means "wake the paused
+        # Fly machine"; the in-machine orchestrator interprets it as
+        # "resume orchestrator state from disk." For a `_bootstrap-*` id,
+        # no orchestrator state exists yet (by definition — classify
+        # hasn't run), so the orchestrator's --resume branch dies with
+        # "does not match any known run." The orchestrator's
+        # --run-id <bootstrap-*> branch already honors the id and creates
+        # fresh state; filtering --resume here routes there. Post-classify
+        # resumes keep --resume (LEERIE_RUN_ID was promoted to the final
+        # id by the rewrite block at lines 1843-1856 above, so this guard
+        # is False and REWRITTEN_ARGS flows through unchanged).
+        if [ "${IS_RESUME:-false}" = "true" ] && [[ "$LEERIE_RUN_ID" == _bootstrap-* ]]; then
+          _filtered=()
+          for _a in ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}; do
+            [ "$_a" = "--resume" ] || _filtered+=("$_a")
+          done
+          REWRITTEN_ARGS=(${_filtered[@]+"${_filtered[@]}"})
+        fi
+
         _launch_argv_json="$(python3 -c '
 import json, sys
 print(json.dumps(sys.argv[1:]))
