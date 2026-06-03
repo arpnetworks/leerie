@@ -2454,6 +2454,7 @@ Environment variables consumed by `provision.sh`:
 | `FLY_REGION` | `iad` | Fly.io region |
 | `FLY_VM_CPUS` | `4` | vCPU count for the machine. Setting >8 auto-promotes to Fly's `performance` CPU class (much more expensive — ~14x per CPU-second). |
 | `FLY_VM_MEMORY` | `8192` | Memory in MB for the machine. Setting >16384 auto-promotes to Fly's `performance` CPU class. |
+| `FLY_VM_DISK_GB` | unset (use Fly default) | When set, creates a per-machine Fly volume sized at this many GB and mounts it at `/home/leerie`. The volume is destroyed when the machine is destroyed (clean exit or `--kill`). When unset, the machine runs on Fly's default ephemeral rootfs with no volume — same as today. Opt-in for runs that hit ENOSPC on the rootfs (worker session-env accumulation under parallel waves), or for runs that need to pause-and-resume across a long window. |
 | `LEERIE_MACHINE_START_TIMEOUT` | `120` | Seconds to wait for `state=started` |
 
 `FLY_IMAGE_TAG` is resolved by the launcher (`resolve_fly_image_tag()`)
@@ -3124,6 +3125,48 @@ Two surfaces address this together:
    the run branch is already pushed (`pushed_at` set), it short-
    circuits with "already finalized."
 
+**`leerie --finalize` accepts either id.** The launcher resolves
+`<run-id>` against `.leerie/runs/<run-id>/` locally to pick up
+`fly-machine.json` and the partial sidecar. When `<run-id>` is the
+**final id** (e.g. `feat-foo-abc123`) but only the bootstrap dir
+exists locally (the orchestrator died before its host-side sync wrote
+the final dir), the launcher falls back to the sibling `_bootstrap-*`
+dir that has `fly-machine.json` and proceeds via that machine. Once
+`fetch_branch` discovers the actual final id on the machine, the
+existing `LEERIE_REMOTE_RUN_ID` plumbing migrates the host-side dir
+(launcher lines 1684–1700 already do this for `--resume`). Multi-match
+or no-match falls through to the original error, augmented with a hint
+to run `leerie --list`.
+
+**`leerie --finalize <run-id> --force`** recovers a run whose
+orchestrator died before writing `finished_at`. The launcher SSHes
+into the machine via `flyctl ssh console -C "bash -lc '…'"` and runs
+`scripts/remote/force-finalize.sh`, which:
+
+1. Lists `/work/.leerie/runs/` for the single non-`_bootstrap-*` dir
+   (fails clearly on multi-match).
+2. Reads `run.json`; if `finished_at` is already set, no-op (idempotent).
+3. Reads `orchestrator.pid` and checks the orchestrator process:
+   - Pid file present + `kill -0 <pid>` succeeds + `/proc/<pid>/comm`
+     contains `python` → orchestrator alive → **REFUSE** with a message
+     naming the live pid.
+   - Pid file present + `kill -0` fails (`ESRCH`) → orchestrator dead;
+     the pid file is the expected stale artifact (nothing in
+     `orchestrator/leerie.py` ever cleans it up) → safe to proceed.
+   - Pid file missing → refuse; tell the user to attach manually.
+4. Patches `run.json` in-place with `finished_at = <now>`,
+   `no_push = false`, `recovered_at = <now>`,
+   `recovered_via = "force-finalize"`, and falls through to the normal
+   `fetch_branch` flow.
+
+The synthesized audit fields (`recovered_at`, `recovered_via`) preserve
+provenance of forced recoveries so post-mortems can distinguish them
+from naturally-finalized runs.
+
+`--finalize` logs the action it took before SSHing in:
+`finalize: machine=<id> run=<id> action=<fetch|fetch+force-patch|already-synced>`
+so post-mortems of future failures are shorter.
+
 This matches the convention that destructive and side-effecting actions
 are explicit verbs (DESIGN §6 *The user-visible verb surface*) rather
 than implicit consequences of stream timing.
@@ -3133,7 +3176,8 @@ Optional convenience: `leerie --attach --tail --auto-finalize` runs
 for users who want zero-touch finalization when they happen to be
 watching.
 
-Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*.
+Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*,
+*Finalization* (recovery sub-paragraph).
 
 ---
 
@@ -3224,6 +3268,9 @@ discovery without parsing the full `state.json`):
 | `killed_at` | ISO-8601 str \| null | when the remote run was explicitly destroyed by `leerie --kill <run-id>`. The Fly Machine has been destroyed and the run is no longer resumable. Null for any other terminal state. |
 | `sync_failed_at` | ISO-8601 str \| null | when the clean-exit branch of `decide_teardown` ran `fetch_branch` and it failed. The orchestrator finished cleanly on the machine, but the run branch + state directory could not be pulled back to the host. The machine is LEFT RUNNING (not stopped) so the user can recover manually via `leerie --finalize` (retry sync + push), `leerie --attach` (inspect), or `leerie --kill` (destroy only after work is safely on host). Orthogonal to `paused_at`/`pushed_at`/`killed_at` — the machine is neither paused nor destroyed. Mutex-checked against `pushed_at` (a successfully pushed run can't be sync-failed) and `killed_at` (a destroyed machine can't be sync-failed). Requires `fly_machine_id` to be set (the running machine needs a pointer). |
 | `sync_fail_reason` | str \| null | short tag accompanying `sync_failed_at` (currently always `sync-failed-on-clean-exit`). Null when `sync_failed_at` is null. |
+| `recovered_at` | ISO-8601 str \| null | when `leerie --finalize <run-id> --force` patched this run's `finished_at` after the orchestrator died before its natural finalize. Set by `scripts/remote/force-finalize.sh` together with `finished_at` and `no_push=false`. A non-null value means the run reached host-side finalize via the recovery path rather than the natural one. Orthogonal to all terminal-state fields. Written **once** on the first successful `--force` run; subsequent `--force` invocations short-circuit on the now-set `finished_at` and leave `recovered_at` unchanged (the recovery timestamp records the original recovery, not the most recent verb invocation). |
+| `recovered_via` | str \| null | short tag accompanying `recovered_at`; currently always `"force-finalize"`. Null when `recovered_at` is null. |
+| `volume_id` | str \| null | Fly volume ID (e.g. `vol_…`) when the machine was provisioned with `FLY_VM_DISK_GB` set. Mounted at `/home/leerie` on the machine. Destroyed when the machine is destroyed (clean exit or `leerie --kill`). Null when the run used Fly's default ephemeral rootfs. If non-null, `fly_machine_id` must also be non-null — a volume without a machine to attach it to is invalid (enforced by `_validate_run_json`). |
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped because the user opted out of pushing (`push_will_happen(no_push, host_no_push)` is False — local `--no-push` or Fly `host_no_push=true`), or had not yet run; `host_finalize` uses its deterministic fallback in that case. |
 | `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
@@ -3234,6 +3281,7 @@ discovery without parsing the full `state.json`):
 - If `pr_url` is set, `pushed_at` must be set (cannot have a PR without a push).
 - `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive (a run cannot be in more than one terminal-or-paused state). If `paused_at` is set, `fly_machine_id` must also be set (you cannot pause a run without knowing where to resume it). If `killed_at` is set, `fly_machine_id` must also be set (you cannot have destroyed a machine you don't have a pointer to).
 - `sync_failed_at` is mutex-checked against `pushed_at` (a successfully pushed run can't be sync-failed) and against `killed_at` (a destroyed machine can't be sync-failed). When `sync_failed_at` is set, `fly_machine_id` must also be set — the running machine needs a pointer for the user to recover via `--finalize`/`--kill`.
+- If `volume_id` is set, `fly_machine_id` must also be set — a Fly volume without a machine to attach it to is a corrupt sidecar (provision.sh always writes the two together).
 - `killed_at` runs are not resumable; `--resume` against a killed run errors with "run was killed at <ts>; start a new run instead."
 
 A corrupt sidecar is flagged but does not block the rest of the system; `leerie --list` will render that run with `status=corrupt-sidecar` and the user can inspect or delete the file.

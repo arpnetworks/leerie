@@ -1804,6 +1804,10 @@ def _validate_run_json(data: dict) -> None:
        cannot pause a run without knowing where to resume it.
     6. If `killed_at` is set, `fly_machine_id` must also be set — you
        cannot have destroyed a machine you don't have a pointer to.
+    7. If `volume_id` is set, `fly_machine_id` must also be set — a Fly
+       volume without a machine to attach it to is a corrupt sidecar
+       (provision.sh writes the two together; the only way to violate
+       this is external mutation).
 
     Raises ValueError on any violation. Caller (e.g., `leerie --list`)
     decides whether to die, warn, or render as `status=corrupt-sidecar`."""
@@ -1871,6 +1875,17 @@ def _validate_run_json(data: dict) -> None:
         raise ValueError(
             "run.json invariant: sync_failed_at is set but fly_machine_id is null; "
             "the running machine needs a pointer for the user to recover via --finalize/--kill"
+        )
+    # `volume_id`: written by provision.sh when FLY_VM_DISK_GB is set.
+    # The provision path always writes volume_id and fly_machine_id
+    # together (provision.sh:574-580), so this invariant cannot be
+    # violated by anything leerie ships — it's a defense against
+    # external mutation or a corrupted run dir.
+    volume_id = data.get("volume_id")
+    if volume_id is not None and fly_machine_id is None:
+        raise ValueError(
+            "run.json invariant: volume_id is set but fly_machine_id is null; "
+            "a Fly volume without a machine to attach it to is invalid"
         )
 
 

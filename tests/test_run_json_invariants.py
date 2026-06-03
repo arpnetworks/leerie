@@ -1,21 +1,35 @@
-"""Tests for `_validate_run_json()` — enforces the four logical
-invariants on the `run.json` sidecar (IMPLEMENTATION.md §8).
+"""Tests for `_validate_run_json()` — enforces the logical invariants
+on the `run.json` sidecar (IMPLEMENTATION.md §8).
 
-Invariants:
+Invariants (mirrors orchestrator/leerie.py:_validate_run_json):
 1. `pushed_at` and `push_error` are mutually exclusive.
 2. `pr_url` and `pr_error` are mutually exclusive.
 3. If `pr_url` is set, `pushed_at` must be set (no PR without a push).
-4. `paused_at` and `pushed_at` are mutually exclusive; if `paused_at`
-   is set, `fly_machine_id` must also be set.
+4. `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive
+   (a run is at most one terminal-or-paused state).
+5. If `paused_at` is set, `fly_machine_id` must also be set
+   (cannot pause without knowing where to resume).
+6. If `killed_at` is set, `fly_machine_id` must also be set
+   (cannot have destroyed a machine you don't have a pointer to).
+7. `sync_failed_at` is mutex-checked against `pushed_at` (a pushed run
+   can't be sync-failed) and `killed_at` (a destroyed machine can't be
+   sync-failed). When set, `fly_machine_id` must also be set.
+8. If `volume_id` is set, `fly_machine_id` must also be set
+   (a Fly volume without a machine to attach it to is invalid).
 
-Valid status combinations (leerie --list derives these):
-- `done-local`        — no push attempted, no PR.
-- `done-pushed-no-pr` — pushed, PR not attempted (offline-pr case).
-- `done-pushed-pr`    — pushed + PR opened.
-- `push-failed`       — push attempted and failed.
-- `pr-failed`         — push succeeded, PR creation failed.
-- `paused-remote`     — remote run paused on failure; resume via --resume.
-- `in-progress`       — finalize hasn't run yet (no fields set).
+Valid status combinations (leerie --list derives these via
+`_derive_run_status`):
+- `done-local`          — no push attempted, no PR.
+- `done-pushed-no-pr`   — pushed, PR not attempted (offline-pr case).
+- `done-pushed-pr`      — pushed + PR opened.
+- `push-failed`         — push attempted and failed.
+- `pr-failed`           — push succeeded, PR creation failed.
+- `paused-remote`       — remote run paused on failure; resume via --resume.
+- `killed-remote`       — terminal state via leerie --kill; not resumable.
+- `sync-failed-running` — orchestrator finished but fetch_branch failed;
+                          machine still up, recover via --finalize/--kill.
+- `corrupt-sidecar`     — run.json violates an invariant above.
+- `in-progress`         — finalize hasn't run yet (no fields set).
 """
 from __future__ import annotations
 
@@ -202,6 +216,27 @@ def test_rejects_killed_and_pushed_both_set(leerie):
             killed_at="2026-05-29T16:00:00+00:00",
             pushed_at="2026-05-29T15:00:00+00:00",
             fly_machine_id="abc",
+        ))
+
+
+# --- volume_id invariant (DESIGN §6 *Remote disk policy*) ------------------
+
+def test_accepts_volume_id_with_fly_machine_id(leerie):
+    """Valid: volume_id and fly_machine_id both set (the FLY_VM_DISK_GB
+    path; provision.sh always writes them together)."""
+    leerie._validate_run_json(_minimal_run_json(
+        fly_machine_id="148e445b911389",
+        volume_id="vol_abcdef0123456789",
+    ))
+
+
+def test_rejects_volume_id_without_fly_machine_id(leerie):
+    """A volume without a machine to attach it to is invalid. Defends
+    against external mutation / corruption — leerie's own provision.sh
+    cannot produce this state."""
+    with pytest.raises(ValueError, match="volume_id is set but fly_machine_id"):
+        leerie._validate_run_json(_minimal_run_json(
+            volume_id="vol_abcdef0123456789",
         ))
 
 

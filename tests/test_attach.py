@@ -317,11 +317,27 @@ def test_attach_tail_mode_uses_orchestrator_log_wrapper(tmp_path: Path):
     assert "/logs/*.log" not in invocations
     # And NOT a bare shell.
     assert "exec bash" not in invocations
+    # Part 1.5 regression guard: the --command payload must be wrapped
+    # in `bash -lc` so shell builtins (export) and operators (`;`) in
+    # the wrapper script execute via a shell rather than as argv. This
+    # is what made the recovery procedure for the 2026-06-02 incident
+    # work end-to-end.
+    assert "bash -lc" in invocations, (
+        "expected `bash -lc` wrapping of --command payload "
+        "(Part 1.5 attach.sh fix)"
+    )
     # D1 regression guard: the run-id must reach the wrapper via env
-    # var (not positional, which flyctl ssh console drops).
-    assert "LEERIE_TAIL_RUN_ID='my-run-004'" in invocations or \
-           "LEERIE_TAIL_RUN_ID=my-run-004" in invocations, \
-           f"run-id missing from --command; flyctl invocation was:\n{invocations}"
+    # var (not positional, which flyctl ssh console drops). After
+    # Part 1.5's bash -lc wrapping the literal `'my-run-004'` becomes
+    # `'\\''my-run-004'\\''` inside the outer single-quoted string, so
+    # the substring test has to accept any quoting variant — what we
+    # care about is that the run-id is in scope on the LEERIE_TAIL_RUN_ID
+    # assignment line. The script is one big payload sent through stdin
+    # of `bash -lc '…'`; the literal `my-run-004` must appear in the
+    # vicinity of `LEERIE_TAIL_RUN_ID=`.
+    assert "LEERIE_TAIL_RUN_ID=" in invocations and "my-run-004" in invocations, (
+        f"run-id missing from --command; flyctl invocation was:\n{invocations}"
+    )
 
 
 def test_attach_tail_with_all_logs_uses_per_worker_logs(tmp_path: Path):

@@ -93,6 +93,31 @@ except Exception:
   return 0
 }
 
+# Mirror of _resolve_fly_machine_id_from_run_dir for the per-machine Fly
+# volume created when FLY_VM_DISK_GB is set. provision.sh persists
+# volume_id into both fly-machine.json (bootstrap window) and run.json
+# (post-classify). --kill consults this so the volume is reaped
+# alongside the machine instead of orphaning.
+_resolve_volume_id_from_run_dir() {
+  local run_dir="$1"
+  local candidate
+  for candidate in "$run_dir/fly-machine.json" "$run_dir/run.json"; do
+    if [ -f "$candidate" ]; then
+      python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    vid = d.get("volume_id")
+    print(vid if vid else "")
+except Exception:
+    pass
+' "$candidate"
+      return 0
+    fi
+  done
+  return 0
+}
+
 # --- _ensure_run_json --------------------------------------------------
 # If run_dir has fly-machine.json but no run.json, bootstrap a minimal
 # run.json so subsequent `update_run_json` writes (paused_at,
@@ -300,6 +325,13 @@ case "${1:-}" in
     require_flyctl || exit 1
     LEERIE_MACHINE_ID="$_kill_machine_id"
     export LEERIE_MACHINE_ID
+    # If the run was provisioned with FLY_VM_DISK_GB, look up its volume
+    # so destroy_machine reaps the volume too. Empty when the run used
+    # Fly's default ephemeral rootfs.
+    if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
+      LEERIE_VOLUME_ID="$(_resolve_volume_id_from_run_dir "$_kill_run_dir")"
+      export LEERIE_VOLUME_ID
+    fi
     remote_log "--kill: destroying machine $LEERIE_MACHINE_ID"
     destroy_machine
     # Bootstrap run.json from fly-machine.json if needed (in-flight
@@ -331,16 +363,55 @@ case "${1:-}" in
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
+    # Pull the run-id (first positional). Then scan remaining args for
+    # `--force` so we know whether to attempt the stuck-run recovery
+    # path before SSHing. --no-verify / --no-push are scanned later in
+    # the same block (lines ~480) so we don't need to lift those here.
     _fin_run_id="${1:-}"
+    _FINALIZE_FORCE=false
+    for _a in "$@"; do
+      [ "$_a" = "--force" ] && _FINALIZE_FORCE=true
+    done
     if [ -z "$_fin_run_id" ]; then
       remote_log "--finalize requires a <run-id>"
-      echo "  Usage: leerie --finalize <run-id>" >&2
+      echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push]" >&2
       exit 1
     fi
     _fin_run_dir="$USER_REPO/.leerie/runs/$_fin_run_id"
     if [ ! -d "$_fin_run_dir" ]; then
-      remote_log "--finalize: no run dir at $_fin_run_dir"
-      exit 1
+      # Final-id fallback: when the user passes the final run-id but
+      # only the bootstrap dir exists locally (the orchestrator died
+      # before its host-side sync wrote the final dir), look for a
+      # sibling `_bootstrap-*` with `fly-machine.json` and proceed via
+      # that machine. `fetch_branch` will discover the real final id
+      # on the machine and the existing LEERIE_REMOTE_RUN_ID plumbing
+      # below (line ~447) migrates the host-side dir. Mirrors the
+      # bootstrap→final-id promotion `--resume` already does at lines
+      # 1684–1700.
+      _bootstrap_candidates=()
+      if [ -d "$USER_REPO/.leerie/runs" ]; then
+        # shellcheck disable=SC2231
+        for _d in "$USER_REPO"/.leerie/runs/_bootstrap-*; do
+          [ -d "$_d" ] || continue
+          [ -f "$_d/fly-machine.json" ] || continue
+          _bootstrap_candidates+=("$_d")
+        done
+      fi
+      if [ "${#_bootstrap_candidates[@]}" -eq 1 ]; then
+        _fin_run_dir="${_bootstrap_candidates[0]}"
+        remote_log "--finalize: $_fin_run_id not local; using bootstrap dir $(basename "$_fin_run_dir") (fetch_branch will discover the final id on the machine)"
+      elif [ "${#_bootstrap_candidates[@]}" -gt 1 ]; then
+        remote_log "--finalize: no local run dir at .leerie/runs/$_fin_run_id and multiple bootstrap dirs to choose from:"
+        for _d in "${_bootstrap_candidates[@]}"; do
+          remote_log "  $(basename "$_d")"
+        done
+        remote_log "  Re-run --finalize with one of the bootstrap ids above."
+        exit 1
+      else
+        remote_log "--finalize: no run dir at $_fin_run_dir"
+        remote_log "  Run \`leerie --list\` to see known runs on this host."
+        exit 1
+      fi
     fi
     # Short-circuit if already finalized (only possible once run.json
     # exists, i.e. after fetch_branch has run at least once).
@@ -436,9 +507,32 @@ except Exception:
         exit 1
       fi
       export LEERIE_MACHINE_ID
+      # Action log (P2d) — name the path being taken so post-mortems are
+      # shorter.
+      if [ "$_FINALIZE_FORCE" = "true" ]; then
+        remote_log "finalize: machine=$LEERIE_MACHINE_ID run=$_fin_run_id action=force-patch+fetch"
+      else
+        remote_log "finalize: machine=$LEERIE_MACHINE_ID run=$_fin_run_id action=fetch"
+      fi
+      # --finalize --force: patch finished_at on the machine before
+      # fetch_branch scans for it. Refuses on alive orchestrator pid;
+      # idempotent on already-finalized runs.
+      if [ "$_FINALIZE_FORCE" = "true" ]; then
+        # shellcheck disable=SC1091
+        . "$LEERIE_REPO/scripts/remote/force-finalize.sh"
+        if ! force_finalize_remote "$FLY_APP" "$LEERIE_MACHINE_ID"; then
+          remote_log "error: --force could not patch the run on machine $LEERIE_MACHINE_ID"
+          exit 1
+        fi
+      fi
       remote_log "--finalize: streaming completed run from machine $LEERIE_MACHINE_ID"
       if ! fetch_branch; then
         remote_log "error: fetch_branch failed"
+        if [ "$_FINALIZE_FORCE" != "true" ]; then
+          remote_log "  If the orchestrator died before writing finished_at, retry with:"
+          remote_log "    leerie --finalize $_fin_run_id --force"
+          remote_log "  (--force refuses if the orchestrator is still alive.)"
+        fi
         exit 1
       fi
       # fetch_branch sets LEERIE_REMOTE_RUN_ID to the discovered final run-id
@@ -773,6 +867,62 @@ done
 # Maintain backward-compat REMOTE alias consumed downstream.
 REMOTE=false
 [ "$RUNTIME" = "fly" ] && REMOTE=true
+
+# --- FLY_VM_DISK_GB (opt-in per-machine Fly volume size in GB) ------------
+# Resolution ladder (highest → lowest):
+#   1. --fly-disk-gb N / --fly-disk-gb=N on the CLI
+#   2. $FLY_VM_DISK_GB already set in the env
+#   3. fly_disk_gb = N in leerie.toml
+#   4. unset (provision.sh skips the volume; machine uses Fly default disk)
+#
+# When set, provision.sh creates a per-machine Fly volume sized at N GB,
+# mounts it at /home/leerie, persists the volume_id into run.json, and
+# destroys the volume when the machine is destroyed.
+# (DESIGN §6 *Remote disk policy*; IMPLEMENTATION §2.)
+_cli_fly_disk_gb=""
+_prev_was_fly_disk=false
+for arg in "$@"; do
+  if $_prev_was_fly_disk; then
+    _cli_fly_disk_gb="$arg"
+    _prev_was_fly_disk=false
+    continue
+  fi
+  case "$arg" in
+    --fly-disk-gb=*) _cli_fly_disk_gb="${arg#--fly-disk-gb=}" ;;
+    --fly-disk-gb)   _prev_was_fly_disk=true ;;
+  esac
+done
+if [ -n "$_cli_fly_disk_gb" ]; then
+  FLY_VM_DISK_GB="$_cli_fly_disk_gb"
+elif [ -z "${FLY_VM_DISK_GB:-}" ] && [ -f "$USER_REPO/leerie.toml" ]; then
+  # Same flat-key grep pattern as the no_push read below (line ~1002),
+  # mirroring orchestrator/leerie.py:_read_toml_key.
+  _toml_fly_disk_gb="$( { grep -E '^[[:space:]]*fly_disk_gb[[:space:]]*=' \
+                              "$USER_REPO/leerie.toml" 2>/dev/null \
+                            | head -1 \
+                            | sed -E 's/^[[:space:]]*fly_disk_gb[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//; s/^"//; s/"$//' ; } || true)"
+  if [ -n "$_toml_fly_disk_gb" ]; then
+    FLY_VM_DISK_GB="$_toml_fly_disk_gb"
+  fi
+  unset _toml_fly_disk_gb
+fi
+unset _cli_fly_disk_gb _prev_was_fly_disk
+# Validate: must be a positive integer when set. provision.sh would otherwise
+# pass garbage to `flyctl volumes create --size` and the failure mode would
+# be a confusing flyctl error.
+if [ -n "${FLY_VM_DISK_GB:-}" ]; then
+  case "$FLY_VM_DISK_GB" in
+    ''|*[!0-9]*)
+      remote_log "FLY_VM_DISK_GB='$FLY_VM_DISK_GB' is not a positive integer (GB)"
+      exit 1
+      ;;
+    0)
+      remote_log "FLY_VM_DISK_GB=0 is invalid; unset the var to use Fly's default disk"
+      exit 1
+      ;;
+  esac
+  export FLY_VM_DISK_GB
+fi
 
 # DRY_RUN is referenced by scripts/runtime-install.sh; default to false
 # in the launcher (the launcher has no --dry-run flag — that's install.sh).

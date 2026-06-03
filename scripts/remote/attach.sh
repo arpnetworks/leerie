@@ -208,6 +208,11 @@ if [ "$ATTACH_TAIL" = "true" ]; then
   RUN_ID_ENV="LEERIE_TAIL_RUN_ID='$ATTACH_RUN_ID'; export LEERIE_TAIL_RUN_ID
 "
 
+  # The tail payload is shell script (uses `export`, semicolons, etc.) so
+  # it must run through `bash -lc`, not as direct argv.
+  _TAIL_PAYLOAD="${RUN_ID_ENV}${AUTO_FINALIZE_ENV}$TAIL_SCRIPT"
+  _TAIL_PAYLOAD_Q="$(printf %s "$_TAIL_PAYLOAD" | sed "s/'/'\\\\''/g")"
+
   if [ "$ATTACH_AUTO_FINALIZE" = "true" ]; then
     # Capture stderr through a tee so the user still sees the stream,
     # but we can also grep for the token to drive auto-finalize.
@@ -217,7 +222,7 @@ if [ "$ATTACH_TAIL" = "true" ]; then
     flyctl ssh console \
       --app "$ATTACH_APP" \
       --machine "$ATTACH_MACHINE_ID" \
-      --command "${RUN_ID_ENV}${AUTO_FINALIZE_ENV}$TAIL_SCRIPT" \
+      --command "bash -lc '$_TAIL_PAYLOAD_Q'" \
       2> >(tee "$_stderr_capture" >&2)
     rc=$?
     set -e
@@ -237,17 +242,23 @@ if [ "$ATTACH_TAIL" = "true" ]; then
   exec flyctl ssh console \
     --app "$ATTACH_APP" \
     --machine "$ATTACH_MACHINE_ID" \
-    --command "${RUN_ID_ENV}$TAIL_SCRIPT"
+    --command "bash -lc '$_TAIL_PAYLOAD_Q'"
 fi
 
 # Default: bare shell at /work with $PS1 identifying the run-id.
+# `flyctl ssh console --command` execs the string as argv (not via a shell),
+# so any shell builtin (`cd`, `export`) or operator (`&&`) must be wrapped in
+# `bash -lc '...'`. Single-quote the script and escape any embedded single
+# quotes so $PS1's literal backslashes and dollar reach bash unmangled.
 if [ -n "$ATTACH_RUN_ID" ]; then
   REMOTE_CMD="cd /work && PS1='leerie@$ATTACH_RUN_ID:\\w\\$ ' exec bash --noprofile --norc -i"
 else
   REMOTE_CMD="cd /work && PS1='leerie@remote:\\w\\$ ' exec bash --noprofile --norc -i"
 fi
+# shell-quote REMOTE_CMD for `bash -lc`: replace each ' with '\''
+_REMOTE_CMD_Q="$(printf %s "$REMOTE_CMD" | sed "s/'/'\\\\''/g")"
 
 exec flyctl ssh console \
   --app "$ATTACH_APP" \
   --machine "$ATTACH_MACHINE_ID" \
-  --command "$REMOTE_CMD"
+  --command "bash -lc '$_REMOTE_CMD_Q'"

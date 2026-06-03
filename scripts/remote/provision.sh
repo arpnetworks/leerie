@@ -51,6 +51,13 @@ FLY_APP="${LEERIE_FLY_APP:-leerie}"
 FLY_REGION="${FLY_REGION:-iad}"
 FLY_VM_CPUS="${FLY_VM_CPUS:-4}"
 FLY_VM_MEMORY="${FLY_VM_MEMORY:-8192}"
+# Opt-in: per-machine Fly volume mounted at /home/leerie. UNSET by default
+# — when blank, no volume is created and the `flyctl machine run` argv is
+# byte-for-byte today's. Setting to a positive integer N creates a Fly
+# volume sized at N GB and adds --volume "<id>:/home/leerie" to the run
+# argv. Volume is destroyed alongside the machine in destroy_machine.
+# (DESIGN §6 *Remote disk policy*, IMPLEMENTATION §2.)
+FLY_VM_DISK_GB="${FLY_VM_DISK_GB:-}"
 
 # Fly's `shared` CPU class tops out at 8 CPUs / 16384 MB. Above either
 # ceiling, promote to `performance` CPUs (significantly more expensive —
@@ -67,6 +74,10 @@ MACHINE_START_TIMEOUT="${LEERIE_MACHINE_START_TIMEOUT:-120}"
 
 # Exported machine ID — empty until provision_machine succeeds.
 LEERIE_MACHINE_ID=""
+# Volume ID — empty unless FLY_VM_DISK_GB is set and provision_machine
+# successfully created a volume. Destroyed alongside the machine in
+# destroy_machine.
+LEERIE_VOLUME_ID=""
 
 # require_flyctl now lives in lib.sh (sourced above) with auto-install
 # support. Inline detection here has been removed to avoid drift.
@@ -88,6 +99,10 @@ stop_machine() {
 
 # --- destroy machine -----------------------------------------------------
 # Full reap. Idempotent: destroy is no-op if the machine is already gone.
+# When LEERIE_VOLUME_ID is set (FLY_VM_DISK_GB path), the volume is
+# destroyed AFTER the machine is gone — volumes pinned to a destroyed
+# machine can be reaped cleanly; the reverse order (volume first) errors
+# with "in use by machine X".
 destroy_machine() {
   local mid="$LEERIE_MACHINE_ID"
   if [ -z "$mid" ]; then
@@ -105,6 +120,25 @@ destroy_machine() {
     flyctl machine stop "$mid" --app "$FLY_APP" 2>/dev/null || true
     flyctl machine destroy "$mid" --app "$FLY_APP" --force 2>/dev/null || true
     remote_log "remote: machine $mid stop+destroy attempted (may already be gone)"
+  fi
+  # Destroy the attached volume if one was provisioned (FLY_VM_DISK_GB
+  # path). Fly volumes outlive their machines on a bare `machine destroy`
+  # — they have to be explicitly reaped or they orphan and continue to
+  # accrue per-GB-month charges.
+  if [ -n "$LEERIE_VOLUME_ID" ]; then
+    remote_log "remote: destroying volume $LEERIE_VOLUME_ID ..."
+    if flyctl volumes destroy "$LEERIE_VOLUME_ID" \
+         --app "$FLY_APP" \
+         --yes \
+         2>/dev/null; then
+      remote_log "remote: volume $LEERIE_VOLUME_ID destroyed"
+    else
+      # Best-effort: log and continue. An orphan volume is a billing
+      # issue, not a correctness issue; the user can reap it via
+      # `flyctl volumes list --app "$FLY_APP"` + manual destroy.
+      remote_log "warning: failed to destroy volume $LEERIE_VOLUME_ID (may already be gone or pinned)"
+    fi
+    LEERIE_VOLUME_ID=""
   fi
   # Drop the PID-keyed attach pointer (Phase 3) — the machine no longer
   # exists, so attach should report "no active remote machine" next time.
@@ -289,9 +323,14 @@ decide_teardown() {
         echo "  could not be pulled back. The machine is being LEFT RUNNING" >&2
         echo "  so your work is not lost. Recover manually:" >&2
         echo "" >&2
-        echo "    1. Investigate / retry sync:" >&2
+        echo "    1. Investigate / retry sync (most common):" >&2
         echo "         leerie --finalize ${LEERIE_RUN_ID:-<run-id>}" >&2
         echo "       (this calls fetch_branch + host push; safe to retry)" >&2
+        echo "" >&2
+        echo "       If that errors with \"no completed unpushed run\", the" >&2
+        echo "       orchestrator died before writing finished_at. Recover with:" >&2
+        echo "         leerie --finalize ${LEERIE_RUN_ID:-<run-id>} --force" >&2
+        echo "       (--force refuses if the orchestrator is still alive.)" >&2
         echo "" >&2
         echo "    2. Or attach + inspect manually:" >&2
         echo "         leerie --attach ${LEERIE_RUN_ID:-<run-id>}" >&2
@@ -411,6 +450,47 @@ provision_machine() {
 
   require_flyctl || return 1
 
+  # Opt-in volume: create BEFORE `flyctl machine run` so we can pass the
+  # volume ID on the run command (Fly mounts at machine create time, not
+  # post-create). If volume-create fails, abort before creating the
+  # machine. If it succeeds but the subsequent machine-create fails, the
+  # explicit-orphan-cleanup block below reaps the volume — there is no
+  # trap covering this window yet (the EXIT trap is only registered
+  # after machine create succeeds).
+  if [ -n "$FLY_VM_DISK_GB" ]; then
+    # Volume name: alphanumeric + underscore, ≤30 chars per Fly's volume
+    # naming rule. Use a leerie_data_<6hex> shape so collisions are
+    # vanishingly unlikely and the name fits comfortably.
+    local vol_name="leerie_data_$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+    remote_log "remote: creating volume $vol_name (${FLY_VM_DISK_GB} GB, region=$FLY_REGION)..."
+    local vol_create_output=""
+    if ! vol_create_output="$(flyctl volumes create "$vol_name" \
+           --app "$FLY_APP" \
+           --region "$FLY_REGION" \
+           --size "$FLY_VM_DISK_GB" \
+           --yes \
+           2>&1)"; then
+      remote_log "failed to create Fly volume — flyctl output:"
+      printf '  %s\n' "$vol_create_output" >&2
+      return 1
+    fi
+    # Extract the volume ID (vol_*) from the create output. flyctl
+    # volumes create emits a key/value table; the ID appears in a line
+    # like "ID: vol_abc123..." (with possible ANSI color codes).
+    LEERIE_VOLUME_ID="$(printf '%s' "$vol_create_output" \
+                       | sed 's/\x1b\[[0-9;]*m//g' \
+                       | awk '/^[[:space:]]*ID[[:space:]]*[:=]/ { print $2; exit }')"
+    if [ -z "$LEERIE_VOLUME_ID" ]; then
+      remote_log "failed to extract volume ID from flyctl output:"
+      printf '  %s\n' "$vol_create_output" >&2
+      # Best-effort orphan reap by name (we don't have the ID).
+      flyctl volumes destroy "$vol_name" --app "$FLY_APP" --yes 2>/dev/null || true
+      return 1
+    fi
+    export LEERIE_VOLUME_ID
+    remote_log "remote: created volume $LEERIE_VOLUME_ID ($vol_name)"
+  fi
+
   remote_log "remote: creating machine (app=$FLY_APP region=$FLY_REGION image=$FLY_IMAGE_TAG)..."
 
   # flyctl machine run --detach starts the machine without streaming its
@@ -421,12 +501,26 @@ provision_machine() {
   # parser failure doesn't trigger set -u at the empty-check below.
   local create_output=""
   local machine_id=""
+  # Build the machine-run argv conditionally so the volume-less path is
+  # byte-for-byte identical to the pre-FLY_VM_DISK_GB invocation. Bash
+  # arrays handle the optional --volume arg without word-splitting
+  # surprises.
+  local _vol_args=()
+  if [ -n "$LEERIE_VOLUME_ID" ]; then
+    _vol_args=(--volume "${LEERIE_VOLUME_ID}:/home/leerie")
+  fi
+  # ${arr[@]+"${arr[@]}"} is the bash idiom to expand an array safely
+  # under `set -u`: when the array is empty (no volume), the +word
+  # substitution produces nothing and `"${arr[@]}"` is never evaluated;
+  # when it has elements, they expand verbatim. Plain `"${_vol_args[@]}"`
+  # under set -u errors with "unbound variable" on empty arrays.
   if create_output="$(flyctl machine run "$FLY_IMAGE_TAG" \
        --app "$FLY_APP" \
        --region "$FLY_REGION" \
        --vm-cpus "$FLY_VM_CPUS" \
        --vm-memory "$FLY_VM_MEMORY" \
        --vm-cpu-kind "$FLY_VM_CPU_KIND" \
+       ${_vol_args[@]+"${_vol_args[@]}"} \
        --detach \
        2>&1)"; then
     # Extract the first whitespace-delimited token after "Machine ID:".
@@ -439,6 +533,14 @@ provision_machine() {
   if [ -z "$machine_id" ]; then
     remote_log "failed to create Fly Machine — flyctl output:"
     printf '  %s\n' "$create_output" >&2
+    # Orphan cleanup: if we created a volume above, the failed machine-run
+    # leaves it dangling (no machine ever attached to it). Reap now —
+    # the EXIT trap isn't registered yet at this point.
+    if [ -n "$LEERIE_VOLUME_ID" ]; then
+      remote_log "remote: cleaning up orphan volume $LEERIE_VOLUME_ID after machine-create failure"
+      flyctl volumes destroy "$LEERIE_VOLUME_ID" --app "$FLY_APP" --yes 2>/dev/null || true
+      LEERIE_VOLUME_ID=""
+    fi
     return 1
   fi
 
@@ -460,7 +562,13 @@ provision_machine() {
   if [ -n "${USER_REPO:-}" ] && [ -n "${LEERIE_RUN_ID:-}" ]; then
     local sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
     if [ -f "$sidecar" ]; then
-      update_run_json "$sidecar" fly_machine_id "$machine_id" || true
+      if [ -n "$LEERIE_VOLUME_ID" ]; then
+        update_run_json "$sidecar" \
+          fly_machine_id "$machine_id" \
+          volume_id "$LEERIE_VOLUME_ID" || true
+      else
+        update_run_json "$sidecar" fly_machine_id "$machine_id" || true
+      fi
     fi
   fi
 
@@ -479,9 +587,9 @@ provision_machine() {
     # from "the in-Fly orchestrator was told not to push because it
     # can't reach github" (the latter is a mechanism flag the launcher
     # forces, NOT a user-intent flag).
-    python3 - "$pid_record" "$machine_id" "$FLY_APP" "${LEERIE_RUN_ID:-}" "$$" "${NO_PUSH:-false}" <<'PY'
+    python3 - "$pid_record" "$machine_id" "$FLY_APP" "${LEERIE_RUN_ID:-}" "$$" "${NO_PUSH:-false}" "${LEERIE_VOLUME_ID:-}" <<'PY'
 import json, sys, datetime
-path, mid, app, run_id, pid, no_push = sys.argv[1:]
+path, mid, app, run_id, pid, no_push, vol_id = sys.argv[1:]
 data = {
     "fly_app": app,
     "fly_machine_id": mid,
@@ -490,6 +598,8 @@ data = {
     "launcher_pid": int(pid),
     "host_no_push": no_push in ("true", "1", "yes"),
 }
+if vol_id:
+    data["volume_id"] = vol_id
 with open(path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")

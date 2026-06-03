@@ -276,6 +276,38 @@ and delegates the entire worker lifecycle to the Fly.io API. The
 local container runtime (Colima on macOS, containerd on Linux) is
 only needed for the default `local` runtime.
 
+**Disk sizing.** By default Fly Machines run on the platform's default
+ephemeral rootfs. If a run errors out with `ENOSPC: no space left on
+device` (typically during parallel waves when many `claude -p` workers
+accumulate session-env state at once) or if you need to pause a run
+and resume it days later, set `FLY_VM_DISK_GB` (or pass
+`--fly-disk-gb N`, or put `fly_disk_gb = N` in `leerie.toml`). That
+provisions a per-machine Fly volume sized at N GB and mounts it at
+`/home/leerie`:
+
+```bash
+FLY_VM_DISK_GB=30 leerie 'task' --runtime fly
+# or:
+leerie 'task' --runtime fly --fly-disk-gb 50
+```
+
+The volume is created at machine-provision time and destroyed when the
+machine is destroyed (clean exit or `leerie --kill`), so steady-state
+storage cost is zero. While a paused run is on its volume, Fly charges
+per-GB-month — minimal at typical sizes but non-zero. If you regularly
+run very long-running tasks or want the §6 *Remote pause-on-failure*
+contract to hold across long pauses, set this value.
+
+**Recovery if an orchestrator dies mid-run.** If a run errors out and
+the post-run sync fails (e.g. the machine ran out of disk before the
+orchestrator could write `finished_at`), `leerie --finalize <run-id>
+--force` recovers the work. The launcher SSHes into the machine,
+verifies the orchestrator process is dead, patches `finished_at`, and
+proceeds with the normal fetch + push + PR flow. `--force` refuses if
+the orchestrator is still alive, so it is safe to use proactively when
+in doubt. See `docs/IMPLEMENTATION.md` §7 *Detached run finalization*
+for the full semantics.
+
 **`--local-build` opt-in** (most users should NOT use this). Pass
 `--local-build` or set `LEERIE_LOCAL_BUILD=1` to build the leerie image
 locally with `nerdctl`/`docker` and push to Fly's registry from your

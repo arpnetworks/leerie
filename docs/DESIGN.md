@@ -77,7 +77,7 @@ Orchestrator (deterministic — owns all control flow, caps, state)
 │
 ├─ Phase 1   Classify the task into 1..9 categories          → 1 worker
 │              ↓ derive the run identifier from category + task + start time
-├─ Phase 0   Clarify — intent-only questions, only if needed
+├─ Phase 1·5 Clarify  (optional — skipped for fully-specified tasks)
 ├─ Phase 2   Plan — one planner per matched category         → N workers (parallel)
 │              ↓ reconcile cross-domain capability tags       → 0 or 1 worker
 ├─ Phase 3   Schedule — merge plans, build global DAG, sort into waves
@@ -91,10 +91,10 @@ Orchestrator (deterministic — owns all control flow, caps, state)
              locally — the PR is the proposed integration.)
 ```
 
-**Why classification precedes clarification.** Phase 1 runs before Phase 0
+**Why classification precedes clarification.** Phase 1 runs before Phase 1·5
 because Leerie cannot know what to ask until it knows what kind of task this
 is — the set of questions worth asking is a function of the classification.
-Phase 0 is skipped entirely for fully-specified tasks.
+Phase 1·5 is skipped entirely for fully-specified tasks.
 
 **Why planners run before scheduling.** Decomposition (Phase 2) and scheduling
 (Phase 3) are separate because decomposition needs LLM judgment about a domain
@@ -553,6 +553,29 @@ push + PR sit between them on the host:
    sync-failure recovery path (work is preserved; the user destroys
    manually via `leerie --kill <run-id>` when satisfied).
 
+**Recovery when the orchestrator dies before `finished_at`.** A worker
+or orchestrator crash before `phase_finalize` leaves a run that
+`fetch-branch.sh` cannot discover (its predicate requires
+`finished_at` set + `pushed_at` unset). For these cases, `leerie
+--finalize <run-id> --force` SSHes into the machine, verifies the
+orchestrator process is dead (via the `orchestrator.pid` file and
+`/proc/<pid>/comm`), patches `finished_at` into `run.json` along with
+audit fields `recovered_at` and `recovered_via="force-finalize"`, and
+then falls through to the normal finalize flow. The pid check is the
+safety belt: if the orchestrator is still alive, `--force` refuses with
+a message naming the live pid. This makes the manual "attach, hand-edit
+JSON, re-run" recovery procedure (last documented in
+`docs/IMPLEMENTATION.md` §6) unnecessary while preserving the audit
+trail of recovered runs.
+
+Additionally, `leerie --finalize` accepts either the **bootstrap id**
+(`_bootstrap-<6hex>`) or the **final run-id** (e.g.
+`feat-foo-abc123`). When the user passes the final id but only the
+bootstrap dir exists locally (the orchestrator died before host sync),
+the launcher resolves the machine via the bootstrap dir's
+`fly-machine.json` and lets the existing `LEERIE_REMOTE_RUN_ID`
+plumbing migrate the dir to the final id after `fetch_branch` runs.
+
 The local-runtime path runs the same `host_finalize` block inline in
 the launcher (no trap is needed; the launcher and the pusher are the
 same process). Both paths share `scripts/host-finalize.sh`; the
@@ -901,7 +924,7 @@ observe it.
 The run-id is the bridge. With detached invocation the launcher needs
 the run-id *before* starting the orchestrator (so it knows which
 `orchestrator.log` path to tail), but today's orchestrator generates
-its run-id internally during phase 0. The launcher therefore generates
+its run-id internally during phase 1. The launcher therefore generates
 the slug + suffix host-side using the same pattern and passes it as
 `--run-id <id>` — reusing the plumbing that `--resume` already
 establishes. The orchestrator's `--run-id` short-circuit accepts the
@@ -953,15 +976,27 @@ exit codes regardless of where it runs, and the launcher routes those
 exit codes through the runtime-appropriate teardown.
 
 `flyctl machine stop` (not destroy) on the pause branch preserves the
-machine's filesystem on its Fly volume; the orchestrator's own state is
-already in `.leerie/runs/<run-id>/run.json` on that volume, the run
-branch holds the committed work, and `flyctl machine start` brings the
-machine back from disk without losing anything. Memory state is not
-preserved across a pause — the contract this section relies on is
-that the run branch (the committed work) plus `.leerie/runs/<run-id>/`
-(the orchestrator's own state) are the only durable record of a run,
-and both already live on the machine's Fly volume by the time a pause
-fires.
+machine's filesystem; the orchestrator's own state is already in
+`.leerie/runs/<run-id>/run.json` and the run branch holds the committed
+work, and `flyctl machine start` brings the machine back from disk
+without losing anything. Memory state is not preserved across a pause —
+the contract this section relies on is that the run branch (the
+committed work) plus `.leerie/runs/<run-id>/` (the orchestrator's own
+state) are the only durable record of a run, and both already live on
+the machine's filesystem by the time a pause fires.
+
+**Disk durability is conditional on `FLY_VM_DISK_GB`.** When the env
+var is set, `provision.sh` creates a per-machine Fly volume mounted at
+`/home/leerie` and the pause-on-failure contract above is unconditional
+— the volume survives `machine stop` and reattaches on `machine start`,
+indefinitely. When `FLY_VM_DISK_GB` is **unset** (the default), the
+machine runs on its ephemeral rootfs disk with no volume. A short
+`machine stop` window preserves the rootfs and `start` resumes
+normally; but a sufficiently long stop, or any Fly-side reclamation,
+discards the rootfs and the run dir with it. Users running anything
+they intend to pause-and-resume across a long window should set
+`FLY_VM_DISK_GB`. The same env var doubles as the recovery for runs
+that hit ENOSPC mid-execution.
 
 Six sidecar fields on `run.json` capture remote lifecycle state:
 
