@@ -1146,6 +1146,21 @@ implements this as `_resolve_fly_machine_id_from_run_dir` in `leerie`;
 `scripts/remote/attach.sh` (a standalone script that runs before the
 launcher's helpers are sourced) inlines the same lookup shape.
 
+A sibling `task.txt` lives next to `fly-machine.json` in the same
+bootstrap dir. The launcher writes the user's positional `task`
+argument there on first launch — just the raw task string, no JSON
+envelope. On a bootstrap-stage resume the user's argv has no task
+(they typed `leerie --resume --run-id <bootstrap-id> --runtime fly`,
+nothing else); the launcher strips `--resume` so the orchestrator
+routes to its fresh-launch branch, which requires a task. Without
+`task.txt` the user would have to retype the original task on every
+retry. The persist is idempotent (`! -f` guard) and the restore is
+guarded by "no task in argv" so an explicit re-supplied task on the
+resume command line wins over the file. The orchestrator never reads
+`task.txt`; once a final id has been minted and `state.json` is
+written, `state.json.task` is the source of truth and `task.txt`
+becomes a vestigial breadcrumb.
+
 `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive — a
 run cannot be in more than one terminal-or-paused state.
 `sync_failed_at` is orthogonal (the machine is neither paused nor

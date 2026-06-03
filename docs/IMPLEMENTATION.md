@@ -2758,6 +2758,39 @@ clean terminal exits (rc=0/10/75: `_try_fetch_branch_for_teardown` runs
 machine RUNNING for user recovery), **detach** for SIGINT/SIGTERM,
 **pause** for other non-zero rc.
 
+**Bootstrap-stage resume — `--resume` is host-only, task is recovered
+from `task.txt`.** `leerie --resume` on the host means "wake the paused
+Fly machine"; the in-machine orchestrator interprets the same flag as
+"resume state from disk." On a bootstrap-stage resume (run-id still
+`_bootstrap-<6hex>`, classify never ran on the machine, no `state.json`
+exists), the orchestrator's `--resume` branch would die in
+`resolve_run_id` with `does not match any known run`. The launcher
+filters `--resume` out of `REWRITTEN_ARGS` when `LEERIE_RUN_ID` starts
+with `_bootstrap-`, routing the in-machine orchestrator to its
+`elif args.run_id and args.run_id.startswith("_bootstrap-"):` arm at
+`orchestrator/leerie.py:12592` (honors the id, creates fresh State).
+That arm needs a `task` positional, which is gone from the user's
+resume argv. The launcher persists the user's original task argument
+to `$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/task.txt` on first launch
+(adjacent to the `fly-machine.json` early-promote write), and on
+bootstrap-stage resume — when `LEERIE_TASK_ARG` is empty in this
+invocation's argv — reads it back and appends to `REWRITTEN_ARGS`.
+Both writes are idempotent (`! -f` and "no task in argv" guards), so
+an explicit re-supplied task on the resume command line wins. Post-
+classify resumes (final id `<cat>-<slug>-<6hex>`) bypass the strip
+entirely (the bootstrap-prefix guard is False) and the orchestrator's
+normal `--resume` → `state.json.task` path applies. `task.txt` is
+launcher-side; the orchestrator never reads it.
+
+The launcher's task extractor walks `$@` once at startup, skipping
+the value of any `--flag` that takes one. The list of value-taking
+flags (`_value_flags` literal in `leerie`) is source-coupled to the
+orchestrator's argparse by `tests/test_launcher_value_flags_coupling.py`
+— a value-taker added upstream that is not mirrored in the launcher
+would silently misclassify its value as the task and persist the wrong
+string. Per-worker `--model-<W>` / `--effort-<W>` overrides are matched
+by prefix pattern (`--model-*` / `--effort-*`) rather than enumerated.
+
 Maps to `DESIGN.md` §6 (container boundary / teardown / finalization)
 and §6 *Remote execution* (the one-microVM-per-run model and the
 host-as-the-only-credential-holder contract).
