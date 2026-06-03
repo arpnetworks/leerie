@@ -1935,6 +1935,14 @@ if [ "$RUNTIME" = "fly" ]; then
 import json, sys
 print(json.dumps(sys.argv[1:]))
 ' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}")"
+        # Derive the host's IANA timezone so we can bake it into
+        # child_env["TZ"] inside the heredoc below. `readlink` of
+        # /etc/localtime works on both macOS (/var/db/timezone/...)
+        # and Linux (/usr/share/zoneinfo/...); the sed strips
+        # everything up through `/zoneinfo/` to leave the IANA
+        # name. Empty if /etc/localtime isn't a symlink — Python's
+        # astimezone() then falls back to UTC.
+        _host_tz="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
         _launch_script="$(cat <<PY
 import os, pwd, subprocess
 argv = ${_launch_argv_json}
@@ -1970,6 +1978,15 @@ child_env["LOGNAME"] = "leerie"
 # heredoc is unquoted (<<PY), so basename runs host-side and the
 # resulting literal is baked into the script piped to the Fly machine.
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
+# Carry the host's IANA timezone so the in-machine orchestrator's
+# log() ISO-8601 prefix matches the host-side remote_log() offset.
+# Fly machines default to UTC; without this the user reads mixed
+# offsets (host -05:00, machine +00:00) in the tailed stream and
+# can't compare timestamps at a glance. The Dockerfile installs
+# tzdata so /usr/share/zoneinfo/<IANA> resolves. If readlink fails
+# (e.g. /etc/localtime not a symlink), the substitution yields ""
+# and Python's astimezone() falls back to UTC — same as today.
+child_env["TZ"] = "${_host_tz}"
 # Ensure the launcher's PATH includes the mise-managed claude binary.
 # (The Dockerfile installs claude into the mise-managed node prefix;
 # fly's hallpass ssh session inherits a minimal PATH that may not

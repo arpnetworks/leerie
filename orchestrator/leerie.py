@@ -35,7 +35,7 @@ import sys
 import time
 import uuid
 from collections import deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -1144,7 +1144,8 @@ def now() -> str:
 
 def log(msg: str) -> None:
     repo = Path(os.environ.get("USER_REPO") or os.getcwd()).name or "?"
-    print(f"{datetime.now().strftime('%H:%M:%S')} [leerie] [{repo}] {msg}", flush=True)
+    ts = datetime.now().astimezone().isoformat(timespec="seconds")
+    print(f"{ts} [leerie] [{repo}] {msg}", flush=True)
 
 
 def die(msg: str, code: int = 1):
@@ -4802,12 +4803,15 @@ def _summarize_stream_event(sid: str, event: dict, verbosity: str) -> str | None
     return None
 
 
-def _get_progress(st: "State") -> tuple[int, int] | None:
-    """Return (done, total) subtask counts for the inline `[done N/M]` prefix.
+def _get_progress(st: "State") -> tuple[int, int, int, int] | None:
+    """Return (done, total, wave_idx, wave_total) for the inline
+    `[wave W/V · done N/M]` prefix.
 
     Only meaningful once waves are scheduled — returns None before that so
     classifier/planner workers emit no prefix. Terminal statuses are complete,
-    failed, and blocked; in-progress subtasks don't count toward done."""
+    failed, and blocked; in-progress subtasks don't count toward done. The
+    wave index is 1-based for display (`completed_waves + 1`) so that the
+    in-flight wave reads as `1/3` while wave 1 is running, not `0/3`."""
     waves = st.data.get("waves")
     if not waves:
         return None
@@ -4816,7 +4820,8 @@ def _get_progress(st: "State") -> tuple[int, int] | None:
         return None
     done = sum(1 for v in st.data.get("subtask_status", {}).values()
                if v in _TERMINAL_STATUSES)
-    return done, total
+    wave_idx = st.data.get("completed_waves", 0) + 1
+    return done, total, wave_idx, len(waves)
 
 
 # --- cgroup v2 containment for worker subtrees ---------------------------
@@ -4936,7 +4941,8 @@ def _cgroup_destroy(cgroup_path: Path | None) -> None:
 
 async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   sid: str, leerie_dir: Path, verbosity: str,
-                  progress: tuple[int, int] | None = None,
+                  progress: Callable[[], tuple[int, int, int, int] | None]
+                  | None = None,
                   idle_warn_sec: float | None = None,
                   worker_memory_max_bytes: int | None = None,
                   worker_pids_max: int | None = None) -> dict:
@@ -5077,14 +5083,22 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     # Inline summary (verbosity-gated). Multi-line
                     # summaries (multi-block events, multi-line text)
                     # are emitted one log() call per line so each
-                    # line gets its own HH:MM:SS [leerie] prefix —
+                    # line gets its own ISO-8601 [leerie] prefix —
                     # otherwise the timestamp only renders on line 1
                     # and lines 2+ visually disconnect from the
                     # orchestrator's timestamped log stream.
                     summary = _summarize_stream_event(sid, event, verbosity)
                     if summary:
-                        prog_prefix = (f"[done {progress[0]}/{progress[1]}] "
-                                       if progress else "")
+                        # Recompute per event so siblings finishing
+                        # mid-run bump the count for still-running
+                        # workers. Cached for this event's splitlines
+                        # loop so a multi-line summary doesn't
+                        # straddle two different counts.
+                        prog = progress() if progress else None
+                        prog_prefix = (
+                            f"[wave {prog[2]}/{prog[3]} · "
+                            f"done {prog[0]}/{prog[1]}] "
+                            if prog else "")
                         for ln in summary.splitlines():
                             if ln:
                                 log(prog_prefix + ln)
@@ -5496,7 +5510,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         _t0 = time.monotonic()
         envelope = await _invoke(build(retry_note), cwd, timeout,
                                  sid, leerie_dir, verbosity,
-                                 progress=_get_progress(st),
+                                 progress=lambda: _get_progress(st),
                                  idle_warn_sec=caps.get(
                                      "worker_idle_warn_sec",
                                      DEFAULT_CAPS["worker_idle_warn_sec"]),

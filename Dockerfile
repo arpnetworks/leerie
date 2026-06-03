@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       procps \
       build-essential \
       rsync \
+      tzdata \
     && rm -rf /var/lib/apt/lists/*
 
 # Python runtime deps. See docs/IMPLEMENTATION.md §0 "Python runtime"

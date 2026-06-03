@@ -1,6 +1,6 @@
 """Tests for orchestrator/leerie.py's log() prefix helper.
 
-Asserts the HH:MM:SS [leerie] [<repo>] <msg> prefix shape — the same
+Asserts the ISO-8601 [leerie] [<repo>] <msg> prefix shape — the same
 user-visible contract that tests/test_remote_log.py guards for the
 host-side bash remote_log(). Both halves of the shell ↔ python boundary
 have to render the same `<repo>` tag, otherwise the prefix flips
@@ -22,8 +22,13 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 ORCH = REPO_ROOT / "orchestrator" / "leerie.py"
 
+# ISO-8601 with second precision and a local-tz offset: e.g.
+# `2026-06-03T05:07:10-05:00` or `2026-06-03T10:07:10+00:00`. The
+# offset is always present because log() goes through .astimezone(),
+# which never produces a naive datetime.
 PREFIX_RE = re.compile(
-    r"^\d{2}:\d{2}:\d{2} \[leerie\] \[(?P<repo>[^\]]+)\] (?P<body>.*)$"
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} "
+    r"\[leerie\] \[(?P<repo>[^\]]+)\] (?P<body>.*)$"
 )
 
 

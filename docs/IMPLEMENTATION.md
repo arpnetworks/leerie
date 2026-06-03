@@ -1004,12 +1004,23 @@ convention.
 | `stream` | `-v` / (default) | `normal` + one-line summary per worker event |
 | `debug`  | `-vv` / `--verbosity debug` | `stream` + raw event payloads, tool I/O, schema diffs, retry diagnostics |
 
-Streaming log lines for Phase 5 work carry the prefix `[done N/M]`, where
-`N` is the number of subtasks in a terminal status (`complete`, `failed`,
-`blocked`) and `M` is the total scheduled subtask count. Built by
+Streaming log lines for Phase 5 work carry the prefix
+`[wave W/V · done N/M]`, where `W` / `V` is the 1-based current wave
+index and total wave count, and `N` / `M` is the number of subtasks in
+a terminal status (`complete`, `failed`, `blocked`) over the total
+scheduled subtask count. The wave context exists so that `done 0/M`
+at the start of Phase 5 reads as "wave 1 is in flight, nothing has
+reached terminal yet," not "the run hasn't started." Built by
 `_get_progress` (`orchestrator/leerie.py`); emitted only after Phase 3
 schedules the waves, which is why classifier / planner / reconciler log
 lines have no prefix.
+
+`_invoke` takes `progress` as a callable (`Callable[[], tuple[...] |
+None] | None`), not a spawn-time snapshot, and calls it per stream
+event. This is so a long-running worker's prefix advances as siblings
+complete — two workers logging at the same wall-clock instant agree on
+the count instead of carrying frozen snapshots from their respective
+spawn moments.
 
 Resolution order (highest priority first):
 
@@ -2631,6 +2642,13 @@ child_env["LOGNAME"] = "leerie"
 # to the Fly machine. Keeps orchestrator log() prefix consistent
 # with host-side remote_log() (else log() falls back to cwd=/work).
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
+# Host IANA TZ baked in so the in-machine log() ISO-8601 offset
+# matches host-side remote_log() (else mixed -05:00 / +00:00 in
+# the tailed stream). _host_tz is computed in outer bash via
+# `readlink /etc/localtime | sed 's|.*/zoneinfo/||'` (works on
+# macOS and Linux). Dockerfile installs `tzdata` so the IANA name
+# resolves; empty value → Python astimezone() falls back to UTC.
+child_env["TZ"] = "${_host_tz}"
 extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
 if extra_path not in child_env.get("PATH", ""):
     child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
@@ -3128,7 +3146,7 @@ Two surfaces address this together:
    backgrounding. `leerie --attach --tail` watches this pid (via a small
    `while kill -0 $pid; do sleep 1; done` loop alongside the `tail -F`)
    and, when the pid disappears, prints a one-line banner like
-   `HH:MM:SS [leerie] remote: orchestrator exited — syncing run branch + state to host...`.
+   `<ISO-8601> [leerie] remote: orchestrator exited — syncing run branch + state to host...`.
    The tail then exits.
 2. **`leerie --finalize <run-id>`** — new launcher fast-path that runs the
    post-orchestrator block the launcher used to run inline: source

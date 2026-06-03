@@ -285,7 +285,7 @@ def test_multi_line_summary_each_line_has_timestamp(leerie, leerie_dir,
                                                      monkeypatch, capsys):
     """A multi-line summary (multi-line text block, or multiple
     tool_use blocks in one event) must produce one log() call per
-    line so each line gets its own HH:MM:SS [leerie] prefix.
+    line so each line gets its own ISO-8601 [leerie] prefix.
 
     Earlier behavior returned a \\n-joined string and called log()
     once, which prepended the timestamp only to the first line —
@@ -308,8 +308,10 @@ def test_multi_line_summary_each_line_has_timestamp(leerie, leerie_dir,
         verbosity="stream"))
     out = capsys.readouterr().out
     # Each text line is on its own output line, each prefixed with
-    # the HH:MM:SS [leerie] timestamp.
-    line_prefix_re = re.compile(r"^\s*\d{2}:\d{2}:\d{2} \[leerie\]")
+    # the ISO-8601 second-precision local-tz [leerie] timestamp.
+    line_prefix_re = re.compile(
+        r"^\s*\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2} "
+        r"\[leerie\]")
     paragraphs = ["first paragraph", "second paragraph", "third paragraph"]
     for para in paragraphs:
         # Find the line containing this paragraph and assert it has
@@ -318,7 +320,7 @@ def test_multi_line_summary_each_line_has_timestamp(leerie, leerie_dir,
         assert matching, f"missing line for {para!r}; got: {out!r}"
         for l in matching:
             assert line_prefix_re.match(l), (
-                f"line {l!r} lacks HH:MM:SS [leerie] prefix — the "
+                f"line {l!r} lacks ISO-8601 [leerie] prefix — the "
                 "log() call per line guarantee broke")
 
 
@@ -459,11 +461,14 @@ def test_value_error_from_line_limit_becomes_worker_error(leerie,
         "WorkerError. See Pass-12 audit.")
 
 
-def test_progress_prefix_shown_when_progress_passed(leerie, leerie_dir,
-                                                      monkeypatch, capsys):
-    """When progress=(done, total) is passed to _invoke, every inline
-    summary line is prefixed with [done N/M] before the worker tag.
-    This is the implementer/integrator/conformer path once waves exist."""
+def test_progress_prefix_shows_wave_and_done(leerie, leerie_dir,
+                                              monkeypatch, capsys):
+    """When progress is passed to _invoke as a callable returning
+    (done, total, wave_idx, wave_total), every inline summary line
+    is prefixed with `[wave W/V · done N/M]` before the worker tag.
+    The callable is invoked per event so sibling workers finishing
+    mid-run bump the count for still-running workers — the prefix
+    is not a spawn-time snapshot."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
         json.dumps({"type": "result", "subtype": "success",
@@ -474,10 +479,43 @@ def test_progress_prefix_shown_when_progress_passed(leerie, leerie_dir,
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-prog", leerie_dir=leerie_dir,
-        verbosity="stream", progress=(3, 12)))
+        verbosity="stream", progress=lambda: (3, 12, 2, 3)))
     out = capsys.readouterr().out
-    assert "[done 3/12]" in out
+    assert "[wave 2/3 · done 3/12]" in out
     assert "[t-prog] starting" in out
+
+
+def test_progress_prefix_recomputes_per_event(leerie, leerie_dir,
+                                                monkeypatch, capsys):
+    """The progress callable is invoked per event, not once at spawn.
+    Pin this directly: a counter that returns increasing values must
+    show up as monotonically increasing prefixes across the worker's
+    stream."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "step 1"}]}}),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "step 2"}]}}),
+        json.dumps({"type": "result", "subtype": "success",
+                    "num_turns": 1, "is_error": False}),
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    counter = {"done": 0}
+
+    def get_progress() -> tuple[int, int, int, int]:
+        counter["done"] += 1
+        return counter["done"], 14, 1, 3
+
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="t-fresh", leerie_dir=leerie_dir,
+        verbosity="stream", progress=get_progress))
+    out = capsys.readouterr().out
+    assert "[wave 1/3 · done 1/14]" in out
+    assert "[wave 1/3 · done 2/14]" in out
+    assert "[wave 1/3 · done 3/14]" in out
 
 
 def test_create_subprocess_exec_uses_high_limit(leerie, leerie_dir,
