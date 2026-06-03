@@ -37,9 +37,9 @@ in real Python: `for` loops, `if` statements, counters. It cannot drift.
 leerie "<task>"
    ├─ Phase 1  Classify into 1..9 categories                    → 1 claude -p
    │             ↓ derive run_id (category + slug + start-hex)
-   ├─ Phase 0  Clarify — intent-only questions, default zero
+   │           • Clarify — intent-only questions (optional; skipped for fully-specified tasks)
    ├─ Phase 2  Plan — one planner per category (parallel)        → N claude -p
-   │             ↓ reconcile cross-domain capability tags          → 0 or 1 claude -p
+   │           • Reconcile — cross-domain capability-tag bridging (0 or 1 claude -p, when needed)
    ├─ Phase 3  Schedule — global dependency graph → topo waves   (pure Python)
    ├─ Phase 4  Create leerie/runs/<run-id> branch + worktree (per-run unique)
    ├─ Phase 5  Per wave: implement (parallel, isolated worktrees) → claude -p each

@@ -4803,7 +4803,7 @@ def _summarize_stream_event(sid: str, event: dict, verbosity: str) -> str | None
 
 
 def _get_progress(st: "State") -> tuple[int, int] | None:
-    """Return (done, total) subtask counts for the inline progress prefix.
+    """Return (done, total) subtask counts for the inline `[done N/M]` prefix.
 
     Only meaningful once waves are scheduled — returns None before that so
     classifier/planner workers emit no prefix. Terminal statuses are complete,
@@ -5083,7 +5083,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     # orchestrator's timestamped log stream.
                     summary = _summarize_stream_event(sid, event, verbosity)
                     if summary:
-                        prog_prefix = (f"[{progress[0]}/{progress[1]}] "
+                        prog_prefix = (f"[done {progress[0]}/{progress[1]}] "
                                        if progress else "")
                         for ln in summary.splitlines():
                             if ln:
@@ -7019,9 +7019,9 @@ async def run_mise_install(repo_root: Path, log_dir: Path,
 async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
                          models: dict[str, str],
                          efforts: dict[str, str | None]) -> dict:
-    """Phase 1 (classify), which also produces the Phase 0 clarification
-    questions: classify the task and surface only genuinely underivable
-    (intent-level) questions."""
+    """Phase 1 (classify), which also produces the Clarify sub-step's
+    intent questions: classify the task and surface only genuinely
+    underivable (intent-level) questions."""
     log("phase 1: classifying task")
     st.data["current_phase"] = "phase 1: classify"
     st.save()

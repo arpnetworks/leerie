@@ -462,7 +462,7 @@ def test_value_error_from_line_limit_becomes_worker_error(leerie,
 def test_progress_prefix_shown_when_progress_passed(leerie, leerie_dir,
                                                       monkeypatch, capsys):
     """When progress=(done, total) is passed to _invoke, every inline
-    summary line is prefixed with [done/total] before the worker tag.
+    summary line is prefixed with [done N/M] before the worker tag.
     This is the implementer/integrator/conformer path once waves exist."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
@@ -476,7 +476,7 @@ def test_progress_prefix_shown_when_progress_passed(leerie, leerie_dir,
         timeout=60, sid="t-prog", leerie_dir=leerie_dir,
         verbosity="stream", progress=(3, 12)))
     out = capsys.readouterr().out
-    assert "[3/12]" in out
+    assert "[done 3/12]" in out
     assert "[t-prog] starting" in out
 
 

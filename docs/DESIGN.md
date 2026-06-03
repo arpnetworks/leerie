@@ -77,9 +77,9 @@ Orchestrator (deterministic — owns all control flow, caps, state)
 │
 ├─ Phase 1   Classify the task into 1..9 categories          → 1 worker
 │              ↓ derive the run identifier from category + task + start time
-├─ Phase 1·5 Clarify  (optional — skipped for fully-specified tasks)
+│           • Clarify — intent-only questions (optional; skipped for fully-specified tasks)
 ├─ Phase 2   Plan — one planner per matched category         → N workers (parallel)
-│              ↓ reconcile cross-domain capability tags       → 0 or 1 worker
+│           • Reconcile — cross-domain capability-tag bridging (0 or 1 worker, when needed)
 ├─ Phase 3   Schedule — merge plans, build global DAG, sort into waves
 ├─ Phase 4   Set up the run branch and worktree (per-run unique)
 ├─ Phase 5   For each wave, in sequence:
@@ -91,10 +91,20 @@ Orchestrator (deterministic — owns all control flow, caps, state)
              locally — the PR is the proposed integration.)
 ```
 
-**Why classification precedes clarification.** Phase 1 runs before Phase 1·5
-because Leerie cannot know what to ask until it knows what kind of task this
-is — the set of questions worth asking is a function of the classification.
-Phase 1·5 is skipped entirely for fully-specified tasks.
+**Why classification precedes clarification.** The Clarify sub-step runs
+within Phase 1, after the classifier, because Leerie cannot know what to ask
+until it knows what kind of task this is — the set of questions worth
+asking is a function of the classification. Clarify is skipped entirely for
+fully-specified tasks.
+
+**A note on phase numbering.** The diagram shows six integer-numbered
+phases. Some phases have sub-steps shown as nested bullets — `Clarify`
+under `Phase 1`, `Reconcile` under `Phase 2`. Sub-steps that always run
+carry no qualifier; sub-steps that may be skipped are explicitly marked
+`(optional)`. The phase table in `docs/IMPLEMENTATION.md` §4 uses the
+same nesting and additionally lists `Provision` (per-repo dep detection)
+as a Phase 1 sub-step — it's an implementation-layer concern not shown
+in this architectural diagram.
 
 **Why planners run before scheduling.** Decomposition (Phase 2) and scheduling
 (Phase 3) are separate because decomposition needs LLM judgment about a domain
