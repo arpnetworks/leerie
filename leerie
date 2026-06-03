@@ -672,6 +672,7 @@ done
 # (DESIGN §6 Remote pause-on-failure). We don't shift the arg off $@ —
 # it's still forwarded via REWRITTEN_ARGS to the orchestrator's argparse.
 LEERIE_RUN_ID=""
+IS_RESUME=false
 _prev=""
 for arg in "$@"; do
   if [ "$_prev" = "--run-id" ]; then
@@ -679,10 +680,12 @@ for arg in "$@"; do
   fi
   case "$arg" in
     --run-id=*) LEERIE_RUN_ID="${arg#--run-id=}" ;;
+    --resume)   IS_RESUME=true ;;
   esac
   _prev="$arg"
 done
 export LEERIE_RUN_ID
+export IS_RESUME
 
 # --- runtime-mode knob ---------------------------------------------------
 # Resolves RUNTIME=local|fly. Precedence: CLI --runtime > LEERIE_RUNTIME env
@@ -1613,23 +1616,17 @@ if [ "$RUNTIME" = "fly" ]; then
     # shellcheck disable=SC1090
     . "$FETCH_SCRIPT"
 
-    # Pause-on-failure resume path: if --run-id <id> is set and the run
-    # sidecar has paused_at set, resume the existing Fly Machine instead
-    # of provisioning a new one. (DESIGN §6 Remote pause-on-failure.)
+    # Resume path: if a machine pointer exists for this run-id, resume
+    # the existing Fly Machine instead of provisioning a new one.
+    # (DESIGN §6 Remote pause-on-failure.) Uses the dual-file resolver
+    # at leerie:76 — fly-machine.json first, then run.json — to mirror
+    # the existing --stop/--kill/--finalize/--attach behavior. For
+    # bootstrap-id runs paused before classify, run.json may not exist
+    # on the host; fly-machine.json is the source of truth.
     _paused_mid=""
     if [ -n "$LEERIE_RUN_ID" ]; then
-      _sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
-      if [ -f "$_sidecar" ]; then
-        _paused_mid="$(python3 -c "
-import json,sys
-try:
-    d = json.load(open(sys.argv[1]))
-    if d.get('paused_at') and d.get('fly_machine_id'):
-        print(d['fly_machine_id'])
-except Exception:
-    pass
-" "$_sidecar" 2>/dev/null || true)"
-      fi
+      _paused_mid="$(_resolve_fly_machine_id_from_run_dir \
+                       "$USER_REPO/.leerie/runs/$LEERIE_RUN_ID")"
     fi
 
     _provisioned=false
@@ -1638,7 +1635,26 @@ except Exception:
       if resume_machine "$_paused_mid"; then
         _provisioned=true
         _resumed=true
+      elif [ "$IS_RESUME" = "true" ]; then
+        # User explicitly asked to resume and the target machine is
+        # unrecoverable (destroyed / refuses to start). resume_machine
+        # already named the cause on stderr. Do NOT silently provision
+        # a duplicate — exit with the failure so the user knows.
+        container_rc=1
       fi
+    elif [ "$IS_RESUME" = "true" ]; then
+      # --resume against a run-id with no machine pointer anywhere
+      # (no fly-machine.json, no run.json with fly_machine_id). Either
+      # the run-id is a typo or the run was already cleaned up. Fail
+      # loudly instead of silently provisioning a brand-new machine —
+      # the user typed "resume", not "start a new run".
+      remote_log "--resume: no Fly machine pointer found for run-id $LEERIE_RUN_ID"
+      echo "  Looked for: $USER_REPO/.leerie/runs/$LEERIE_RUN_ID/fly-machine.json" >&2
+      echo "             $USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json (fly_machine_id field)" >&2
+      echo "  Neither exists with a usable machine id." >&2
+      echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
+      echo "  start a fresh run." >&2
+      container_rc=1
     elif provision_machine; then
       _provisioned=true
     fi
@@ -1894,7 +1910,15 @@ $_tail_script"
         fi
       fi
     else
-      container_rc=1
+      # Reached when neither resume_machine nor provision_machine
+      # produced a running machine (or --resume strict-fail set
+      # container_rc=1 above). Surface a hint so the prior log lines
+      # aren't the only signal — without this, a user reading the
+      # tail sees `creating machine ...` followed by silence.
+      if [ -z "${container_rc:-}" ] || [ "$container_rc" = "0" ]; then
+        container_rc=1
+      fi
+      remote_log "remote: no Fly machine is running (resume/provision did not succeed) — aborting"
     fi
     # The EXIT trap registered in provision.sh (decide_teardown) reads
     # LEERIE_REMOTE_EXIT_RC to classify the orchestrator's exit code.

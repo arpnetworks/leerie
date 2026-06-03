@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+### Fixed
+
+- **`leerie --resume --runtime fly` no longer silently provisions a
+  duplicate Fly machine for bootstrap-id runs.** The launcher's
+  resume dispatch looked the run-id up only in
+  `.leerie/runs/<id>/run.json`, but for runs paused before
+  phase_classify completed, the host-side machine pointer lives in
+  `fly-machine.json` — `run.json` doesn't exist on the host yet (it
+  only materializes after the orchestrator on the machine has minted
+  a final run-id and synced state back). The miss made `_paused_mid`
+  empty; the dispatch fell through to `provision_machine` and started
+  a brand-new machine, overwriting `fly-machine.json` with the
+  duplicate's id and orphaning the original on Fly. Telemetry
+  reproducer: two distinct `fly_machine_id`s
+  (`2861322f49e708`, `2879390f17dd48`) written for the same
+  `_bootstrap-195f58` three hours apart, by two different launcher
+  PIDs. The user got an "attach: machine doesn't exist" error later
+  because the host pointer named the duplicate, which had also been
+  destroyed by the time they reattached.
+
+  The fix routes `--resume` through
+  `_resolve_fly_machine_id_from_run_dir` (the dual-file lookup
+  already used by `--stop`/`--kill`/`--finalize`/`--attach`).
+  Explicit `--resume` is now strict-fail: a missing machine pointer
+  or a failed `resume_machine` aborts with a diagnostic pointing at
+  `leerie --list` instead of falling through to provision. Fresh
+  runs (no `--resume`) keep their existing behavior — first call
+  still provisions. Behavior change for the misuse case:
+  `leerie --resume --run-id <typo-or-cleaned-up> --runtime fly` no
+  longer silently starts a new run; it tells the user the pointer
+  is missing.
+
 ## [0.2.6] - 2026-06-01
 
 This release fixes a hard failure on `--runtime fly` against any repo

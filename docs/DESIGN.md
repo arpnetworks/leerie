@@ -983,6 +983,23 @@ Six sidecar fields on `run.json` capture remote lifecycle state:
 - `sync_fail_reason` — short tag accompanying `sync_failed_at`
   (`sync-failed-on-clean-exit`).
 
+These fields live on `run.json` once the orchestrator on the machine
+has minted a final run-id and synced state back. Before that — i.e.,
+during the bootstrap window when the run dir is still
+`_bootstrap-<hex>` and `run.json` has not yet been written on the
+host — the `fly_machine_id` pointer lives on
+`.leerie/runs/<run-id>/fly-machine.json` instead. `provision.sh`
+writes a PID-keyed pointer at `.leerie/remote/$$.json` immediately
+after `flyctl machine run` succeeds and the launcher promotes it to
+the run-keyed `fly-machine.json` once the run-id is known, so a
+crash before classify still leaves a recoverable pointer. Every
+verb that acts on a known run-id (`--stop`, `--kill`, `--finalize`,
+`--attach`, `--resume`) does the same host-side machine-id lookup:
+try `fly-machine.json` first, fall back to `run.json`. The launcher
+implements this as `_resolve_fly_machine_id_from_run_dir` in `leerie`;
+`scripts/remote/attach.sh` (a standalone script that runs before the
+launcher's helpers are sourced) inlines the same lookup shape.
+
 `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive — a
 run cannot be in more than one terminal-or-paused state.
 `sync_failed_at` is orthogonal (the machine is neither paused nor
