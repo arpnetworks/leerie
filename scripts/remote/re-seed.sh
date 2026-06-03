@@ -49,22 +49,32 @@ re_seed() {
     remote_log "re_seed: USER_REPO is not set"
     return 1
   fi
-  local sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
-  if [ ! -f "$sidecar" ]; then
-    remote_log "re_seed: no run.json at $sidecar"
-    return 1
-  fi
-  local mid
-  mid="$(python3 -c "
+  # Resolve fly_machine_id from the run dir. Mirror the launcher's
+  # _resolve_fly_machine_id_from_run_dir (leerie:66-94): fly-machine.json
+  # is the source of truth during the bootstrap window (the launcher
+  # writes it the moment provision_machine succeeds, before run.json
+  # exists); run.json is the post-classify source. Either is acceptable.
+  # Without the fly-machine.json fallback, --resume of a paused
+  # bootstrap-stage run reaches re_seed but aborts here because run.json
+  # isn't minted until after classify.
+  local run_dir="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID"
+  local mid=""
+  local candidate
+  for candidate in "$run_dir/fly-machine.json" "$run_dir/run.json"; do
+    if [ -f "$candidate" ]; then
+      mid="$(python3 -c "
 import json, sys
 try:
     d = json.load(open(sys.argv[1]))
     print(d.get('fly_machine_id') or '')
 except Exception:
     pass
-" "$sidecar" 2>/dev/null || true)"
+" "$candidate" 2>/dev/null || true)"
+      [ -n "$mid" ] && break
+    fi
+  done
   if [ -z "$mid" ]; then
-    remote_log "re_seed: no fly_machine_id recorded in $sidecar"
+    remote_log "re_seed: no fly_machine_id at $run_dir/fly-machine.json or $run_dir/run.json"
     return 1
   fi
 
