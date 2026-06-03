@@ -32,23 +32,35 @@
 #     pid file MISSING                         → REFUSE (early-failure or
 #                                                 tampering — bail to manual)
 #     pid file present + kill -0 succeeds +    → REFUSE (orchestrator is
-#       /proc/<pid>/comm contains "python"      alive; force would race the
+#       /proc/<pid>/cmdline contains "python"   alive; force would race the
 #                                                running orchestrator)
 #     pid file present + kill -0 fails ESRCH   → SAFE (stale pid file from
 #                                                 a dead orchestrator; this
 #                                                 is what we expect)
 #
-# The /proc/<pid>/comm guard catches pid reuse — short-lived per-run Fly
-# machines make this very unlikely but it's a cheap check.
+# The /proc/<pid>/cmdline guard catches pid reuse — short-lived per-run
+# Fly machines make this very unlikely but it's a cheap check.
+#
+# Why cmdline and not comm: the kernel sets /proc/<pid>/comm from argv[0]
+# of the parent's execve call (basename of the *invoked* binary), NOT
+# from the shebang interpreter the kernel actually loaded. For a
+# pip-installed Python script like `pytest`, that means comm = "pytest"
+# even though the running ELF is /usr/bin/python3 — "python" not in
+# "pytest", so a comm-based check would let an alive orchestrator slip
+# through on any non-trivial launcher. /proc/<pid>/cmdline holds the
+# full execve argv (NUL-separated) after shebang resolution, which
+# always names the interpreter explicitly. Verified inside
+# python:3.10-slim on 2026-06-02 that comm='pytest' but cmdline starts
+# with '/usr/local/bin/python3.10\0/usr/local/bin/pytest\0…'.
 #
 # Platform note: the Python payload runs ON THE MACHINE (Linux), which
 # always has /proc. The pid-reuse guard works as designed there. If the
 # payload is ever exercised on a system without /proc (e.g. a macOS
-# host test fixture), pathlib.Path("/proc/<pid>/comm").read_text()
-# raises and the exception handler sets comm="?" — the "python" in comm
-# check then evaluates False and the script falls through to the patch
-# branch. That is intentional for the production code path (Linux
-# machine only) and documented here for any future Darwin reuse;
+# host test fixture), pathlib.Path("/proc/<pid>/cmdline").read_bytes()
+# raises and the exception handler sets the identity marker to "?" —
+# the "python" check then evaluates False and the script falls through
+# to the patch branch. That is intentional for the production code path
+# (Linux machine only) and documented here for any future Darwin reuse;
 # tests/test_force_finalize_sh.py::test_refuses_when_pid_alive gates on
 # sys.platform == "linux" for the same reason.
 #
@@ -161,17 +173,25 @@ except PermissionError:
     # EPERM means it exists but is not signalable; treat as alive.
     alive = True
 
-comm = ""
+ident = ""
 if alive:
+    # Read /proc/<pid>/cmdline (NUL-separated execve argv) rather than
+    # /proc/<pid>/comm. See the header comment "Why cmdline and not
+    # comm" — comm is the basename of the invoked binary (e.g.
+    # "pytest"), but cmdline always names the interpreter explicitly.
     try:
-        comm = pathlib.Path(f"/proc/{pid}/comm").read_text().strip()
+        cmdline_raw = pathlib.Path(f"/proc/{pid}/cmdline").read_bytes()
+        is_python = b"python" in cmdline_raw
+        first = cmdline_raw.split(b"\x00", 1)[0].decode(errors="replace")
+        ident = first.rsplit("/", 1)[-1] if first else "?"
     except Exception:
-        comm = "?"
+        is_python = False
+        ident = "?"
     # Guard against pid reuse: only refuse if the live process looks like
     # the orchestrator (a python process).  On short-lived Fly machines
     # collision is unlikely but the check is cheap.
-    if "python" in comm:
-        print(f"REFUSE-ALIVE:{pid}:{comm}")
+    if is_python:
+        print(f"REFUSE-ALIVE:{pid}:{ident}")
         sys.exit(0)
     # If it's NOT python, treat the pid file as a stale collision and
     # proceed.  Log this in audit fields below.

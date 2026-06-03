@@ -227,10 +227,11 @@ def test_refuses_when_pid_alive(tmp_path):
         patched = json.loads((run_dir / "run.json").read_text())
         assert "finished_at" not in patched, patched
     else:
-        # On Darwin, /proc/<pid>/comm doesn't exist; the payload's
-        # try/except sets comm="?" and falls into the not-python branch,
-        # which proceeds with the patch. Document this as the platform's
-        # behavior and verify the resulting recovered_via field.
+        # On Darwin, /proc/<pid>/cmdline doesn't exist; the payload's
+        # try/except sets ident="?" and is_python=False, which falls
+        # into the not-python branch and proceeds with the patch.
+        # Document this as the platform's behavior and verify the
+        # resulting recovered_via field.
         assert result.returncode == 0, result.stderr
 
 

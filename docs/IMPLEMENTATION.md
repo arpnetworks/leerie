@@ -3159,9 +3159,14 @@ into the machine via `flyctl ssh console -C "bash -lc '…'"` and runs
    (fails clearly on multi-match).
 2. Reads `run.json`; if `finished_at` is already set, no-op (idempotent).
 3. Reads `orchestrator.pid` and checks the orchestrator process:
-   - Pid file present + `kill -0 <pid>` succeeds + `/proc/<pid>/comm`
+   - Pid file present + `kill -0 <pid>` succeeds + `/proc/<pid>/cmdline`
      contains `python` → orchestrator alive → **REFUSE** with a message
-     naming the live pid.
+     naming the live pid. (`cmdline` not `comm` because `comm` is the
+     basename of the script-launcher binary — for a pip-installed
+     `pytest` shim it is `"pytest"`, which does not contain `"python"`
+     and would let an alive orchestrator slip through the guard.
+     `cmdline` is the full execve argv, which always names the
+     interpreter explicitly.)
    - Pid file present + `kill -0` fails (`ESRCH`) → orchestrator dead;
      the pid file is the expected stale artifact (nothing in
      `orchestrator/leerie.py` ever cleans it up) → safe to proceed.

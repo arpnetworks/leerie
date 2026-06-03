@@ -569,7 +569,7 @@ or orchestrator crash before `phase_finalize` leaves a run that
 `finished_at` set + `pushed_at` unset). For these cases, `leerie
 --finalize <run-id> --force` SSHes into the machine, verifies the
 orchestrator process is dead (via the `orchestrator.pid` file and
-`/proc/<pid>/comm`), patches `finished_at` into `run.json` along with
+`/proc/<pid>/cmdline`), patches `finished_at` into `run.json` along with
 audit fields `recovered_at` and `recovered_via="force-finalize"`, and
 then falls through to the normal finalize flow. The pid check is the
 safety belt: if the orchestrator is still alive, `--force` refuses with
