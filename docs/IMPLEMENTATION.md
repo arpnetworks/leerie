@@ -1071,16 +1071,46 @@ convention.
 | `stream` | `-v` / (default) | `normal` + one-line summary per worker event |
 | `debug`  | `-vv` / `--verbosity debug` | `stream` + raw event payloads, tool I/O, schema diffs, retry diagnostics |
 
-Streaming log lines for Phase 5 work carry the prefix
-`[wave W/V · done N/M]`, where `W` / `V` is the 1-based current wave
-index and total wave count, and `N` / `M` is the number of subtasks in
-a terminal status (`complete`, `failed`, `blocked`) over the total
-scheduled subtask count. The wave context exists so that `done 0/M`
-at the start of Phase 5 reads as "wave 1 is in flight, nothing has
-reached terminal yet," not "the run hasn't started." Built by
-`_get_progress` (`orchestrator/leerie.py`); emitted only after Phase 3
-schedules the waves, which is why classifier / planner / reconciler log
-lines have no prefix.
+Streaming log lines for Phase 5 work carry an activity prefix:
+
+```
+[wave 1 of 1 · running 5 subtasks]                         # wave start
+[wave 1 of 1 · running 2 subtasks · 3 subtasks done]       # mid-wave
+[wave 1 of 1 · 1 subtask in conformer · 4 subtasks done]   # last subtask in advisory phase
+[wave 1 of 1 · 5 subtasks done]                            # wave fully settled
+```
+
+The prefix is built from three per-wave counters, each rendered as its
+own ` · `-separated segment when non-zero (segments with a zero count
+are omitted entirely, so `0/M`-style fragments never appear):
+
+- **`running N subtask(s)`** — implementer not yet at terminal status
+  (no entry in `subtask_status[sid]`, or value not in
+  `_TERMINAL_STATUSES = {complete, failed, blocked}`).
+- **`N subtask(s) in conformer`** — implementer reached `complete` and
+  the advisory conformer phase is still in flight. The signal is
+  `subtask_status[sid] == "complete"` *and* `conformance[sid]` absent —
+  the conformance dict is written by `settle_subtask` exactly when the
+  conformer settles, so this is a precise live indicator (DESIGN §9
+  *Post-work conformance*).
+- **`N subtask(s) done`** — implementer settled *and*, if `complete`,
+  the conformer has also wrapped; or implementer hit `failed` /
+  `blocked` (terminal regardless of conformer). Always rendered last so
+  rising progress reads on the right side of the prefix.
+
+The wave header `wave W of V` is the 1-based current wave index and
+total wave count. Counts are restricted to the current wave's
+membership (`waves[completed_waves]`), not the whole run — that's what
+keeps `running 5 subtasks` meaningful at wave start.
+
+Singular/plural is rendered on the count (`1 subtask` vs `5 subtasks`).
+
+Built by `_get_progress` (`orchestrator/leerie.py`); emitted only after
+Phase 3 schedules the waves, which is why classifier / planner /
+reconciler log lines have no prefix. Post-wave-loop workers
+(`summarizer`, `pr_writer`, `run_final_conformance`) also emit no prefix:
+`_get_progress` returns `None` once `completed_waves >= len(waves)`,
+since there is no in-flight wave to count.
 
 `_invoke` takes `progress` as a callable (`Callable[[], tuple[...] |
 None] | None`), not a spawn-time snapshot, and calls it per stream

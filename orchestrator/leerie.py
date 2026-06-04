@@ -4975,25 +4975,76 @@ def _summarize_stream_event(sid: str, event: dict, verbosity: str) -> str | None
     return None
 
 
-def _get_progress(st: "State") -> tuple[int, int, int, int] | None:
-    """Return (done, total, wave_idx, wave_total) for the inline
-    `[wave W/V · done N/M]` prefix.
+def _format_progress_prefix(
+        prog: tuple[int, int, int, int, int] | None) -> str:
+    """Render the activity prefix from a `_get_progress` tuple, or "" when
+    progress is None (pre-Phase-5 workers).
+
+    Each non-zero counter becomes its own ` · `-separated segment; zero
+    counters are omitted so the prefix never reads `0 subtasks anything`.
+    `done` is always last so the eye follows rising progress on the right.
+    See IMPLEMENTATION.md §Verbosity & log prefix for the rendering rules."""
+    if prog is None:
+        return ""
+    running, in_conformer, done, wave_idx, wave_total = prog
+
+    def plural(n: int) -> str:
+        return "subtask" if n == 1 else "subtasks"
+
+    segs = [f"wave {wave_idx} of {wave_total}"]
+    if running:
+        segs.append(f"running {running} {plural(running)}")
+    if in_conformer:
+        segs.append(f"{in_conformer} {plural(in_conformer)} in conformer")
+    if done:
+        segs.append(f"{done} {plural(done)} done")
+    return f"[{' · '.join(segs)}] "
+
+
+def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
+    """Return (running, in_conformer, done, wave_idx, wave_total) for the
+    inline activity prefix (see IMPLEMENTATION.md §Verbosity & log prefix).
 
     Only meaningful once waves are scheduled — returns None before that so
-    classifier/planner workers emit no prefix. Terminal statuses are complete,
-    failed, and blocked; in-progress subtasks don't count toward done. The
-    wave index is 1-based for display (`completed_waves + 1`) so that the
-    in-flight wave reads as `1/3` while wave 1 is running, not `0/3`."""
+    classifier/planner workers emit no prefix. Counts are restricted to the
+    *current* wave's membership (`waves[completed_waves]`) so that "running 5
+    subtasks" reads as "5 of this wave's implementers are in flight," not
+    "5 of all subtasks across all waves." The wave index is 1-based for
+    display (`completed_waves + 1`) so that the in-flight wave reads as
+    `1 of 3` while wave 1 is running, not `0 of 3`.
+
+    A subtask is:
+      - running:      `subtask_status[sid]` absent or not in _TERMINAL_STATUSES
+      - in_conformer: status == "complete" but `conformance[sid]` absent
+                      (settle_subtask writes that key exactly when the
+                      advisory conformer phase finishes, so absence is a
+                      precise live signal — DESIGN §9)
+      - done:         status in _TERMINAL_STATUSES, and (if status ==
+                      "complete") `conformance[sid]` is present.
+                      `failed` / `blocked` are terminal regardless of
+                      conformance — the conformer only runs on the success
+                      path."""
     waves = st.data.get("waves")
     if not waves:
         return None
-    total = sum(len(w) for w in waves)
-    if total == 0:
+    completed = st.data.get("completed_waves", 0)
+    if completed >= len(waves):
         return None
-    done = sum(1 for v in st.data.get("subtask_status", {}).values()
-               if v in _TERMINAL_STATUSES)
-    wave_idx = st.data.get("completed_waves", 0) + 1
-    return done, total, wave_idx, len(waves)
+    wave = waves[completed]
+    if not wave:
+        return None
+    statuses = st.data.get("subtask_status", {})
+    conformance = st.data.get("conformance", {})
+    running = in_conformer = done = 0
+    for sid in wave:
+        status = statuses.get(sid)
+        if status not in _TERMINAL_STATUSES:
+            running += 1
+        elif status == "complete" and sid not in conformance:
+            in_conformer += 1
+        else:
+            done += 1
+    return running, in_conformer, done, completed + 1, len(waves)
 
 
 # --- cgroup v2 containment for worker subtrees ---------------------------
@@ -5267,10 +5318,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                         # loop so a multi-line summary doesn't
                         # straddle two different counts.
                         prog = progress() if progress else None
-                        prog_prefix = (
-                            f"[wave {prog[2]}/{prog[3]} · "
-                            f"done {prog[0]}/{prog[1]}] "
-                            if prog else "")
+                        prog_prefix = _format_progress_prefix(prog)
                         for ln in summary.splitlines():
                             if ln:
                                 log(prog_prefix + ln)
@@ -11967,7 +12015,8 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     start = st.data.get("completed_waves", 0)
     for wi in range(start, len(waves)):
         wave = waves[wi]
-        log(f"phase 5: wave {wi + 1}/{len(waves)} — {len(wave)} subtask(s)")
+        log(f"phase 5: wave {wi + 1} of {len(waves)} — "
+            f"{len(wave)} subtask{'s' if len(wave) != 1 else ''}")
 
         pairs = await gather_or_cancel(*(settle_one(sid) for sid in wave))
         results: dict[str, dict] = dict(pairs)

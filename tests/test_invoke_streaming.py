@@ -461,14 +461,14 @@ def test_value_error_from_line_limit_becomes_worker_error(leerie,
         "WorkerError. See Pass-12 audit.")
 
 
-def test_progress_prefix_shows_wave_and_done(leerie, leerie_dir,
-                                              monkeypatch, capsys):
-    """When progress is passed to _invoke as a callable returning
-    (done, total, wave_idx, wave_total), every inline summary line
-    is prefixed with `[wave W/V · done N/M]` before the worker tag.
-    The callable is invoked per event so sibling workers finishing
-    mid-run bump the count for still-running workers — the prefix
-    is not a spawn-time snapshot."""
+def test_progress_prefix_shows_wave_and_activity(leerie, leerie_dir,
+                                                  monkeypatch, capsys):
+    """When progress is passed to _invoke as a callable returning the
+    (running, in_conformer, done, wave_idx, wave_total) tuple, every
+    inline summary line is prefixed with the activity prefix before the
+    worker tag. The callable is invoked per event so sibling workers
+    finishing mid-run bump the count for still-running workers — the
+    prefix is not a spawn-time snapshot."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
         json.dumps({"type": "result", "subtype": "success",
@@ -476,21 +476,21 @@ def test_progress_prefix_shows_wave_and_done(leerie, leerie_dir,
     ]
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
+    # 9 running, 0 in_conformer, 3 done, wave 2 of 3
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-prog", leerie_dir=leerie_dir,
-        verbosity="stream", progress=lambda: (3, 12, 2, 3)))
+        verbosity="stream", progress=lambda: (9, 0, 3, 2, 3)))
     out = capsys.readouterr().out
-    assert "[wave 2/3 · done 3/12]" in out
+    assert "[wave 2 of 3 · running 9 subtasks · 3 subtasks done]" in out
     assert "[t-prog] starting" in out
 
 
 def test_progress_prefix_recomputes_per_event(leerie, leerie_dir,
                                                 monkeypatch, capsys):
     """The progress callable is invoked per event, not once at spawn.
-    Pin this directly: a counter that returns increasing values must
-    show up as monotonically increasing prefixes across the worker's
-    stream."""
+    Pin this directly: a counter whose `done` rises across events must
+    show up as a monotonically rising `N subtasks done` segment."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
         json.dumps({"type": "assistant", "message": {"content": [
@@ -504,18 +504,20 @@ def test_progress_prefix_recomputes_per_event(leerie, leerie_dir,
                         _make_subprocess_exec_mock(events))
     counter = {"done": 0}
 
-    def get_progress() -> tuple[int, int, int, int]:
+    def get_progress() -> tuple[int, int, int, int, int]:
         counter["done"] += 1
-        return counter["done"], 14, 1, 3
+        # (running, in_conformer, done, wave_idx, wave_total)
+        return 14 - counter["done"], 0, counter["done"], 1, 3
 
     asyncio.run(leerie._invoke(
         ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
         timeout=60, sid="t-fresh", leerie_dir=leerie_dir,
         verbosity="stream", progress=get_progress))
     out = capsys.readouterr().out
-    assert "[wave 1/3 · done 1/14]" in out
-    assert "[wave 1/3 · done 2/14]" in out
-    assert "[wave 1/3 · done 3/14]" in out
+    assert "1 subtask done" in out
+    assert "2 subtasks done" in out
+    assert "3 subtasks done" in out
+    assert "wave 1 of 3" in out
 
 
 def test_create_subprocess_exec_uses_high_limit(leerie, leerie_dir,
