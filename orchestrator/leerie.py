@@ -2278,18 +2278,20 @@ def _format_run_for_disambiguation(run: dict, leerie_root: Path) -> str:
         except (OSError, ValueError):
             pass
     status = _derive_run_status(run_json, run)
-    # Last-activity: mtime of state.json formatted as the elapsed
-    # duration from now. A live run shows seconds-to-minutes; a hung
-    # or abandoned run shows hours-to-days.
+    # Last-activity: mtime of the run's sidecar (state.json for normal
+    # runs, fly-machine.json for `seed-failed` orphans), formatted as
+    # the elapsed duration from now. A live run shows seconds-to-
+    # minutes; a hung or abandoned run shows hours-to-days.
     last_activity = "?"
-    state_path = run.get("path")
-    if state_path:
+    sidecar_path = run.get("path")
+    if sidecar_path:
         try:
-            mtime = os.path.getmtime(state_path)
+            mtime = os.path.getmtime(sidecar_path)
             last_activity = _format_age(datetime.now(timezone.utc).timestamp()
                                         - mtime)
         except (OSError, ValueError, OverflowError):
-            # OSError: state.json deleted between discover_runs and now.
+            # OSError: the sidecar (state.json or fly-machine.json) was
+            # deleted between discover_runs and now.
             # ValueError/OverflowError: pathological mtime (NaN, inf) that
             # _format_age's int() would reject. Both are extremely unlikely
             # in practice; this is defense-in-depth so a one-in-a-million
