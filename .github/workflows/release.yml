@@ -1,0 +1,123 @@
+# Creates a v<VERSION> tag and GitHub Release whenever a
+# `chore(release): X.Y.Z` commit lands on main. Any other push exits at
+# the subject-line guard without side effects.
+#
+# Why a subject-line guard instead of a path filter on .claude-plugin/**:
+# path filters fire on every manifest edit (including non-release
+# edits); the subject convention is the precise signal we already use
+# in our release commits (see df86cf2, c45ce17, 0eb0073, 478db35).
+#
+# Distribution note: this is a discoverability nicety. The plugin
+# marketplace reads .claude-plugin/*.json directly off main and the
+# installer at scripts/install.sh curls from
+# raw.githubusercontent.com/.../main/..., so neither path depends on
+# tags or releases. Tags + releases just give https://github.com/
+# enricai/leerie/releases something to show.
+name: release
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Parse release version from commit subject
+        id: parse
+        run: |
+          set -euo pipefail
+          subject="$(git log -1 --pretty=%s)"
+          echo "subject=$subject"
+          # Match exactly `chore(release): X.Y.Z` (semver, three numeric
+          # components). Trailing whitespace is tolerated; anything else
+          # in the subject is not — this prevents accidental matches
+          # from "chore(release): 0.3.15 plus follow-up" etc.
+          if [[ "$subject" =~ ^chore\(release\):[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+)[[:space:]]*$ ]]; then
+            version="${BASH_REMATCH[1]}"
+            echo "version=$version" >> "$GITHUB_OUTPUT"
+            echo "is_release=true" >> "$GITHUB_OUTPUT"
+            echo "Release commit detected: v$version"
+          else
+            echo "is_release=false" >> "$GITHUB_OUTPUT"
+            echo "Not a release commit — exiting cleanly."
+          fi
+
+      - name: Verify both manifests agree with subject version
+        if: steps.parse.outputs.is_release == 'true'
+        env:
+          SUBJECT_VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Same cross-manifest check as CLAUDE.md's task-completion
+          # checklist and tests/test_version_flag.py — fail loudly if
+          # the two manifests disagree or if either disagrees with the
+          # subject. Half-broken releases are worse than no release.
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+
+          subject_version = os.environ["SUBJECT_VERSION"]
+          plugin = json.load(open(".claude-plugin/plugin.json"))["version"]
+          marketplace = json.load(open(".claude-plugin/marketplace.json"))["plugins"][0]["version"]
+          if plugin != marketplace:
+              print(f"manifest mismatch: plugin.json={plugin!r} marketplace.json={marketplace!r}", file=sys.stderr)
+              sys.exit(1)
+          if plugin != subject_version:
+              print(f"commit subject says {subject_version!r} but manifests say {plugin!r}", file=sys.stderr)
+              sys.exit(1)
+          print(f"version OK: {plugin}")
+          PY
+
+      - name: Skip if tag already exists (idempotent)
+        if: steps.parse.outputs.is_release == 'true'
+        id: tagcheck
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if git ls-remote --tags origin "refs/tags/$tag" | grep -q "$tag"; then
+            echo "Tag $tag already exists on origin — nothing to do."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push annotated tag
+        if: steps.parse.outputs.is_release == 'true' && steps.tagcheck.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $VERSION"
+          git push origin "$tag"
+
+      - name: Create GitHub Release
+        if: steps.parse.outputs.is_release == 'true' && steps.tagcheck.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.parse.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          # --generate-notes pulls PRs/commits since the prior tag.
+          # First-ever release (v0.3.15) will include all repo history
+          # in its notes — one-time noise; the operator can hand-edit.
+          gh release create "$tag" --title "$tag" --generate-notes
