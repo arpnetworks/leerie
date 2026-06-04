@@ -287,7 +287,7 @@ def test_orchestrate_calls_detect_no_work_between_reconcile_and_schedule():
     assert finish_idx > detect_idx, (
         "_run_phases must call _finish_no_work_run() to record the "
         "no-work outcome and write finished_at — otherwise leerie --list "
-        "won't show the run as done-local.")
+        "won't show the run as done.")
     assert return_idx > detect_idx, (
         "_run_phases must return after _finish_no_work_run() so "
         "phase_execute / phase_finalize are skipped — they would "

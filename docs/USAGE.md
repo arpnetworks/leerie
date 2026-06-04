@@ -246,10 +246,15 @@ orchestrator never noticed you were gone.
 
 **Listing runs.** `leerie --list` shows every run (local and remote) in
 one table, with the Fly Machine ID column populated for remote runs.
-Filter by status with `leerie --list --status <state>` (e.g.
-`paused-remote`, `killed-remote`, `in-progress`). The taxonomy lives in
+Filter by status with `leerie --list --status <state>` (e.g. `paused`,
+`killed`, `in-progress`) and by runtime with `--runtime <local|fly>`.
+The two axes are orthogonal: `--list --status paused --runtime fly`
+shows every paused Fly run. The status taxonomy lives in
 `RUN_STATUSES` in `orchestrator/leerie.py`; `leerie --list --status ?`
-prints the full set.
+prints the full set. `--list --runtime fly` (without `--status`)
+short-circuits to a direct Fly query (`flyctl machines list`) covering
+every machine under the app, regardless of which host repo launched
+them — useful when you've lost track of a machine ID after Ctrl-C.
 
 > **In-flight detached runs** — runs that are still in the bootstrap
 > phase (before classify completes, ~1 min) won't show up in `leerie

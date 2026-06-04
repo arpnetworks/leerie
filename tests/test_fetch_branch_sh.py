@@ -296,7 +296,7 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
       - skip the bundle step when the probe fails (exit non-zero)
       - succeed overall (return 0)
       - still stream the state directory back so `leerie --list`
-        shows the run as `done-local`.
+        shows the run as `done`.
 
     Critically, fetch_branch must NOT use `run.json.no_push` as a
     proxy for "no branch was materialized" — `no_push=true` is the
@@ -366,7 +366,7 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
         f"run branch {run_branch} should NOT be created for a no_push run"
     )
     # But the state directory MUST be streamed back so `leerie --list`
-    # can render the run as done-local on the host.
+    # can render the run as done on the host.
     host_run_dir = repo / ".leerie" / "runs" / run_id
     assert host_run_dir.exists(), (
         f"host run dir not found: {host_run_dir} — Step 3 (state-dir "

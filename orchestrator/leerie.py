@@ -2277,19 +2277,23 @@ def _format_age(seconds: float) -> str:
 RUN_STATUSES = (
     "corrupt-sidecar",
     "in-progress",
-    "done-local",
+    "done",
     "done-pushed-no-pr",
     "done-pushed-pr",
     "push-failed",
     "pr-failed",
-    "paused-remote",
-    "killed-remote",
-    "sync-failed-running",
+    "paused",
+    "killed",
+    "sync-failed",
 )
 
 
 def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
     """Pure function: derive a run's status from run.json + state.json.
+
+    Status is the run's lifecycle dimension; runtime (local vs fly) is a
+    separate axis surfaced via `fly_machine_id` and filtered with
+    `--list --runtime <local|fly>`.
 
     Order of checks matters — earlier checks fire first:
       1. run.json invariant-invalid → `corrupt-sidecar`.
@@ -2297,12 +2301,12 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
       3. pr_error set              → `pr-failed`.
       4. pr_url set                → `done-pushed-pr`.
       5. pushed_at set             → `done-pushed-no-pr`.
-      6. sync_failed_at set        → `sync-failed-running` (machine still up,
-                                     work not on host yet — recover via
+      6. sync_failed_at set        → `sync-failed` (machine still up, work
+                                     not on host yet — recover via
                                      `leerie --finalize` then `--kill`).
-      7. finished_at set           → `done-local` (run completed, --no-push).
-      8. killed_at set             → `killed-remote` (explicit --kill).
-      9. paused_at set             → `paused-remote` (pause-on-failure or --stop).
+      7. finished_at set           → `done` (run completed, --no-push).
+      8. killed_at set             → `killed` (explicit --kill).
+      9. paused_at set             → `paused` (pause-on-failure or --stop).
      10. otherwise                 → `in-progress`.
 
     Precedence note: push/PR errors fire before the paused/killed checks
@@ -2330,13 +2334,13 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
     if rj.get("pushed_at"):
         return "done-pushed-no-pr"
     if rj.get("sync_failed_at"):
-        return "sync-failed-running"
+        return "sync-failed"
     if rj.get("finished_at"):
-        return "done-local"
+        return "done"
     if rj.get("killed_at"):
-        return "killed-remote"
+        return "killed"
     if rj.get("paused_at"):
-        return "paused-remote"
+        return "paused"
     return "in-progress"
 
 
@@ -2394,32 +2398,47 @@ def _render_run_table(rows: list[tuple[str, str, str, str, str]]) -> None:
             print(fmt.format(r[0], r[1], r[2], r[4]))
 
 
-def list_runs(leerie_root: Path, status_filter: str | None = None) -> None:
+def list_runs(
+    leerie_root: Path,
+    status_filter: str | None = None,
+    runtime_filter: str | None = None,
+) -> None:
     """Render a sortable columnar table of runs to stdout. Used by
     `leerie --list`. Reads run.json sidecar (commit 4) for status
     derivation; falls back to state.json fields for runs without a
     sidecar.
 
-    `status_filter` (if given) restricts the table to rows whose derived
-    status matches. Validated against `RUN_STATUSES` by argparse before
-    this is called; an unknown value here renders an empty table."""
+    Filters compose:
+      `status_filter` restricts to rows whose derived status matches.
+      `runtime_filter` restricts to rows by execution backend: 'fly'
+      means rows with a non-empty fly_machine_id; 'local' means rows
+      without. Both are validated against argparse `choices=` before
+      this is called; unknown values render an empty table."""
     rows = _collect_run_rows(leerie_root)
     if status_filter is not None:
         rows = [r for r in rows if r[2] == status_filter]
+    if runtime_filter == "fly":
+        rows = [r for r in rows if r[3]]
+    elif runtime_filter == "local":
+        rows = [r for r in rows if not r[3]]
     if not rows:
+        msg = "no runs"
         if status_filter is not None:
-            print(f"no runs with status={status_filter}")
-        else:
-            print("no runs under .leerie/runs/")
+            msg += f" with status={status_filter}"
+        if runtime_filter is not None:
+            msg += f" with runtime={runtime_filter}"
+        if status_filter is None and runtime_filter is None:
+            msg = "no runs under .leerie/runs/"
+        print(msg)
         return
     _render_run_table(rows)
 
 
 def list_paused_runs(leerie_root: Path) -> None:
     """Deprecated alias: routes through `list_runs(status_filter=
-    "paused-remote")`. The new equivalent is `leerie --list --status
-    paused-remote`. Kept for backward-compat."""
-    list_runs(leerie_root, status_filter="paused-remote")
+    "paused")`. The new equivalent is `leerie --list --status
+    paused`. Kept for backward-compat."""
+    list_runs(leerie_root, status_filter="paused")
 
 
 def _read_toml_key(path: Path, key: str) -> str | None:
@@ -10724,7 +10743,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
     launcher polls `finished_at` as the "ready to push" sentinel, and
     there is no run branch to push (none was materialized). `_derive_
     run_status` reads `finished_at` + the missing `pushed_at` / `pr_url`
-    and renders the run as `done-local` in `leerie --list`.
+    and renders the run as `done` in `leerie --list`.
 
     Does NOT invoke `finalize.sh` / `cleanup.sh` — `finalize.sh` would
     fail its non-empty-branch check and `cleanup.sh` has no subtask
@@ -12819,7 +12838,7 @@ def main() -> None:
                          f"derived status matches STATE. One of: "
                          f"{', '.join(RUN_STATUSES)}.")
     ap.add_argument("--list-paused", action="store_true", dest="list_paused",
-                    help="DEPRECATED: alias for --list --status paused-remote. "
+                    help="DEPRECATED: alias for --list --status paused. "
                          "Kept for backward-compat; prefer the explicit form.")
     ap.add_argument("--answers", metavar="FILE",
                     help="JSON file of pre-supplied clarification answers")
@@ -13059,7 +13078,11 @@ def main() -> None:
     # be inspecting runs from outside a git repo.
     if args.list_runs:
         leerie_root = Path(".leerie").resolve()
-        list_runs(leerie_root, status_filter=args.status_filter)
+        list_runs(
+            leerie_root,
+            status_filter=args.status_filter,
+            runtime_filter=args.runtime,
+        )
         return
     if args.list_paused:
         leerie_root = Path(".leerie").resolve()

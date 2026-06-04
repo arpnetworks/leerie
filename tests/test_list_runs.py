@@ -143,13 +143,13 @@ def test_list_runs_falls_back_to_compute_run_branch(leerie, tmp_path, capsys):
     assert "leerie/runs/feat-a-aaaaaa" in out
 
 
-# --- list_paused_runs (deprecated alias for --list --status paused-remote)
+# --- list_paused_runs (deprecated alias for --list --status paused)
 
 def test_list_paused_runs_empty(leerie, tmp_path, capsys):
     """No runs at all → empty-with-filter message."""
     leerie.list_paused_runs(tmp_path)
     out = capsys.readouterr().out
-    assert "no runs" in out and "paused-remote" in out
+    assert "no runs" in out and "paused" in out
 
 
 def test_list_paused_runs_filters_to_paused_only(leerie, tmp_path, capsys):
@@ -173,14 +173,14 @@ def test_list_paused_runs_filters_to_paused_only(leerie, tmp_path, capsys):
     leerie.list_paused_runs(tmp_path)
     out = capsys.readouterr().out
     assert "feat-paused-bbbbb" in out
-    assert "paused-remote" in out
+    assert "paused" in out
     assert "feat-running-aaaaa" not in out
     assert "feat-done-cccccc" not in out
 
 
 def test_list_paused_excludes_paused_with_push_error(leerie, tmp_path, capsys):
     """Precedence: a paused run with push_error renders as push-failed,
-    not paused-remote, so it doesn't appear in --list-paused."""
+    not paused, so it doesn't appear in --list-paused."""
     _make_run(tmp_path, "feat-mixed-ddddd",
               {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"},
               run_json={
@@ -239,7 +239,7 @@ def test_list_runs_status_filter_in_progress(leerie, tmp_path, capsys):
 
 
 def test_list_runs_status_filter_killed_remote(leerie, tmp_path, capsys):
-    """--list --status killed-remote isolates killed runs."""
+    """--list --status killed isolates killed runs."""
     _make_run(tmp_path, "feat-killed-aaaaa",
               {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"},
               run_json={
@@ -248,10 +248,10 @@ def test_list_runs_status_filter_killed_remote(leerie, tmp_path, capsys):
               })
     _make_run(tmp_path, "feat-running-bbbbb",
               {"started_at": "2026-05-29T11:00:00+00:00", "task": "y"})
-    leerie.list_runs(tmp_path, status_filter="killed-remote")
+    leerie.list_runs(tmp_path, status_filter="killed")
     out = capsys.readouterr().out
     assert "feat-killed-aaaaa" in out
-    assert "killed-remote" in out
+    assert "killed" in out
     assert "feat-running-bbbbb" not in out
 
 
@@ -259,6 +259,6 @@ def test_list_runs_status_filter_empty_match_message(leerie, tmp_path, capsys):
     """Filter that matches nothing prints a useful empty message."""
     _make_run(tmp_path, "feat-a-aaaaaa",
               {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"})
-    leerie.list_runs(tmp_path, status_filter="killed-remote")
+    leerie.list_runs(tmp_path, status_filter="killed")
     out = capsys.readouterr().out
-    assert "no runs" in out and "killed-remote" in out
+    assert "no runs" in out and "killed" in out

@@ -5,11 +5,11 @@ When every planner returns `status: "ready"` with empty `subtasks`,
 the orchestrator records the no-work outcome, writes `finished_at` to
 both state.json and run.json, and exits 0. `_derive_run_status` reads
 the `finished_at` + missing `pushed_at` / `pr_url` and renders the run
-as `done-local` in `leerie --list`.
+as `done` in `leerie --list`.
 
 These tests pin the contract end-to-end: state.json gets the audit
 fields, run.json gets `finished_at` + `no_push=True`, and the
-existing terminal-status derivation returns `done-local` without any
+existing terminal-status derivation returns `done` without any
 new status enum.
 """
 from __future__ import annotations
@@ -41,7 +41,7 @@ def _bootstrap_run_dir(tmp_path: Path, leerie):
 def test_finish_no_work_run_writes_done_local(leerie, tmp_path):
     """_finish_no_work_run records no_work_required + finished_at in
     state.json, writes finished_at + no_push=True to run.json, and
-    _derive_run_status renders the run as done-local."""
+    _derive_run_status renders the run as done."""
     st = _bootstrap_run_dir(tmp_path, leerie)
     reasons = {
         "bug-fixing": "HEAD already ships the fix",
@@ -64,8 +64,8 @@ def test_finish_no_work_run_writes_done_local(leerie, tmp_path):
     assert rj["no_push"] is True
     assert rj["no_verify"] is False
     # And the existing terminal-status derivation classifies this as
-    # done-local (no push, no PR — there's no commit to propose).
-    assert leerie._derive_run_status(rj, loaded) == "done-local"
+    # done (no push, no PR — there's no commit to propose).
+    assert leerie._derive_run_status(rj, loaded) == "done"
 
 
 def test_finish_no_work_run_preserves_existing_run_json_fields(leerie, tmp_path):

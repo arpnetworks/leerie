@@ -3282,7 +3282,7 @@ do not require `--no-runtime-install` handling — `require_flyctl`
 respects it.
 
 The `killed_at` field is added to `RUN_STATUSES` in `orchestrator/leerie.py`
-as a new terminal state (`killed-remote`); `_derive_run_status` reads it
+as a new terminal state (`killed`); `_derive_run_status` reads it
 before `paused_at`. `_validate_run_json` enforces that `paused_at`,
 `pushed_at`, and `killed_at` are mutually exclusive (same invariant
 pattern as today's `paused_at` vs `pushed_at`).
@@ -3290,10 +3290,14 @@ pattern as today's `paused_at` vs `pushed_at`).
 Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*, *The
 user-visible verb surface*.
 
-#### Unified `leerie --list` (machine column + `--status` filter)
+#### Unified `leerie --list` (machine column + `--status` + `--runtime` filters)
 
 `list_runs()` in `orchestrator/leerie.py` is extended to surface remote
-runs alongside local runs in a single table.
+runs alongside local runs in a single table. Status and runtime are
+**orthogonal axes**: status describes lifecycle (`paused`, `killed`,
+`done`, `sync-failed`, `in-progress`, `done-pushed-pr`,
+`done-pushed-no-pr`, `push-failed`, `pr-failed`, `corrupt-sidecar`);
+runtime describes where the run executed (`local` or `fly`).
 
 Changes:
 
@@ -3302,19 +3306,32 @@ Changes:
 - `_render_run_table()` adds a `machine` column between `status` and
   `branch`. Column auto-hides when no row in the result set has a
   non-empty value (so pure-local users see no extra noise).
-- New `--status <state>` argparse flag on `--list`. Filters rows to
-  only those whose derived status matches. `<state>` accepts any
-  value in `RUN_STATUSES` (`in-progress`, `done-local`,
-  `done-pushed-pr`, `done-pushed-no-pr`, `push-failed`, `pr-failed`,
-  `paused-remote`, `killed-remote`, `sync-failed-running`,
-  `corrupt-sidecar`). Invalid values produce an argparse error
-  listing the allowed set.
+- `--status <state>` argparse flag on `--list` filters rows to only
+  those whose derived status matches. `<state>` accepts any value in
+  `RUN_STATUSES` (see list above). Invalid values produce an
+  argparse error listing the allowed set.
 - `--list-paused` is deprecated. The existing flag continues to work
   and `list_paused_runs` is kept as a thin alias that calls
-  `list_runs(leerie_root, status_filter="paused-remote")` — preserves
-  every existing import site and test against `list_paused_runs`.
-  `--help` marks `--list-paused` as deprecated and recommends
-  `--list --status paused-remote`.
+  `list_runs(leerie_root, status_filter="paused")` — preserves every
+  existing import site and test against `list_paused_runs`. `--help`
+  marks `--list-paused` as deprecated and recommends `--list --status
+  paused`.
+- `--list --runtime fly` is intercepted by the launcher (bash) before
+  the orchestrator dispatch and queries Fly directly via `flyctl
+  machines list --app <FLY_APP> --json`. Renders a `machine_id |
+  state | region | created_at | run_id (local)` table covering every
+  machine under the app, regardless of which host repo launched them.
+  `run_id` is best-effort filled by scanning `.leerie/runs/*/{fly-
+  machine.json,run.json}` in the current repo; machines launched from
+  another repo show `run_id=?`. Falls back to the orchestrator-side
+  local-sidecar list when `flyctl` is missing or auth fails. Plain
+  `--list` (no `--runtime fly`) is unchanged.
+
+Verbs `--stop`, `--kill`, `--attach`, `--finalize` accept an optional
+`--runtime <local|fly>` flag for forward-compatibility. Today only
+`fly` is meaningful; `--runtime local` errors with "no local-runtime
+equivalent yet." Without the flag, the verbs infer the runtime from
+the sidecar (`fly_machine_id` presence) — existing behavior preserved.
 
 Maps to `DESIGN.md`: §6 *The user-visible verb surface*.
 
@@ -3483,7 +3500,7 @@ discovery without parsing the full `state.json`):
 | `pr_url` | str \| null | the PR URL `gh` returned; null until PR creation succeeds |
 | `pr_error` | str \| null | captured `gh` stderr if PR creation failed; logical invariant — `pr_error` can be set only after `pushed_at` is set |
 | `fly_machine_id` | str \| null | Fly Machine ID for a remote (`--runtime fly`) run; written by `scripts/remote/provision.sh` immediately after `flyctl machine run` succeeds, so a launcher that crashes before classifying still leaves a recoverable pointer. Null for local runs. |
-| `paused_at` | ISO-8601 str \| null | when the remote run was paused — either on failure (set by the launcher's EXIT trap on the pause branch) or by explicit user request (`leerie --stop <run-id>`). Null for successful runs, killed runs, and runs the user merely detached from. **Cleared at finalize**: `fetch_branch`'s `tar -xC` (scripts/remote/fetch-branch.sh:225) overwrites the host sidecar with the machine's `run.json`, which has no `paused_at` set because the machine isn't aware of the user's pause action. Intentional — the post-finalize status should be `done-pushed-pr`, not `paused-remote`. Pause/resume forensics are not preserved across finalize. |
+| `paused_at` | ISO-8601 str \| null | when the remote run was paused — either on failure (set by the launcher's EXIT trap on the pause branch) or by explicit user request (`leerie --stop <run-id>`). Null for successful runs, killed runs, and runs the user merely detached from. **Cleared at finalize**: `fetch_branch`'s `tar -xC` (scripts/remote/fetch-branch.sh:225) overwrites the host sidecar with the machine's `run.json`, which has no `paused_at` set because the machine isn't aware of the user's pause action. Intentional — the post-finalize status should be `done-pushed-pr`, not `paused`. Pause/resume forensics are not preserved across finalize. |
 | `pause_reason` | str \| null | short tag identifying which path set `paused_at` (`worker-error`, `orchestrator-exception`, `finalize-failed`, `user-requested`). Null when `paused_at` is null. Cleared with `paused_at` at finalize (see above). |
 | `killed_at` | ISO-8601 str \| null | when the remote run was explicitly destroyed by `leerie --kill <run-id>`. The Fly Machine has been destroyed and the run is no longer resumable. Null for any other terminal state. |
 | `sync_failed_at` | ISO-8601 str \| null | when the clean-exit branch of `decide_teardown` ran `fetch_branch` and it failed. The orchestrator finished cleanly on the machine, but the run branch + state directory could not be pulled back to the host. The machine is LEFT RUNNING (not stopped) so the user can recover manually via `leerie --finalize` (retry sync + push), `leerie --attach` (inspect), or `leerie --kill` (destroy only after work is safely on host). Orthogonal to `paused_at`/`pushed_at`/`killed_at` — the machine is neither paused nor destroyed. Mutex-checked against `pushed_at` (a successfully pushed run can't be sync-failed) and `killed_at` (a destroyed machine can't be sync-failed). Requires `fly_machine_id` to be set (the running machine needs a pointer). |
@@ -3515,15 +3532,15 @@ A corrupt sidecar is flagged but does not block the rest of the system; `leerie 
 | `pr-failed` | `pr_error` is set (and push succeeded) | re-run `gh pr create` manually using the command logged at finalize |
 | `done-pushed-pr` | `pr_url` is set | the happy path: PR open, work merged locally |
 | `done-pushed-no-pr` | `pushed_at` set but `pr_url` not | rare: push succeeded, PR wasn't attempted (e.g., gh removed between push and PR) |
-| `sync-failed-running` | `sync_failed_at` set (and no `killed_at`) | the orchestrator finished but `fetch_branch` failed; the Fly machine is still running with un-synced work. Run `leerie --finalize <id>` to retry sync + push, or `leerie --attach <id>` to inspect manually; only `leerie --kill <id>` once work is safely on host. (DESIGN §6 *Remote pause-on-failure* — sync-before-destroy contract.) |
-| `done-local` | `finished_at` set, no `pushed_at` | the user passed `--no-push`; push manually if desired |
-| `paused-remote` | `paused_at` is set | inspect/attach to the Fly Machine, then `leerie --resume --run-id <id> --runtime fly` (DESIGN §6 *Remote pause-on-failure*) |
-| `killed-remote` | `killed_at` is set | terminal state — the machine was destroyed by `leerie --kill`. Not resumable; start a new run instead. |
+| `sync-failed` | `sync_failed_at` set (and no `killed_at`) | the orchestrator finished but `fetch_branch` failed; the Fly machine is still running with un-synced work. Run `leerie --finalize <id>` to retry sync + push, or `leerie --attach <id>` to inspect manually; only `leerie --kill <id>` once work is safely on host. (DESIGN §6 *Remote pause-on-failure* — sync-before-destroy contract.) |
+| `done` | `finished_at` set, no `pushed_at` | the user passed `--no-push`; push manually if desired |
+| `paused` | `paused_at` is set | inspect/attach to the Fly Machine, then `leerie --resume --run-id <id> --runtime fly` (DESIGN §6 *Remote pause-on-failure*) |
+| `killed` | `killed_at` is set | terminal state — the machine was destroyed by `leerie --kill`. Not resumable; start a new run instead. |
 | `in-progress` | none of the above | the run is still active (or died very early); resume with `--resume --run-id <id>` |
 
 `RUN_STATUSES` in `leerie.py` declares the ten values; a test coupling check asserts the tuple matches every value `_derive_run_status` can return.
 
-`leerie --list --status <state>` filters the table to runs whose derived status matches. `<state>` accepts any value in `RUN_STATUSES`; invalid values produce an argparse error listing the allowed set. `leerie --list-paused` is a deprecated alias for `leerie --list --status paused-remote` and continues to work. Both short-circuit before any git/CLI preflight, the same as `--list`.
+`leerie --list --status <state>` filters the table to runs whose derived status matches. `<state>` accepts any value in `RUN_STATUSES`; invalid values produce an argparse error listing the allowed set. `leerie --list-paused` is a deprecated alias for `leerie --list --status paused` and continues to work. Both short-circuit before any git/CLI preflight, the same as `--list`.
 
 `state.json` fields. This table is canonical: every field the orchestrator
 writes to `st.data` must appear here, and every field listed here must be
@@ -3563,7 +3580,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `conditional_drops` | dict[str, dict] | planner-emitted consumer subtasks dropped by the reconciler's `conditional_drops` resolution op (DESIGN §5) — i.e. the planner authored the subtask as "no-op if X" and X turned out to be unresolvable. Each value is `{reason: str, from_unresolved_tag: str}` where `reason` quotes the consumer's conditional intent + names why the precondition is false (the reconciler emits this) and `from_unresolved_tag` records which unresolved tag's resolution motivated the drop (looked up from the unresolved set at apply time). Absent when no conditional_drop fired. Distinct audit field from `dropped_subtasks` (off-tree soft drops, phase 3) so the two causes stay separately auditable. |
 | `plan_overlap_judge` | dict | full output of the phase 2¾ `plan_overlap_judge` worker (DESIGN §5 *Cross-domain surface overlap*) — `{collisions: [{a_sid, b_sid, artifact, resolution, reason, merge_feasibility?}, …]}`. Persisted before the apply step (so if a `die()` fires on `unresolvable` or the merge-feasibility backstop the audit record survives). Absent when `phase_overlap_judge` cheap-skipped (single-planner / <2-subtask runs / `--skip-overlap-judge`) or when the judge returned `{collisions: []}`. |
 | `plan_overlap_applied` | list[dict] | post-apply mutation summary for the phase 2¾ judge. Each entry is either `{action: merge|drop_a|drop_b, artifact: str, surviving_sid: str, dropped_sid: str, reason: str}` recording a mutation against the plan, or `{action: skipped_redundant, artifact: str, collapsed_to: str, original_a_sid: str, original_b_sid: str, merge_feasibility: str, reason: str}` recording a redundant pair whose endpoints had already collapsed to the same survivor via an earlier resolution (the closing edge of a connected cluster — kept in the audit trail so resume-time inspection sees every collision the judge emitted). The anchor-survivor rule may make the `surviving_sid` differ from `_apply_overlap_merge`'s default lex-smaller pick when the merge participates in a cluster — see "Phase 2¾ checks" above. Useful for resume-time replay debugging — `state.data["plan_overlap_judge"]` records what the judge said, this records what the orchestrator did. Empty list when the judge returned no collisions; absent when the phase cheap-skipped. |
-| `no_work_required` | bool | set to `True` by `_finish_no_work_run` when every planner returns `status: "ready"` with `subtasks: []` (DESIGN §8 *The cleared-but-empty terminal state*). When `True`, the orchestrator wrote `finished_at`, skipped phases 3–6, and exited 0 — the task was already satisfied on HEAD, no run branch was materialized, no PR will be opened. `leerie --list` renders the run as `done-local` (no push, no PR, distinct from `done-pushed-no-pr` and `done-pushed-pr`). Absent on every normal run. |
+| `no_work_required` | bool | set to `True` by `_finish_no_work_run` when every planner returns `status: "ready"` with `subtasks: []` (DESIGN §8 *The cleared-but-empty terminal state*). When `True`, the orchestrator wrote `finished_at`, skipped phases 3–6, and exited 0 — the task was already satisfied on HEAD, no run branch was materialized, no PR will be opened. `leerie --list` renders the run as `done` (no push, no PR, distinct from `done-pushed-no-pr` and `done-pushed-pr`). Absent on every normal run. |
 | `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. Keys are domain names (e.g. `"bug-fixing"`, `"testing"`); values are the `basis` string the planner emitted explaining why no work was needed. Absent on every normal run. |
 | `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `.leerie/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
 

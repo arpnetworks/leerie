@@ -107,7 +107,7 @@ fetch_branch() {
   # skipped for cleared-but-empty terminal-state runs (DESIGN §8 — no
   # setup-run.sh ran, so there is no run branch to bundle on the
   # machine; the state dir still needs to come back so `leerie --list`
-  # shows the run as `done-local`). Use python3 (always available in
+  # shows the run as `done`). Use python3 (always available in
   # the leerie image) to parse the JSON safely.
   local run_id run_branch working_branch run_no_push
   local discover_output

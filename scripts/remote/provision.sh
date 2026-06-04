@@ -200,9 +200,26 @@ _try_fetch_branch_for_teardown() {
 # Idempotent: the trap fires on every exit, including success; the
 # stop/destroy primitives no-op on an empty LEERIE_MACHINE_ID.
 decide_teardown() {
+  # Idempotency: when the launcher takes SIGINT, the INT trap fires
+  # decide_teardown once, then the subsequent EXIT trap would fire it
+  # a second time with a clobbered rc (the launcher's post-INT
+  # cleanup path can set container_rc=1 → LEERIE_REMOTE_EXIT_RC=1 →
+  # the *) pause arm would pause a machine the user only meant to
+  # detach from). Skip every pass after the first.
+  if [ -n "${LEERIE_TEARDOWN_DONE:-}" ]; then
+    return 0
+  fi
+  # The launcher pre-sets LEERIE_REMOTE_EXIT_RC=130 at the top of
+  # its Fly branch so the SIGINT-trap-before-line-2203 race routes
+  # here with rc=130 (detach banner). The :-0 default is preserved
+  # for unit tests and any other entry path that sources provision.sh
+  # without going through the launcher's Fly branch — those want
+  # clean-exit semantics.
   local rc="${LEERIE_REMOTE_EXIT_RC:-0}"
   local mid="$LEERIE_MACHINE_ID"
   if [ -z "$mid" ]; then
+    LEERIE_TEARDOWN_DONE=1
+    export LEERIE_TEARDOWN_DONE
     return 0
   fi
   case "$rc" in
@@ -378,15 +395,28 @@ decide_teardown() {
       # orchestrator. The orchestrator is still running on the machine.
       # Leave the machine alone and print reattach hints.
       echo "" >&2
-      remote_log "detached from run ${LEERIE_RUN_ID:-<unknown>} (machine $mid still running)"
-      if [ -n "${LEERIE_RUN_ID:-}" ]; then
-        echo "       reattach:  leerie --attach $LEERIE_RUN_ID --tail" >&2
-        echo "       pause:     leerie --stop $LEERIE_RUN_ID" >&2
-        echo "       destroy:   leerie --kill $LEERIE_RUN_ID" >&2
-      else
-        echo "       reattach:  leerie --attach <run-id> --tail" >&2
-        echo "       (run-id was not exported; check leerie --list for the active machine)" >&2
+      echo "================================================================" >&2
+      remote_log "detached from run ${LEERIE_RUN_ID:-<unknown>} — orchestrator still running on Fly."
+      echo "  You stopped watching the tail. The orchestrator was NOT" >&2
+      echo "  signalled and keeps making progress on the machine. When" >&2
+      echo "  you want to come back:" >&2
+      echo "" >&2
+      echo "    1. Reattach + resume tailing (most common):" >&2
+      echo "         leerie --attach ${LEERIE_RUN_ID:-<run-id>} --tail" >&2
+      echo "" >&2
+      echo "    2. Pause the machine (graceful stop, keeps work on the" >&2
+      echo "       Fly volume; resume later with leerie --resume):" >&2
+      echo "         leerie --stop ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "" >&2
+      echo "    3. Destroy the machine (drops it; only do this once your" >&2
+      echo "       work is safely back on the host):" >&2
+      echo "         leerie --kill ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "" >&2
+      if [ -z "${LEERIE_RUN_ID:-}" ]; then
+        echo "  (run-id was not exported yet; check leerie --list to find it.)" >&2
       fi
+      echo "  Machine: $mid (still running on Fly)" >&2
+      echo "================================================================" >&2
       # Intentionally no stop/destroy — the orchestrator must keep running.
       ;;
     *)
@@ -419,6 +449,8 @@ decide_teardown() {
       # Don't clear LEERIE_MACHINE_ID — leave the pointer for the user.
       ;;
   esac
+  LEERIE_TEARDOWN_DONE=1
+  export LEERIE_TEARDOWN_DONE
 }
 
 # --- wait for machine to reach state "started" ---------------------------

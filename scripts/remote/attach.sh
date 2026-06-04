@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-_ATTACH_USAGE='Usage: leerie --attach [<run-id>] [--tail] [--auto-finalize] [--all-logs] [--app <app>]'
+_ATTACH_USAGE='Usage: leerie --attach [<run-id>] [--tail] [--auto-finalize] [--all-logs] [--app <app>] [--runtime fly]'
 
 # --- arg parsing ---------------------------------------------------------
 ATTACH_RUN_ID=""
@@ -37,6 +37,7 @@ ATTACH_TAIL=false
 ATTACH_AUTO_FINALIZE=false
 ATTACH_ALL_LOGS=false
 ATTACH_APP="${LEERIE_FLY_APP:-leerie}"
+ATTACH_RUNTIME=""
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -45,6 +46,8 @@ while [ "$#" -gt 0 ]; do
     --all-logs)        ATTACH_ALL_LOGS=true; shift ;;
     --app)             ATTACH_APP="$2"; shift 2 ;;
     --app=*)           ATTACH_APP="${1#--app=}"; shift ;;
+    --runtime)         ATTACH_RUNTIME="${2:-}"; shift 2 ;;
+    --runtime=*)       ATTACH_RUNTIME="${1#--runtime=}"; shift ;;
     --help|-h)         echo "$_ATTACH_USAGE" >&2; exit 0 ;;
     --*)
       echo "attach: unknown flag: $1" >&2
@@ -61,6 +64,14 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+if [ -n "$ATTACH_RUNTIME" ] && [ "$ATTACH_RUNTIME" != "fly" ] && [ "$ATTACH_RUNTIME" != "local" ]; then
+  echo "attach: --runtime must be 'local' or 'fly' (got '$ATTACH_RUNTIME')" >&2
+  exit 1
+fi
+if [ "$ATTACH_RUNTIME" = "local" ]; then
+  echo "attach --runtime local: no local-runtime equivalent yet (local runs run inline)." >&2
+  exit 1
+fi
 
 # --- resolve repo root ---------------------------------------------------
 # USER_REPO is set by the launcher; fall back to PWD if invoked standalone.

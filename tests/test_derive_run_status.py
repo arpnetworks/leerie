@@ -7,7 +7,7 @@ Status table (in priority order):
   3. pr_error set              → `pr-failed`
   4. pr_url set                → `done-pushed-pr`
   5. pushed_at set             → `done-pushed-no-pr`
-  6. finished_at set           → `done-local`
+  6. finished_at set           → `done`
   7. otherwise                 → `in-progress`
 """
 from __future__ import annotations
@@ -26,7 +26,7 @@ def test_status_in_progress_none_run_json(leerie):
 def test_status_done_local(leerie):
     """Finalize completed but --no-push was set (or no push attempted)."""
     rj = {"finished_at": "2026-05-26T15:00:00+00:00"}
-    assert leerie._derive_run_status(rj, {}) == "done-local"
+    assert leerie._derive_run_status(rj, {}) == "done"
 
 
 def test_status_done_pushed_no_pr(leerie):
@@ -91,7 +91,7 @@ def test_status_paused_remote(leerie):
         "fly_machine_id": "1234567890abcd",
         "pause_reason": "worker-error",
     }
-    assert leerie._derive_run_status(rj, {}) == "paused-remote"
+    assert leerie._derive_run_status(rj, {}) == "paused"
 
 
 def test_status_paused_without_machine_id_is_corrupt(leerie):
@@ -128,7 +128,7 @@ def test_status_killed_remote(leerie):
         "killed_at": "2026-05-29T16:00:00+00:00",
         "fly_machine_id": "1234567890abcd",
     }
-    assert leerie._derive_run_status(rj, {}) == "killed-remote"
+    assert leerie._derive_run_status(rj, {}) == "killed"
 
 
 def test_status_killed_without_machine_id_is_corrupt(leerie):
@@ -169,19 +169,19 @@ def test_status_killed_fires_before_paused(leerie):
         "killed_at": "2026-05-29T16:00:00+00:00",
         "fly_machine_id": "abc",
     }
-    # paused_at NOT set → killed-remote (clean case).
-    assert leerie._derive_run_status(rj, {}) == "killed-remote"
+    # paused_at NOT set → killed (clean case).
+    assert leerie._derive_run_status(rj, {}) == "killed"
 
 
 def test_status_table_lists_every_value_used(leerie):
     """RUN_STATUSES tuple must contain every value _derive_run_status
     can return — drift guard."""
     expected = {
-        "corrupt-sidecar", "in-progress", "done-local",
+        "corrupt-sidecar", "in-progress", "done",
         "done-pushed-no-pr", "done-pushed-pr",
         "push-failed", "pr-failed",
-        "paused-remote", "killed-remote",
-        "sync-failed-running",
+        "paused", "killed",
+        "sync-failed",
     }
     assert set(leerie.RUN_STATUSES) == expected
 
@@ -200,7 +200,7 @@ def test_push_error_priority_over_pr_url(leerie):
 
 def test_sync_failed_at_surfaces_as_sync_failed_running(leerie):
     """sync_failed_at set + fly_machine_id set + no killed_at → status
-    is `sync-failed-running`. This is the orchestrator-finished-but-
+    is `sync-failed`. This is the orchestrator-finished-but-
     fetch_branch-failed state where the machine is still running on
     Fly with un-synced work."""
     rj = {
@@ -209,7 +209,7 @@ def test_sync_failed_at_surfaces_as_sync_failed_running(leerie):
         "sync_fail_reason": "sync-failed-on-clean-exit",
         "fly_machine_id": "abc123",
     }
-    assert leerie._derive_run_status(rj, {}) == "sync-failed-running"
+    assert leerie._derive_run_status(rj, {}) == "sync-failed"
 
 
 def test_sync_failed_takes_precedence_over_done_local(leerie):
@@ -221,7 +221,7 @@ def test_sync_failed_takes_precedence_over_done_local(leerie):
         "sync_failed_at": "2026-06-01T18:43:34Z",
         "fly_machine_id": "abc123",
     }
-    assert leerie._derive_run_status(rj, {}) == "sync-failed-running"
+    assert leerie._derive_run_status(rj, {}) == "sync-failed"
 
 
 def test_sync_failed_at_requires_fly_machine_id(leerie):

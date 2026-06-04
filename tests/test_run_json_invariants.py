@@ -19,14 +19,14 @@ Invariants (mirrors orchestrator/leerie.py:_validate_run_json):
 
 Valid status combinations (leerie --list derives these via
 `_derive_run_status`):
-- `done-local`          — no push attempted, no PR.
+- `done`          — no push attempted, no PR.
 - `done-pushed-no-pr`   — pushed, PR not attempted (offline-pr case).
 - `done-pushed-pr`      — pushed + PR opened.
 - `push-failed`         — push attempted and failed.
 - `pr-failed`           — push succeeded, PR creation failed.
-- `paused-remote`       — remote run paused on failure; resume via --resume.
-- `killed-remote`       — terminal state via leerie --kill; not resumable.
-- `sync-failed-running` — orchestrator finished but fetch_branch failed;
+- `paused`       — remote run paused on failure; resume via --resume.
+- `killed`       — terminal state via leerie --kill; not resumable.
+- `sync-failed` — orchestrator finished but fetch_branch failed;
                           machine still up, recover via --finalize/--kill.
 - `corrupt-sidecar`     — run.json violates an invariant above.
 - `in-progress`         — finalize hasn't run yet (no fields set).

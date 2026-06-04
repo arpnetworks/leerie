@@ -1222,8 +1222,14 @@ remote run lifecycle, each doing exactly one thing:
 | `leerie --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
 
 Plus `leerie --list` (unified across local and remote, with `--status
-<state>` filtering — `--list-paused` becomes a deprecated alias for
-`--list --status paused-remote`).
+<state>` and `--runtime <local|fly>` filtering as orthogonal axes —
+`--list-paused` becomes a deprecated alias for `--list --status
+paused`). Status describes the run's lifecycle (`paused`, `killed`,
+`done`, `sync-failed`, `in-progress`, `done-pushed-pr`, ...); runtime
+describes where it ran (`local` or `fly`). `--list --runtime fly`
+short-circuits in the launcher and queries Fly directly via `flyctl
+machines list --json`, so it surfaces machines launched from any host
+repo (not just the cwd).
 
 This separation matches the convention every comparable tool follows:
 `fly machine start` / `stop` / `destroy` are distinct verbs;
@@ -1578,7 +1584,7 @@ schedule: there is no decomposition to feed phase 3, no work to execute
 in phase 5, no run branch to integrate or push in phase 6. The
 orchestrator records `no_work_required=true` in state.json with each
 domain's `confidence.basis` quoted, writes `finished_at`, skips phases
-3–6, and exits 0. The run renders as `done-local` in `leerie --list` (no
+3–6, and exits 0. The run renders as `done` in `leerie --list` (no
 push, no PR — there is no commit to propose). A mixed outcome (some
 ready+empty, some ready+nonempty) proceeds normally; the empty domains
 simply contribute nothing. The all-blocked case still dies — a blocker

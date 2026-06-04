@@ -154,6 +154,98 @@ case "${1:-}" in
     echo "leerie $LEERIE_VERSION"
     exit 0
     ;;
+  --list)
+    # `--list --runtime fly` is a runtime-aware view: query Fly directly
+    # for every machine under FLY_APP, then best-effort cross-reference
+    # `.leerie/runs/*/{fly-machine.json,run.json}` in the current repo
+    # to fill in run-id columns. Without --runtime fly, this arm restores
+    # the original argv and lets execution continue past the case block;
+    # the orchestrator's argparse handles plain `--list`.
+    _list_runtime=""
+    _list_rest=("$@")
+    shift
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --runtime) _list_runtime="${2:-}"; shift 2 ;;
+        --runtime=*) _list_runtime="${1#--runtime=}"; shift ;;
+        *) shift ;;
+      esac
+    done
+    if [ "$_list_runtime" = "fly" ] || [ "${LEERIE_RUNTIME:-}" = "fly" ]; then
+      FLY_APP="${LEERIE_FLY_APP:-leerie}"
+      USER_REPO="${USER_REPO:-$PWD}"
+      if ! command -v flyctl >/dev/null 2>&1; then
+        echo "leerie: --list --runtime fly: flyctl not found on PATH; falling back to local sidecars." >&2
+        set -- "${_list_rest[@]}"
+      elif ! _list_json="$(flyctl machines list --app "$FLY_APP" --json 2>&1)"; then
+        echo "leerie: --list --runtime fly: flyctl machines list failed:" >&2
+        echo "$_list_json" >&2
+        echo "  Falling back to local sidecars." >&2
+        set -- "${_list_rest[@]}"
+      else
+        LEERIE_LIST_FLY_JSON="$_list_json" python3 - "$USER_REPO" "$FLY_APP" <<'PY'
+import json, os, sys
+from pathlib import Path
+
+repo = Path(sys.argv[1])
+app = sys.argv[2]
+raw = os.environ.get("LEERIE_LIST_FLY_JSON", "")
+try:
+    machines = json.loads(raw) if raw.strip() else []
+except ValueError as e:
+    print(f"leerie: --list --runtime fly: could not parse flyctl JSON: {e}", file=sys.stderr)
+    sys.exit(1)
+
+m2r: dict[str, str] = {}
+runs_dir = repo / ".leerie" / "runs"
+if runs_dir.is_dir():
+    for run_dir in runs_dir.iterdir():
+        if not run_dir.is_dir():
+            continue
+        for sidecar in (run_dir / "fly-machine.json", run_dir / "run.json"):
+            if not sidecar.is_file():
+                continue
+            try:
+                d = json.loads(sidecar.read_text())
+            except (OSError, ValueError):
+                continue
+            if isinstance(d, dict):
+                mid = d.get("fly_machine_id")
+                if mid and mid not in m2r:
+                    m2r[mid] = run_dir.name
+                    break
+
+if not machines:
+    print(f"(no machines on Fly app '{app}')")
+    sys.exit(0)
+
+rows = []
+for m in machines:
+    if not isinstance(m, dict):
+        continue
+    mid = m.get("id") or ""
+    state = m.get("state") or ""
+    region = m.get("region") or ""
+    created = m.get("created_at") or ""
+    run_id = m2r.get(mid, "?")
+    rows.append((mid, state, region, created, run_id))
+
+headers = ("machine_id", "state", "region", "created_at", "run_id (local)")
+widths = [max(len(h), *(len(r[i]) for r in rows)) for i, h in enumerate(headers)]
+fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+print(fmt.format(*headers))
+print(fmt.format(*("-" * w for w in widths)))
+for r in rows:
+    print(fmt.format(*r))
+print()
+print(f"app: {app}   (run_id '?' = sidecar not in {repo}/.leerie/runs/)")
+PY
+        exit 0
+      fi
+    else
+      set -- "${_list_rest[@]}"
+    fi
+    ;;
   --attach)
     # Fast-path: open a PTY into a running/paused Fly Machine.
     # (DESIGN §6 *Interactive attach over PTY in remote mode*.)
@@ -207,10 +299,31 @@ case "${1:-}" in
     shift
     USER_REPO="${USER_REPO:-$PWD}"
     export USER_REPO
-    _stop_run_id="${1:-}"
+    _stop_run_id=""
+    _stop_runtime=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --runtime) _stop_runtime="${2:-}"; shift 2 ;;
+        --runtime=*) _stop_runtime="${1#--runtime=}"; shift ;;
+        --*) remote_log "unknown --stop flag: $1"; exit 1 ;;
+        *)
+          if [ -z "$_stop_run_id" ]; then _stop_run_id="$1"; shift
+          else remote_log "unexpected --stop arg: $1"; exit 1
+          fi
+          ;;
+      esac
+    done
+    if [ -n "$_stop_runtime" ] && [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "local" ]; then
+      remote_log "--stop: --runtime must be 'local' or 'fly' (got '$_stop_runtime')"
+      exit 1
+    fi
+    if [ "$_stop_runtime" = "local" ]; then
+      remote_log "--stop --runtime local: no local-runtime equivalent yet (local runs run synchronously)."
+      exit 1
+    fi
     if [ -z "$_stop_run_id" ]; then
       remote_log "--stop requires a <run-id>"
-      echo "  Usage: leerie --stop <run-id>" >&2
+      echo "  Usage: leerie --stop <run-id> [--runtime fly]" >&2
       exit 1
     fi
     _stop_run_dir="$USER_REPO/.leerie/runs/$_stop_run_id"
@@ -260,6 +373,7 @@ case "${1:-}" in
     _kill_machine_id=""
     _kill_force=0
     _kill_app=""
+    _kill_runtime=""
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --force) _kill_force=1; shift ;;
@@ -267,6 +381,8 @@ case "${1:-}" in
         --machine-id=*) _kill_machine_id="${1#--machine-id=}"; shift ;;
         --app) _kill_app="$2"; shift 2 ;;
         --app=*) _kill_app="${1#--app=}"; shift ;;
+        --runtime) _kill_runtime="${2:-}"; shift 2 ;;
+        --runtime=*) _kill_runtime="${1#--runtime=}"; shift ;;
         --*) remote_log "unknown --kill flag: $1"; exit 1 ;;
         *)
           if [ -z "$_kill_run_id" ]; then _kill_run_id="$1"; shift
@@ -275,6 +391,14 @@ case "${1:-}" in
           ;;
       esac
     done
+    if [ -n "$_kill_runtime" ] && [ "$_kill_runtime" != "fly" ] && [ "$_kill_runtime" != "local" ]; then
+      remote_log "--kill: --runtime must be 'local' or 'fly' (got '$_kill_runtime')"
+      exit 1
+    fi
+    if [ "$_kill_runtime" = "local" ]; then
+      remote_log "--kill --runtime local: no local-runtime equivalent yet (local runs are not persistently running)."
+      exit 1
+    fi
     [ -n "${LEERIE_FORCE_KILL:-}" ] && _kill_force=1
     FLY_APP="${_kill_app:-${LEERIE_FLY_APP:-leerie}}"
     export FLY_APP
@@ -341,7 +465,7 @@ case "${1:-}" in
     # state.json (which only the orchestrator writes); the run.json
     # written here is for audit-trail purposes only. Non-bootstrap kills
     # already have state.json from a prior fetch_branch or local run,
-    # so they do appear in --list with status=killed-remote.
+    # so they do appear in --list with status=killed.
     if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
       _ensure_run_json "$_kill_run_dir" || true
       _kill_sidecar="$_kill_run_dir/run.json"
@@ -369,12 +493,31 @@ case "${1:-}" in
     # the same block (lines ~480) so we don't need to lift those here.
     _fin_run_id="${1:-}"
     _FINALIZE_FORCE=false
+    _fin_runtime=""
+    _fin_prev=""
     for _a in "$@"; do
-      [ "$_a" = "--force" ] && _FINALIZE_FORCE=true
+      if [ "$_fin_prev" = "--runtime" ]; then
+        _fin_runtime="$_a"
+        _fin_prev=""
+        continue
+      fi
+      case "$_a" in
+        --force) _FINALIZE_FORCE=true ;;
+        --runtime=*) _fin_runtime="${_a#--runtime=}" ;;
+        --runtime) _fin_prev="--runtime" ;;
+      esac
     done
+    if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ]; then
+      remote_log "--finalize: --runtime must be 'local' or 'fly' (got '$_fin_runtime')"
+      exit 1
+    fi
+    if [ "$_fin_runtime" = "local" ]; then
+      remote_log "--finalize --runtime local: no local-runtime equivalent yet (local runs finalize inline)."
+      exit 1
+    fi
     if [ -z "$_fin_run_id" ]; then
       remote_log "--finalize requires a <run-id>"
-      echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push]" >&2
+      echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
       exit 1
     fi
     _fin_run_dir="$USER_REPO/.leerie/runs/$_fin_run_id"
@@ -1715,6 +1858,16 @@ if [ "$RUNTIME" = "fly" ]; then
   # GitHub credentials). Orchestration inside the machine follows after both
   # seedings succeed.
   remote_log "remote: starting Fly.io machine (--runtime fly / LEERIE_RUNTIME=fly / leerie.toml runtime=fly)"
+
+  # Default LEERIE_REMOTE_EXIT_RC to 130 (SIGINT) so the EXIT/INT trap
+  # registered by provision.sh routes a Ctrl-C-during-tail to the
+  # `130|143)` detach banner arm in decide_teardown — even when the
+  # INT trap fires before the post-tail `export
+  # LEERIE_REMOTE_EXIT_RC=$container_rc` (~30 lines below) runs.
+  # Overwritten on every non-SIGINT path; the 130 default only
+  # "survives" when the launcher dies before the post-tail export,
+  # which is exactly the Ctrl-C case.
+  export LEERIE_REMOTE_EXIT_RC=130
 
   # Preflight: ensure flyctl is on PATH and authenticated. require_flyctl
   # in lib.sh handles auto-install on first --runtime fly use (parallels
