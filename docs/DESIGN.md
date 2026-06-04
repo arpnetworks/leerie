@@ -547,13 +547,27 @@ The mechanical re-check that *catches* a merge that broke the tree
 runs immediately after: once the integrator commits the merge, the
 orchestrator scans the integrated worktree for unresolved conflict
 markers (`<<<<<<<`). A merge that left markers behind aborts the
-run. There is no LLM-level wave validator beyond that: per-subtask
-quality is the implementer's confidence gate (§8); whether the
-integrated tree is *behaviorally* correct is a question the
-conformance phase touches and the human PR review confirms. Leerie
-does not re-run subtask criteria at the wave boundary — that role
-belonged to an earlier wave-level validator that was removed when the
-criteria file became informational (§8, §9).
+run. Per-wave quality stops there: per-subtask quality is the
+implementer's confidence gate (§8), and Leerie does not re-run
+subtask criteria at the wave boundary — that role belonged to an
+earlier wave-level validator that was removed when the criteria file
+became informational (§8, §9).
+
+After the *final* wave integrates — once the staging tree contains
+every subtask's work — one conformer pass runs on the integrated
+tree as a whole. It is the same conformer the per-subtask phase
+spawns (§9), pointed at the staging worktree with `DIFF_BASE` set
+to the user's working branch (the PR's eventual base) so the diff
+under review is what the PR will contain. The pass catches drift
+that only manifests once two subtasks co-exist: a lint rule
+sensitive to file count, an import collision that compiled cleanly
+in isolation, a test fixture two implementers each augmented in
+incompatible ways. Its findings are advisory in the same sense as
+the per-subtask phase (§9) — the orchestrator never blocks
+finalize on them; the residuals surface as warnings on state and
+in the PR body, where a human and CI can act on them. The pass is
+bounded by the same `conformance_rounds` cap and the same per-run
+worker budget; its `claude -p` invocation has no special standing.
 
 ### When integration cannot succeed
 
@@ -1701,6 +1715,19 @@ with the rest of §12: what cannot be guaranteed in code (a model genuinely
 catching every documentation drift) is not promoted to a hard guarantee by
 prompt; what *can* be guaranteed (protected paths stayed untouched, the
 worker's structured output is well-formed) is enforced in code.
+
+The same conformer runs once more after every wave has integrated, on
+the staging worktree, with `DIFF_BASE` set to the working branch (§6,
+*Worktree and integration model*, final-tree pass paragraph). The per-subtask passes review each subtask's
+diff in isolation; this final pass reviews the merged whole. Every
+discipline above applies unchanged: the protected-path check is
+re-run against the conformer's commits, the round budget is the same
+`conformance_rounds` cap, residuals are advisory, and the prompt is
+unchanged — only the inputs (cwd, `DIFF_BASE`, and the absence of a
+subtask spec / criteria file) differ. The pass's structured output
+lands at `st.data["conformance"]["_final"]` and is threaded into the
+`pr_writer` payload so its residuals surface as an advisory section
+in the PR body alongside the wave-by-wave summary.
 
 ---
 

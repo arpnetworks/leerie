@@ -40,6 +40,7 @@ def _default_caps(leerie) -> dict:
         "max_total_workers": d["max_total_workers"],
         "subtask_call_estimate": d["subtask_call_estimate"],
         "budget_safety_margin": d["budget_safety_margin"],
+        "conformance_rounds": d["conformance_rounds"],
     }
 
 
@@ -72,7 +73,8 @@ def test_medium_plan_fits_default_cap(leerie):
     estimate should be conservative but still under the cap."""
     st = _FakeState(worker_count=4)  # classifier + provision + 2 planners
     caps = _default_caps(leerie)
-    # Predicted: 4 + (13*2.5 + 3 + 2) = 4 + 37.5 = 41.5. ×1.15 = 47.7. Under 60.
+    # Predicted: 4 + (13*2.5 + 3 + 2 + 1) = 4 + 38.5 = 42.5. ×1.15 = 48.875.
+    # Under 60.
     leerie.check_budget_feasibility(st, caps, _make_subtasks(13), _make_waves(3))
 
 
@@ -113,15 +115,16 @@ def test_just_under_boundary_passes(leerie):
     margin) must pass without dying."""
     st = _FakeState(worker_count=0)
     # Construct caps so the estimate is exactly at the boundary.
-    # estimate = N*2.5 + waves + 1. With N=21, waves=1: 21*2.5+1+1 = 54.5;
-    # 54.5 * 1.15 = 62.675 — just over 60. Pick N=20: 20*2.5+1+1 = 52;
-    # 52 * 1.15 = 59.8 — just under 60.
+    # estimate = N*2.5 + waves + conformance_rounds + 1.
+    # With conformance_rounds=2, waves=1: N=19 → 19*2.5+1+2+1 = 51.5;
+    # 51.5 * 1.15 = 59.225 — just under 60. N=20 would be 54 * 1.15 = 62.1.
     caps = {
         "max_total_workers": 60,
         "subtask_call_estimate": 2.5,
         "budget_safety_margin": 1.15,
+        "conformance_rounds": 2,
     }
-    leerie.check_budget_feasibility(st, caps, _make_subtasks(20), _make_waves(1))
+    leerie.check_budget_feasibility(st, caps, _make_subtasks(19), _make_waves(1))
 
 
 def test_just_over_boundary_dies(leerie, capsys):
@@ -132,11 +135,12 @@ def test_just_over_boundary_dies(leerie, capsys):
         "max_total_workers": 60,
         "subtask_call_estimate": 2.5,
         "budget_safety_margin": 1.15,
+        "conformance_rounds": 2,
     }
-    # 21*2.5+1+1 = 54.5. 54.5 * 1.15 = 62.675 → > 60 → dies.
+    # 20*2.5+1+2+1 = 54. 54 * 1.15 = 62.1 → > 60 → dies.
     with pytest.raises(SystemExit) as exc:
         leerie.check_budget_feasibility(st, caps,
-                                        _make_subtasks(21), _make_waves(1))
+                                        _make_subtasks(20), _make_waves(1))
     assert exc.value.code == leerie.EXIT_BUDGET_INFEASIBLE
 
 

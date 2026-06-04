@@ -247,6 +247,13 @@ STATE_FIELDS = (
     # phases 3-6, and exits 0. Absent on every normal run.
     "no_work_required",
     "no_work_reasons",
+    # working_branch: the user's branch at the moment phase_classify
+    # runs (`git rev-parse --abbrev-ref HEAD`). Mirrored to run.json
+    # and to `.leerie/runs/<id>/working-branch` (setup-run.sh writes
+    # the on-disk copy later). Persisted into st.data so downstream
+    # readers (pr_writer payload, run_final_conformance's DIFF_BASE)
+    # do not have to re-query git or re-read run.json.
+    "working_branch",
 )
 
 CATEGORIES = [
@@ -10789,12 +10796,17 @@ def check_budget_feasibility(st: State, caps: dict,
     n_waves = len(waves)
     # 1 fixed: `pr_writer` (the only post-execute LLM call —
     # finalize itself is shell scripts: `git push` + `gh pr create`).
-    # Everything else (classifier, planners, reconciler, overlap_judge,
-    # provision) has already spawned and been counted into
-    # `worker_count` by the time we get here.
+    # Plus up to `conformance_rounds` calls for the final-tree
+    # conformance pass (DESIGN §6 *Worktree and integration model*,
+    # final-tree pass) which runs once on the integrated staging
+    # worktree after the last wave. Everything else (classifier,
+    # planners, reconciler, overlap_judge, provision) has already
+    # spawned and been counted into `worker_count` by the time we get
+    # here.
     remaining_estimate = (
         n_subtasks * caps["subtask_call_estimate"]
         + n_waves
+        + caps["conformance_rounds"]
         + 1
     )
     total_estimate = already_spent + remaining_estimate
@@ -11190,6 +11202,30 @@ async def _branch_head_sha(worktree: str) -> str:
     return r.stdout.strip()
 
 
+async def _protected_paths_since(worktree: str,
+                                 before_sha: str) -> list[str]:
+    """Return the list of protected paths the diff `before_sha..HEAD`
+    touched in `worktree`, or [] when clean / empty / git failure.
+
+    The per-subtask conformer reuses `check_diff_scope` which is
+    hardcoded to diff against the run branch — that comparison is
+    correct for a subtask's own worktree but produces an empty diff
+    on the staging worktree (which sits at the run-branch HEAD).
+    This helper does the analogous protected-path check for the
+    final-tree conformance pass, scoped to "what did this round
+    add to staging."""
+    if not before_sha:
+        return []
+    r = await run_proc(
+        ["git", "diff", "--name-only", f"{before_sha}..HEAD"],
+        cwd=worktree,
+    )
+    if r.returncode != 0:
+        return []
+    touched = [f for f in r.stdout.strip().splitlines() if f]
+    return [f for f in touched if is_protected_path(f)]
+
+
 async def rollback_conformer_commits(worktree: str, before_sha: str) -> None:
     """Hard-reset the subtask branch back to `before_sha`. Used when the
     conformer wrote to a protected path — the implementer's commits
@@ -11418,6 +11454,174 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     if last_res is not None:
         warnings.extend(_summarize_residuals(last_res))
     return last_res, warnings
+
+
+async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
+                                models: dict[str, str],
+                                efforts: dict[str, str | None]) -> None:
+    """Whole-tree conformance pass on the integrated staging worktree
+    (DESIGN §6 *Worktree and integration model*, final-tree pass).
+
+    Runs once after every wave has integrated, before phase_finalize.
+    Same conformer worker, same prompt, same `conformance_rounds` cap,
+    same protected-path rollback as the per-subtask phase — the only
+    differences are cwd (staging worktree), DIFF_BASE (working_branch
+    rather than the run branch), and the absence of a subtask spec /
+    criteria file. Advisory: any failure mode (missing staging
+    worktree, WorkerError, malformed result, exhausted rounds) is
+    recorded under `st.data["conformance"]["_final"]["warnings"]`,
+    never raised."""
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        log("phase 5: final conformance skipped — staging worktree absent")
+        return
+    working_branch = st.data.get("working_branch")
+    if not working_branch:
+        log("phase 5: final conformance skipped — working_branch not in state")
+        return
+    # Resume idempotence: phase_execute is gated on `completed_waves`
+    # but the final pass leaves no per-round sentinel of its own. On
+    # `--resume` after this pass already recorded a result, re-running
+    # would burn worker budget and could overwrite a clean result with
+    # a different one. The presence of `_final` in `st.data["conformance"]`
+    # is the completion sentinel.
+    if (st.data.get("conformance") or {}).get("_final") is not None:
+        log("phase 5: final conformance already complete — skipping (resume)")
+        return
+
+    log("phase 5: final-tree conformance on staging")
+    st.data["current_phase"] = "phase 5: final conformance"
+    st.save()
+
+    repo_root = st.leerie_root.parent
+    rules_files = discover_rules_files(repo_root)
+    blt = _infer_build_lint_test(repo_root)
+
+    warnings: list[str] = []
+    last_res: dict | None = None
+
+    sys_prompt = load_prompt("conformer")
+    rules_paths_str = ", ".join(
+        str(p.relative_to(repo_root)) if str(p).startswith(str(repo_root))
+        else str(p)
+        for p in rules_files
+    ) or "(none)"
+
+    for c_round in range(caps["conformance_rounds"]):
+        before_sha = await _branch_head_sha(str(staging))
+
+        # Build the per-round user prompt. Mirrors run_conformer's shape
+        # but the spec / criteria lines are replaced with one sentence
+        # framing this as the post-integration whole-tree pass — there
+        # is no per-subtask spec file to point at.
+        up = [
+            "Run the post-integration whole-tree conformance phase on "
+            "the merged run branch. This is the final conformer pass "
+            "before the PR is opened; you are reviewing the *combined* "
+            "diff of every subtask in this run, not any one subtask.",
+            f"LEERIE_DIR is {leerie_dir} (absolute). There is no "
+            "subtask spec or criteria file for this pass — the unit "
+            "of work is the whole run.",
+            "Your current working directory IS the integrated staging "
+            "worktree. Make and commit any fixes here. Every commit "
+            "subject must start with `conformer:`.",
+            f"RULES_FILES: {rules_paths_str}",
+            f"BUILD_CMD: {blt.get('build') or '(none)'}",
+            f"LINT_CMD: {blt.get('lint') or '(none)'}",
+            f"TEST_CMD: {blt.get('test') or '(none)'}",
+            f"DIFF_BASE: {working_branch} (compare with "
+            f"`git diff {working_branch}..HEAD`)",
+        ]
+        recipe_section = _format_provision_recipe_section(
+            (st.data.get("provision") or {}).get("recipe") or [],
+            audience="conformer")
+        if recipe_section is not None:
+            up.append(recipe_section)
+
+        try:
+            st.bump_workers(caps)
+            res = await claude_p(
+                user_prompt="\n".join(up),
+                system_prompt=sys_prompt,
+                schema_key="conformer", cwd=str(staging),
+                allowed_tools=ACT_TOOLS, max_turns=60,
+                autonomous=True, caps=caps, st=st,
+                model=models["conformer"],
+                effort=efforts["conformer"],
+                sid=f"final-conformer-r{c_round}")
+        except WorkerError as e:
+            warnings.append(f"final conformer round {c_round}: "
+                            f"WorkerError: {e}")
+            break
+        except subprocess.TimeoutExpired:
+            timeout = caps.get("worker_timeout_sec", "?")
+            warnings.append(f"final conformer round {c_round}: timed out "
+                            f"after {timeout}s")
+            break
+
+        last_res = res
+        # validate_conformance_result enforces shape rules
+        # (residuals-imply-rules-files-read, every fixed violation
+        # cites a rule) and path-traversal safety for docs/tests
+        # update entries. The worktree it resolves paths against is
+        # the staging worktree here, mirroring how the per-subtask
+        # call passes the subtask worktree.
+        err = validate_conformance_result(res, str(staging))
+        if err:
+            warnings.append(f"final conformer round {c_round}: "
+                            f"malformed result: {err}")
+            break
+
+        # Protected-path rollback: same discipline as the per-subtask
+        # loop, but using `_protected_paths_since(before_sha)` instead
+        # of `check_diff_scope` — the latter is hardcoded to diff
+        # against the run branch, which on the staging worktree (at
+        # the run-branch HEAD) would produce an empty diff and
+        # silently no-op. Scoping the check to this round's added
+        # commits is the correct semantics for the final pass: the
+        # protected-path discipline is about the conformer's own
+        # commits, not about anything implementers may have done
+        # (those were caught by the per-subtask gates).
+        protected = await _protected_paths_since(str(staging), before_sha)
+        if protected:
+            discarded = await _uncommitted_paths(str(staging))
+            if discarded:
+                warnings.append(
+                    f"final conformer round {c_round}: discarding "
+                    f"{len(discarded)} uncommitted file(s) during "
+                    f"rollback: {[line[3:] for line in discarded]}")
+            await rollback_conformer_commits(str(staging), before_sha)
+            warnings.append(f"final conformer round {c_round}: "
+                            f"protected-path violation reverted "
+                            f"(touched {protected})")
+            break
+
+        dirty = await _uncommitted_paths(str(staging))
+        if dirty:
+            warnings.append(f"final conformer round {c_round}: left "
+                            f"{len(dirty)} uncommitted change(s) — not "
+                            "rolled back, but surfaced as advisory")
+
+        unprefixed = await _unprefixed_conformer_commits(
+            str(staging), before_sha)
+        for subject in unprefixed:
+            warnings.append(f"final conformer round {c_round}: commit "
+                            f"subject missing `conformer:` prefix: "
+                            f"{subject!r}")
+
+        if _conformance_clean(res):
+            break
+
+    if last_res is not None:
+        warnings.extend(_summarize_residuals(last_res))
+
+    st.data.setdefault("conformance", {})["_final"] = {
+        "result": last_res,
+        "warnings": warnings,
+    }
+    st.save()
+    for w in warnings:
+        log(f"  final conformance: {w}")
 
 
 async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
@@ -11885,6 +12089,12 @@ def find_pr_template(repo_root: Path,
 PR_WRITER_COMMIT_LOG_MAX_BYTES = 80_000
 PR_WRITER_TEMPLATE_MAX_BYTES = 32_000
 PR_WRITER_DIFF_SAMPLE_MAX_LINES = 500
+# Bound on the `final_conformance` payload field (DESIGN §6 final-tree
+# pass paragraph). Defends against a pathological run that produces
+# many residuals / many warnings; typical runs are well under this.
+# The combined argv-bound payload + system prompt must stay under
+# Debian's ~128 KB ARG_MAX.
+PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES = 8_000
 
 
 def _cap_text(s: str, max_bytes: int, label: str) -> tuple[str, bool]:
@@ -11943,6 +12153,65 @@ def _truncate_diff_sample(diff_text: str, max_lines: int) -> tuple[str, bool]:
     kept.append(f"... [diff sample truncated at {max_lines} lines; "
                 "remaining hunks omitted — rely on the commit log] ...")
     return ("\n".join(kept), True)
+
+
+def _final_conformance_payload(st: "State") -> dict | None:
+    """Compact view of the final-tree conformer pass for the pr_writer
+    payload. Returns None when there is nothing advisory to say —
+    pass was skipped, crashed without recording, or returned a fully
+    clean result with no warnings — so the field is simply absent
+    from the payload (the prompt treats absence as "nothing to add").
+
+    The serialized JSON is bounded by
+    `PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES`. A pathological run that
+    produces many residuals / many warnings would otherwise add an
+    unbounded field to a payload already sized close to ARG_MAX."""
+    block = (st.data.get("conformance") or {}).get("_final")
+    if not block:
+        return None
+    res = block.get("result") or {}
+    residuals = [
+        {"rule": (r.get("rule") or "").strip(),
+         "why_not_fixed": (r.get("why_not_fixed") or "").strip()}
+        for r in (res.get("rule_violations_residual") or [])
+        if (r.get("rule") or "").strip()
+    ]
+    failed_axes: list[dict] = []
+    for axis in ("build", "lint", "tests"):
+        a = res.get(axis) or {}
+        if a.get("ran") and not a.get("passed"):
+            failed_axes.append({
+                "axis": axis,
+                "command": (a.get("command") or "").strip(),
+                "summary": (a.get("summary") or "").strip() or "(no summary)",
+            })
+    warnings = [w for w in (block.get("warnings") or []) if w]
+    if not residuals and not failed_axes and not warnings:
+        return None
+    out = {"residuals": residuals,
+           "failed_axes": failed_axes,
+           "warnings": warnings}
+    # Truncation: failed_axes is bounded by 3 (build/lint/tests) and
+    # tiny; residuals and warnings are the only fields that can grow.
+    # Trim each list from the tail until the JSON byte length fits;
+    # leave at least one element each so the worker still sees that
+    # there *was* drift. Append a `truncated` marker so the prompt's
+    # advisory section can mention it honestly.
+    cap = PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES
+    if len(json.dumps(out, separators=(",", ":")).encode("utf-8")) <= cap:
+        return out
+    truncated = False
+    while (len(json.dumps(out, separators=(",", ":")).encode("utf-8")) > cap
+           and (len(out["residuals"]) > 1 or len(out["warnings"]) > 1)):
+        if len(out["warnings"]) > 1:
+            out["warnings"].pop()
+            truncated = True
+        elif len(out["residuals"]) > 1:
+            out["residuals"].pop()
+            truncated = True
+    if truncated:
+        out["truncated"] = True
+    return out
 
 
 async def _compose_pr_via_llm(st: "State",
@@ -12062,6 +12331,9 @@ async def _compose_pr_via_llm(st: "State",
             "diff_sample": diff_sample,
             "diff_sample_truncated": diff_truncated,
         }
+        fc = _final_conformance_payload(st)
+        if fc is not None:
+            payload["final_conformance"] = fc
 
         sys_prompt = load_prompt("pr_writer")
         model = models.get("pr_writer", MODEL_DEFAULT_PER_WORKER.get(
@@ -12361,6 +12633,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 ["git", "rev-parse", "--abbrev-ref", "HEAD"])
             working_branch = (head_proc.stdout.strip()
                               if head_proc.returncode == 0 else "")
+            # Persist into st.data so downstream code (pr_writer payload,
+            # final-tree conformance pass DIFF_BASE) can read it without
+            # re-querying git. The same value is mirrored to run.json
+            # below and to .leerie/runs/<id>/working-branch by
+            # setup-run.sh; this is the in-memory copy of all three.
+            st.data["working_branch"] = working_branch
+            st.save()
             _write_run_json(
                 st.run_dir,
                 run_id=final_run_id,
@@ -12435,6 +12714,24 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         write_plan(leerie_dir, task, st, subtasks, waves)
 
     await phase_execute(leerie_dir, st, caps, models, efforts)
+    # Final-tree conformance pass on the integrated staging worktree
+    # (DESIGN §6 *Worktree and integration model*, final-tree pass).
+    # Advisory — never raises; failure modes surface in
+    # st.data["conformance"]["_final"].
+    try:
+        await run_final_conformance(leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        # Defense-in-depth: run_final_conformance is documented to
+        # never raise, but a bug in its glue (e.g. a future state
+        # mutation that throws) must not block phase_finalize. Record
+        # and move on.
+        log(f"final conformance phase raised {type(e).__name__}: {e} — "
+            "surfaced as advisory, finalize proceeds")
+        st.data.setdefault("conformance", {}).setdefault(
+            "_final", {"result": None, "warnings": []}
+        )["warnings"].append(
+            f"orchestrator-side exception: {type(e).__name__}: {e}")
+        st.save()
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False),

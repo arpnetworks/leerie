@@ -39,7 +39,12 @@ The orchestrator gives you, in your prompt, a JSON payload:
   "diff_stat": "<git diff --stat output>",
   "dirstat":  "<git diff --dirstat=files,5 output>",
   "diff_sample": "<concatenated hunks from top-N files by line count, capped>",
-  "diff_sample_truncated": true | false
+  "diff_sample_truncated": true | false,
+  "final_conformance": {
+    "residuals": [{"rule": "...", "why_not_fixed": "..."}],
+    "failed_axes": [{"axis": "build|lint|tests", "command": "...", "summary": "..."}],
+    "warnings": ["...", "..."]
+  } | absent
 }
 ```
 
@@ -67,6 +72,18 @@ it as missing — do not fabricate detail for cut-off content.
 `subtask_titles` are the planner's intent labels. They were written
 *before* the work and tend to be the cleanest summary of what each
 subtask aimed to do; the commit log records what actually landed.
+
+`final_conformance` is the output of the post-integration whole-tree
+conformer pass — a final review of the merged staging tree against
+the repo's rules and its build/lint/test commands. The field is
+**absent** when that pass had nothing advisory to say (skipped,
+clean, or every fix succeeded). When present, surface it in the PR
+body as an advisory `## Conformance notes` section (or fold it into
+an equivalent section the template defines): one short bullet per
+entry, in the order *failed axes → residuals → warnings*. Quote the
+`summary` / `why_not_fixed` text verbatim — these are warnings for
+the human reviewer, not your interpretation. Do not invent fixes,
+do not downplay failures, do not omit entries.
 
 ## Output
 

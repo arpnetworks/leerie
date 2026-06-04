@@ -85,6 +85,19 @@ def test_pr_writer_byte_budgets_defined(leerie):
         f"large payload fields sum to {total} bytes — too close to "
         f"Linux ARG_MAX (128 KB). Reduce one of the caps."
     )
+    # The `final_conformance` field added by `_final_conformance_payload`
+    # is capped by its own constant. Pin the constant and verify
+    # everything still fits under ARG_MAX. The 8 KB cap is enough for
+    # the realistic worst case (10 residuals + 3 axes + 20 warnings ≈
+    # 9.9 KB *uncapped*); `_final_conformance_payload` trims the
+    # residuals + warnings lists from the tail until the JSON fits.
+    assert leerie.PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES == 8_000
+    assert (total + leerie.PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES) < 128_000, (
+        f"adding ~{leerie.PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES} bytes "
+        f"of final_conformance to the existing {total}-byte payload "
+        f"would cross ARG_MAX (128 KB). Either lower the cap or reduce "
+        "one of the existing caps."
+    )
 
 
 def test_truncate_diff_sample_short_passthrough(leerie):
