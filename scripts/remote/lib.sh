@@ -5,6 +5,27 @@
 # Pure functions — no global state, no traps. Callers own their own
 # lifecycle decisions; this file only provides reusable building blocks.
 
+# --- _seed_timeout_prefix ------------------------------------------------
+# Emit the `timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` prefix
+# used to bound the `flyctl ssh console` side of bulk transfers. On hosts
+# without GNU `timeout` (BSD macOS w/o coreutils) the function echoes
+# nothing — caller falls back to an unbounded pipe, matching pre-fix
+# behavior. The fix converts a silent multi-hour hang into a clean
+# non-zero rc (124 on TERM, 137 on KILL) that seed_auth's existing retry
+# / failure path already knows how to handle. Background:
+# `flyctl ssh console -C` is known to hang without exiting when the
+# WireGuard tunnel stalls mid-transfer (observed 2026-06-04 across four
+# parallel runs). See plan file for full evidence.
+#
+# Usage:
+#   $(_seed_timeout_prefix) flyctl ssh console ... -C ...
+_seed_timeout_prefix() {
+  if ! command -v timeout >/dev/null 2>&1; then
+    return 0
+  fi
+  printf 'timeout --kill-after=5 %s' "${LEERIE_SEED_TIMEOUT_S:-600}"
+}
+
 # --- update_run_json -----------------------------------------------------
 # Atomically merge key/value pairs into a run.json sidecar on the host.
 #
@@ -426,7 +447,14 @@ wait_for_fly_ssh_ready() {
       return 0
     fi
     attempts=$((attempts + 1))
+    # Heartbeat every 3rd probe (~15 s) so a slow hallpass startup is
+    # visible to the user instead of looking like a silent wait. Today
+    # the function was silent until success or the full 60 s budget;
+    # users couldn't distinguish "waiting normally" from "hung."
     if [ "$attempts" -lt "$max_attempts" ]; then
+      if [ $((attempts % 3)) -eq 0 ]; then
+        remote_log "remote: still waiting for hallpass on $machine_id (attempt $attempts of $max_attempts)..."
+      fi
       sleep 5
     fi
   done
