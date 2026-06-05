@@ -61,7 +61,7 @@ def test_empty_plan_does_not_die(leerie):
 
 def test_small_plan_fits_default_cap(leerie):
     """Single subtask, single wave. Models the refactor-remove
-    1-subtask successful run (worker_count ended at 8, default cap 60)."""
+    1-subtask successful run (worker_count ended at 8, default cap 100)."""
     st = _FakeState(worker_count=3)  # classifier + planner ×2
     caps = _default_caps(leerie)
     leerie.check_budget_feasibility(st, caps, _make_subtasks(1), _make_waves(1))
@@ -69,12 +69,12 @@ def test_small_plan_fits_default_cap(leerie):
 
 def test_medium_plan_fits_default_cap(leerie):
     """13 subtasks, 3 waves. Models the feat-please-read-remote
-    successful run (worker_count=37, default cap 60). The preflight
+    successful run (worker_count=37, default cap 100). The preflight
     estimate should be conservative but still under the cap."""
     st = _FakeState(worker_count=4)  # classifier + provision + 2 planners
     caps = _default_caps(leerie)
     # Predicted: 4 + (13*2.5 + 3 + 2 + 1) = 4 + 38.5 = 42.5. ×1.15 = 48.875.
-    # Under 60.
+    # Under 100.
     leerie.check_budget_feasibility(st, caps, _make_subtasks(13), _make_waves(3))
 
 
@@ -84,8 +84,8 @@ def test_medium_plan_fits_default_cap(leerie):
 
 def test_summarizer_scenario_dies(leerie, capsys):
     """29 subtasks, 7 waves, worker_count=8 (the upstream phases on a
-    multi-domain run). With default cap 60 and the default 2.5
-    multiplier, the estimate vastly exceeds the cap. This is the exact
+    multi-domain run). With default cap 100 and the default 2.5
+    multiplier, the estimate exceeds the cap. This is the exact
     scenario that motivated the preflight (run
     `feat-migrate-the-application-code-c65cbe`, 2026-06-03)."""
     st = _FakeState(worker_count=8)  # classifier + provision + 4 planners + reconciler + overlap_judge
@@ -181,7 +181,7 @@ def test_recommended_cap_passes_when_applied(leerie, capsys):
     m = re.search(r"--max-workers (\d+)", err)
     assert m is not None, f"no --max-workers <N> in error: {err!r}"
     recommended = int(m.group(1))
-    # The message includes both the original "vs --max-workers 60" mention
+    # The message includes both the original "vs --max-workers 100" mention
     # and the recommendation. The recommendation should be after "Re-run
     # with". Capture that one specifically.
     m2 = re.search(r"Re-run with --max-workers (\d+)", err)

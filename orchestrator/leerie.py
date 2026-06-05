@@ -92,7 +92,7 @@ MIN_CLAUDE_CLI = (2, 1, 22)
 
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
-    "max_total_workers": 60,        # hard ceiling on claude -p invocations
+    "max_total_workers": 100,       # hard ceiling on claude -p invocations
     # Concurrent workers within a wave. Lowered from 4 to 2 because the
     # subprocess fan-out *inside* each `claude -p` worker (Bash tool, the
     # Task tool's background-job pattern, toolchain children like vitest
