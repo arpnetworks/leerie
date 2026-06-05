@@ -1764,6 +1764,20 @@ catching every documentation drift) is not promoted to a hard guarantee by
 prompt; what *can* be guaranteed (protected paths stayed untouched, the
 worker's structured output is well-formed) is enforced in code.
 
+Within a round, the conformer is expected to invoke each build/lint/test axis
+**exactly once** (with a targeted-falsifier exception when verifying a single
+file's behavior). The orchestrator surfaces an advisory warning when this
+expectation is violated — either the same axis was invoked multiple times in
+one round, or a Bash-tool-auto-backgrounded BLT command was followed by a
+fresh BLT invocation rather than a temp-file `Read` recovery. Both warnings
+are observability, not enforcement: the round still completes and the
+subtask still returns `complete`. The expectation pairs with explicit prompt
+guidance to pass `timeout: 600000` on long-running test/build commands so
+the auto-background trap is avoided in the first place. This is the same
+§12 boundary as the rest of the phase: the discipline is checked
+mechanically (by parsing the per-worker JSONL log), the response is
+advisory.
+
 The same conformer runs once more after every wave has integrated, on
 the staging worktree, with `DIFF_BASE` set to the working branch (§6,
 *Worktree and integration model*, final-tree pass paragraph). The per-subtask passes review each subtask's

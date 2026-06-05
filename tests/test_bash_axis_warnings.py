@@ -358,3 +358,26 @@ def test_only_first_of_two_consecutive_bg_same_axis_is_orphan(
     ])
     assert leerie._count_orphaned_bg_axis(
         log, leerie._BLT_AXIS_RES["test"]) == ["b1"]
+
+
+def test_warning_text_recommends_read_not_bashoutput(leerie, tmp_path):
+    """The retry-after-backgrounded warning must recommend temp-file
+    `Read` for recovery, not `BashOutput shell_id=<id>`. The conformer
+    runs with `--allowedTools ACT_TOOLS`, and `ACT_TOOLS` does not
+    include `BashOutput` — recommending it would tell the worker to
+    call a tool it doesn't have. (Detection of BashOutput as recovery
+    in `_count_orphaned_bg_axis` stays — it's forward-compatible with
+    future tool-surface changes — but the recommendation does not.)"""
+    log = tmp_path / "w-conformer.log"
+    _write_log(log, [
+        _bash_event("a", "npm test 2>&1"),
+        _result_event("a", _bg_text("bxyz")),
+        _bash_event("b", "pnpm test 2>&1"),
+        _result_event("b", _bg_text("bxyz2")),
+    ])
+    warnings: list[str] = []
+    leerie._emit_bash_axis_warnings(log, "conformer round 0", warnings)
+    msg = next(w for w in warnings if "auto-backgrounded" in w)
+    assert "Read file_path" in msg
+    assert "BashOutput" not in msg
+    assert "shell_id" not in msg

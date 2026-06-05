@@ -146,15 +146,16 @@ front and avoid the trap.
 In the rare case a command DOES auto-background (e.g., a repo's
 suite genuinely exceeds 10 min), the Bash tool tells you the output
 file path in its response. Recover the result by **reading that temp
-file** (`Read file_path="<path>"` or `cat <path>`) OR by calling
-`BashOutput shell_id="<id>"` to poll — either is correct. **What is
+file** with `Read file_path="<path>"` (or `cat <path>`) — wait for
+the file to grow if it's still empty, then read again. **What is
 NOT correct: firing a new test/build command in response to the
 backgrounded one** — that leaves the original consuming CPU while
 you start another copy of the same work. If after waiting ~15
-minutes the command is still running, use `KillBash shell_id="<id>"`
-and report the axis as `{ran: true, passed: false, command: "...",
-summary: "timed out after 15 min"}` — a legitimate honest result,
-not a reason to retry.
+minutes the command is still running, kill the process via Bash
+(e.g. `pkill -f vitest` or `kill <PID>` after `ps -ef | grep
+<axis>`) and report the axis as `{ran: true, passed: false, command:
+"<the original command>", summary: "timed out after 15 min"}` — a
+legitimate honest result, not a reason to retry.
 
 Falsification of a specific claim about a specific file is the only
 exception to "exactly once": run a single targeted command (e.g.,

@@ -11887,8 +11887,9 @@ def _emit_bash_axis_warnings(log_path: Path, round_label: str,
                 f"{axis.upper()}_CMD invocation — that is the "
                 "retry-instead-of-recover pattern. Set `timeout: 600000` "
                 "on the original invocation to prevent the background "
-                "trap (conformer.md §4); recover via temp-file `Read` "
-                "or `BashOutput shell_id=<id>` if it still backgrounds.")
+                "trap (conformer.md §4); if it still backgrounds, "
+                "recover by reading the temp output file the Bash tool "
+                "reports (`Read file_path=<path>`).")
 
 
 async def _run_conformance_phase(sid: str, leerie_dir: Path,
