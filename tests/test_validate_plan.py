@@ -231,3 +231,87 @@ def test_requires_in_plan_without_provider_still_dies(leerie, capsys):
     err = capsys.readouterr().err
     assert "requires 'missing-cap'" in err
     assert "nothing provides it" in err
+
+
+# ---- DESIGN §5 *Artifact passing*: protected paths in files_likely_touched ----
+
+
+def test_files_likely_touched_with_leerie_path_dies(leerie, capsys):
+    """The planner must not name `.leerie/` paths in
+    files_likely_touched. The motivating failure: a planner named
+    `.leerie/dashboard-redesign-spec.md` as a deliverable; the
+    implementer wrote the file, the diff scope check rejected it as a
+    protected meta-directory, the run aborted with the work lost.
+    Catching it at validate_plan time gives the planner a corrective
+    retry round and points it at the artifacts channel."""
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            files_likely_touched=[".leerie/dashboard-redesign-spec.md"],
+        ),
+    }
+    with pytest.raises(SystemExit):
+        leerie.validate_plan(plan)
+    err = capsys.readouterr().err
+    assert "feat-001" in err
+    assert ".leerie/dashboard-redesign-spec.md" in err
+    assert "protected" in err.lower()
+    assert "artifacts" in err  # points to the right channel
+
+
+def test_files_likely_touched_with_git_path_dies(leerie, capsys):
+    """The `.git/` prefix is protected for the same reason."""
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            files_likely_touched=[".git/hooks/pre-commit"],
+        ),
+    }
+    with pytest.raises(SystemExit):
+        leerie.validate_plan(plan)
+    err = capsys.readouterr().err
+    assert ".git/hooks/pre-commit" in err
+
+
+def test_files_likely_touched_with_claude_settings_dies(leerie, capsys):
+    """Top-level `.claude/<file>` (settings.json etc.) is protected.
+    The subtrees `.claude/agents/`, `.claude/commands/`, `.claude/skills/`
+    remain exempt."""
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            files_likely_touched=[".claude/settings.json"],
+        ),
+    }
+    with pytest.raises(SystemExit):
+        leerie.validate_plan(plan)
+    err = capsys.readouterr().err
+    assert ".claude/settings.json" in err
+
+
+def test_files_likely_touched_with_claude_agents_passes(leerie):
+    """`.claude/agents/` is a documented Claude Code user-deliverable
+    subtree — explicitly allowed by `is_protected_path`."""
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            files_likely_touched=[".claude/agents/my-agent.md"],
+        ),
+    }
+    leerie.validate_plan(plan)  # no SystemExit
+
+
+def test_files_likely_touched_normal_paths_unaffected(leerie):
+    """Ordinary source paths continue to pass — this check is
+    additive, not a tightening of what the planner can name."""
+    plan = {
+        "feat-001": _good_subtask(
+            "feat-001",
+            files_likely_touched=[
+                "src/foo.ts",
+                "docs/README.md",
+                "tests/test_foo.py",
+            ],
+        ),
+    }
+    leerie.validate_plan(plan)

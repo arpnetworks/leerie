@@ -43,6 +43,36 @@ The subtask spec includes the overall task, the `source_of_truth`, the
 clarification answers, and this subtask's `success_criteria_seed`,
 `depends_on`, `investigation_notes`, and `files_likely_touched`.
 
+## Artifacts from upstream subtasks
+
+When an upstream subtask your work depends on has produced structured
+deliverables (a research spec, a design summary, generated
+parameters), the orchestrator injects those deliverables into your
+prompt under a section titled `## Artifacts from upstream subtasks`.
+Each entry is labelled with the producing subtask id and the
+artifact's name. Treat the content as **part of your specification**
+— it has the same authority as your `success_criteria_seed` and
+`investigation_notes`. The orchestrator is the channel; you do not
+need to read any file under `.leerie/` to obtain upstream artifacts,
+and `.leerie/` remains off-limits to your writes.
+
+## Producing artifacts for downstream subtasks
+
+If your subtask exists specifically to produce a structured
+deliverable for a later subtask to consume — for example, a
+research-only subtask whose output is a redesign spec — return the
+deliverable through the `artifacts` field on your result, not by
+committing a file to the worktree. The schema is an array of
+`{name, kind, content, summary?}` items where `kind` is `markdown`,
+`json`, or `text`. The orchestrator persists each artifact to
+`.leerie/runs/<run-id>/artifacts/<id>.json` and injects it into the
+prompts of subtasks whose predecessor graph names you. A subtask
+whose **only** output is a non-empty `artifacts` array may legitimately
+return `status: "complete"` with no commits — the orchestrator treats
+the artifact as a substitute deliverable and does not require a commit
+in that case. Do not write artifact files to `.leerie/` yourself;
+that directory is protected and any commit touching it is rejected.
+
 ## The loop
 
 ### 1. Write a success-criteria note (informational)
@@ -308,7 +338,8 @@ Return **only** this JSON object as your final message — no prose, no fences:
   "checkpoint_path": null,
   "blocker": null,
   "summary": "What changed and how it was verified, in two or three sentences.",
-  "clarification_question": null
+  "clarification_question": null,
+  "artifacts": []
 }
 ```
 
@@ -322,3 +353,9 @@ Return **only** this JSON object as your final message — no prose, no fences:
 - `needs-clarification` requires both `checkpoint_path` set AND
   `clarification_question` set to `{id, question, why_underivable}` (all
   three string fields non-empty). See §6b for the gate.
+- `artifacts` is optional. Omit or leave empty when your subtask is
+  a normal code change (commits in the worktree are your deliverable).
+  Populate with one or more `{name, kind, content, summary?}` items
+  when your subtask produces structured deliverables for downstream
+  subtasks — see the "Producing artifacts for downstream subtasks"
+  section above for when this applies.

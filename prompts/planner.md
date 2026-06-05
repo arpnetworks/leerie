@@ -243,3 +243,32 @@ Rules:
   an inspected repo, surface it in `investigation_notes` and add a
   `requires` entry with `extent: "external"` naming the owning repo;
   do not emit an implementable subtask for the cross-repo change.
+- `files_likely_touched` is for **production code paths** the implementer
+  will commit to the run branch. Do **not** name protected meta-
+  directories there:
+  - `.leerie/...` (the orchestrator's coordination directory)
+  - `.git/...`
+  - `.claude/<file>` at the top level (settings.json, settings.local.json,
+    or any future per-session state) — `.claude/agents/`,
+    `.claude/commands/`, and `.claude/skills/` ARE allowed as legitimate
+    Claude Code deliverable subtrees.
+
+  `validate_plan` rejects any subtask naming a protected path here, and
+  the implementer's `check_diff_scope` would reject the commit anyway.
+- When a subtask's deliverable is a **coordination artifact** that a later
+  subtask consumes — a research spec, a design summary, generated
+  parameters, anything that should not land on the production branch —
+  do not name an `.leerie/<file>.md` path or any other file location.
+  Instead:
+  1. Give the producer a `provides: ["<tag>"]` capability tag describing
+     the artifact (e.g. `provides: ["dashboard-redesign-spec"]`).
+  2. Give each consumer either `depends_on: ["<producer-id>"]` or a
+     matching `requires: [{tag: "<tag>", extent: "in_plan"}]` entry.
+  3. Trust the orchestrator: it routes the producer's `artifacts` result
+     field into the consumer's prompt under
+     `## Artifacts from upstream subtasks`. No file path is needed.
+
+  A producer whose only deliverable is an artifact may legitimately
+  have an empty `files_likely_touched` — the implementer's `artifacts`
+  result substitutes for a code commit (DESIGN §5 *Artifact passing
+  between subtasks*).

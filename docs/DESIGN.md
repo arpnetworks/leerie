@@ -419,6 +419,48 @@ absorbed into A. This is the same silent-data-loss class the
 per-pair merge-feasibility discipline exists to prevent, applied
 across the chain of absorptions rather than within a single pair.
 
+### Artifact passing between subtasks
+
+Some subtasks produce a structured deliverable that a downstream subtask
+consumes — a research spec that an implementation subtask reads, a
+parameter set that a configuration subtask applies, a design summary that
+a coding subtask follows. Committing such a deliverable to the worktree
+is the wrong shape: it pollutes the merged branch with a coordination
+document users did not ask for, and it relies on the downstream worker
+inferring relevance from the commit history rather than receiving the
+deliverable through a declared contract.
+
+The contract for cross-subtask deliverables is therefore separate from
+the contract for code changes. A producing subtask returns an
+`artifacts` field on its implementer result; the orchestrator persists
+the artifacts to `.leerie/runs/<run-id>/artifacts/<sid>.json` and injects
+them into the prompts of subtasks whose predecessor graph names the
+producer. Code-implementation subtasks emit an absent or empty
+`artifacts` field — the deliverable mechanism does not change for them.
+
+The routing channel is the predecessor graph already used for wave
+ordering. A subtask B receives subtask A's artifacts when either (a) B
+declares `depends_on: ["A"]`, or (b) B declares a `requires` entry whose
+tag matches one of A's `provides`. No separate dependency mechanism is
+needed — the same edges that gate execution also route artifacts. This
+preserves tight-context discipline: a subtask sees only the artifacts of
+its declared upstream, never the run-wide artifact set.
+
+The artifacts directory is owned by the orchestrator. Workers do not
+write there directly — the artifact payload travels through the
+implementer result JSON, and the orchestrator materializes the file. The
+`.leerie/` protected boundary stays intact; the artifacts channel exists
+*instead of* widening that boundary. A producer subtask whose only
+output is artifacts is permitted to return `status: "complete"` with no
+commits — the `check_branch_has_commits` gate treats a non-empty
+`artifacts` field as a deliverable that substitutes for a code commit.
+
+This is the sanctioned channel for cross-subtask coordination data that
+should not land on the production branch. Subtasks that need to share
+production code use the existing worktree/commit/integration model; the
+artifacts channel is for the orthogonal case where the data is
+deliberately ephemeral to the run.
+
 ### Why waves are sequential
 
 Each wave's worktrees are branched from the integrated result of all prior
@@ -1789,12 +1831,13 @@ stored inside it would vanish exactly when a successor worker needs to read it.
 Coordination state must outlive the worktree that produced it.
 
 Coordination state is **per-run**, rooted at `.leerie/runs/<run-id>/`.
-State, plan, criteria, checkpoints, logs, the worktrees themselves, and the
-PR-result sidecar all live under that directory. Two runs in the same
-repository share no coordination state — each has its own subtree, and
-neither can clobber the other's `state.json`, log files, or worktrees by
-collision. The parent `.leerie/` is otherwise empty of run data; it only
-hosts the `runs/` directory.
+State, plan, criteria, checkpoints, logs, the worktrees themselves, the
+PR-result sidecar, and the per-subtask `artifacts/` directory (§5
+*Artifact passing between subtasks*) all live under that directory. Two
+runs in the same repository share no coordination state — each has its
+own subtree, and neither can clobber the other's `state.json`, log
+files, or worktrees by collision. The parent `.leerie/` is otherwise
+empty of run data; it only hosts the `runs/` directory.
 
 ---
 

@@ -994,6 +994,34 @@ SCHEMAS: dict[str, dict] = {
                 },
                 "required": ["id", "question", "why_underivable"],
             },
+            # DESIGN §5 *Artifact passing between subtasks*. Structured
+            # deliverables that downstream subtasks (named by the
+            # predecessor graph) consume — research specs, design
+            # summaries, generated parameters. The orchestrator
+            # materializes the array to
+            # `.leerie/runs/<run-id>/artifacts/<sid>.json` on a
+            # successful `complete` result and injects upstream entries
+            # into the prompts of dependent subtasks. Absent or empty for
+            # pure code-implementation subtasks. A non-empty artifacts
+            # array is a substitute deliverable that lets
+            # `check_branch_has_commits` accept a 'complete' with no
+            # commits (DESIGN §5).
+            "artifacts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["name", "kind", "content"],
+                    "properties": {
+                        "name": {"type": "string"},
+                        "kind": {
+                            "type": "string",
+                            "enum": ["markdown", "json", "text"],
+                        },
+                        "content": {"type": "string"},
+                        "summary": {"type": "string"},
+                    },
+                },
+            },
         },
     },
     "integrator": {
@@ -3705,6 +3733,31 @@ def validate_plan(subtasks: dict) -> None:
             if extent == "in_plan" and tag not in all_provides:
                 errors.append(f"{sid}: requires '{tag}' but nothing provides it — "
                               "dependency is unresolvable and will be silently dropped")
+        # DESIGN §5 *Artifact passing between subtasks*: the planner
+        # must not name protected meta-directories (.leerie/, .git/, or
+        # top-level .claude/) in files_likely_touched. The implementer's
+        # check_diff_scope would reject any commit that touched them,
+        # and the worker can't even `git add` such paths (the worktree
+        # gitignore excludes .leerie/). Catching this at plan-
+        # validation time avoids burning an implementer invocation on
+        # an impossible deliverable and gives the planner a corrective
+        # retry round. For coordination artifacts (research specs,
+        # design summaries) the right channel is the implementer's
+        # `artifacts` result field routed via provides/depends_on.
+        bad_paths = [
+            f for f in (s.get("files_likely_touched") or [])
+            if isinstance(f, str) and is_protected_path(f)
+        ]
+        if bad_paths:
+            errors.append(
+                f"{sid}: files_likely_touched names protected meta-"
+                f"directory path(s) {bad_paths} — implementers cannot "
+                "commit there (.leerie/, .git/, and top-level .claude/ "
+                "are off-limits). For coordination artifacts (research "
+                "specs, design summaries) use the implementer's "
+                "`artifacts` result field with provides/depends_on "
+                "instead of files_likely_touched (DESIGN §5 *Artifact "
+                "passing between subtasks*).")
 
     if errors:
         bullet = "\n".join(f"  • {e}" for e in errors)
@@ -10986,6 +11039,115 @@ def check_budget_feasibility(st: State, caps: dict,
         )
 
 
+def _write_subtask_artifacts(leerie_dir: Path, sid: str,
+                              artifacts: list) -> None:
+    """Persist a subtask's `artifacts` result field to
+    `.leerie/runs/<run-id>/artifacts/<sid>.json` so downstream subtasks
+    can read it. Atomic temp + rename, matching `State.save()`. See
+    DESIGN §5 *Artifact passing between subtasks*.
+
+    The orchestrator owns this directory — workers do not write here
+    directly; the artifact payload travels through the implementer
+    result JSON and the orchestrator materializes the file. Callers
+    must check the artifacts array is non-empty before calling: an
+    empty array is the common code-implementation case and no file
+    should be written for it (a present-but-empty file would
+    misrepresent the subtask as having produced something).
+    """
+    art_dir = leerie_dir / "artifacts"
+    art_dir.mkdir(exist_ok=True)
+    path = art_dir / f"{sid}.json"
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"subtask_id": sid, "artifacts": artifacts},
+                              indent=2))
+    tmp.replace(path)
+
+
+def _read_upstream_artifacts(leerie_dir: Path,
+                              predecessor_ids: list[str]) -> list[dict]:
+    """Read the artifacts files for `predecessor_ids` and return them
+    in input order. Missing files are skipped silently — the common
+    code-implementation predecessor produces no artifacts file and
+    that is not an error. Returns a list of `{subtask_id, artifacts}`
+    dicts, one per predecessor that produced any.
+    """
+    out: list[dict] = []
+    art_dir = leerie_dir / "artifacts"
+    for pid in predecessor_ids:
+        path = art_dir / f"{pid}.json"
+        if not path.exists():
+            continue
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if payload.get("artifacts"):
+            out.append(payload)
+    return out
+
+
+def _format_upstream_artifacts_for_sid(leerie_dir: Path,
+                                        sid: str) -> str | None:
+    """End-to-end helper: load the persisted plan, recompute the
+    predecessor graph, read the artifacts files for `sid`'s
+    predecessors, and render the prompt section. Returns None when
+    there is nothing to inject (no predecessors, no predecessor
+    produced artifacts, plan.json missing or unreadable).
+
+    Re-deriving the graph from disk on every implementer spawn keeps
+    the resume path identical to the fresh-run path — both load the
+    same `plan.json` and run the same `_build_predecessor_graph`.
+    The cost is one small JSON read per implementer; negligible at
+    leerie's worker cadence.
+    """
+    plan_path = leerie_dir / "plan.json"
+    if not plan_path.exists():
+        return None
+    try:
+        plan = json.loads(plan_path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    subtasks = plan.get("subtasks") or {}
+    if not isinstance(subtasks, dict) or sid not in subtasks:
+        return None
+    preds, _, _ = _build_predecessor_graph(subtasks)
+    predecessor_ids = sorted(preds.get(sid, set()))
+    if not predecessor_ids:
+        return None
+    payloads = _read_upstream_artifacts(leerie_dir, predecessor_ids)
+    return _format_upstream_artifacts_section(payloads)
+
+
+def _format_upstream_artifacts_section(payloads: list[dict]) -> str | None:
+    """Render upstream artifact payloads as a prompt section, or None
+    if there is nothing to render. Inlines `content` verbatim — see
+    DESIGN §5 *Artifact passing between subtasks* on tight-context
+    discipline: a subtask only ever sees artifacts from its declared
+    predecessors, never the run-wide artifact set.
+    """
+    if not payloads:
+        return None
+    lines = ["## Artifacts from upstream subtasks",
+             "",
+             "The subtasks listed below produced structured deliverables "
+             "you are expected to consume. Treat each artifact's content "
+             "as part of your specification for this subtask."]
+    for payload in payloads:
+        pid = payload.get("subtask_id", "?")
+        for art in payload.get("artifacts", []):
+            name = art.get("name", "")
+            kind = art.get("kind", "text")
+            summary = art.get("summary", "").strip()
+            content = art.get("content", "")
+            lines.append("")
+            lines.append(f"### {pid} — {name} ({kind})")
+            if summary:
+                lines.append(summary)
+                lines.append("")
+            lines.append(content)
+    return "\n".join(lines)
+
+
 def write_plan(leerie_dir: Path, task: str, st: State,
                subtasks: dict, waves: list[list[str]]) -> None:
     """Persist the merged plan and per-subtask spec files the implementers read."""
@@ -11117,6 +11279,16 @@ async def run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
         audience="implementer")
     if recipe_section is not None:
         up.append(recipe_section)
+    # DESIGN §5 *Artifact passing between subtasks*: inject the
+    # artifacts produced by this subtask's predecessors. The
+    # predecessor graph is the same one the scheduler uses for wave
+    # ordering — `depends_on` + `requires`-derived edges. The plan
+    # lives on disk in `plan.json`; we re-derive the graph there
+    # rather than rely on in-memory state so resume works the same as
+    # a fresh run.
+    artifacts_section = _format_upstream_artifacts_for_sid(leerie_dir, sid)
+    if artifacts_section is not None:
+        up.append(artifacts_section)
     if continuation:
         up.append(f"This is a CONTINUATION. Read the checkpoint at "
                   f"{leerie_dir}/checkpoints/{sid}.md, validate it against the "
@@ -11857,11 +12029,20 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         st.save()
 
         if status == "complete":
+            # DESIGN §5 *Artifact passing between subtasks*: a non-empty
+            # `artifacts` array is a substitute deliverable that lets a
+            # research-style subtask pass the commit-presence gate
+            # without committing code. The orchestrator persists the
+            # artifacts on the success path below; the
+            # commit/dirty/scope checks below stay as written for the
+            # code-implementation case (empty artifacts) and for the
+            # mixed case (some commits and some artifacts).
+            has_artifacts = bool(res.get("artifacts"))
             # a 'complete' claim with no commits is a retryable mistake —
             # the worker may genuinely have work to commit and just forgot
             commit_err = await check_branch_has_commits(
                 sid, worktree, compute_run_branch(st.run_id))
-            if commit_err:
+            if commit_err and not has_artifacts:
                 kind, message = commit_err
                 log(f"  branch check failed for {sid}: {message}")
                 done = await fail(kind, message)
@@ -11889,6 +12070,15 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 if done is not None:
                     return done
                 continue
+
+            # DESIGN §5 *Artifact passing between subtasks*: persist
+            # structured deliverables for downstream subtasks. The
+            # orchestrator owns the artifacts directory — workers do
+            # not write there directly. Atomic write (temp +
+            # os.replace) keeps a partial file from ever appearing if
+            # the orchestrator dies mid-flush.
+            if has_artifacts:
+                _write_subtask_artifacts(leerie_dir, sid, res["artifacts"])
 
             # DESIGN §9 *Post-work conformance*: advisory phase. Runs only on
             # the success path (every check above has passed), never produces

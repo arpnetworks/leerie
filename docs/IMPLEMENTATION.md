@@ -1844,6 +1844,7 @@ permissive same-file-different-surface class).
 | every `depends_on` id exists | dangling edges silently dropped by the scheduler |
 | every `requires` entry is an object `{tag, extent, reason?}`; `extent ∈ {in_plan, external}`; `reason` non-empty when `extent: external` | malformed planner output (caught at JSON-schema validation in `claude_p`; this row is the post-merge defensive re-check) |
 | every `requires` entry with `extent: in_plan` has a provider in some subtask's `provides` | unresolvable cross-domain dependency (only `in_plan` is checked; `external` entries are explicitly out-of-graph by planner declaration) |
+| no `files_likely_touched` entry matches `is_protected_path()` (`.leerie/`, `.git/`, or top-level `.claude/` outside the deliverable subtrees) | planner named a protected meta-directory as an implementer deliverable — the implementer would either fail `check_diff_scope` mid-run or work around the gitignore and still be rejected. Catching this at plan-validation time gives the planner a corrective-retry round instead of burning an implementer invocation. For coordination artifacts (research specs, design summaries) the planner should use `provides`/`depends_on` and the implementer's `artifacts` result field — see DESIGN §5 *Artifact passing between subtasks* — not `files_likely_touched`. |
 
 `warn_cross_planner_file_overlap()` runs immediately after
 `phase_reconcile` (before `validate_plan` and the scheduler) and **logs a
@@ -1883,7 +1884,7 @@ sees both messages and re-frames the task.
 |-------|---------|-----------|
 | `validate_result()` — `incomplete-handoff` with missing checkpoint file | session-limit no-op; `--max-turns` with no checkpoint written | **Retryable** (`failure_kind="empty_handoff"`) |
 | `validate_result()` — other cross-field invariants | `handoff` with null `checkpoint_path`; `blocked` with no blocker; `failed` with no summary; `needs-clarification` with no `clarification_question` / invalid `checkpoint_path` | **Terminal** (`failure_kind="broken"`) |
-| `check_branch_has_commits()` | `complete` claim, nothing committed | **Retryable** |
+| `check_branch_has_commits()` | `complete` claim, nothing committed *and* no `artifacts` returned. A non-empty `artifacts` array on the result is a substitute deliverable (DESIGN §5 *Artifact passing between subtasks*) — research-style subtasks whose only output is structured data for downstream subtasks pass this gate without commits. | **Retryable** |
 | dirty worktree check | uncommitted changes that vanish on integration | **Retryable** |
 | `check_diff_scope()` | `.leerie/` or `.git/` in the diff; any `.claude/` path *except* `.claude/agents/`, `.claude/commands/`, `.claude/skills/` (the documented Claude Code user-deliverable subtrees — implementers may write a subagent/command/skill file there as a legitimate deliverable, but never `settings.json` or any top-level `.claude/` file) | **Terminal** (protected path); scope-volume warning is non-fatal (triggered when `files_likely_touched` is non-empty *and* touched > max(3× expected, 5), or when touched > 15 regardless of the planner's estimate) |
 | `validate_checkpoint()` — on `incomplete-handoff` | required section missing; required section empty/whitespace; required section contains only a placeholder token (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing `.`/`!`/`?`/`…` ignored and repeated `?` collapsed); a path listed under `## Files touched` no longer exists in the worktree and is not flagged `[deleted]` | returns `blocked` |
@@ -3490,6 +3491,17 @@ coordination state.
         ├── plan.json                merged planner output
         ├── subtasks/<id>.json       per-subtask spec handed to each implementer
         ├── criteria/<id>.md         informational success-criteria notes (DESIGN §9)
+        ├── artifacts/<id>.json      structured deliverables returned by an
+        │                            implementer's `artifacts` result field
+        │                            (DESIGN §5 *Artifact passing between
+        │                            subtasks*). Orchestrator-owned: written
+        │                            by `settle_subtask` on a successful
+        │                            `complete` result with non-empty
+        │                            `artifacts`, read by `run_implementer`
+        │                            to inject upstream deliverables into the
+        │                            prompts of subtasks whose predecessor
+        │                            graph names this subtask. Absent for
+        │                            code-implementation subtasks.
         ├── checkpoints/<id>.md      handoff checkpoints (7-section schema)
         ├── logs/<sid>.log           per-worker raw stream-json event log (one file
         │                            per claude_p invocation by sid; always written
@@ -3739,10 +3751,15 @@ type. Required fields, current shape:
   required to carry `checkpoint_path` as well so the work-in-progress
   survives the question to the user; orchestrator surfaces the question
   through the same interactive/non-interactive paths used by the
-  Phase-1 classifier). The criteria file is informational per DESIGN
-  §9; `criteria_results` is recorded for telemetry but does not gate
-  the subtask. The retired `criteria_revision_proposal` field is no
-  longer in the schema.
+  Phase-1 classifier), `artifacts` (DESIGN §5 *Artifact passing between
+  subtasks*: array of `{name (required string), kind (required enum
+  "markdown" | "json" | "text"), content (required string),
+  summary (optional string)}` — structured deliverables for downstream
+  subtasks whose predecessor graph names this subtask; absent or empty
+  for code-implementation subtasks). The criteria file is informational
+  per DESIGN §9; `criteria_results` is recorded for telemetry but does
+  not gate the subtask. The retired `criteria_revision_proposal` field
+  is no longer in the schema.
 - **integrator** — required: `incoming_subtask`, `status` (`resolved` /
   `design-conflict` / `failed`). Optional: `resolution_summary`,
   `diagnosis` (read as a fallback for `resolution_summary` when
