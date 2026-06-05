@@ -4,11 +4,16 @@ Verifies that each chain verb dispatches correctly to the leerie-chain HTTP API
 (curl stubbed) and that --runs/--target are NOT in _value_flags.
 
 Verbs under test:
-  --chain-submit   POST /chains with --runs and --target
+  --chain-submit   POST /chains with --runs / --wave-{a,b}-runs and --target
   --chain-status   GET  /chains/<id>
   --list-chains    GET  /chains
   --chain-kill     DELETE /chains/<id>
   --chain-attach   GET  /chains/<id>/log
+
+The --chain-submit launcher reads each prompt-file path it receives and
+sends the file's contents (one {prompt, wave} object per file) in the
+JSON body — these tests create real prompt files in tmp_path and pass
+their absolute paths to --runs/--wave-*-runs.
 """
 from __future__ import annotations
 
@@ -32,6 +37,18 @@ def _stub_curl(tmp_path: Path, response: str = '{"ok":true}', rc: int = 0) -> Pa
     )
     fake.chmod(0o755)
     return fake
+
+
+def _write_prompts(tmp_path: Path, names: list[str]) -> str:
+    """Create one prompt file per name under tmp_path and return them
+    as a comma-separated absolute-path string suitable for --runs."""
+    paths: list[str] = []
+    for n in names:
+        p = tmp_path / n
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"prompt content for {n}")
+        paths.append(str(p))
+    return ",".join(paths)
 
 
 def _run_launcher(tmp_path: Path, args: list[str],
@@ -70,9 +87,10 @@ def _curl_invocations(tmp_path: Path) -> str:
 
 def test_chain_submit_posts_to_chains_endpoint(tmp_path: Path):
     """--chain-submit posts to /chains with the correct method and endpoint."""
+    runs = _write_prompts(tmp_path, ["prompts/run-1.txt", "prompts/run-2.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--runs", "prompts/run-1.txt,prompts/run-2.txt",
+        "--runs", runs,
         "--target", "/tmp/my-repo",
     ])
     assert result.returncode == 0, result.stderr
@@ -82,25 +100,27 @@ def test_chain_submit_posts_to_chains_endpoint(tmp_path: Path):
     assert "http://test-chain.internal" in invoc
 
 
-def test_chain_submit_includes_runs_in_payload(tmp_path: Path):
-    """--chain-submit includes the --runs value in the JSON payload."""
+def test_chain_submit_includes_prompts_in_payload(tmp_path: Path):
+    """--chain-submit reads each prompt file and sends its contents."""
+    runs = _write_prompts(tmp_path, ["a.txt", "b.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--runs", "a.txt,b.txt",
+        "--runs", runs,
         "--target", "/tmp/repo",
     ])
     assert result.returncode == 0, result.stderr
     invoc = _curl_invocations(tmp_path)
-    # The JSON body is passed via -d; it should contain the run filenames.
-    assert "a.txt" in invoc
-    assert "b.txt" in invoc
+    # The JSON body is passed via -d; it should contain each file's contents.
+    assert "prompt content for a.txt" in invoc
+    assert "prompt content for b.txt" in invoc
 
 
 def test_chain_submit_includes_target_in_payload(tmp_path: Path):
     """--chain-submit includes the --target path in the JSON payload."""
+    runs = _write_prompts(tmp_path, ["run.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--runs", "run.txt",
+        "--runs", runs,
         "--target", "/my/special/repo",
     ])
     assert result.returncode == 0, result.stderr
@@ -108,17 +128,87 @@ def test_chain_submit_includes_target_in_payload(tmp_path: Path):
     assert "/my/special/repo" in invoc
 
 
+def test_chain_submit_legacy_runs_designates_wave_a(tmp_path: Path):
+    """--runs (legacy alias) makes every prompt a Wave A run."""
+    runs = _write_prompts(tmp_path, ["legacy.txt"])
+    result = _run_launcher(tmp_path, [
+        "--chain-submit",
+        "--runs", runs,
+        "--target", "/tmp/repo",
+    ])
+    assert result.returncode == 0, result.stderr
+    invoc = _curl_invocations(tmp_path)
+    assert '"wave": "a"' in invoc
+    assert '"wave": "b"' not in invoc
+
+
+def test_chain_submit_wave_a_and_b_split(tmp_path: Path):
+    """--wave-a-runs and --wave-b-runs designate runs per wave."""
+    a_paths = _write_prompts(tmp_path, ["wave_a/p1.txt", "wave_a/p2.txt"])
+    b_paths = _write_prompts(tmp_path, ["wave_b/p3.txt"])
+    result = _run_launcher(tmp_path, [
+        "--chain-submit",
+        "--wave-a-runs", a_paths,
+        "--wave-b-runs", b_paths,
+        "--target", "/tmp/repo",
+    ])
+    assert result.returncode == 0, result.stderr
+    invoc = _curl_invocations(tmp_path)
+    assert '"wave": "a"' in invoc
+    assert '"wave": "b"' in invoc
+    assert "prompt content for wave_a/p1.txt" in invoc
+    assert "prompt content for wave_b/p3.txt" in invoc
+
+
+def test_chain_submit_runs_and_wave_a_runs_are_mutually_exclusive(tmp_path: Path):
+    """--runs and --wave-a-runs together is an error (both mean wave A)."""
+    a = _write_prompts(tmp_path, ["a.txt"])
+    b = _write_prompts(tmp_path, ["b.txt"])
+    result = _run_launcher(tmp_path, [
+        "--chain-submit",
+        "--runs", a,
+        "--wave-a-runs", b,
+    ])
+    assert result.returncode != 0
+    assert "mutually exclusive" in result.stderr
+
+
+def test_chain_submit_missing_prompt_file_errors(tmp_path: Path):
+    """A --runs path that does not exist is a hard error, not a silent drop."""
+    result = _run_launcher(tmp_path, [
+        "--chain-submit",
+        "--runs", str(tmp_path / "does-not-exist.txt"),
+        "--target", "/tmp/repo",
+    ])
+    assert result.returncode != 0
+    assert "cannot read prompt file" in result.stderr
+
+
+def test_chain_submit_empty_prompt_file_errors(tmp_path: Path):
+    """An empty prompt file is rejected — an empty task is never the user's intent."""
+    empty = tmp_path / "empty.txt"
+    empty.write_text("")
+    result = _run_launcher(tmp_path, [
+        "--chain-submit",
+        "--runs", str(empty),
+        "--target", "/tmp/repo",
+    ])
+    assert result.returncode != 0
+    assert "empty" in result.stderr
+
+
 def test_chain_submit_requires_runs(tmp_path: Path):
-    """--chain-submit without --runs exits non-zero with an error."""
+    """--chain-submit without --runs/--wave-*-runs exits non-zero with an error."""
     result = _run_launcher(tmp_path, ["--chain-submit", "--target", "/tmp/repo"])
     assert result.returncode != 0
-    assert "--runs" in result.stderr
+    assert "--runs" in result.stderr or "wave" in result.stderr.lower()
 
 
 def test_chain_submit_target_optional(tmp_path: Path):
     """--chain-submit without --target succeeds (target defaults to USER_REPO)."""
+    runs = _write_prompts(tmp_path, ["run.txt"])
     result = _run_launcher(tmp_path, [
-        "--chain-submit", "--runs", "run.txt",
+        "--chain-submit", "--runs", runs,
     ])
     assert result.returncode == 0, result.stderr
     invoc = _curl_invocations(tmp_path)
@@ -128,8 +218,9 @@ def test_chain_submit_target_optional(tmp_path: Path):
 
 def test_chain_submit_rejects_unknown_flags(tmp_path: Path):
     """--chain-submit rejects unknown flags."""
+    runs = _write_prompts(tmp_path, ["a.txt"])
     result = _run_launcher(tmp_path, [
-        "--chain-submit", "--runs", "a.txt", "--bogus",
+        "--chain-submit", "--runs", runs, "--bogus",
     ])
     assert result.returncode != 0
 

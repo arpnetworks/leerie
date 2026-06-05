@@ -116,6 +116,15 @@ def _get(url: str) -> tuple[int, dict]:
         return exc.code, json.loads(exc.read())
 
 
+def _delete(url: str) -> tuple[int, dict]:
+    req = urllib.request.Request(url, method="DELETE")
+    try:
+        with urllib.request.urlopen(req) as resp:
+            return resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
 def _post_webhook(base_url: str, payload: Any, secret: str = _SECRET) -> tuple[int, dict]:
     body = json.dumps(payload).encode()
     sig = _sign(secret, body)
@@ -547,6 +556,319 @@ class TestWebhookFly:
 
 
 # ---------------------------------------------------------------------------
+# GET /chains  (list)
+# ---------------------------------------------------------------------------
+
+class TestListChains:
+    def test_empty_db_returns_empty_list(self, server_url: str) -> None:
+        status, body = _get(f"{server_url}/chains")
+        assert status == 200
+        assert body == {"chains": []}
+
+    def test_lists_all_chains(self, server_url: str, cs: ChainState) -> None:
+        c1 = cs.create_chain(
+            target="https://github.com/org/r1",
+            run_prompts=[("A", "a")],
+        )
+        c2 = cs.create_chain(
+            target="https://github.com/org/r2",
+            run_prompts=[("B", "a")],
+        )
+        status, body = _get(f"{server_url}/chains")
+        assert status == 200
+        ids = {c["id"] for c in body["chains"]}
+        assert ids == {c1, c2}
+
+    def test_list_does_not_include_runs(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        """The list endpoint is a summary; per-chain runs live behind GET /chains/<id>."""
+        cs.create_chain(
+            target="https://github.com/org/r",
+            run_prompts=[("A", "a"), ("B", "b")],
+        )
+        _, body = _get(f"{server_url}/chains")
+        for c in body["chains"]:
+            assert "runs" not in c
+
+
+# ---------------------------------------------------------------------------
+# GET /chains/<id>/log  (event history)
+# ---------------------------------------------------------------------------
+
+class TestGetChainLog:
+    def test_returns_event_history(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        chain_id = cs.create_chain(
+            target="https://github.com/org/r",
+            run_prompts=[("Task A", "a"), ("Task B", "b")],
+        )
+        status, body = _get(f"{server_url}/chains/{chain_id}/log")
+        assert status == 200
+        assert body["chain_id"] == chain_id
+        # Three events: one chain-level + one per run.
+        kinds = [e["kind"] for e in body["events"]]
+        assert kinds.count("chain") == 1
+        assert kinds.count("run") == 2
+
+    def test_events_include_machine_id_after_transition(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        chain_id = cs.create_chain(
+            target="https://github.com/org/r",
+            run_prompts=[("Task", "a")],
+        )
+        snap = cs.load_chain(chain_id)
+        assert snap is not None
+        cs.transition_run(snap["runs"][0]["id"], "running", machine_id="m-abc")
+
+        _, body = _get(f"{server_url}/chains/{chain_id}/log")
+        run_events = [e for e in body["events"] if e["kind"] == "run"]
+        assert len(run_events) == 1
+        assert run_events[0]["machine_id"] == "m-abc"
+        assert run_events[0]["status"] == "running"
+
+    def test_missing_chain_returns_404(self, server_url: str) -> None:
+        status, _ = _get(f"{server_url}/chains/nonexistent-id/log")
+        assert status == 404
+
+
+# ---------------------------------------------------------------------------
+# DELETE /chains/<id>  (cancel)
+# ---------------------------------------------------------------------------
+
+class TestDeleteChain:
+    def test_cancels_chain_and_returns_snapshot(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        chain_id = cs.create_chain(
+            target="https://github.com/org/r",
+            run_prompts=[("Task", "a")],
+        )
+        with patch("chain.server.fly_client.destroy_machine"):
+            status, body = _delete(f"{server_url}/chains/{chain_id}")
+        assert status == 200
+        assert body["chain"]["id"] == chain_id
+        assert body["chain"]["status"] == "cancelled"
+
+    def test_destroys_running_machines(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        chain_id = cs.create_chain(
+            target="https://github.com/org/r",
+            run_prompts=[("A1", "a"), ("A2", "a"), ("B1", "b")],
+        )
+        snap = cs.load_chain(chain_id)
+        assert snap is not None
+        running_machines = ["m-running-1", "m-running-2"]
+        for run, mid in zip(
+            [r for r in snap["runs"] if r["wave"] == "a"],
+            running_machines,
+        ):
+            cs.transition_run(run["id"], "running", machine_id=mid)
+
+        destroyed: list[str] = []
+
+        def fake_destroy(machine_id: str) -> None:
+            destroyed.append(machine_id)
+
+        with patch("chain.server.fly_client.destroy_machine", side_effect=fake_destroy):
+            status, body = _delete(f"{server_url}/chains/{chain_id}")
+        assert status == 200
+        assert set(destroyed) == set(running_machines)
+
+    def test_skips_non_running_runs(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        """Queued and already-done runs do not trigger destroy_machine calls."""
+        chain_id = cs.create_chain(
+            target="https://github.com/org/r",
+            run_prompts=[("A", "a"), ("B", "a")],
+        )
+        snap = cs.load_chain(chain_id)
+        assert snap is not None
+        # One run is done, one is still queued — neither should be destroyed.
+        cs.transition_run(snap["runs"][0]["id"], "done", machine_id="m-done")
+
+        destroyed: list[str] = []
+        with patch(
+            "chain.server.fly_client.destroy_machine",
+            side_effect=lambda m: destroyed.append(m),
+        ):
+            status, _ = _delete(f"{server_url}/chains/{chain_id}")
+        assert status == 200
+        assert destroyed == []
+
+    def test_marks_running_runs_failed(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        """Cancelling transitions still-running runs to 'failed' in the DB."""
+        chain_id = cs.create_chain(
+            target="https://github.com/org/r",
+            run_prompts=[("A", "a")],
+        )
+        snap = cs.load_chain(chain_id)
+        assert snap is not None
+        cs.transition_run(snap["runs"][0]["id"], "running", machine_id="m-x")
+
+        with patch("chain.server.fly_client.destroy_machine"):
+            _delete(f"{server_url}/chains/{chain_id}")
+
+        updated = cs.load_chain(chain_id)
+        assert updated is not None
+        assert updated["runs"][0]["status"] == "failed"
+        assert updated["status"] == "cancelled"
+
+    def test_missing_chain_returns_404(self, server_url: str) -> None:
+        status, _ = _delete(f"{server_url}/chains/nonexistent-id")
+        assert status == 404
+
+    def test_destroy_error_is_reported_as_warning(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        """If destroy_machine raises, DB state is still consistent and the
+        warning is surfaced — the caller may retry the DELETE."""
+        from chain import fly_client as _fc
+
+        chain_id = cs.create_chain(
+            target="https://github.com/org/r",
+            run_prompts=[("A", "a")],
+        )
+        snap = cs.load_chain(chain_id)
+        assert snap is not None
+        cs.transition_run(snap["runs"][0]["id"], "running", machine_id="m-bad")
+
+        with patch(
+            "chain.server.fly_client.destroy_machine",
+            side_effect=_fc.FlyClientError("nope"),
+        ):
+            status, body = _delete(f"{server_url}/chains/{chain_id}")
+        assert status == 200
+        assert body["chain"]["status"] == "cancelled"
+        assert "warnings" in body
+        assert any("nope" in w for w in body["warnings"])
+
+    def test_idempotent_on_already_cancelled_chain(
+        self, server_url: str, cs: ChainState
+    ) -> None:
+        chain_id = cs.create_chain(
+            target="https://github.com/org/r",
+            run_prompts=[("A", "a")],
+        )
+        with patch("chain.server.fly_client.destroy_machine"):
+            _delete(f"{server_url}/chains/{chain_id}")
+            # Assert the chain is already cancelled BEFORE the second
+            # DELETE — without this, the final-state assertion below
+            # would also pass if a buggy DELETE toggled the chain
+            # through an intermediate state and back to cancelled.
+            mid = cs.load_chain(chain_id)
+            assert mid is not None and mid["status"] == "cancelled"
+            status, body = _delete(f"{server_url}/chains/{chain_id}")
+        assert status == 200
+        assert body["chain"]["status"] == "cancelled"
+
+
+# ---------------------------------------------------------------------------
+# Launcher-server coupling: every URL the launcher hits must be a real route
+# ---------------------------------------------------------------------------
+
+class TestLauncherServerCoupling:
+    """Bridge the launcher and the server: every (method, path) the bash
+    launcher invokes via curl must land on a handler in chain/server.py.
+
+    The bug class this prevents: launcher tests stub curl (so they happily
+    pass with any URL) and server tests don't drive the missing endpoints
+    (so the gap stays invisible). One coupling test closes the loop —
+    same pattern as ``tests/test_retry_policy_strings.py`` which couples
+    retry-policy markers to their check-function strings.
+    """
+
+    def test_every_launcher_curl_call_hits_a_real_route(
+        self, server_url: str
+    ) -> None:
+        import re
+        from pathlib import Path as _Path
+
+        launcher = _Path(__file__).resolve().parent.parent / "leerie"
+        # Collapse bash line-continuations so multi-line curl calls
+        # (POST /chains uses several backslash-continued lines) appear as
+        # one logical line to the regex.
+        text = launcher.read_text().replace("\\\n", " ")
+
+        # Grep for curl invocations in the chain-verb fast-paths. The
+        # pattern matches the lines actually present in the launcher
+        # (optional -X METHOD, then the URL with $_chain_url and a fixed path).
+        # We allow $_chain_id / $_ck_chain_id / $_ca_chain_id placeholders.
+        invocations: list[tuple[str, str]] = []
+        for m in re.finditer(
+            r'curl\s+-fsSL\s+(?:-X\s+(POST|DELETE|GET)\s+)?'
+            r'[^\n]*?"\$_chain_url(/[^"\s]+)"',
+            text,
+            flags=re.DOTALL,
+        ):
+            method = m.group(1) or "GET"
+            path = m.group(2)
+            # Substitute live placeholders with literals so we can drive
+            # the real server. The placeholders only appear in path
+            # segments (chain ids), not in the route prefix.
+            path = re.sub(r"\$_chain_id|\$_ck_chain_id|\$_ca_chain_id",
+                          "coupling-probe", path)
+            invocations.append((method, path))
+
+        assert invocations, "no curl invocations parsed from launcher"
+        # Every chain verb must be represented.
+        verbs_seen = {(m, p) for m, p in invocations}
+        assert ("POST", "/chains") in verbs_seen, "missing POST /chains"
+        assert ("GET", "/chains") in verbs_seen, "missing GET /chains (--list-chains)"
+        assert ("DELETE", "/chains/coupling-probe") in verbs_seen, (
+            "missing DELETE /chains/<id> (--chain-kill)"
+        )
+        assert ("GET", "/chains/coupling-probe/log") in verbs_seen, (
+            "missing GET /chains/<id>/log (--chain-attach)"
+        )
+
+        # For each (method, path), confirm the server's route exists.
+        # Distinguish two kinds of 404:
+        #   - "no such route"  → {"error": "not found: <path>"}   (real failure)
+        #   - "chain id missing" → {"error": "chain 'X' not found"} (route is fine)
+        # A 405 also signals a missing handler method.
+        for method, path in invocations:
+            url = f"{server_url}{path}"
+            req_kwargs: dict[str, Any] = {"method": method}
+            if method == "POST":
+                # POST /chains expects a body. Drive a 400 (invalid body)
+                # not a 404 (route missing) — the test only cares about
+                # routing, not validation.
+                req_kwargs["data"] = b"{}"
+                req_kwargs["headers"] = {
+                    "Content-Type": "application/json",
+                    "Content-Length": "2",
+                }
+            req = urllib.request.Request(url, **req_kwargs)
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    status = resp.status
+                    body = json.loads(resp.read())
+            except urllib.error.HTTPError as exc:
+                status = exc.code
+                try:
+                    body = json.loads(exc.read())
+                except (ValueError, json.JSONDecodeError):
+                    body = {}
+            assert status != 405, (
+                f"launcher route {method} {path}: server has no handler "
+                f"for this HTTP method (405)"
+            )
+            if status == 404:
+                err = (body or {}).get("error", "")
+                assert err.startswith("chain "), (
+                    f"launcher route {method} {path}: server returned a "
+                    f"'no such route' 404 ({err!r}) — the route is missing"
+                )
+
+
+# ---------------------------------------------------------------------------
 # Unknown routes
 # ---------------------------------------------------------------------------
 
@@ -557,4 +879,8 @@ class TestRouting:
 
     def test_unknown_post_returns_404(self, server_url: str) -> None:
         status, _ = _post(f"{server_url}/unknown/path", {})
+        assert status == 404
+
+    def test_unknown_delete_returns_404(self, server_url: str) -> None:
+        status, _ = _delete(f"{server_url}/unknown/path")
         assert status == 404

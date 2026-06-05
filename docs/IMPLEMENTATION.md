@@ -844,8 +844,18 @@ export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
 # they never start a container and do not forward to the Python orchestrator.
 # LEERIE_CHAIN_URL sets the API base URL (default: http://localhost:8080).
 
-# Submit a new chain. --runs is a comma-separated list of prompt-file paths;
+# Submit a new chain. --wave-a-runs and --wave-b-runs each take a comma-
+# separated list of prompt-file paths. Wave A runs execute in parallel
+# against the repo's current state; Wave B runs execute against the
+# accumulated Wave A results (a stage-<chain-id> branch).
 # --target is the repo path (defaults to $USER_REPO or $PWD).
+leerie --chain-submit \
+  --wave-a-runs prompts/fetch.txt,prompts/lint.txt \
+  --wave-b-runs prompts/publish.txt \
+  --target ~/src/myrepo
+
+# Legacy alias: --runs is equivalent to --wave-a-runs (Wave A only).
+# Use this shape for chains with no Wave B consumers.
 leerie --chain-submit --runs prompts/run-1.txt,prompts/run-2.txt --target ~/src/myrepo
 
 # Check status of a chain. Prints the JSON response from GET /chains/<id>.
@@ -1677,15 +1687,25 @@ container.
 
 | Verb | Flags | API call |
 |------|-------|----------|
-| `leerie --chain-submit` | `--runs <files>` (required), `--target <repo>` (optional, defaults to `$USER_REPO` or `$PWD`) | `POST /chains` — body is `{"runs": [...], "target": "..."}` built with `python3 -c '...'` |
+| `leerie --chain-submit` | one or more of `--wave-a-runs <files>`, `--wave-b-runs <files>`; legacy alias `--runs <files>` = Wave A only; `--target <repo>` (optional, defaults to `$USER_REPO` or `$PWD`) | `POST /chains` — body is `{"runs": [{"prompt": ..., "wave": "a" \| "b"}, ...], "target": "..."}` built with `python3 -c '...'`. Each `--runs`/`--wave-*-runs` value is a comma-separated list of *prompt file paths*; the launcher reads each file and sends its contents as the prompt (DESIGN.md §19 *Wave A and Wave B sequencing*). |
 | `leerie --chain-status <chain-id>` | positional `<chain-id>` | `GET /chains/<chain-id>` |
-| `leerie --list-chains` | none | `GET /chains` |
-| `leerie --chain-kill <chain-id>` | positional `<chain-id>` | `DELETE /chains/<chain-id>` |
-| `leerie --chain-attach <chain-id>` | positional `<chain-id>` | `GET /chains/<chain-id>/log` (streaming) |
+| `leerie --list-chains` | none | `GET /chains` — returns `{"chains": [...]}` (summary rows; no run details) |
+| `leerie --chain-kill <chain-id>` | positional `<chain-id>` | `DELETE /chains/<chain-id>` — server destroys every still-running per-run Fly machine via `fly_client.destroy_machine`, transitions the chain to `'cancelled'`, returns `{"chain": <snapshot>}` (or `{"chain": ..., "warnings": [...]}` on partial Fly-side failure). Idempotent on already-terminal chains. |
+| `leerie --chain-attach <chain-id>` | positional `<chain-id>` | `GET /chains/<chain-id>/log` — returns `{"chain_id": ..., "events": [...]}`. First-cut: latest event per run plus one chain-level entry, ordered by `updated_at`. Not a true stream — true streaming needs a per-chain log file the current data model does not maintain. |
 
 All five verbs exit non-zero on missing required args or when a positional
 argument looks like a flag (starts with `--`). `--chain-submit` exits non-zero
-when `--runs` is omitted or an unrecognised flag is passed.
+when none of `--runs`/`--wave-a-runs`/`--wave-b-runs` are passed, when
+`--runs` and `--wave-a-runs` are both passed (mutually exclusive — both mean
+Wave A), when a referenced prompt file does not exist or is empty, or when
+an unrecognised flag is passed.
+
+The launcher/server route contract is enforced mechanically by
+`tests/test_chain_server.py::TestLauncherServerCoupling` — it greps every
+`curl … $_chain_url/<path>` invocation out of the launcher and confirms each
+hits a real handler in `chain/server.py`. Drift on either side (launcher
+adds a verb without a server route, server removes a route still called by
+the launcher) trips the test.
 
 #### `LEERIE_CHAIN_URL`
 
@@ -1716,7 +1736,7 @@ directory:
 |--------|---------|
 | `GH_DISPATCH_PAT` | GitHub Personal Access Token scoped to the target repository. Used by leerie-chain to clone the repo, create branches, and open PRs via `gh`. |
 | `FLY_API_TOKEN` | Fly API token scoped to the user's org. Used by leerie-chain to launch per-run Fly machines via the Machines API. |
-| `FLY_WEBHOOK_SIGNING_SECRET` | Signing secret registered with Fly's webhook delivery. leerie-chain verifies every incoming `POST /webhooks/fly` request against this secret before acting on the payload. |
+| `CHAIN_WEBHOOK_SECRET` | Signing secret registered with Fly's webhook delivery. leerie-chain verifies every incoming `POST /webhooks/fly` request against this secret before acting on the payload. |
 
 These are not `LEERIE_*` environment variables consumed by the launcher or
 the core orchestrator — they are Fly app secrets consumed by `leerie-chain`
@@ -3671,12 +3691,19 @@ preflight, alongside `--kill` / `--stop`), never forwarded to the Python
 orchestrator, and never start a container. `LEERIE_CHAIN_URL` sets the
 base URL (default: `http://localhost:8080`).
 
-- **`leerie --chain-submit --runs <files> [--target <repo>]`** — POST
-  `/chains`. `--runs` accepts a comma-separated list of prompt-file paths;
-  `--target` is the repo path (defaults to `$USER_REPO` or `$PWD`). The
-  launcher converts the values to a JSON body via `python3 -c '...'` and
-  passes it to `curl -X POST`. Exits non-zero when `--runs` is omitted or
-  an unknown flag is passed.
+- **`leerie --chain-submit [--wave-a-runs <files>] [--wave-b-runs <files>]
+  [--runs <files>] [--target <repo>]`** — POST `/chains`. Each
+  `--wave-*-runs` / `--runs` value is a comma-separated list of prompt-file
+  paths; the launcher reads each file and emits one
+  `{"prompt": <file contents>, "wave": "a" | "b"}` object per file in the
+  request body. `--runs` is preserved as a back-compat alias for Wave A and
+  is mutually exclusive with `--wave-a-runs`. `--target` is the repo path
+  (defaults to `$USER_REPO` or `$PWD`). The launcher converts the values to
+  a JSON body via `python3 -c '...'` and passes it to `curl -X POST`. Exits
+  non-zero when none of `--runs` / `--wave-a-runs` / `--wave-b-runs` are
+  passed, when `--runs` and `--wave-a-runs` are both passed, when a
+  referenced prompt file does not exist or is empty, or when an unknown
+  flag is passed.
 
 - **`leerie --chain-status <chain-id>`** — GET `/chains/<chain-id>` and
   print the JSON response. Exits non-zero when `<chain-id>` is missing or
@@ -3696,6 +3723,70 @@ launcher (the table at `leerie:942-947` that tells the main dispatch how to
 skip value tokens when forwarding to the orchestrator's argparse). Chain
 verbs consume these flags inline and never reach the forwarding path;
 `tests/test_launcher_value_flags_coupling.py` guards this invariant.
+
+#### Live deploy and smoke test
+
+Closes DESIGN.md §16's "reasoned, not observed" caveat for the chain
+subsystem. Until these steps have been run end-to-end against a real
+Fly deployment, the contract between launcher, server, and Fly webhook
+delivery is verified mechanically but not observed in production.
+
+**Prerequisites.**
+
+1. Fly org account with billing attached (the user's `personal` org).
+2. `flyctl` installed locally and authenticated (`flyctl auth status`).
+3. GitHub PAT with `repo` + `workflow` scopes for a throwaway target repo.
+4. A signing secret: `openssl rand -hex 32`.
+5. A Fly API token: `flyctl tokens create deploy --name leerie-chain`.
+
+**Deploy.**
+
+```bash
+cd chain
+fly launch --config fly.toml --dockerfile Dockerfile \
+  --name leerie-chain --region iad --no-deploy
+fly volumes create chain_data --region iad --size 1 --app leerie-chain
+fly secrets set \
+  GH_DISPATCH_PAT="<github-pat>" \
+  FLY_API_TOKEN="<fly-token>" \
+  CHAIN_WEBHOOK_SECRET="<openssl-rand-hex-32>" \
+  --app leerie-chain
+fly deploy --config fly.toml --app leerie-chain
+```
+
+After deploy, register the machine-exit webhook with Fly so events
+fire at `POST $LEERIE_CHAIN_URL/webhooks/fly`. The exact `flyctl`
+subcommand depends on the current Fly webhook surface — confirm at
+deploy time via `flyctl --help | grep -i webhook` (this step is the
+known unknown that the live test will pin down).
+
+**Smoke test.**
+
+```bash
+export LEERIE_CHAIN_URL=https://leerie-chain.fly.dev
+echo "Add a blank line to README.md" > /tmp/a.txt
+echo "Add a comment to that line"    > /tmp/b.txt
+leerie --chain-submit \
+  --wave-a-runs /tmp/a.txt \
+  --wave-b-runs /tmp/b.txt \
+  --target git@github.com:<user>/<throwaway>.git
+# capture CHAIN_ID from the response JSON
+leerie --chain-status "$CHAIN_ID"   # poll
+leerie --list-chains                # confirm the chain shows up
+leerie --chain-attach "$CHAIN_ID"   # event history
+leerie --chain-kill "$CHAIN_ID"     # idempotent on done chains
+```
+
+**Pass criteria.**
+
+- Wave A machine launches, exits cleanly, Fly fires the webhook.
+- `wave_state` advances `wave_a` → `wave_b`.
+- Wave B machine launches against the `stage-<chain-id>` branch.
+- Both runs land PRs against the target repo.
+
+After the test passes, DESIGN.md §16's chain-orchestration caveat
+should be updated to record the date and the validation artifact
+(chain id + Fly machine logs URL).
 
 #### `chain/` Python package
 

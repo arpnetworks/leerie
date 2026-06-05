@@ -385,16 +385,30 @@ prompts/
 ```bash
 export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev  # point at your deployed app
 
+# Canonical form: --wave-a-runs and --wave-b-runs split the chain into
+# Wave A (runs against current main, executed in parallel) and Wave B
+# (runs against the accumulated Wave A results — a stage-<chain-id>
+# branch). In this example, the data-model refactor lands first, then
+# the migration and API update execute in Wave B against the refactor.
+leerie --chain-submit \
+  --wave-a-runs prompts/01-refactor-data-model.md \
+  --wave-b-runs prompts/02-write-migration.md,prompts/03-update-api-layer.md \
+  --target ~/src/myrepo
+
+# Legacy alias: --runs is equivalent to --wave-a-runs (Wave A only).
+# Use this shape when every task is independent and runs in parallel.
 leerie --chain-submit \
   --runs prompts/01-refactor-data-model.md,prompts/02-write-migration.md,prompts/03-update-api-layer.md \
   --target ~/src/myrepo
 ```
 
-`--runs` is a comma-separated list of prompt-file paths (resolved on
-the host). `--target` is the local path of the repository to run
-against; it defaults to `$PWD` when omitted. `leerie-chain` receives
-a `POST /chains` request, inserts a chain record, and immediately
-launches the first run. The command prints the new `chain-id`:
+Each `--wave-a-runs` / `--wave-b-runs` / `--runs` value is a
+comma-separated list of prompt-file paths (resolved on the host).
+`--target` is the local path of the repository to run against; it
+defaults to `$PWD` when omitted. `leerie-chain` receives a `POST
+/chains` request, inserts a chain record, and immediately launches
+the Wave A runs in parallel. Wave B launches after all Wave A runs
+complete cleanly. The command prints the new `chain-id`:
 
 ```
 {"chain_id": "chain-abc123", "status": "running", "current_run": 0}
@@ -463,10 +477,13 @@ export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
 # Local development instance:
 export LEERIE_CHAIN_URL=http://localhost:8080
 
-leerie --chain-submit --runs prompts/a.md,prompts/b.md --target ~/src/myrepo
+leerie --chain-submit \
+  --wave-a-runs prompts/a.md \
+  --wave-b-runs prompts/b.md \
+  --target ~/src/myrepo
 ```
 
 For the `leerie-chain` setup steps (deploying the Fly app, setting
-`GH_DISPATCH_PAT`, `FLY_API_TOKEN`, and `FLY_WEBHOOK_SIGNING_SECRET`),
+`GH_DISPATCH_PAT`, `FLY_API_TOKEN`, and `CHAIN_WEBHOOK_SECRET`),
 see [`docs/IMPLEMENTATION.md`](IMPLEMENTATION.md) §7 "Chain launcher
 verbs" and the `chain/` subdirectory's own `README`.

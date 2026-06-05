@@ -860,33 +860,84 @@ PY
     ;;
   --chain-submit)
     # Fast-path: submit a new chain to the leerie-chain HTTP API.
-    # POST /chains with runs (comma-separated prompt files) and target.
+    # POST /chains with runs (each {prompt, wave}) and target.
+    # DESIGN.md §19 Wave A/B sequencing requires every run to carry an
+    # explicit wave; --wave-a-runs and --wave-b-runs are the canonical
+    # split. --runs is preserved as a back-compat alias and is treated
+    # as Wave A (so the legacy "all parallel, no Wave B" shape still works).
+    # Each --runs/--wave-*-runs value is a comma-separated list of prompt
+    # *file paths*; the launcher reads each file and sends its contents
+    # as the prompt (per QUEUE_JOBS.md "Prompts passed at chain-submit time").
     # LEERIE_CHAIN_URL sets the base URL (default: http://localhost:8080).
     shift
     _cs_runs=""
+    _cs_wave_a=""
+    _cs_wave_b=""
     _cs_target="${USER_REPO:-$PWD}"
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --runs) _cs_runs="${2:-}"; shift 2 ;;
         --runs=*) _cs_runs="${1#--runs=}"; shift ;;
+        --wave-a-runs) _cs_wave_a="${2:-}"; shift 2 ;;
+        --wave-a-runs=*) _cs_wave_a="${1#--wave-a-runs=}"; shift ;;
+        --wave-b-runs) _cs_wave_b="${2:-}"; shift 2 ;;
+        --wave-b-runs=*) _cs_wave_b="${1#--wave-b-runs=}"; shift ;;
         --target) _cs_target="${2:-}"; shift 2 ;;
         --target=*) _cs_target="${1#--target=}"; shift ;;
         --*) remote_log "--chain-submit: unknown flag: $1"; exit 1 ;;
         *) remote_log "--chain-submit: unexpected argument: $1"; exit 1 ;;
       esac
     done
-    if [ -z "$_cs_runs" ]; then
-      remote_log "--chain-submit: --runs is required"
-      echo "  Usage: leerie --chain-submit --runs <file1,file2,...> [--target <repo-path>]" >&2
+    # --runs is the legacy alias for Wave A. Forbid mixing it with
+    # --wave-a-runs to avoid silent surprises.
+    if [ -n "$_cs_runs" ] && [ -n "$_cs_wave_a" ]; then
+      remote_log "--chain-submit: --runs and --wave-a-runs are mutually exclusive"
+      exit 1
+    fi
+    if [ -n "$_cs_runs" ]; then
+      _cs_wave_a="$_cs_runs"
+    fi
+    if [ -z "$_cs_wave_a" ] && [ -z "$_cs_wave_b" ]; then
+      remote_log "--chain-submit: at least one of --runs, --wave-a-runs, --wave-b-runs is required"
+      echo "  Usage: leerie --chain-submit --wave-a-runs <f1,f2,...> [--wave-b-runs <f3,...>] [--target <repo>]" >&2
+      echo "         leerie --chain-submit --runs <f1,f2,...> [--target <repo>]    (legacy: all Wave A)" >&2
       exit 1
     fi
     _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
+    # Build the JSON payload. python3 reads each prompt-file path and
+    # emits {prompt, wave} objects in the order the user supplied them.
+    # A missing file is a hard error — silently dropping it would let
+    # the chain start with fewer runs than the user intended.
     _cs_payload="$(python3 -c '
 import json, sys
-runs_raw, target = sys.argv[1], sys.argv[2]
-runs = [r.strip() for r in runs_raw.split(",") if r.strip()]
+wave_a_raw, wave_b_raw, target = sys.argv[1], sys.argv[2], sys.argv[3]
+
+
+def _load(raw, wave):
+    out = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        try:
+            with open(entry, "r", encoding="utf-8") as fh:
+                text = fh.read().strip()
+        except OSError as exc:
+            sys.stderr.write(f"--chain-submit: cannot read prompt file {entry!r}: {exc}\n")
+            sys.exit(1)
+        if not text:
+            sys.stderr.write(f"--chain-submit: prompt file {entry!r} is empty\n")
+            sys.exit(1)
+        out.append({"prompt": text, "wave": wave})
+    return out
+
+
+runs = _load(wave_a_raw, "a") + _load(wave_b_raw, "b")
+if not runs:
+    sys.stderr.write("--chain-submit: no runs to submit\n")
+    sys.exit(1)
 print(json.dumps({"runs": runs, "target": target}))
-' "$_cs_runs" "$_cs_target")"
+' "$_cs_wave_a" "$_cs_wave_b" "$_cs_target")" || exit 1
     curl -fsSL -X POST \
       -H "Content-Type: application/json" \
       -d "$_cs_payload" \

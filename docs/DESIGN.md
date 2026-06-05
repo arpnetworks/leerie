@@ -2392,6 +2392,19 @@ Fly app — the persistent HTTP server, its SQLite state machine, Wave A/B
 sequencing, and machine-exit webhook handling — has not been exercised
 in a live run. The chain subsystem's behavior is reasoned, not observed.
 
+**Chain Wave A finalization is an explicit open item.** The webhook
+handler in `chain/server.py` transitions runs to `done`/`failed` and
+advances the chain's wave state, but it does *not* push the run branch
+to origin or open the PR. The helpers exist (`chain/git_ops.push_branch`,
+`chain/git_ops.open_pr`) but are unwired. A clean Wave A exit today
+therefore advances the chain to Wave B without producing a PR for the
+finished run. Wiring the push + PR into the webhook path is non-trivial
+because the per-run Fly machine has already exited (and is typically
+destroyed) by the time the webhook fires — the chain orchestrator must
+either fetch the branch from the machine before destruction or persist
+the branch tip into its own clone before the run is teardown'd. Both
+are real design work that belongs in §19 once chosen.
+
 **Recommended first step.** Run Leerie once on a throwaway repository with a
 small, fully-specified task before trusting it on real work.
 
@@ -2460,7 +2473,58 @@ branch has advanced. That sequencing problem is outside the scope of the
 core orchestrator, which is scoped to one run. Chain orchestration is
 the subsystem that manages it.
 
-### Why a separate Fly app, not in-orchestrator
+### Pre-build verification (Q1–Q4)
+
+The chain orchestration build was gated on four pre-build questions
+(QUEUE_JOBS.md lines 90–154). The answers below were derived from the
+existing single-run code before any chain-orchestration code was
+written, and they justify the shape of the chain subsystem as
+implemented.
+
+**Q1 — Does the in-Fly orchestrator push to origin itself?**
+No. The host launcher pushes. On a clean exit, the launcher's
+`decide_teardown` trap fetches the run branch back from the machine
+(`scripts/remote/fetch-branch.sh`), then sources `scripts/host-finalize.sh`
+to run `git push` and `gh pr create` inline on the host (DESIGN §6
+*Finalization*; `scripts/host-finalize.sh:105–127`). **Implication for
+the chain case**: the chain orchestrator launches per-run Fly machines
+via the Machines API directly (`chain/fly_client.py`), bypassing the
+launcher and its trap. There is no `host_finalize` in the chain-launched
+path, so the run branch is *not* on origin when the machine-exit webhook
+fires. The chain orchestrator must therefore push the branch and open
+the PR itself: `chain/git_ops.py` exposes `push_branch` and `open_pr`
+helpers for this purpose. **Open item**: those helpers exist but are not
+yet wired into `chain/server.py`'s webhook handler — Wave A
+finalization is currently a no-op. See §16 *Verification status*
+for the open work.
+
+**Q2 — Fly webhook payload shape.**
+Event type lives in `type` or `event_type`; the value of interest is
+`io.fly.machine.exited`. Machine identity comes from `machine_id` |
+`id` | `instance_id` (tried in that order). Exit code comes from
+`exit_code` | `exit_status`. Non-exit event types are silently ignored.
+The defensive field-order tolerance is in `chain/webhooks.py:74–132`
+and is exercised by `tests/test_chain_webhooks.py:127–152`.
+
+**Q3 — leerie launcher on Linux (no Keychain).**
+The launcher's Keychain extraction is macOS-only (`leerie:1862–1877`,
+guarded by `if [ "$OS" = "Darwin" ]`). On Linux it relies solely on
+`CLAUDE_CODE_OAUTH_TOKEN`. The chain orchestrator's Fly machines run
+a Debian-based image (per `chain/Dockerfile`), so they take the Linux
+env-var path cleanly with no Keychain fallback errors.
+
+**Q4 — How does leerie know what branch to base on?**
+Whatever the host working tree's HEAD points to at invocation time.
+`scripts/remote/seed-repo.sh:133–272` bundles and rsyncs the working
+tree as-is — no `git checkout` and no `git rev-parse HEAD` in the
+seeding path. The chain orchestrator establishes the stage branch in
+its own clone via `chain/git_ops.create_stage_branch`, then launches
+each Wave B machine with the stage branch already checked out in the
+clone the seeder reads from. The seeding mechanism does not change;
+the chain app manages branch state, not the seeder. (See also
+*Wave B seeding* below.)
+
+
 
 The core orchestrator runs as a subprocess on the user's development
 machine (or inside a short-lived Fly machine for `--runtime fly` runs).
@@ -2656,6 +2720,13 @@ The chain feature is surfaced as new `--flag` verbs on the existing
 rationale behind the CLI-subprocess shape that makes this natural):
 
 ```
+leerie --chain-submit \
+       --wave-a-runs prompts/fetch.txt,prompts/lint.txt \
+       --wave-b-runs prompts/summarize.txt,prompts/publish.txt \
+       --target ~/src/enric/summarizer
+
+# Legacy alias: --runs is equivalent to --wave-a-runs (Wave A only).
+# Use this shape when the chain has no Wave B consumers.
 leerie --chain-submit \
        --runs prompts/run-1.txt,prompts/run-2.txt,prompts/run-3.txt \
        --target ~/src/enric/summarizer

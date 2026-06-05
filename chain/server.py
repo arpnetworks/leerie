@@ -1,6 +1,7 @@
 """chain.server — stdlib HTTP server for the leerie-chain orchestrator app.
 
-Three endpoints:
+Six endpoints (the five launcher chain verbs from QUEUE_JOBS.md plus the
+webhook receiver):
 
   POST /chains
       Create a new chain. Request body (JSON):
@@ -15,8 +16,24 @@ Three endpoints:
       all Wave A machines immediately via the Fly Machines API, and persists
       the chain in SQLite. Returns 201 with the full chain snapshot.
 
+  GET /chains
+      List all chains as a JSON array (no run rows; call GET /chains/<id>
+      for a full snapshot). Mirrors ``leerie --list-chains``.
+
   GET /chains/<id>
       Return the chain snapshot for *id* as JSON, or 404 if not found.
+
+  GET /chains/<id>/log
+      Return a JSON event history derived from the chain's run-status
+      transitions (one event per run state change). Polling-only; true
+      streaming requires a per-chain log file that the current data
+      model does not maintain. Returns 404 if the chain is not found.
+
+  DELETE /chains/<id>
+      Cancel a chain. Destroys every still-running per-run Fly machine via
+      the Machines API, then transitions the chain to ``'cancelled'``.
+      Returns 200 with the updated snapshot, or 404 if not found. Idempotent
+      against an already-terminal chain (returns 200 with the snapshot).
 
   POST /webhooks/fly
       Receive Fly machine-exit events. Verifies the HMAC-SHA256 signature
@@ -102,17 +119,34 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
     # ------------------------------------------------------------------
 
     def do_GET(self) -> None:
-        if self.path.startswith("/chains/") and self.path.count("/") == 2:
-            chain_id = self.path[len("/chains/"):]
-            self._handle_get_chain(chain_id)
-        else:
-            self._send_json(404, {"error": f"not found: {self.path}"})
+        if self.path == "/chains":
+            self._handle_list_chains()
+            return
+        if self.path.startswith("/chains/"):
+            tail = self.path[len("/chains/"):]
+            # /chains/<id>/log — event history for the chain
+            if tail.endswith("/log") and tail.count("/") == 1:
+                chain_id = tail[: -len("/log")]
+                self._handle_get_chain_log(chain_id)
+                return
+            # /chains/<id> — full snapshot
+            if "/" not in tail:
+                self._handle_get_chain(tail)
+                return
+        self._send_json(404, {"error": f"not found: {self.path}"})
 
     def do_POST(self) -> None:
         if self.path == "/chains":
             self._handle_post_chains()
         elif self.path == "/webhooks/fly":
             self._handle_post_webhook()
+        else:
+            self._send_json(404, {"error": f"not found: {self.path}"})
+
+    def do_DELETE(self) -> None:
+        if self.path.startswith("/chains/") and self.path.count("/") == 2:
+            chain_id = self.path[len("/chains/"):]
+            self._handle_delete_chain(chain_id)
         else:
             self._send_json(404, {"error": f"not found: {self.path}"})
 
@@ -126,6 +160,101 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(404, {"error": f"chain {chain_id!r} not found"})
             return
         self._send_json(200, snap)
+
+    # ------------------------------------------------------------------
+    # GET /chains  (list)
+    # ------------------------------------------------------------------
+
+    def _handle_list_chains(self) -> None:
+        # list_chains returns one row per chain (no run rows). Callers who
+        # want runs walk to GET /chains/<id> for the full snapshot.
+        chains = self._cs.list_chains()
+        self._send_json(200, {"chains": chains})
+
+    # ------------------------------------------------------------------
+    # GET /chains/<id>/log  (event history)
+    # ------------------------------------------------------------------
+
+    def _handle_get_chain_log(self, chain_id: str) -> None:
+        # First-cut event log: derive a chronological event list from the
+        # run rows' current state. The chain DB does not retain a full
+        # transition history (only the latest status + updated_at per run),
+        # so this is a snapshot of the latest event per run, ordered by
+        # updated_at. True streaming would need a per-chain log file; that
+        # is a follow-up — see DESIGN.md §19 "Chain attach is polling".
+        snap = self._cs.load_chain(chain_id)
+        if snap is None:
+            self._send_json(404, {"error": f"chain {chain_id!r} not found"})
+            return
+        events: list[dict[str, Any]] = []
+        # Chain-level top entry so a poller sees the wave/status without
+        # having to also call GET /chains/<id>.
+        events.append({
+            "at": snap["updated_at"],
+            "kind": "chain",
+            "status": snap["status"],
+            "wave_state": snap["wave_state"],
+        })
+        for run in snap["runs"]:
+            events.append({
+                "at": run["updated_at"],
+                "kind": "run",
+                "run_id": run["id"],
+                "wave": run["wave"],
+                "status": run["status"],
+                "machine_id": run.get("machine_id"),
+            })
+        events.sort(key=lambda e: e["at"])
+        self._send_json(200, {"chain_id": chain_id, "events": events})
+
+    # ------------------------------------------------------------------
+    # DELETE /chains/<id>  (cancel)
+    # ------------------------------------------------------------------
+
+    def _handle_delete_chain(self, chain_id: str) -> None:
+        snap = self._cs.load_chain(chain_id)
+        if snap is None:
+            self._send_json(404, {"error": f"chain {chain_id!r} not found"})
+            return
+        # Destroy every still-running per-run Fly machine. We mark each
+        # one failed in the DB *before* the destroy call so a slow/erroring
+        # API doesn't leave the DB claiming it's running. fly_client treats
+        # 404 as success (machine already gone), so this is safe to retry.
+        # The chain-status transition is wrapped in try/finally so the
+        # "chain is cancelled" guarantee holds even if a future code path
+        # introduces a new exception type through transition_run /
+        # destroy_machine — without the finally, a mid-loop raise would
+        # leave the chain stuck in wave_a/wave_b with some runs failed.
+        destroy_errors: list[str] = []
+        try:
+            for run in snap["runs"]:
+                if run["status"] != "running":
+                    continue
+                machine_id = run.get("machine_id")
+                if not machine_id:
+                    continue
+                self._cs.transition_run(run["id"], "failed")
+                try:
+                    fly_client.destroy_machine(machine_id)
+                except fly_client.FlyClientError as exc:
+                    destroy_errors.append(f"{machine_id}: {exc}")
+        finally:
+            self._cs.transition_chain(chain_id, "cancelled")
+        updated = self._cs.load_chain(chain_id)
+        if destroy_errors:
+            # Surface partial failures but still report the cancellation:
+            # the DB is consistent (chain is cancelled, runs marked failed),
+            # only the Fly-side teardown was incomplete. Caller may want
+            # to retry DELETE — it's idempotent.
+            self._send_json(
+                200,
+                {
+                    "chain": updated,
+                    "warnings": [f"machine destroy failed: {e}" for e in destroy_errors],
+                },
+            )
+            return
+        self._send_json(200, {"chain": updated})
 
     # ------------------------------------------------------------------
     # POST /chains
