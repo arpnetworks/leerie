@@ -68,7 +68,11 @@ def test_seed_auth_fails_without_credentials_or_token(tmp_path):
     fake_flyctl = tmp_path / "flyctl"
     fake_flyctl.write_text(
         "#!/usr/bin/env bash\n"
-        # tar pipe (machine exec --stdin) succeeds
+        # tar pipe (machine exec --stdin) succeeds. Drain stdin so the
+        # gzipped tar producer doesn't SIGPIPE — GNU tar (Linux CI) forks
+        # gzip, and gzip dying with SIGPIPE makes tar exit non-zero,
+        # which `set -euo pipefail` in seed-auth.sh then propagates.
+        "cat >/dev/null\n"
         "exit 0\n"
     )
     fake_flyctl.chmod(0o755)
@@ -93,10 +97,14 @@ def test_seed_auth_fails_without_git_identity(tmp_path):
     creds = stage / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
-    # stub flyctl: tar exec succeeds, git config calls succeed
+    # stub flyctl: tar exec succeeds, git config calls succeed.
+    # Drain stdin so the gzipped tar producer doesn't SIGPIPE under GNU
+    # tar (Linux CI); see test_seed_auth_fails_without_credentials_or_token
+    # for the full explanation.
     fake_flyctl = tmp_path / "flyctl"
     fake_flyctl.write_text(
         "#!/usr/bin/env bash\n"
+        "cat >/dev/null\n"
         "exit 0\n"
     )
     fake_flyctl.chmod(0o755)
@@ -129,9 +137,13 @@ def test_seed_auth_succeeds_with_credentials_file(tmp_path):
     creds = stage / ".claude" / ".credentials.json"
     creds.write_text('{"claudeAiOauth":{"accessToken":"tok"}}')
 
+    # Drain stdin so the gzipped tar producer doesn't SIGPIPE under GNU
+    # tar (Linux CI); see test_seed_auth_fails_without_credentials_or_token
+    # for the full explanation.
     fake_flyctl = tmp_path / "flyctl"
     fake_flyctl.write_text(
         "#!/usr/bin/env bash\n"
+        "cat >/dev/null\n"
         "exit 0\n"
     )
     fake_flyctl.chmod(0o755)
@@ -167,8 +179,12 @@ def test_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
     received_stdin = tmp_path / "received_stdin.txt"
     fake_flyctl = tmp_path / "flyctl"
     # On the second invocation (credentials write via --stdin sh -c), capture stdin.
+    # Drain stdin so the gzipped tar producer doesn't SIGPIPE under GNU
+    # tar (Linux CI); see test_seed_auth_fails_without_credentials_or_token
+    # for the full explanation.
     fake_flyctl.write_text(
         "#!/usr/bin/env bash\n"
+        "cat >/dev/null\n"
         "exit 0\n"
     )
     fake_flyctl.chmod(0o755)
