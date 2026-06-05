@@ -229,6 +229,29 @@ leerie "task" --model-implementer opus --model-classifier haiku
 # Optional but recommended — lower the auto-compaction threshold
 # for worker processes (default is 95%):
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
+
+# Chain orchestration: submit and track multi-run chains via the
+# leerie-chain HTTP API (LEERIE_CHAIN_URL sets the endpoint;
+# default: http://localhost:8080).
+
+# Submit a new chain. --runs is a comma-separated list of prompt files;
+# --target is the local repo path (defaults to $PWD).
+leerie --chain-submit --runs prompts/run-a.md,prompts/run-b.md --target ~/src/myrepo
+
+# Check status of a running or completed chain:
+leerie --chain-status <chain-id>
+
+# List all chains known to the leerie-chain app:
+leerie --list-chains
+
+# Stream the chain orchestrator's log (follows until interrupted):
+leerie --chain-attach <chain-id>
+
+# Cancel an in-progress chain:
+leerie --chain-kill <chain-id>
+
+# Point at a deployed leerie-chain app instead of localhost:
+export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
 ```
 
 Inside Claude Code (after `/plugin install leerie@enricai-leerie`):
@@ -361,8 +384,9 @@ surface (flags, timeouts, schema enforcement).
 
 ## Walkthrough
 
-For a worked end-to-end example — from invocation through clarification,
-wave execution, run-branch review, and merge — see
+For worked end-to-end examples — from invocation through clarification,
+wave execution, run-branch review, and merge; and for chain orchestration
+(submitting, monitoring, and cancelling a multi-run chain) — see
 [`docs/USAGE.md`](docs/USAGE.md).
 
 ## Documentation
@@ -451,6 +475,8 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `commands/leerie.md` | Thin plugin skill — reachable as `/leerie` from Claude Code; relays the `--clarify` Q-and-A flow |
 | `skills/judge-llm-batch/SKILL.md` | Post-run skill — scores captured `claude -p` calls against a 3-dimensional accuracy rubric (schema, factual grounding, hallucination-freeness) |
 | `skills/llm-self-heal/SKILL.md` | Post-run skill — autonomous self-heal loop that proposes prompt patches against failing call types, replays under judge scoring, and reports the best-found patch |
+| `chain/Dockerfile` | leerie-chain container image — Debian 13-slim + git + gh + flyctl + stdlib Python3. Leaner than the root Dockerfile: omits mise, claude-code, and build-essential (the chain app runs the HTTP API, not worker tasks). Entrypoint: `python3 -m chain`. |
+| `chain/fly.toml` | Fly app config for the persistent leerie-chain HTTP service — `min_machines_running=1`, `[http_service]` on port 8080, `[mounts]` SQLite volume at `/data`. Provision once with `fly launch --config chain/fly.toml`. |
 | `CLAUDE.md` | Repo-local guidance for Claude Code working in this codebase (the three-layer rule, mandatory requirements, code style) |
 | `CONTRIBUTING.md` | Development setup, task-completion checklist, PR conventions |
 | `SECURITY.md` | Threat model, supported versions, vulnerability reporting policy |
@@ -459,7 +485,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `docs/DESIGN.md` | Full design document and rationale (theory) |
 | `docs/IMPLEMENTATION.md` | Current code-surface spec — functions, caps, schemas (mechanism) |
 | `docs/INSTALL.md` | Per-OS container runtime setup and the Fly.io runtime prerequisites |
-| `docs/USAGE.md` | End-to-end walkthrough of one Leerie run |
+| `docs/USAGE.md` | End-to-end walkthrough of one Leerie run + chain orchestration example |
 
 ## Safety
 
