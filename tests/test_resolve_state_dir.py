@@ -126,6 +126,17 @@ _validate_state_ownership() {
     echo "leerie: state-dir target $dir looks like the leerie install directory" >&2
     exit 1
   fi
+  local _parent _basename
+  _parent="$(dirname "$dir")"
+  _basename="$(basename "$dir")"
+  if [ -d "$_parent/.git" ] && [ -x "$_parent/leerie" ]; then
+    case "$_basename" in
+      chain|commands|docs|orchestrator|prompts|scripts|skills|tests|.claude-plugin|.github)
+        echo "leerie: state-dir target $dir is a subdirectory of the leerie install dir at $_parent" >&2
+        exit 1
+        ;;
+    esac
+  fi
   printf '%s\n' "$USER_REPO" > "$dir/.owner"
 }
 
@@ -501,3 +512,27 @@ def test_ownership_claims_empty_dir(tmp_path):
     rc, _, _ = _run_ownership(repo, state_dir)
     assert rc == 0
     assert (state_dir / ".owner").read_text().strip() == repo
+
+
+def test_ownership_rejects_install_subtree(tmp_path):
+    """The default key is just the basename, so a user repo named
+    `docs` (or any other top-level dir inside the installer's clone)
+    resolves to a path that IS a subdirectory of the install dir. The
+    install dir's top-level markers (.git/, leerie exec) sit one level
+    above, so the existing install-detect branches don't fire — the
+    parent-scan check catches it."""
+    fake_install = tmp_path / "fake-install"
+    fake_install.mkdir()
+    (fake_install / ".git").mkdir()
+    leerie_exec = fake_install / "leerie"
+    leerie_exec.write_text("#!/bin/sh\n")
+    leerie_exec.chmod(0o755)
+    docs_subtree = fake_install / "docs"
+    docs_subtree.mkdir()
+    (docs_subtree / "DESIGN.md").write_text("")
+    rc, _, stderr = _run_ownership(
+        "/tmp/user/docs", docs_subtree, expect_fail=True
+    )
+    assert rc != 0
+    assert "subdirectory of the leerie install dir" in stderr
+    assert not (docs_subtree / ".owner").exists()

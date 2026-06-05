@@ -45,6 +45,14 @@ There is no `pyproject.toml`; contributors develop out of the checkout.
 End-users get a one-command install via the Claude Code plugin marketplace
 or `scripts/install.sh` — see [README *Install*](README.md#install).
 
+A committed `leerie.toml` at the repo root pins this repo's state to
+`~/.leerie/_self/` (the launcher's default would otherwise resolve to
+`~/.leerie/leerie/`, which is the installer's clone location and would
+fail the install-dir guard). The first time you run `./leerie "task"`
+from your clone, that dir gets created with `.owner` recording your
+clone's absolute path. Other repos you work on are unaffected — the
+override is scoped to this checkout via the toml.
+
 ## Running the tests
 
 ```bash
