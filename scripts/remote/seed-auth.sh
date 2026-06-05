@@ -39,15 +39,19 @@
 #   Claude Code CLI reads from ~/.claude/.credentials.json on Linux.
 #
 # Seeding mechanism:
-#   Files are delivered via `flyctl ssh console -C` with a tar pipe:
-#       tar -cC "$STAGE" . | flyctl ssh console --pty=false \
-#         -C "sh -c 'tar -xC /home/leerie && chown -R leerie: /home/leerie'"
+#   Files are delivered via `flyctl ssh console -C` with a gzipped tar pipe:
+#       tar -czC "$STAGE" . | flyctl ssh console --pty=false \
+#         -C "sh -c 'tar -xzC /home/leerie && chown -R leerie: /home/leerie'"
 #   `ssh console -C` is the only flyctl transport that takes the command
 #   as a single string AND forwards host stdin (current flyctl dropped
 #   `--stdin` and the post-`--` argv form from `machine exec`). The
 #   trailing `chown -R leerie:` is necessary because the ssh-console
 #   session lands as root by default; without it the orchestrator
 #   (running as leerie) couldn't read its own credentials.
+#
+#   ~/.claude/plugins/cache and plugins/marketplaces are excluded from
+#   the tar (hundreds of MB; rebuilt on the remote via `claude plugin
+#   install` in step 4 below).
 
 set -euo pipefail
 
@@ -94,10 +98,13 @@ seed_auth() {
   # Claude auth + git identity; SSH keys for pushing are the host's concern.
   # Current flyctl removed `--stdin` from `machine exec`. Use
   # `flyctl ssh console -C` instead: it forwards host stdin to the
-  # remote command and supports arbitrarily large payloads (we
-  # routinely transfer ~640 MB of Claude plugins/agents). Requires
-  # an active Fly SSH cert in the leerie-private ssh-agent —
-  # require_fly_ssh ensures that.
+  # remote command. Today's residual payload is ~15 MB on the wire
+  # (gzipped tar of $STAGE with plugin cache excluded); historically
+  # the stage was ~640 MB and hit EOFs on the stdin pipe at that
+  # size, which motivated the plugins/cache exclusion (rebuilt on
+  # the remote in step 4) and the gzip wrap. Requires an active Fly
+  # SSH cert in the leerie-private ssh-agent — require_fly_ssh
+  # ensures that.
   # require_fly_ssh lives in lib.sh (sourced by provision.sh, which the
   # launcher sources before seed-auth.sh). Defensive check for callers
   # that source seed-auth.sh standalone (e.g. tests).
@@ -134,7 +141,12 @@ seed_auth() {
     err_log="$(mktemp)"
     _seed_progress_bg "seed_auth" &
     _hb_pid=$!
-    COPYFILE_DISABLE=1 tar -cC "$STAGE" \
+    # `-z` (gzip) on both ends: the residual stage is mostly JSON /
+    # markdown / small binaries; gzip cuts ~2x off the wire. The
+    # Debian 13 image has GNU tar which auto-detects -z. macOS bsdtar
+    # also supports -z. COPYFILE_DISABLE=1 strips the macOS provenance
+    # xattr so the stream is byte-deterministic.
+    COPYFILE_DISABLE=1 tar -czC "$STAGE" \
          --exclude='.gitconfig' \
          --exclude='.gitconfig.local' \
          --exclude='.gitignore' \
@@ -149,7 +161,7 @@ seed_auth() {
              --app "$FLY_APP" \
              --machine "$machine_id" \
              --pty=false \
-             -C "sh -c 'tar -xC /home/leerie && chown -R leerie: /home/leerie'" 2>"$err_log"
+             -C "sh -c 'tar -xzC /home/leerie && chown -R leerie: /home/leerie'" 2>"$err_log"
     tar_rc=${PIPESTATUS[1]}
     kill "$_hb_pid" 2>/dev/null || true
     wait "$_hb_pid" 2>/dev/null || true
@@ -276,6 +288,112 @@ seed_auth() {
   flyctl ssh console --app "$FLY_APP" --machine "$machine_id" --pty=false \
     -C "su leerie -c 'HOME=/home/leerie PATH=/usr/local/share/mise/installs/node/lts-current/bin:/usr/bin:/bin claude --version'" \
     >/dev/null 2>&1 || true
+
+  # --- 4. Rebuild plugin cache on the remote -----------------------------
+  # The launcher's CLAUDE_SKIP excludes plugins/cache and
+  # plugins/marketplaces from the tar pipe (hundreds of MB on a typical
+  # host). Repopulate them on the machine's fast public egress using the
+  # small JSON files we did seed:
+  #   known_marketplaces.json → claude plugin marketplace add <owner>/<repo>
+  #   installed_plugins.json  → claude plugin install <name>@<marketplace>
+  # The CLI does not auto-refill the cache on session start; if the
+  # plugin's directory is missing it prints "Plugin not found in cache"
+  # and skips. So we trigger the installs here before any worker runs.
+  # Failures are logged but non-fatal — a missing plugin only matters
+  # if a user-supplied task explicitly invokes it, in which case the
+  # CLI's existing skip-with-warning behavior is the right surface.
+  remote_log "remote: rebuilding plugin cache (marketplaces + installs)..."
+  # runuser, not su -c 'sh -s'. su consumes stdin for the password prompt
+  # and util-linux's stdin-forwarding to the inner shell is implementation-
+  # specific; runuser is the documented non-interactive equivalent (in
+  # util-linux on Debian, at /usr/sbin/runuser) and forwards stdin
+  # transparently. env (coreutils) sets HOME/PATH for the leerie process
+  # without relying on sh -c re-quoting.
+  #
+  # Bracket with the same timeout prefix + heartbeat the main tar pipe
+  # uses (lines 135-200): the rebuild runs `git clone` + `bun install`
+  # per plugin and routinely takes 30-90 s on a fresh machine, which
+  # without these would (a) hang silently if `flyctl ssh console`
+  # exhibits its known Mode-2 stall, and (b) read as "frozen" to the
+  # user even on the happy path.
+  local _rebuild_hb_pid _rebuild_rc=0
+  _seed_progress_bg "plugin_rebuild" &
+  _rebuild_hb_pid=$!
+  $_seed_to flyctl ssh console --app "$FLY_APP" --machine "$machine_id" --pty=false \
+    -C "runuser -u leerie -- env HOME=/home/leerie PATH=/usr/local/share/mise/installs/node/lts-current/bin:/usr/bin:/bin sh -s" \
+    <<'REMOTE_SH' >/dev/null 2>&1
+set -u
+mkdir -p "$HOME/.cache/leerie"
+LOG="$HOME/.cache/leerie/plugin-install.log"
+: > "$LOG"
+KNOWN="$HOME/.claude/plugins/known_marketplaces.json"
+INSTALLED="$HOME/.claude/plugins/installed_plugins.json"
+
+# (a) Register marketplaces. python3 over jq because jq isn't in the
+# leerie image (see Dockerfile). Emit one "owner/repo" per line for
+# entries whose source is a GitHub repo; silently skip non-github
+# sources (e.g., local-path marketplaces don't survive the trip).
+if [ -s "$KNOWN" ]; then
+  python3 -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for entry in data.values():
+    src = entry.get("source") or {}
+    if src.get("source") == "github":
+        repo = src.get("repo")
+        if repo:
+            print(repo)
+  ' "$KNOWN" | while read -r repo; do
+    [ -n "$repo" ] || continue
+    echo "+ claude plugin marketplace add $repo" >> "$LOG"
+    claude plugin marketplace add "$repo" >> "$LOG" 2>&1 \
+      || echo "WARN: marketplace $repo add failed (continuing)" >> "$LOG"
+  done
+fi
+
+# (b) Reinstall plugins. The JSON key is the install spec
+# (e.g., "vercel@claude-plugins-official"). Note: project-scoped
+# entries on the host carry a host-only projectPath; we install
+# everything at the CLI default scope (user) on the remote. Intentional
+# — the Fly machine is single-task, so flattening project-scope to
+# user-scope makes the plugin available to whichever task is running
+# instead of nothing (the host projectPath doesn't exist remotely).
+if [ -s "$INSTALLED" ]; then
+  python3 -c '
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(0)
+for spec in (data.get("plugins") or {}).keys():
+    print(spec)
+  ' "$INSTALLED" | while read -r spec; do
+    [ -n "$spec" ] || continue
+    echo "+ claude plugin install $spec" >> "$LOG"
+    claude plugin install "$spec" >> "$LOG" 2>&1 \
+      || echo "WARN: $spec install failed (continuing)" >> "$LOG"
+  done
+fi
+REMOTE_SH
+  _rebuild_rc=$?
+  kill "$_rebuild_hb_pid" 2>/dev/null || true
+  wait "$_rebuild_hb_pid" 2>/dev/null || true
+  # Non-fatal regardless of rc — a missing plugin only matters if a
+  # user-supplied task explicitly invokes it, in which case the Claude
+  # CLI's existing "plugin not found in cache" warning is the right
+  # surface. But surface the rc honestly: rc 124/137 means $_seed_to
+  # fired (stall); any other non-zero means the ssh console or the
+  # remote heredoc itself errored out.
+  if [ "$_rebuild_rc" -eq 0 ]; then
+    remote_log "remote: plugin cache rebuild complete (log on machine: ~/.cache/leerie/plugin-install.log)"
+  elif [ "$_rebuild_rc" -eq 124 ] || [ "$_rebuild_rc" -eq 137 ]; then
+    remote_log "remote: plugin cache rebuild timed out (rc=$_rebuild_rc) after ${LEERIE_SEED_TIMEOUT_S:-600}s — continuing without rebuild; verify with 'flyctl ssh console --app $FLY_APP --machine $machine_id -C \"cat /home/leerie/.cache/leerie/plugin-install.log\"'"
+  else
+    remote_log "remote: plugin cache rebuild attempted but ssh console returned rc=$_rebuild_rc — continuing; check /home/leerie/.cache/leerie/plugin-install.log on the machine"
+  fi
 
   remote_log "remote: seed_auth complete"
   return 0

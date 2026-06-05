@@ -1591,10 +1591,16 @@ CLAUDE_SKIP=(
   # @anthropic-ai/claude-code globally via the Dockerfile, so this is
   # pure dead weight on the wire to Fly. Local nerdctl runs bind-mount
   # the host $HOME/.claude so they pick up the local install regardless.
-  # NOTE: keep .claude/plugins/cache — that's where installed plugins
-  # actually live (per installed_plugins.json's installPath); workers
-  # may invoke them.
   local
+  # Skip the plugin cache and marketplaces (hundreds of MB on a typical
+  # host — vercel's node_modules alone is ~150 MB). These are rebuildable
+  # from the small JSON files we still seed (installed_plugins.json,
+  # known_marketplaces.json). seed_auth runs `claude plugin marketplace
+  # add` + `claude plugin install` on the remote after the tar pipe to
+  # repopulate them on the machine's fast public egress instead of the
+  # slow WireGuard wire.
+  plugins/cache
+  plugins/marketplaces
 )
 if command -v rsync >/dev/null 2>&1; then
   EXCLUDES=()
