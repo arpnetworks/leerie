@@ -564,6 +564,14 @@ HEAL_SUCCESS_THRESHOLD_ENV = "LEERIE_HEAL_SUCCESS_THRESHOLD"
 HEAL_MAX_ROUNDS_FILE = "leerie.toml"
 HEAL_SUCCESS_THRESHOLD_FILE = "leerie.toml"
 
+# State directory override — see IMPLEMENTATION.md §2 "State directory".
+# When set, leerie writes all run state (state.json, runs/, logs/) under
+# this path instead of the default repo-relative `.leerie/`. This decouples
+# the persisted state location from the repo mount so users can keep a single
+# ~/.leerie-style directory across all repos rather than one per repo.
+# Unset → falls back to `<repo_root>/.leerie` (today's behavior preserved).
+STATE_DIR_ENV = "LEERIE_STATE_DIR"
+
 
 
 
@@ -2607,6 +2615,21 @@ def resolve_task_argument(raw: str) -> str:
             die(f"task file {raw!r} is empty")
         return contents
     return raw
+
+
+def resolve_leerie_root(repo_root: Path) -> Path:
+    """Resolve the leerie state root directory.
+
+    Resolution order: LEERIE_STATE_DIR env var → repo_root / '.leerie'.
+
+    When LEERIE_STATE_DIR is set, all run state (state.json, runs/, logs/)
+    is written there instead of inside the repo. Unset preserves today's
+    repo-relative '.leerie/' behavior.
+    """
+    env = os.environ.get(STATE_DIR_ENV, "").strip()
+    if env:
+        return Path(env).resolve()
+    return (repo_root / ".leerie").resolve()
 
 
 def resolve_source_of_truth(repo_root: Path,
@@ -6150,9 +6173,17 @@ class State:
     `leerie_root / "runs" / run_id / state.json`. Two State instances with
     different run_ids share no on-disk state. See DESIGN.md §6 and §10."""
 
-    def __init__(self, leerie_root: Path, run_id: str):
+    def __init__(
+        self,
+        leerie_root: Path,
+        run_id: str,
+        repo_root: Path | None = None,
+    ):
         self.leerie_root = leerie_root
         self.run_id = run_id
+        # leerie_root may now live outside the repo (LEERIE_STATE_DIR), so
+        # repo_root cannot be derived from it as leerie_root.parent in general.
+        self.repo_root: Path = repo_root if repo_root is not None else leerie_root.parent
         self.run_dir = leerie_root / "runs" / run_id
         self.path = self.run_dir / "state.json"
         self.data: dict = {}
@@ -10771,7 +10802,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             "disputed surface (name which API survives, or split it into "
             "two distinct artifacts), and re-run.\n"
             "  • Or manually delete one of the colliding subtask specs "
-            "in .leerie/runs/<run-id>/subtasks/ and `--resume`."
+            "in <state-root>/runs/<run-id>/subtasks/ and `--resume`."
         )
 
     # Apply merges and drops in input order via the pure helper.
@@ -11621,7 +11652,7 @@ async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
     is recorded as a warning by the caller — DESIGN §9: the phase is
     advisory)."""
     sys_prompt = load_prompt("conformer")
-    repo_root = st.leerie_root.parent
+    repo_root = st.repo_root
     rules_paths_str = ", ".join(
         str(p.relative_to(repo_root)) if str(p).startswith(str(repo_root))
         else str(p)
@@ -11903,7 +11934,7 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     violations on conformer commits, exhausted rounds — surface as
     entries in `warnings`. The subtask still returns `complete`."""
     warnings: list[str] = []
-    repo_root = st.leerie_root.parent
+    repo_root = st.repo_root
     rules_files = discover_rules_files(repo_root)
     blt = _infer_build_lint_test(repo_root)
     run_branch = compute_run_branch(st.run_id)
@@ -12017,7 +12048,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     st.data["current_phase"] = "phase 5: final conformance"
     st.save()
 
-    repo_root = st.leerie_root.parent
+    repo_root = st.repo_root
     rules_files = discover_rules_files(repo_root)
     blt = _infer_build_lint_test(repo_root)
 
@@ -13559,7 +13590,7 @@ def main() -> None:
     # .leerie/runs/* and exit. No git/CLI checks needed; the user might
     # be inspecting runs from outside a git repo.
     if args.list_runs:
-        leerie_root = Path(".leerie").resolve()
+        leerie_root = resolve_leerie_root(Path(os.getcwd()))
         list_runs(
             leerie_root,
             status_filter=args.status_filter,
@@ -13567,7 +13598,7 @@ def main() -> None:
         )
         return
     if args.list_paused:
-        leerie_root = Path(".leerie").resolve()
+        leerie_root = resolve_leerie_root(Path(os.getcwd()))
         list_paused_runs(leerie_root)
         return
 
@@ -13610,7 +13641,7 @@ def main() -> None:
     # run we don't know the final run_id until phase_classify has chosen
     # a category, so state lives in `_bootstrap-<6hex>/` until then; the
     # rename to the final run_id happens in orchestrate() after classify.
-    leerie_root = Path(".leerie").resolve()
+    leerie_root = resolve_leerie_root(Path(os.getcwd()))
     leerie_root.mkdir(parents=True, exist_ok=True)
     (leerie_root / "runs").mkdir(parents=True, exist_ok=True)
     if args.resume:

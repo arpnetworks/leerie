@@ -32,7 +32,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/container-entry.sh` | Container PID 1. `cd /work`. If invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately), `exec sleep infinity` to keep the namespace alive. Otherwise `exec python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
 | `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-finalize-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, source `scripts/host-finalize.sh` and call `host_finalize <run-dir>` to push + open the PR with the host's auth; **only if push succeeds** does `destroy_machine` run; on push failure leave the machine RUNNING with a recovery banner pointing at `leerie --finalize <run-id>`; on sync failure same recovery pattern with `sync_failed_at` written to the sidecar), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: stop machine, write `paused_at`/`pause_reason` to the run sidecar). |
-| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `attach.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `update_run_json()` (atomic merge of fields into `.leerie/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), and `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated). Replaces four duplicated detection blocks across the remote scripts. |
+| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `attach.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `update_run_json()` (atomic merge of fields into `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), and `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated). Replaces four duplicated detection blocks across the remote scripts. |
 | `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch when a `fly_machine_id` is recoverable for the run-id — looked up via the dual-file resolver `_resolve_fly_machine_id_from_run_dir` at `leerie:76-94`, which tries `fly-machine.json` first then `run.json`, matching `--stop`/`--kill`/`--finalize`/`--attach`). Exports `resume_machine()`: runs `flyctl machine start` (idempotent on already-running machines via the `flyctl machine status` fallback at lines 47-53), waits for `started`, and clears `paused_at`/`pause_reason` from `run.json` if it exists. The launcher then runs the orchestrator inside the resumed machine with `--resume --run-id <id>`. |
 | `scripts/remote/attach.sh` | PTY-attach helper (invoked via `leerie --attach`). Resolves the Fly Machine ID for a given run (or the only active record under `.leerie/remote/`) and `exec`s `flyctl ssh console` to open a real PTY into the machine over Fly's WireGuard mesh. `--tail` mode replaces the bare-shell command with `tail -F /work/.leerie/runs/<run-id>/orchestrator.log` — the canonical way to reattach to a detached run after Ctrl-C or laptop disconnect. No sshd in the image, no key management: hallpass is platform-injected by Fly. |
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Exports `re_seed()`: reads `fly_machine_id` from the run sidecar, wakes the machine via `flyctl machine start` if stopped, runs a safety check that refuses re-seed when machine-side `/work` has uncommitted tracked changes (unless `LEERIE_RE_SEED_FORCE=1`), then calls `seed_repo_dirty` from `seed-repo.sh`. Invoked by the launcher's `--re-seed <run-id>` fast-path and by the auto-re-seed step in the `--resume <run-id> --runtime fly` flow. |
@@ -188,8 +188,8 @@ Base layers (top-down):
   `claude` CLI workers invoke; leerie enforces ≥ 2.1.22 at runtime).
 - Non-root `leerie` user created with `--build-arg HOST_UID/HOST_GID`
   matching the host user. This is what makes files the container
-  writes into `/work/.leerie/` and the worktrees keep the host user's
-  ownership.
+  writes into `/work` (worktrees) and `/leerie-state` (run state) keep
+  the host user's ownership.
 - `git config --system --add safe.directory '*'` is set in the image
   (writes to `/etc/gitconfig`). The container is single-tenant (one
   user) and `/work` is its only repo, so blanket-allow is the standard
@@ -301,12 +301,13 @@ Flags:
 The flag is consumed by the launcher and not forwarded to the
 orchestrator (same convention as `--no-runtime-install` and `--remote`).
 
-Note the two `.leerie*` paths inside the container:
+Note the key paths inside the container:
 
-- **`/work/.leerie/`** is the run-state directory inside the user's
-  repo (state.json, logs, worktrees, telemetry). It lives on the
-  host filesystem via the `/work` bind mount and persists across
-  container runs.
+- **`/leerie-state/`** is the run-state directory (state.json, logs,
+  worktrees, telemetry). It lives on the host filesystem via the
+  `/leerie-state` bind mount (`LEERIE_STATE_HOST_DIR`) and persists
+  across container runs. In *local mode*, worktrees land under
+  `/leerie-state/runs/<run-id>/worktrees/` — outside `/work`.
 - **`/opt/leerie-image/`** is the orchestrator source tree. On local
   runs it is a read-only bind mount of `$LEERIE_HOME` on the host; on
   Fly Machines it is the baked copy from the Dockerfile's `COPY`
@@ -315,9 +316,9 @@ Note the two `.leerie*` paths inside the container:
   `/opt/leerie-image/{scripts,orchestrator}/`.
 
 The container's PID 1 (the entry script) reads from `.leerie-image/`
-and writes to `.leerie/`. Confusing the two would either break runs
-(writing to the read-only mount) or corrupt the install (writing to
-the source tree).
+and writes to `/leerie-state/` (the state bind mount). Confusing the
+two would either break runs (writing to the read-only mount) or
+corrupt the install (writing to the source tree).
 
 ### Entrypoint and source mounting
 
@@ -350,7 +351,8 @@ The launcher passes the following mounts to `nerdctl run`:
 
 | Host path | Container path | Mode | Purpose |
 |---|---|---|---|
-| `$(pwd -P)` (user repo) | `/work` | rw | The repo leerie operates on. Worktrees and `.leerie/` state live here. Writes flow back to the host so `--resume` works across container runs. |
+| `$(pwd -P)` (user repo) | `/work` | rw | The repo leerie operates on. Git worktrees live here. Writes flow back to the host so `--resume` works across container runs. Run state (`.leerie/`) is mounted separately via `/leerie-state` (see below). |
+| `$LEERIE_STATE_HOST_DIR` (resolved host state dir) | `/leerie-state` | rw | *Local mode only.* Leerie run state (state.json, runs/, logs/, worktrees/). Mounted at a top-level container path distinct from `/work` so the repo checkout stays pristine — no `.leerie/` dir accumulates inside the project. The orchestrator reads the container path from `LEERIE_STATE_DIR=/leerie-state` (passed as `-e` in the same `nerdctl run` invocation). `LEERIE_STATE_HOST_DIR` is resolved on the host by the launcher before launch; see §2 "Host-side per-repo state directory". |
 | `$LEERIE_HOME` (leerie install dir) | `/opt/leerie-image` | ro | *Local mode only.* Orchestrator source + Dockerfile + prompts. Read-only because the container has no business mutating the install. Shadows the baked COPY layer so edits to `orchestrator/leerie.py` take effect without an image rebuild. Absent in registry / fly.io mode — the baked COPY layer is used directly. |
 | `$STAGE/.claude.json` (per-run host scratch) | `/home/leerie/.claude.json` | rw | Per-container copy of `~/.claude.json` with the `projects[]` block stripped. The host file is never directly mounted into a container: the shared mount is a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226 — all open) that hangs workers in a recovery loop with no backoff. Each container writes only its private copy. |
 | `$STAGE/.claude` (per-run host scratch) | `/home/leerie/.claude` | rw | Per-container copy of `~/.claude/` with bulky, prior-session, and history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `stats-cache.json`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`, `.last-cleanup`, `settings.json.*`, `plugins/cache/`, `plugins/marketplaces/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/installed_plugins.json` + sibling JSON, `mcp-needs-auth-cache.json`, `settings.json`, `local/`, `statsig/`, `cache/`, `package.json`, `policy-limits.json`) ride along. `plugins/cache/` and `plugins/marketplaces/` are rebuilt on the remote in the fly runtime; see `scripts/remote/seed-auth.sh` step 4 (`# --- 4. Rebuild plugin cache`). |
@@ -531,13 +533,14 @@ handling) is identical.
 - Inside the container, `sys.stdin.isatty()` returns False. The
   orchestrator's `gather_answers()` and the mid-execution
   clarification path (`surface_clarification()`) both detect this and trigger
-  the canonical no-TTY signal: write `.leerie/pending-questions.json`
+  the canonical no-TTY signal: write `<state-root>/runs/<run-id>/pending-questions.json`
   to disk and `sys.exit(EXIT_NEEDS_ANSWERS)` (= 10).
-- `.leerie/pending-questions.json` is visible on the host because
-  `/work` is bind-mounted from the user's repo. The plugin agent at
-  `commands/leerie.md` reads it directly, asks the user via the chat
-  UI, writes the matching `.leerie/answers.json`, and re-runs the
-  container with `--answers .leerie/answers.json` and `--resume`.
+- `<state-root>/runs/<run-id>/pending-questions.json` is visible on the
+  host because `/leerie-state` is bind-mounted from `LEERIE_STATE_HOST_DIR`.
+  The plugin agent at `commands/leerie.md` reads it directly, asks the
+  user via the chat UI, writes the matching `<state-root>/answers.json`,
+  and re-runs the container with `--answers <state-root>/answers.json`
+  and `--resume`.
 - Stdout/stderr stream back through the Bash tool to the agent's
   chat session — possibly in 30s-ish chunks per the harness's
   buffering, which is acceptable for the streaming UX.
@@ -555,7 +558,7 @@ Common to both modes:
 
 The plugin mode flow above is exactly what `commands/leerie.md` already
 documents — it works through the container with zero new mechanism
-because `.leerie/` lives on the bind-mounted host filesystem.
+because the state dir lives on the bind-mounted `/leerie-state` host filesystem.
 
 ### What does NOT change in the orchestrator
 
@@ -637,8 +640,8 @@ leerie/
 │       │                           pause-on-failure*); resume_machine() flyctl machine start
 │       │                           + wait_for_started + clear paused_at sentinels
 │       ├── attach.sh               PTY-over-SSH attach for `leerie --attach`; resolves
-│       │                           machine id from .leerie/remote/<pid>.json or
-│       │                           .leerie/runs/<run-id>/fly-machine.json and execs
+│       │                           machine id from <state-root>/remote/<pid>.json or
+│       │                           <state-root>/runs/<run-id>/fly-machine.json and execs
 │       │                           `flyctl ssh console` over Fly WireGuard (no sshd
 │       │                           in the image; hallpass is platform-injected)
 │       ├── re-seed.sh               Mid-run re-rsync (Phase 4) — wakes paused machine,
@@ -732,7 +735,7 @@ export LEERIE_CONFIDENCE_ROUNDS=12
 # Verbosity controls how much per-worker activity surfaces inline.
 # Default is `stream`: one-line summary per worker event. -q drops to
 # leerie's pre-streaming terse output; -qq is fully quiet (errors
-# still emit). -vv adds raw payloads. Per-worker .leerie/logs/<sid>.log
+# still emit). -vv adds raw payloads. Per-worker <state-root>/logs/<sid>.log
 # files are always written regardless of level.
 leerie "task"        # default: stream
 leerie "task" -q      # normal (pre-streaming)
@@ -746,6 +749,15 @@ export LEERIE_VERBOSITY=stream
 # leerie.toml for a per-repo default.
 export LEERIE_SOURCE_OF_TRUTH=codebase    # or: research, both
 leerie "task" --source-of-truth codebase
+
+# Override the host-side per-repo state directory (default:
+# $HOME/.leerie/state/<sha16>-<basename>/). Each repo gets its own
+# subtree under $HOME so Colima auto-shares it. Precedence:
+# default < leerie.toml state_dir < LEERIE_STATE_DIR env < --state-dir CLI.
+export LEERIE_STATE_DIR=~/.leerie/state/myproject
+leerie "task" --state-dir ~/.leerie/state/myproject
+# Or commit a per-repo default in leerie.toml:
+#   state_dir = ~/.leerie/state/myproject
 
 # Select the execution runtime (default: local). `fly` routes each worker
 # through Fly.io machines instead of local nerdctl containers.
@@ -983,6 +995,87 @@ would die at the resume guard (no `waves` field in `state.json`).
 This routing keeps the user from paying for a Fly volume indefinitely
 on a structurally-unrecoverable run.
 
+### Host-side per-repo state directory
+
+Resolves `LEERIE_STATE_HOST_DIR`: the host path where this repo's leerie run
+state (`runs/`, `worktrees/`, etc.) is stored. Lives under `$HOME` so Colima
+auto-shares it without an explicit `--mount` entry; keyed by repo identity so
+each repo gets an isolated subtree, mirroring how `~/.claude/projects/`
+separates per-repo state from the shared install at `~/.claude/`.
+
+Default path: `$HOME/.leerie/state/<key>/` where `<key>` is
+`sha256(abs_path)[:16]-<basename>` — stable, collision-resistant, and
+human-legible without a lookup table. The default must NOT reuse
+`$LEERIE_HOME` (`~/.leerie`) verbatim, because that is the install/clone
+directory (DESIGN §TBD); state lives in a distinct `state/` subtree.
+
+Resolution order (lowest → highest priority):
+
+1. **Default** `$HOME/.leerie/state/<sha16>-<basename>/`. The key is computed
+   by the `_state_dir_default` helper in the launcher via
+   `hashlib.sha256(abs_path.encode()).hexdigest()[:16] + "-" + basename`.
+
+2. **`leerie.toml` at the repo root** with key `state_dir`. Plain
+   `key=value` syntax; bare `~` and `~/`-prefixed values are expanded to
+   `$HOME`:
+
+   ```
+   state_dir = ~/.leerie/state/myproject
+   ```
+
+3. **`LEERIE_STATE_DIR`** environment variable. Overrides the default and
+   any toml value; bare `~` and `~/`-prefixed values are expanded.
+
+4. **`--state-dir PATH`** CLI flag. Highest priority; overrides everything.
+   Bare `~` and `~/`-prefixed values are expanded.
+
+The resolved directory is `mkdir -p`'d by the launcher on every invocation
+(alongside the other `~/.cache/leerie/*` dirs at `leerie:1827`). This
+ensures the directory exists before the container is launched and before any
+mount in a later subtask adds the host-side path.
+
+Resolution lives entirely in the launcher (bash); no Python counterpart —
+the path is passed to `nerdctl run` as a bind-mount volume argument once
+resolved. Tested by `tests/test_resolve_state_dir.py`.
+
+> The CLI/env > file order follows the same session-scoped vs.
+> committed-default split as `--source-of-truth` and `--runtime`.
+
+### State directory
+
+Controls where leerie writes all run state (`state.json`, `runs/`, `logs/`,
+etc.). By default, state is written to a per-repo subtree under `$HOME` —
+never inside the repo itself — so target projects do not accumulate a
+`.leerie/` directory and do not need to add anything to their `.gitignore`.
+The default path is `$HOME/.leerie/state/<sha16>-<basename>/`, giving each
+repo an isolated, human-legible subtree that mirrors how `~/.claude/projects/`
+separates per-repo state from the shared install at `~/.claude/`.
+
+Resolution order (lowest → highest priority):
+
+1. **Default** `$HOME/.leerie/state/<sha16>-<basename>/`. Computed from the
+   absolute path of the repo root; stable and collision-resistant.
+
+2. **`leerie.toml` at the repo root** with key `state_dir`. Plain
+   `key=value` syntax; bare `~` and `~/`-prefixed values are expanded to
+   `$HOME`.
+
+3. **`LEERIE_STATE_DIR`** environment variable — any non-empty value is
+   expanded (`~/` → `$HOME/`) and used verbatim. Set once in your shell
+   profile to keep all repos under a common directory.
+
+4. **`--state-dir PATH`** CLI flag. Highest priority; overrides everything.
+   Bare `~` and `~/`-prefixed values are expanded.
+
+Code counterpart: `resolve_leerie_root(repo_root)` in `leerie.py`;
+constant `STATE_DIR_ENV = "LEERIE_STATE_DIR"`. All three `leerie_root`
+assignments in `main()` call `resolve_leerie_root(Path(os.getcwd()))`.
+The launcher resolves `LEERIE_STATE_HOST_DIR` (the same value, before
+container launch) via `_state_dir_default()` and passes it as the
+`/leerie-state` bind-mount argument and via `-e LEERIE_STATE_DIR=/leerie-state`
+so the orchestrator inside the container always writes to the mounted state
+dir. See §0.5 *Bind-mount table* for the full mount specification.
+
 ### Runtime mode
 
 Controls which execution backend runs the per-subtask worker containers.
@@ -1058,7 +1151,7 @@ each planner / implementer's user prompt — the cap is prompt-governed (see
 ### Verbosity
 
 Controls how much of the per-worker activity surfaces to the
-orchestrator log. Per-worker `.leerie/logs/<sid>.log` files are
+orchestrator log. Per-worker `<state-root>/logs/<sid>.log` files are
 always written with the full raw event stream — verbosity governs
 only the *inline* summary lines. Four named levels with stackable
 `-v`/`-q` shortcuts, following the clig.dev / cargo / kubectl
@@ -1176,8 +1269,8 @@ unneeded.
 ### Telemetry
 
 Controls whether leerie writes NDJSON telemetry events for LLM calls. Events
-land in `<run-dir>/<telemetry_subdir>/` — already under `.leerie/` and thus
-covered by the existing `.gitignore` exclusion. Telemetry is on by default.
+land in `<run-dir>/<telemetry_subdir>/` — already under `<state-root>/` and
+outside the repo, so no `.gitignore` entry is needed. Telemetry is on by default.
 
 Resolution order (highest priority first):
 
@@ -1442,7 +1535,7 @@ wants the old all-Sonnet behavior sets `LEERIE_MODEL=sonnet` (or
 `--model sonnet`). Per-worker overrides (`--model-planner sonnet`) let
 users selectively de-escalate individual workers.
 
-Models are not persisted in `.leerie/state.json`. On `--resume`, models are
+Models are not persisted in `<state-root>/state.json`. On `--resume`, models are
 re-resolved from the current environment, so changing `LEERIE_MODEL` between
 the original run and the resume is intentional and takes effect.
 
@@ -1516,7 +1609,7 @@ values are validated by argparse `choices=`. A worker that resolves to `None`
 (no override and no per-worker default) produces the exact same CLI as
 before this feature landed — zero behavior change for unconfigured workers.
 
-Efforts are not persisted in `.leerie/state.json`. Like models, on `--resume`
+Efforts are not persisted in `<state-root>/state.json`. Like models, on `--resume`
 they are re-resolved from the current environment.
 
 ### The `--answers` file
@@ -1540,7 +1633,7 @@ Each worker is one `claude -p` headless process. Flags used:
 | Flag | Purpose |
 |------|---------|
 | `-p` | non-interactive single-shot |
-| `--output-format stream-json --verbose` | streams one JSON event per stdout line as the worker runs; the final `result` event is the envelope (same shape as `--output-format json`'s single output — `cost`, `usage`, `terminal_reason`, `structured_output`). `_invoke` writes raw events to `.leerie/logs/<sid>.log` and emits per-event inline summaries gated by `state.json["verbosity"]` |
+| `--output-format stream-json --verbose` | streams one JSON event per stdout line as the worker runs; the final `result` event is the envelope (same shape as `--output-format json`'s single output — `cost`, `usage`, `terminal_reason`, `structured_output`). `_invoke` writes raw events to `<state-root>/logs/<sid>.log` and emits per-event inline summaries gated by `state.json["verbosity"]` |
 | `--json-schema <inline>` | the payload schema; serialized inline as a JSON string — a file path is silently ignored (verified against Claude Code 2.1.143) |
 | `--append-system-prompt` | injects the worker's role prompt — read from `prompts/*.md` for classifier/planner/reconciler/plan_overlap_judge/provision/implementer/integrator/conformer, plus the post-run / finalize workers pr_writer, judge, and patch_generator |
 | `--allowedTools` | tool allowlist; two buckets — **inspect** (`INSPECT_TOOLS`: read set + allowlisted `Bash(ls:*)` / `Bash(find:*)` / `Bash(cat:*)` / … for cross-cwd read-only inspection, **no Write/Edit**) for classifier, planner, reconciler, plan_overlap_judge, and provision; **acting** (`ACT_TOOLS`: read set + Bash/Write/Edit) for implementer, integrator, and conformer. The acting bucket keeps Bash unrestricted because its workers run with `--dangerously-skip-permissions`; the inspect bucket uses `Bash(<verb>:*)` prefix patterns to pre-approve specific read-only verbs at the CLI level — no Write/Edit so the prompt's "you do not modify code" rule is enforced mechanically per DESIGN §12 |
@@ -1639,9 +1732,10 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 on the classification.
 
 Between Phase 3 and Phase 4, `write_plan()` persists the merged plan
-(`.leerie/plan.json`) and per-subtask spec files
-(`.leerie/subtasks/<id>.json`). The conformance phase derives its
-advisory test command separately via `_infer_build_lint_test()`.
+(`<state-root>/runs/<run-id>/plan.json`) and per-subtask spec files
+(`<state-root>/runs/<run-id>/subtasks/<id>.json`). The conformance
+phase derives its advisory test command separately via
+`_infer_build_lint_test()`.
 
 `plan.json` carries `{task, waves, subtasks, preconditions}`. The
 `preconditions` array is the deduped list of `extent: external` `requires`
@@ -1677,10 +1771,10 @@ Run-id collisions are detected outside preflight because the final `run_id` is o
 
 | Check | Where | Catches |
 |-------|-------|---------|
-| `State.rename_to(new_run_id)` refuses if the target dir exists | `orchestrate()` after `phase_classify` | `.leerie/runs/<run-id>/` already exists on disk |
+| `State.rename_to(new_run_id)` refuses if the target dir exists | `orchestrate()` after `phase_classify` | `<state-root>/runs/<run-id>/` already exists on disk |
 | `setup-run.sh` preserves an existing `leerie/runs/<run-id>` branch instead of creating it | wave-execute phase | A pre-existing branch with the same name (treated as a resume; the run picks up wherever the branch was left) |
 
-The bootstrap directory `.leerie/runs/_bootstrap-<6hex>/` is used until classify completes; the rename is atomic on POSIX same-filesystem.
+The bootstrap directory `<state-root>/runs/_bootstrap-<6hex>/` is used until classify completes; the rename is atomic on POSIX same-filesystem.
 
 `--skip-smoke` bypasses only the live smoke test (used by the test harness); the CLI version check and the `gh` check still run because they are local and read-only, and skipping them would defer a confusing failure to mid-run.
 
@@ -2288,7 +2382,7 @@ branch, after the `_write_run_json(...)` block and before
    record `kind: none` and return.
 2. **Setup hook.** `run_setup_hook(repo_root, log_dir, st)` execs
    `<repo>/.leerie-setup.sh` if present (10-min timeout, streams to
-   `.leerie/runs/<id>/logs/setup-hook.log`). Idempotent via
+   `<state-root>/runs/<id>/logs/setup-hook.log`). Idempotent via
    `st.data["provision"]["sh_hook_ran"]`. Nonzero exit → `die()`.
    **Runs as the non-root `leerie` container user; no sudo.** The hook
    can install user-space tooling (`mise install <lang>@<version>`,
@@ -2336,7 +2430,7 @@ branch, after the `_write_run_json(...)` block and before
    `.python-version` / `.ruby-version` / `rust-toolchain.toml` /
    `.go-version` because the image sets
    `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=node,python,ruby,rust`.
-   Streams to `.leerie/runs/<id>/logs/provision.log`. Nonzero exit
+   Streams to `<state-root>/runs/<id>/logs/provision.log`. Nonzero exit
    surfaces the failing tool+version to `die()`.
 5. **Version capture.** Runs `mise ls --current --json` (the
    subcommand `mise current --json` does not exist; verified
@@ -2465,11 +2559,11 @@ Every script takes a `RUN_ID` as its first positional argument (after any flags)
 
 | Script | Behavior |
 |--------|----------|
-| `setup-run.sh <run-id>` | Creates `leerie/runs/<run-id>` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch (HEAD-at-run-start) to `.leerie/runs/<run-id>/working-branch` on first run only. Adds the run-branch worktree at `.leerie/runs/<run-id>/worktrees/staging` if missing. Appends `.leerie/` to the repo's `.git/info/exclude` (idempotent). Safe on `--resume`. |
-| `new-worktree.sh <id> <run-id>` | Creates `leerie/subtasks/<run-id>/<id>` worktree at `.leerie/runs/<run-id>/worktrees/<id>` branched off the current `leerie/runs/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. The run-branch (`leerie/runs/…`) and subtask-branch (`leerie/subtasks/…`) prefixes are deliberately disjoint so neither is an ancestor ref of the other — git's loose ref store cannot hold a ref AT a path and another ref UNDER that same path simultaneously. |
-| `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`.leerie/runs/<run-id>/worktrees/staging`): `git merge --no-ff leerie/subtasks/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
+| `setup-run.sh <run-id>` | Creates `leerie/runs/<run-id>` **only if absent** — never force-resets it (an existing branch carries completed waves; resetting it would destroy resume state). Records the working branch (HEAD-at-run-start) to `${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/working-branch` on first run only. Adds the run-branch worktree at `${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/worktrees/staging` if missing. Safe on `--resume`. |
+| `new-worktree.sh <id> <run-id>` | Creates `leerie/subtasks/<run-id>/<id>` worktree at `${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/worktrees/<id>` branched off the current `leerie/runs/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. The run-branch (`leerie/runs/…`) and subtask-branch (`leerie/subtasks/…`) prefixes are deliberately disjoint so neither is an ancestor ref of the other — git's loose ref store cannot hold a ref AT a path and another ref UNDER that same path simultaneously. |
+| `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/worktrees/staging`): `git merge --no-ff leerie/subtasks/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
 | `finalize.sh <run-id>` | Run-branch verifier. Exits 0 if `refs/heads/leerie/runs/<run-id>` exists and contains at least one commit beyond the working branch; exits non-zero with a diagnosis otherwise. The working branch is **never** modified — leerie does not merge into it locally; the PR is the proposed integration. The push and PR step lives in the **host launcher** (`leerie` bash script), not in the container — it runs after `nerdctl run` exits cleanly, using the host's own `git push` + `gh pr create` against the host's auth state. See "Host-side finalize" below. |
-| `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap] [--branches \| --subtask-branches]` | Default (no flag): scans `.leerie/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `.leerie/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches *and* subtask branches (`leerie/runs/<id>` and `leerie/subtasks/<id>/*`). `--subtask-branches` deletes only the subtask branches and keeps `leerie/runs/<id>` (the post-finalize default — the run branch is the PR head and must outlive the orchestrator). Without either flag, all branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh`. Ctrl-C and every other abnormal exit in the orchestrator also preserve state — they call `_cleanup_on_abnormal_exit(full_purge=False)`. There is no `full_purge=True` call site today; the flag is retained as a future hook for an explicit-purge gesture, but no current code path uses it. |
+| `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap] [--branches \| --subtask-branches]` | Default (no flag): scans `<state-root>/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `<state-root>/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches *and* subtask branches (`leerie/runs/<id>` and `leerie/subtasks/<id>/*`). `--subtask-branches` deletes only the subtask branches and keeps `leerie/runs/<id>` (the post-finalize default — the run branch is the PR head and must outlive the orchestrator). Without either flag, all branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh`. Ctrl-C and every other abnormal exit in the orchestrator also preserve state — they call `_cleanup_on_abnormal_exit(full_purge=False)`. There is no `full_purge=True` call site today; the flag is retained as a future hook for an explicit-purge gesture, but no current code path uses it. |
 
 A run branch `leerie/runs/<run-id>` is never reset once created — this is the invariant `--resume` depends on. See `DESIGN.md` §6 ("the run branch is the resume contract").
 
@@ -2928,7 +3022,7 @@ with `_bootstrap-`, routing the in-machine orchestrator to its
 `orchestrator/leerie.py:12592` (honors the id, creates fresh State).
 That arm needs a `task` positional, which is gone from the user's
 resume argv. The launcher persists the user's original task argument
-to `$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/task.txt` on first launch
+to `$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt` on first launch
 (adjacent to the `fly-machine.json` early-promote write), and on
 bootstrap-stage resume — when `LEERIE_TASK_ARG` is empty in this
 invocation's argv — reads it back and appends to `REWRITTEN_ARGS`.
@@ -3112,7 +3206,7 @@ The mechanism is the same in both contexts:
    share the same origin history.
 
 4. **Run state directory** — tars `/work/.leerie/runs/<run-id>`
-   on the machine and extracts it under `$USER_REPO/.leerie/runs/`
+   on the machine and extracts it under `$LEERIE_STATE_HOST_DIR/runs/`
    on the host. After extraction, `run.json` and `state.json`
    are present on the host exactly as they would be after a
    local run.
@@ -3170,20 +3264,20 @@ no-runtime-installed hosts can still attach to a remote run.
 Resolution rules for the machine id:
 
 1. `leerie --attach <run-id>` → look up
-   `$USER_REPO/.leerie/runs/<run-id>/fly-machine.json` first, then
-   `$USER_REPO/.leerie/runs/<run-id>/run.json` (which carries
+   `$LEERIE_STATE_HOST_DIR/runs/<run-id>/fly-machine.json` first, then
+   `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` (which carries
    `fly_machine_id` per Phase 2). If neither yields a value, exit 1.
-2. `leerie --attach` (no arg) → scan `$USER_REPO/.leerie/remote/*.json`
+2. `leerie --attach` (no arg) → scan `$LEERIE_STATE_HOST_DIR/remote/*.json`
    for active records (records whose filename is a launcher PID that
    still exists). Exactly one → use it. Multiple → print the list,
    exit 1. None → exit 1 with "no active remote machine".
 
 `provision.sh` writes the PID-keyed record at
-`$USER_REPO/.leerie/remote/$$.json` immediately after creating the
+`$LEERIE_STATE_HOST_DIR/remote/$$.json` immediately after creating the
 machine. `destroy_machine` removes it on full reap. After
 `fetch_branch` succeeds and `LEERIE_REMOTE_RUN_ID` is known, the
 launcher renames the record to
-`$USER_REPO/.leerie/runs/$LEERIE_REMOTE_RUN_ID/fly-machine.json` so
+`$LEERIE_STATE_HOST_DIR/runs/$LEERIE_REMOTE_RUN_ID/fly-machine.json` so
 post-run attach works using the run-id directly.
 
 Schema for the record (both paths):
@@ -3294,7 +3388,7 @@ Two new launcher flags, routed at the top of `leerie` alongside
 `--attach` (line ~63):
 
 - **`leerie --stop <run-id>`** — clean pause. Reads `fly_machine_id`
-  from `$USER_REPO/.leerie/runs/<run-id>/run.json`, sources
+  from `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json`, sources
   `provision.sh`, exports `LEERIE_MACHINE_ID` and `FLY_APP`, calls
   `stop_machine()`. Then calls `update_run_json` from `lib.sh` to set
   `paused_at = <iso_now>` and `pause_reason = "user-requested"` on
@@ -3470,20 +3564,22 @@ Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*,
 
 ---
 
-## 8. Coordination directory layout (`.leerie/`)
+## 8. Coordination directory layout
 
-Created in the main repository (not in any worktree — worktrees are disposable).
-`setup-run.sh` git-excludes `.leerie/` by appending it to the target
-repo's `.git/info/exclude` rather than to the user's tracked `.gitignore`
-(we deliberately do not modify files the user has committed).
+State lives under the resolved state root — by default
+`$HOME/.leerie/state/<sha16>-<basename>/`, or the path set via
+`LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir` (see §2
+*State directory* for the full resolution order). The state root is always
+outside the target repo, so no `.leerie/` directory accumulates in project
+checkouts and no `.gitignore` entry is needed. Worktrees are
+disposable; the coordination directory outlives them.
 
-Every run's artifacts live under `.leerie/runs/<run-id>/`. The parent
-`.leerie/` directory is otherwise empty of run data; it only hosts the
-`runs/` directory. Two concurrent runs in the same repository share no
-coordination state.
+Every run's artifacts live under `<state-root>/runs/<run-id>/`. The state
+root is otherwise empty of run data; it only hosts the `runs/` directory.
+Two concurrent runs in the same repository share no coordination state.
 
 ```
-.leerie/
+<state-root>/          (default: $HOME/.leerie/state/<sha16>-<basename>/)
 └── runs/
     └── <run-id>/                    (or _bootstrap-<6hex> pre-classify)
         ├── state.json               run state — see field table below
@@ -3645,7 +3741,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `plan_overlap_applied` | list[dict] | post-apply mutation summary for the phase 2¾ judge. Each entry is either `{action: merge|drop_a|drop_b, artifact: str, surviving_sid: str, dropped_sid: str, reason: str}` recording a mutation against the plan, or `{action: skipped_redundant, artifact: str, collapsed_to: str, original_a_sid: str, original_b_sid: str, merge_feasibility: str, reason: str}` recording a redundant pair whose endpoints had already collapsed to the same survivor via an earlier resolution (the closing edge of a connected cluster — kept in the audit trail so resume-time inspection sees every collision the judge emitted). The anchor-survivor rule may make the `surviving_sid` differ from `_apply_overlap_merge`'s default lex-smaller pick when the merge participates in a cluster — see "Phase 2¾ checks" above. Useful for resume-time replay debugging — `state.data["plan_overlap_judge"]` records what the judge said, this records what the orchestrator did. Empty list when the judge returned no collisions; absent when the phase cheap-skipped. |
 | `no_work_required` | bool | set to `True` by `_finish_no_work_run` when every planner returns `status: "ready"` with `subtasks: []` (DESIGN §8 *The cleared-but-empty terminal state*). When `True`, the orchestrator wrote `finished_at`, skipped phases 3–6, and exited 0 — the task was already satisfied on HEAD, no run branch was materialized, no PR will be opened. `leerie --list` renders the run as `done` (no push, no PR, distinct from `done-pushed-no-pr` and `done-pushed-pr`). Absent on every normal run. |
 | `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. Keys are domain names (e.g. `"bug-fixing"`, `"testing"`); values are the `basis` string the planner emitted explaining why no work was needed. Absent on every normal run. |
-| `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `.leerie/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
+| `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `<state-root>/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
 the plugin skill in `commands/leerie.md`):
@@ -3929,6 +4025,7 @@ enforcement functions:
 
 | Test file | Function under test |
 |-----------|----------------------|
+| `test_resolve_leerie_root.py` | `resolve_leerie_root()` — `LEERIE_STATE_DIR` set → custom path; unset/empty/whitespace → `<repo_root>/.leerie`; always absolute |
 | `test_resolve_source_of_truth.py` | `resolve_source_of_truth()` |
 | `test_resolve_runtime.py` | `resolve_runtime()` — CLI > env > TOML > default `local` precedence, both valid values, invalid-value die() paths, empty/whitespace env handling |
 | `test_resolve_models.py` | `resolve_models()` — per-worker precedence (CLI > env > TOML), defaults, validation, empty/whitespace handling |

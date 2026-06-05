@@ -433,7 +433,7 @@ deliverable through a declared contract.
 The contract for cross-subtask deliverables is therefore separate from
 the contract for code changes. A producing subtask returns an
 `artifacts` field on its implementer result; the orchestrator persists
-the artifacts to `.leerie/runs/<run-id>/artifacts/<sid>.json` and injects
+the artifacts to `<state-root>/runs/<run-id>/artifacts/<sid>.json` and injects
 them into the prompts of subtasks whose predecessor graph names the
 producer. Code-implementation subtasks emit an absent or empty
 `artifacts` field — the deliverable mechanism does not change for them.
@@ -495,7 +495,7 @@ three inputs known by the end of Phase 1:
 
 The result looks like `feat-add-telemetry-skills-a3f7c2`. It is the same
 string in three places: the run branch name (`leerie/runs/<run-id>`), the
-per-run state directory (`.leerie/runs/<run-id>/`), and the title of the
+per-run state directory (`<state-root>/runs/<run-id>/`), and the title of the
 PR opened at finalize. A user looking at any of the three can grep for the
 others.
 
@@ -549,7 +549,7 @@ depends on.
 When more than one run is in flight in the same repository, `--resume`
 needs to know *which* run to resume. The orchestrator auto-picks when
 exactly one run exists, and requires an explicit `--run-id` otherwise; the
-discovery scans `.leerie/runs/*/state.json`. Resume never guesses across
+discovery scans `<state-root>/runs/*/state.json`. Resume never guesses across
 multiple runs.
 
 ### Why merge, not cherry-pick
@@ -687,7 +687,7 @@ push + PR sit between them on the host:
      pipes it to the host, where `git fetch` materialises the branch in the
      host's local repo;
    - tars `.leerie/runs/<run-id>/` on the Machine and extracts it under
-     `$USER_REPO/.leerie/runs/` on the host.
+     `$LEERIE_STATE_HOST_DIR/runs/` on the host.
 3. With the run dir now on the host, the trap sources
    `scripts/host-finalize.sh` and calls `host_finalize` directly — push
    + `gh pr create` happen inline, with the host's own auth, before
@@ -849,13 +849,13 @@ resumable via `--resume --run-id <id>` after any abnormal exit.
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
 
-- Worktrees under `.leerie/runs/<run-id>/worktrees/` are removed and
+- Worktrees under `<state-root>/runs/<run-id>/worktrees/` are removed and
   `git worktree prune` clears stale metadata. Worktrees are
   disposable — `scripts/new-worktree.sh` re-creates them idempotently
   on `--resume` from the deterministic branch names.
 - State.json, the run branch (`leerie/runs/<run-id>`), and per-subtask
   branches (`leerie/subtasks/<run-id>/*`) all survive. Implementer
-  checkpoints under `.leerie/runs/<run-id>/checkpoints/` survive too,
+  checkpoints under `<state-root>/runs/<run-id>/checkpoints/` survive too,
   so in-flight subtasks resume from where they left off.
 
 **Worker subtree termination — kernel-enforced via the container
@@ -916,10 +916,11 @@ The container boundary holds across both invocation modes:
   launcher passes `-i` only. Inside the container,
   `sys.stdin.isatty()` returns False, so the orchestrator's existing
   no-TTY clarification path activates: it writes
-  `.leerie/pending-questions.json` (visible on the host via the
-  `/work` bind mount) and exits with `EXIT_NEEDS_ANSWERS=10`. The
-  plugin agent reads the file, asks the user in chat, writes
-  `.leerie/answers.json`, and re-runs the container with `--answers`.
+  `<state-root>/runs/<run-id>/pending-questions.json` (visible on the
+  host via the `/leerie-state` bind mount) and exits with
+  `EXIT_NEEDS_ANSWERS=10`. The plugin agent reads the file, asks the
+  user in chat, writes `<state-root>/answers.json`, and re-runs the
+  container with `--answers`.
   Same exit codes, same file passing, same kernel teardown
   guarantee. The container is transparent to the plugin's existing
   exit-10 dance.
@@ -1078,7 +1079,7 @@ explicit value and skips auto-generation.
 **Remote pause-on-failure (Fly.io).** Local mode reaps the container's
 PID namespace on every exit (success or failure) because the host
 filesystem holds the durable record. Remote mode has the same durable
-record (the run branch and `.leerie/runs/<run-id>/`, both of which the
+record (the run branch and `<state-root>/runs/<run-id>/`, both of which the
 stream-back finalize already understands) but the Fly Machine is *not*
 free — keeping it alive after failure has a real per-second cost, and
 destroying it after failure throws away the in-machine filesystem state
@@ -1122,13 +1123,13 @@ exit codes through the runtime-appropriate teardown.
 
 `flyctl machine stop` (not destroy) on the pause branch preserves the
 machine's filesystem; the orchestrator's own state is already in
-`.leerie/runs/<run-id>/run.json` and the run branch holds the committed
-work, and `flyctl machine start` brings the machine back from disk
-without losing anything. Memory state is not preserved across a pause —
-the contract this section relies on is that the run branch (the
-committed work) plus `.leerie/runs/<run-id>/` (the orchestrator's own
-state) are the only durable record of a run, and both already live on
-the machine's filesystem by the time a pause fires.
+`<state-root>/runs/<run-id>/run.json` and the run branch holds the
+committed work, and `flyctl machine start` brings the machine back from
+disk without losing anything. Memory state is not preserved across a
+pause — the contract this section relies on is that the run branch (the
+committed work) plus `<state-root>/runs/<run-id>/` (the orchestrator's
+own state) are the only durable record of a run, and both already live
+on the machine's filesystem by the time a pause fires.
 
 ### Remote disk policy
 
@@ -1190,8 +1191,8 @@ has minted a final run-id and synced state back. Before that — i.e.,
 during the bootstrap window when the run dir is still
 `_bootstrap-<hex>` and `run.json` has not yet been written on the
 host — the `fly_machine_id` pointer lives on
-`.leerie/runs/<run-id>/fly-machine.json` instead. `provision.sh`
-writes a PID-keyed pointer at `.leerie/remote/$$.json` immediately
+`<state-root>/runs/<run-id>/fly-machine.json` instead. `provision.sh`
+writes a PID-keyed pointer at `<state-root>/remote/$$.json` immediately
 after `flyctl machine run` succeeds and the launcher promotes it to
 the run-keyed `fly-machine.json` once the run-id is known, so a
 crash before classify still leaves a recoverable pointer. Every
@@ -1313,9 +1314,9 @@ concern"). The same mechanism serves four roles:
    never noticed; only the local view paused.
 
 State contract: `scripts/remote/provision.sh` writes a PID-keyed
-record at `$USER_REPO/.leerie/remote/$$.json` immediately after
+record at `$LEERIE_STATE_HOST_DIR/remote/$$.json` immediately after
 provisioning, removes it in `destroy_machine`, and lets the launcher
-rename it to `$USER_REPO/.leerie/runs/<run-id>/fly-machine.json` after
+rename it to `$LEERIE_STATE_HOST_DIR/runs/<run-id>/fly-machine.json` after
 the run-id becomes known (via fetch-branch.sh). `leerie --attach`
 resolves the machine via either path. Multiple concurrent remote
 runs in the same repo are disambiguated by passing a run-id.
@@ -1471,8 +1472,8 @@ classification and planning, layered top-to-bottom by determinism:
    install: (a) the host's checked-out source tree and tracked
    dep artifacts (`node_modules/`, `.venv/`, `target/`, etc.) are
    never written to by leerie's install path — `.leerie-setup.sh`
-   (user-opt-in) and the `.leerie/` coordination directory are the
-   only paths leerie ever modifies under the host repo; (b) no work
+   (user-opt-in) is the only path leerie ever modifies under the host
+   repo (run state lives outside the repo at `<state-root>`); (b) no work
    is wasted on worktrees whose subtasks don't need built deps;
    (c) the same `claude -p` event-streaming the workers use for
    everything else makes install progress visible to the user,
@@ -1844,14 +1845,18 @@ worktree. A worktree is disposable — it is removed at cleanup — so a checkpo
 stored inside it would vanish exactly when a successor worker needs to read it.
 Coordination state must outlive the worktree that produced it.
 
-Coordination state is **per-run**, rooted at `.leerie/runs/<run-id>/`.
-State, plan, criteria, checkpoints, logs, the worktrees themselves, the
-PR-result sidecar, and the per-subtask `artifacts/` directory (§5
-*Artifact passing between subtasks*) all live under that directory. Two
-runs in the same repository share no coordination state — each has its
-own subtree, and neither can clobber the other's `state.json`, log
-files, or worktrees by collision. The parent `.leerie/` is otherwise
-empty of run data; it only hosts the `runs/` directory.
+Coordination state is **per-run**, rooted at `<state-root>/runs/<run-id>/`
+(where `<state-root>` is the resolved state directory — default
+`$HOME/.leerie/state/<sha16>-<basename>/`, overridable via
+`LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir`; always
+outside the target repo). State, plan, criteria, checkpoints, logs, the
+worktrees themselves, the PR-result sidecar, and the per-subtask
+`artifacts/` directory (§5 *Artifact passing between subtasks*) all live
+under that directory. Two runs in the same repository share no
+coordination state — each has its own subtree, and neither can clobber
+the other's `state.json`, log files, or worktrees by collision. The
+state root is otherwise empty of run data; it only hosts the `runs/`
+directory.
 
 ---
 
@@ -2221,7 +2226,7 @@ worker in the system (§7).
 Each run's telemetry lives at:
 
 ```
-.leerie/runs/<run-id>/calls.ndjson
+<state-root>/runs/<run-id>/calls.ndjson
 ```
 
 One file per run. The file is opened for append at run start and written to
