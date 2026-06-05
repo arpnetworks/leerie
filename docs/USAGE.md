@@ -82,11 +82,12 @@ classifier asks.
 
 In an interactive terminal Leerie prompts you; you type answers, the run
 continues. In a non-interactive context (CI, a plugin skill) Leerie
-instead writes `.leerie/pending-questions.json` and exits with code 10 —
-not an error, a structured "need answers" signal. The plugin skill at
-[`commands/leerie.md`](../commands/leerie.md) shows the questions to
-the user, writes their answers to `.leerie/answers.json`, and resumes
-with `--resume --answers .leerie/answers.json`.
+instead writes `<state-root>/pending-questions.json` and exits with
+code 10 — not an error, a structured "need answers" signal. The plugin
+skill at [`commands/leerie.md`](../commands/leerie.md) shows the
+questions to the user, writes their answers to
+`<state-root>/answers.json`, and resumes with
+`--resume --answers <state-root>/answers.json`.
 
 ## Step 3 — Planning and scheduling
 
@@ -107,8 +108,10 @@ subtasks become two waves of one subtask each — the test cannot run until
 the flag exists. The full rationale for the wave model is in
 [`DESIGN.md`](DESIGN.md) §5.
 
-The merged plan lives at `.leerie/plan.json`; per-subtask spec files
-appear at `.leerie/subtasks/<id>.json`.
+The merged plan lives at `<state-root>/plan.json`; per-subtask spec
+files appear at `<state-root>/subtasks/<id>.json`. `<state-root>`
+defaults to `$HOME/.leerie/state/<sha16>-<basename>/`; override with
+`LEERIE_STATE_DIR`, `--state-dir`, or `state_dir =` in `leerie.toml`.
 
 ## Step 4 — Wave execution
 
@@ -127,12 +130,14 @@ On stdout you'll see lines like (with a hypothetical `<run-id>` of
 [wave 1] validating leerie/runs/feat-add-dry-run-flag-a3f7c2
 ```
 
-And `git worktree list` will show entries like:
+And `git worktree list` will show entries like (with `<state-root>`
+expanded to the resolved per-repo state directory — by default
+`$HOME/.leerie/state/<sha16>-<basename>/`):
 
 ```
-/your/repo                                                                       abc1234 [main]
-/your/repo/.leerie/runs/feat-add-dry-run-flag-a3f7c2/worktrees/staging         def5678 [leerie/runs/feat-add-dry-run-flag-a3f7c2]
-/your/repo/.leerie/runs/feat-add-dry-run-flag-a3f7c2/worktrees/feat-add-dry-run-flag  ghi9012 [leerie/subtasks/feat-add-dry-run-flag-a3f7c2/feat-add-dry-run-flag]
+/your/repo                                                                            abc1234 [main]
+<state-root>/runs/feat-add-dry-run-flag-a3f7c2/worktrees/staging                      def5678 [leerie/runs/feat-add-dry-run-flag-a3f7c2]
+<state-root>/runs/feat-add-dry-run-flag-a3f7c2/worktrees/feat-add-dry-run-flag        ghi9012 [leerie/subtasks/feat-add-dry-run-flag-a3f7c2/feat-add-dry-run-flag]
 ```
 
 After every implementer commits in its worktree, the integrator merges
@@ -169,7 +174,7 @@ Phase 6 verifies `leerie/runs/<run-id>` is non-empty, pushes it to
 `origin`, and opens a PR via `gh pr create --base <working-branch>
 --head leerie/runs/<run-id>`. Your working branch (the branch you
 were on when you invoked Leerie, recorded in
-`.leerie/runs/<run-id>/working-branch`) is **not** modified locally —
+`<state-root>/runs/<run-id>/working-branch`) is **not** modified locally —
 review and merge the PR on GitHub when you're satisfied. The run branch
 `leerie/runs/<run-id>` remains in your repo as the PR head until you
 merge the PR. The per-subtask branches `leerie/subtasks/<run-id>/*`
@@ -200,7 +205,7 @@ need that either. For an audit cleanup across every past run, use
 resolve (an external dependency, an ambiguous spec, a failing test it
 cannot fix). The wave aborts *before* integration, the blocker reason
 lands in `state['blocked'][<subtask-id>]` and `subtask_status[<id>] =
-"blocked"` inside `.leerie/runs/<run-id>/state.json`, and Leerie
+"blocked"` inside `<state-root>/runs/<run-id>/state.json`, and Leerie
 exits non-zero. You read the blocker, fix the upstream issue (often by
 editing the task and re-running, sometimes by hand-resolving), then
 `./leerie --resume`. See [`DESIGN.md`](DESIGN.md) §8 for the

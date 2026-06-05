@@ -87,7 +87,9 @@ def test_compose_pr_body_includes_state_json_pointer(leerie):
     detail beyond what the PR summary shows."""
     rid = "feat-foo-abc123"
     body = leerie.compose_pr_body(_full_state(), rid)
-    assert f".leerie/runs/{rid}/state.json" in body
+    assert "leerie --list" in body
+    assert rid in body
+    assert "state.json" in body
 
 
 # --- missing / partial state handling --------------------------------------

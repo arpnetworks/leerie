@@ -2368,7 +2368,7 @@ by test; the worker behavior is the unverified surface.
 
 Two parts of the surface described in this document are *new* and have not
 yet been exercised end-to-end: the per-run namespacing (run-id derivation,
-`.leerie/runs/<run-id>/` layout, parallel-run coexistence, multi-run
+`<state-root>/runs/<run-id>/` layout, parallel-run coexistence, multi-run
 resume), and the push-and-PR finalization step (`gh pr create`, run.json
 sidecar with `pushed_at`/`pr_url`/error fields, `--no-push` and
 `--no-verify`). The single-run, local-finalize design described in earlier

@@ -240,8 +240,8 @@ case "${1:-}" in
   --list)
     # `--list --runtime fly` is a runtime-aware view: query Fly directly
     # for every machine under FLY_APP, then best-effort cross-reference
-    # `.leerie/runs/*/{fly-machine.json,run.json}` in the current repo
-    # to fill in run-id columns. Without --runtime fly, this arm restores
+    # `$LEERIE_STATE_HOST_DIR/runs/*/{fly-machine.json,run.json}` for the
+    # current repo to fill in run-id columns. Without --runtime fly, this arm restores
     # the original argv and lets execution continue past the case block;
     # the orchestrator's argparse handles plain `--list`.
     _list_runtime=""
@@ -672,7 +672,8 @@ except Exception:
     #   (b) No-work run (DESIGN §8): finished_at set, state.json
     #       present, run.json.no_push=true, and the run branch was
     #       NEVER materialized (so it cannot exist locally). The
-    #       auto-sync tarred .leerie/runs/<id>/ back but skipped the
+    #       auto-sync tarred the run dir back to
+    #       $LEERIE_STATE_HOST_DIR/runs/<id>/ but skipped the
     #       bundle (fetch-branch.sh:204–205). host_finalize will
     #       short-circuit on no_push=true.
     _already_synced="false"
@@ -2293,7 +2294,7 @@ if [ "$RUNTIME" = "fly" ]; then
     # decide_teardown pauses the machine and the user's resume command
     # (`leerie --resume --run-id $LEERIE_RUN_ID --runtime fly`) needs this
     # file to resolve fly_machine_id. provision_machine writes
-    # .leerie/remote/$$.json unconditionally on success (provision.sh:587-613);
+    # $LEERIE_STATE_HOST_DIR/remote/$$.json unconditionally on success (provision.sh:587-613);
     # resume_machine doesn't (the prior launcher's file is gone — different $$ —
     # but the run-keyed pointer survives from the original provision, so the
     # `[ ! -f "$_run_record" ]` guard makes this a no-op on resume).
@@ -2605,10 +2606,11 @@ else
   #   Plugin mode (Claude Code's Bash tool: no TTY) → -i only.
   #     Inside the container, sys.stdin.isatty() returns False, so leerie's
   #     gather_answers and mid-execution clarification paths trigger the
-  #     existing EXIT_NEEDS_ANSWERS=10 flow: write .leerie/pending-questions.json
-  #     (visible on the host via the /work bind mount), exit 10. The plugin
-  #     agent reads the file, asks the user in chat, writes .leerie/answers.json,
-  #     re-runs the container with --answers.
+  #     existing EXIT_NEEDS_ANSWERS=10 flow: write pending-questions.json
+  #     under $LEERIE_STATE_DIR (=/leerie-state in the container, visible
+  #     on the host via the LEERIE_STATE_HOST_DIR bind mount), exit 10.
+  #     The plugin agent reads the file, asks the user in chat, writes
+  #     answers.json to the same dir, re-runs the container with --answers.
   # Ctrl-C (terminal) or harness cancellation (plugin) → SIGINT to container
   # PID 1 → orchestrator exits → kernel reaps the PID namespace (DESIGN §6
   # *Worker subtree termination*). The cleanup guarantee is identical in
