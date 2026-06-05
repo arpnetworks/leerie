@@ -29,7 +29,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/install.sh` | The `curl \| bash` shell installer. Preflight (git/claude/curl) → runtime preflight (colima on macOS, nerdctl+containerd on Linux) → clone → symlink → verify. Self-contained bash; deps: `bash`, `curl`, `git`. |
 | `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Fast paths for `--version` skip container startup. |
 | `Dockerfile` | Image recipe (Debian 13 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
-| `scripts/container-entry.sh` | Container PID 1. `cd /work`. If invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately), `exec sleep infinity` to keep the namespace alive. Otherwise `exec python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). |
+| `scripts/container-entry.sh` | Container PID 1. Runs as **root** (the Dockerfile intentionally omits `USER leerie` so the entrypoint can perform cgroup-v2 delegation — `mkdir + chown /sys/fs/cgroup/leerie.slice` to the leerie user — before privilege drop; see DESIGN §6 *Memory containment*). `ulimit -c 0`, the cgroup delegation block, `cd /work`, and the `chown leerie: /work` step all run as root. The final exec drops to leerie via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...`: if invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately, which also drops via `Popen(user="leerie")`), the runuser exec wraps `sleep infinity` to keep the namespace alive; otherwise it wraps `python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). The explicit `env` form is used instead of `runuser --login` because the login form would chdir to `/home/leerie` and override the `cd /work` invariant. |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
 | `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-finalize-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, source `scripts/host-finalize.sh` and call `host_finalize <run-dir>` to push + open the PR with the host's auth; **only if push succeeds** does `destroy_machine` run; on push failure leave the machine RUNNING with a recovery banner pointing at `leerie --finalize <run-id>`; on sync failure same recovery pattern with `sync_failed_at` written to the sidecar), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: stop machine, write `paused_at`/`pause_reason` to the run sidecar). |
 | `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `attach.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `update_run_json()` (atomic merge of fields into `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), and `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated). Replaces four duplicated detection blocks across the remote scripts. |
@@ -203,6 +203,11 @@ Base layers (top-down):
   risk from `su leerie -c "git config --global"` and matches the posture
   of every major CI image.
 - `WORKDIR /work`, `ENTRYPOINT ["/opt/leerie-image/scripts/container-entry.sh"]`.
+  **No `USER leerie` directive** — ENTRYPOINT runs as root so the
+  entrypoint can perform cgroup-v2 delegation (`mkdir + chown
+  /sys/fs/cgroup/leerie.slice` to the leerie user) before dropping
+  privilege via `runuser -u leerie -- ...` to invoke the orchestrator.
+  See DESIGN §6 *Memory containment* for the full mechanism.
 
 ### Registry publish path (fly.io / remote Machines)
 
@@ -322,13 +327,21 @@ corrupt the install (writing to the source tree).
 
 ### Entrypoint and source mounting
 
-`scripts/container-entry.sh` is exec'd as PID 1:
+`scripts/container-entry.sh` is exec'd as PID 1, running as **root**
+(the Dockerfile intentionally omits `USER leerie` — see DESIGN §6
+*Memory containment* for why root at PID 1 is required for the
+cgroup-v2 delegation chown). Sketch of the relevant final exec:
 
 ```sh
 #!/bin/sh
 set -e
+ulimit -c 0
+# … cgroup-v2 delegation: mkdir + chown /sys/fs/cgroup/leerie.slice …
 cd /work
-exec python3 /opt/leerie-image/orchestrator/leerie.py "$@"
+# … /work ownership fix (Fly volume-attach path) …
+exec runuser -u leerie -- \
+  env HOME=/home/leerie USER=leerie LOGNAME=leerie \
+  python3 /opt/leerie-image/orchestrator/leerie.py "$@"
 ```
 
 The orchestrator's source lives at `/opt/leerie-image/`. It is present
@@ -618,7 +631,7 @@ leerie/
 │   │                              decide_teardown's Fly clean-exit branch, and
 │   │                              `leerie --finalize <run-id>` (§7 Host-side finalize)
 │   ├── cleanup.sh                 remove worktrees / branches (default: scoped to one run)
-│   ├── container-entry.sh         container PID 1: `cd /work && exec python3 orchestrator/leerie.py`
+│   ├── container-entry.sh         container PID 1 (root): cgroup-v2 delegation + cd /work + drop to leerie via runuser
 │   ├── install.sh                 one-command installer (curl | bash); preflight git/claude/curl +
 │   │                               runtime preflight (colima / nerdctl) + clones + symlinks
 │   ├── runtime-install.sh         per-OS auto-install of the container runtime (Colima on macOS;
@@ -2359,7 +2372,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | turns per `claude -p` call | per worker (below) | worker stops; implementer → `incomplete-handoff` |
 | per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) | worker killed; implementer → `incomplete-handoff` |
 | per-worker idle-event warning (`worker_idle_warn_sec`) | 300 s (5 min) | log a `no stdout events in <gap>s` warning naming the worker, its PID, and any stderr tail. Observation-only — the worker is NOT killed; `worker_timeout_sec` remains the only kill. Surfaces silent-hang failures (a worker that never emits its first `system/init` event) so the user is not left with zero feedback between phase start and the 90-min hard kill. |
-| per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived from `/proc/meminfo` (VM ram split across `max_parallel + 1` slots, clamped to ≤ 4 GiB), or `--worker-memory-max SIZE` / `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max` in `leerie.toml`. Suffixes K/M/G/T accepted | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services (sshd, lima-guestagent) are not eligible victims. Requires the launcher's writable `/sys/fs/cgroup` bind-mount (see `leerie` launcher); on incompatible hosts the probe at startup logs one warn line and the run continues uncapped. See DESIGN §6 *Memory containment*. |
+| per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived from `/proc/meminfo` (VM ram split across `max_parallel + 1` slots, clamped to ≤ 4 GiB), or `--worker-memory-max SIZE` / `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max` in `leerie.toml`. Suffixes K/M/G/T accepted | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services (sshd, lima-guestagent) are not eligible victims. Requires a writable cgroup root, picked by `_detect_cgroup_root()`: prefers `/sys/fs/cgroup/leerie.slice` (created and chowned to the leerie user by `scripts/container-entry.sh` at PID 1 / root — the Dockerfile intentionally omits `USER leerie` so the entrypoint can chown before dropping privilege via `runuser -u leerie -- ...`), falls back to `/sys/fs/cgroup`. Local nerdctl additionally needs the launcher's `--mount type=bind,source=/sys/fs/cgroup,...rshared` flag so the entrypoint can see the host VM's cgroupfs; Fly's microVM exposes it directly. On incompatible hosts (older kernel, missing v2 controllers) the probe at startup logs one warn line naming the attempted root and the run continues uncapped. See DESIGN §6 *Memory containment*. |
 | per-worker cgroup PIDs cap (`worker_pids_max`) | 256 | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Catches runaway fork-bomb behavior in tool subtrees. |
 | auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap. See §3 *Auth/quota backoff*. |
 
@@ -2928,7 +2941,20 @@ as a single string AND forwards host stdin.)
    issuing only if no cert exists) and `wait_for_fly_ssh_ready` (poll
    `flyctl ssh console --pty=false -C true` against the target
    machine until success; hallpass takes 5-30 s to come up after
-   `flyctl machine start` reports "started").
+   `flyctl machine start` reports "started"). This is the *only*
+   hallpass probe in a run — subsequent transports (`seed_repo_clone`
+   parent + submodule bundles, `seed_repo_dirty` rsync) rely on each
+   pipe's own `LEERIE_SEED_TIMEOUT_S` wrapper (rc 124/137) as the
+   authoritative failure detector. An extra probe before each pipe
+   would only manufacture false-positives — the channel is
+   demonstrably warm by the time seed_auth's multi-MB tar-pipe and
+   plugin-cache rebuild have finished. Bound: ~175 s total (12
+   attempts × 10 s per-probe timeout + 11 × 5 s sleep); on success
+   emits `remote: hallpass ready on <machine>`; on the rare exit-137
+   exhaustion (timeout's SIGKILL fire OR external SIGKILL like macOS
+   Jetsam under host pressure), the warning includes the "killed
+   externally" diagnostic so the operator can distinguish client-side
+   pressure from a real Fly outage.
 
 2. **Tar-pipe delivery of `$STAGE` to /home/leerie.** `tar -czC $STAGE`
    (gzip-compressed; excluding `.gitconfig`, `.gitconfig.local`, `.gitignore`,

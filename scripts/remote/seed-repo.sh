@@ -133,17 +133,19 @@ _seed_repo_preflight() {
 seed_repo_clone() {
   _seed_repo_preflight || return 1
 
-  # Ensure SSH cert is valid and hallpass is ready before the pipe.
-  # Both helpers are no-ops when called against an already-warm
-  # machine, so the cost is one fast probe.
+  # Ensure SSH cert is valid before the pipe. We deliberately do NOT
+  # re-probe hallpass here: seed_auth just transferred ~15 MB of config
+  # and ran a multi-minute plugin install over hallpass, so the channel
+  # is demonstrably warm. The bundle pipe below has its own
+  # LEERIE_SEED_TIMEOUT_S wrapper (rc 124/137 handled at line ~193),
+  # which is the authoritative failure detector if hallpass did drop.
+  # An extra probe here only manufactures false-positive failures and
+  # confusing log lines — see the 2026-06-05 investigation.
   if command -v require_fly_ssh >/dev/null 2>&1; then
     if ! require_fly_ssh; then
       remote_log "seed_repo: Fly SSH setup failed; cannot seed repo"
       return 1
     fi
-  fi
-  if command -v wait_for_fly_ssh_ready >/dev/null 2>&1; then
-    wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID" || true
   fi
 
   remote_log "remote: seeding — bundling $USER_REPO (parent + submodules) to /work ..."
@@ -362,9 +364,11 @@ seed_repo_dirty() {
       return 1
     fi
   fi
-  if command -v wait_for_fly_ssh_ready >/dev/null 2>&1; then
-    wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID" || true
-  fi
+  # No hallpass re-probe here either: seed_repo_clone just bundled the
+  # parent repo + every submodule through hallpass. The rsync transport
+  # below will fail loudly if the channel actually dropped, and that is
+  # the authoritative signal — see the symmetric comment in
+  # seed_repo_clone() above.
 
   local rsync_rc=0
   local file_list wrapper
@@ -743,9 +747,11 @@ seed_inspect_dirs() {
       return 1
     fi
   fi
-  if command -v wait_for_fly_ssh_ready >/dev/null 2>&1; then
-    wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID" || true
-  fi
+  # No hallpass re-probe: by the time we get here seed_auth has done its
+  # cold-start probe and seed_repo has bundled the parent + every
+  # submodule across the same channel. Each transport below has its own
+  # error path; the probe would only manufacture false positives. See
+  # the comment in seed_repo_clone() for the full reasoning.
 
   # mkdir /inspect once + chown leerie: /inspect so per-dir clones/rsyncs
   # land under a leerie-owned parent.

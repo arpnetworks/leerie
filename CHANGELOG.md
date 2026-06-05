@@ -49,6 +49,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **Hallpass cold-start probe is now invoked exactly once per run from
+  `seed_auth`.** Previously the post-`seed_auth` flow re-probed in
+  `seed_repo_clone`, `seed_repo_dirty`, and `seed_inspect_dirs` — three
+  extra `wait_for_fly_ssh_ready` calls against a channel that
+  `seed_auth` had already exercised by transferring ~15 MB of config
+  and running a multi-minute plugin install. The re-probes had no
+  diagnostic value (the bundle/rsync transports' own
+  `LEERIE_SEED_TIMEOUT_S` wrappers are the authoritative failure
+  detector) but manufactured false-positive failures: ~175 s of
+  silent wait per re-probe followed by a misleading "did not accept
+  SSH within 60s" warning before the actual transport proceeded
+  successfully. The 2026-06-05 investigation traced the entire
+  confusing log sequence to this. The surviving probe in `seed_auth`
+  is hardened: success emits `remote: hallpass ready on <machine>`;
+  the misleading "60s" bound string is corrected to "~175s" (the
+  real bound is 12 attempts × 10 s timeout + 11 × 5 s sleep); the
+  probe call is wrapped in a subshell with `2>/dev/null` to suppress
+  bash's `Killed: 9` job-control noise when `timeout` is SIGKILL'd
+  by an external process (most commonly macOS Jetsam under
+  concurrent-run host memory pressure); on loop exhaustion, a last
+  probe with rc 137 is identified in the warning as "killed
+  externally — possible host memory pressure on this client" so the
+  operator can distinguish client-side pressure from a real Fly
+  outage.
+
 - **Per-repo state directory layout: `$HOME/.leerie/state/<sha16>-<basename>/` →
   `$HOME/.leerie/<basename>/`** (DESIGN §10 *Where coordination artifacts live*,
   IMPLEMENTATION §2 *Host-side per-repo state directory*). The launcher's `_state_dir_default` no
@@ -105,6 +130,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   maintainers.
 
 ### Fixed
+
+- **Per-worker cgroup v2 memory containment now actually works on both
+  runtimes (Fly + local nerdctl).** The Dockerfile previously had
+  `USER leerie`, which caused ENTRYPOINT to run as the leerie user
+  (UID 501) — so `chown /sys/fs/cgroup/leerie.slice` in
+  `scripts/container-entry.sh` silently failed with EPERM, the
+  orchestrator's `_cgroup_probe` returned False, and every worker has
+  been running uncapped since the feature shipped (29f61c7,
+  2026-05-30). This silently defeated DESIGN §6's OOM-cascade
+  protection: a runaway vitest / tsc / webpack worker could OOM the
+  whole container instead of being killed inside its own cgroup. The
+  fix drops `USER leerie` from the Dockerfile so PID 1 runs as root,
+  performs the cgroup-v2 delegation chown in container-entry.sh, then
+  drops privilege via `runuser -u leerie -- env HOME=/home/leerie
+  USER=leerie LOGNAME=leerie ...` before exec'ing the orchestrator
+  (local nerdctl path) or `sleep infinity` (Fly — where the
+  orchestrator is started out-of-band by the launcher's ssh-console
+  wrapper that also drops via `Popen(user="leerie")`). The orchestrator
+  gains a `_detect_cgroup_root()` helper that prefers
+  `/sys/fs/cgroup/leerie.slice` and falls back to `/sys/fs/cgroup`
+  only if the delegation step somehow didn't run, and the probe-
+  failure log now names the attempted root so the operator can tell
+  whether the entrypoint's delegation actually ran. The explicit `env`
+  form is used instead of `runuser --login` because the login form
+  would chdir to `/home/leerie` and override the `cd /work` invariant
+  the orchestrator depends on.
 
 - **`FLY_VM_DISK_GB` now actually absorbs run-time disk growth.** The
   opt-in Fly volume previously mounted at `/home/leerie`, which only

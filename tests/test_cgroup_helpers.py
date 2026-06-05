@@ -23,12 +23,16 @@ import pytest
 
 @pytest.fixture(autouse=True)
 def reset_probe_memo(leerie):
-    """Reset the module-level probe memo before every test. Without
-    this, the first test that sets `_CGROUP_PROBE_RESULT` would force
-    the same value into every subsequent test."""
+    """Reset the module-level probe + detected-root memos before every
+    test. Without this, the first test that sets `_CGROUP_PROBE_RESULT`
+    or runs `_detect_cgroup_root()` would force the same value into
+    every subsequent test, defeating each test's `_CGROUP_ROOT`
+    monkeypatch."""
     leerie._CGROUP_PROBE_RESULT = None
+    leerie._CGROUP_DETECTED_ROOT = None
     yield
     leerie._CGROUP_PROBE_RESULT = None
+    leerie._CGROUP_DETECTED_ROOT = None
 
 
 # ---- probe ----------------------------------------------------------------

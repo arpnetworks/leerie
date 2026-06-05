@@ -8,7 +8,10 @@ docs/IMPLEMENTATION.md §0.5 "Remote runtime (Fly.io) transport".
 These tests stub flyctl and exercise the bash function via subprocess.
 The stub recognizes:
 
-  1. `-C "true"`: wait_for_fly_ssh_ready probe → exit 0.
+  1. `-C "true"`: defensive — seed_inspect_dirs no longer re-probes
+     hallpass (seed_auth's single cold-start probe is the only one),
+     but the handler stays in case a future regression reintroduces a
+     probe call.
   2. `-C "sh -c 'mkdir -p /inspect && chown leerie: /inspect'"`: parent
      setup. Rewrite /inspect → DEST/inspect and eval.
   3. `-C "sh -c 'rm -rf /inspect/<base> ... mkdir -p ...'"`: per-dir
@@ -85,7 +88,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# wait_for_fly_ssh_ready probe.
+# Defensive hallpass-probe handler (see module docstring item 1).
 if [ "$remote_cmd" = "true" ]; then
   exit 0
 fi

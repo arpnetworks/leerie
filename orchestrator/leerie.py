@@ -137,8 +137,13 @@ DEFAULT_CAPS = {
     # promoting a prompt-governed limit to a code guarantee.
     "confidence_rounds": 8,
     # Per-worker cgroup v2 memory cap (bytes). Each `claude -p` worker is
-    # enrolled in its own child cgroup at /sys/fs/cgroup/leerie-w-<sid>/ and
-    # the cgroup's memory.max is set to this value. When a worker's tool
+    # enrolled in its own child cgroup at <cgroup-root>/leerie-w-<sid>/ where
+    # <cgroup-root> is /sys/fs/cgroup/leerie.slice on both runtimes (Fly +
+    # local nerdctl — scripts/container-entry.sh runs as PID 1/root and
+    # chowns the slice to the leerie user before privilege drop), with a
+    # generic fallback to /sys/fs/cgroup if the slice somehow wasn't
+    # delegated — see _detect_cgroup_root. The cgroup's memory.max is set
+    # to this value. When a worker's tool
     # subtree (vitest, tsc, webpack workers, etc.) tries to allocate past
     # the cap, the kernel OOM-kills inside the cgroup — sshd / pid 1 /
     # other workers in the container are unaffected. This is the fix for
@@ -5242,7 +5247,7 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
 # --- cgroup v2 containment for worker subtrees ---------------------------
 # Each `claude -p` worker (and every descendant it forks: bash children,
 # vitest pools, webpack workers, tsc, etc.) is enrolled in its own child
-# cgroup at /sys/fs/cgroup/leerie-w-<sid>/. The cgroup's memory.max and
+# cgroup at <cgroup-root>/leerie-w-<sid>/. The cgroup's memory.max and
 # pids.max bound how much RAM / how many PIDs the worker subtree may
 # consume. When the worker subtree exceeds memory.max, the kernel OOM-
 # kills inside that cgroup — sshd / pid 1 / sibling workers are not
@@ -5250,20 +5255,59 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
 # DESIGN §6 Worker subtree termination — Memory containment.
 #
 # Delegation is purely file-permission based on cgroup v2; no
-# CAP_SYS_ADMIN required. The launcher mounts /sys/fs/cgroup writable
-# into the container (see `leerie` launcher: --mount type=bind,source=
-# /sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared). If
-# the mount is not writable (older launcher, host kernel <5.x, custom
-# container shape), the probe degrades the path to no-op with a
-# warn-once log line — leerie must never die because the cap can't be
-# applied.
+# CAP_SYS_ADMIN required. The same delegation mechanism covers both
+# runtimes (Fly + local nerdctl): scripts/container-entry.sh is PID 1
+# and runs as root (the Dockerfile intentionally has no USER directive),
+# so it can mkdir /sys/fs/cgroup/leerie.slice and chown it (plus its
+# cgroup.procs and cgroup.subtree_control) to the leerie user. The
+# entrypoint then drops privilege to leerie via `runuser` before
+# exec'ing the orchestrator (local nerdctl) or sleeping as PID 1 (Fly,
+# where the orchestrator is started out-of-band by the launcher's
+# ssh-console wrapper that explicitly Popens with user="leerie").
+# Either way the orchestrator runs as leerie and operates inside the
+# delegated slice.
+#
+# Local nerdctl additionally needs the launcher's writable bind-mount
+# (`leerie` launcher: --mount type=bind,source=/sys/fs/cgroup,
+# target=/sys/fs/cgroup,bind-propagation=rshared) so the in-container
+# entrypoint can see the host VM's cgroupfs. Fly's Firecracker microVM
+# exposes cgroupfs directly.
+#
+# _detect_cgroup_root() prefers the delegated slice and falls back to
+# the cgroupfs root. If neither yields write access (older kernel,
+# missing cgroup-v2 controllers, entrypoint not running as root for
+# some reason), the probe degrades the path to no-op with a warn-once
+# log line — leerie must never die because the cap can't be applied.
 
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
+_CGROUP_DELEGATED_SLICE = Path("/sys/fs/cgroup/leerie.slice")
 _CGROUP_PROBE_RESULT: bool | None = None
+_CGROUP_DETECTED_ROOT: Path | None = None
+
+
+def _detect_cgroup_root() -> Path:
+    """Pick the cgroup root for worker subtrees. Prefer the delegated
+    `/sys/fs/cgroup/leerie.slice` if it exists — `scripts/container-
+    entry.sh` creates and chowns it to the leerie user at PID 1 (root)
+    on both runtimes (Fly + local nerdctl) before privilege drop, so
+    the orchestrator (running as non-root leerie) can write under it.
+    Fall back to `/sys/fs/cgroup` only if the slice somehow wasn't
+    delegated (older container image, custom entrypoint, kernel
+    without cgroup-v2). Memoized so the choice is stable across the
+    run."""
+    global _CGROUP_DETECTED_ROOT
+    if _CGROUP_DETECTED_ROOT is not None:
+        return _CGROUP_DETECTED_ROOT
+    if _CGROUP_DELEGATED_SLICE.is_dir():
+        _CGROUP_DETECTED_ROOT = _CGROUP_DELEGATED_SLICE
+    else:
+        _CGROUP_DETECTED_ROOT = _CGROUP_ROOT
+    return _CGROUP_DETECTED_ROOT
 
 
 def _cgroup_probe() -> bool:
-    """Once-per-run probe: can we create cgroups under /sys/fs/cgroup/?
+    """Once-per-run probe: can we create cgroups under the detected
+    cgroup root (see `_detect_cgroup_root`)?
 
     Memoized in `_CGROUP_PROBE_RESULT`. Returns True on success, False
     on any failure (RO mount, missing dir, missing controllers, etc.).
@@ -5282,15 +5326,27 @@ def _cgroup_probe() -> bool:
     global _CGROUP_PROBE_RESULT
     if _CGROUP_PROBE_RESULT is not None:
         return _CGROUP_PROBE_RESULT
-    probe_dir = _CGROUP_ROOT / "leerie-probe"
+    root = _detect_cgroup_root()
+    probe_dir = root / "leerie-probe"
     try:
         probe_dir.mkdir(exist_ok=True)
         probe_dir.rmdir()
         _CGROUP_PROBE_RESULT = True
     except OSError as e:
-        log(f"  cgroup probe failed ({e.strerror or e}); worker memory "
-            f"containment is OFF for this run. The launcher may need "
-            f"the --mount type=bind,source=/sys/fs/cgroup,... flag.")
+        # Mention which root we attempted so the operator can tell
+        # whether scripts/container-entry.sh's delegation step ran:
+        # root == leerie.slice means delegation worked but caps still
+        # failed (probably a missing cgroup-v2 controller on the host);
+        # root == /sys/fs/cgroup means delegation never ran (likely
+        # because the entrypoint isn't executing as root — check that
+        # the Dockerfile has no USER directive, the launcher's nerdctl
+        # invocation doesn't pass --user, and the host kernel supports
+        # cgroup v2 + the writable /sys/fs/cgroup bind-mount).
+        log(f"  cgroup probe failed at {root} ({e.strerror or e}); "
+            f"worker memory containment is OFF for this run. Check "
+            f"that scripts/container-entry.sh's cgroup-v2 delegation "
+            f"block ran (chown of /sys/fs/cgroup/leerie.slice succeeded "
+            f"at PID 1 as root).")
         with contextlib.suppress(OSError):
             probe_dir.rmdir()
         _CGROUP_PROBE_RESULT = False
@@ -5306,7 +5362,7 @@ def _cgroup_create(sid: str, memory_max_bytes: int,
     so a config change between spawns takes effect."""
     if not _cgroup_probe():
         return None
-    path = _CGROUP_ROOT / f"leerie-w-{sid}"
+    path = _detect_cgroup_root() / f"leerie-w-{sid}"
     try:
         path.mkdir(exist_ok=True)
         (path / "memory.max").write_text(str(memory_max_bytes))
@@ -5667,7 +5723,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # any worker-tree process that survived _terminate_proc_tree /
         # descendant_tracker.stop_and_reap above — a backstop for the
         # backgrounded grandchild class. Then rmdir the cgroup so we
-        # don't accumulate /sys/fs/cgroup/leerie-w-* entries across a
+        # don't accumulate <cgroup-root>/leerie-w-* entries across a
         # long-running orchestrator. Best-effort: ENOENT etc. are
         # swallowed inside _cgroup_destroy.
         _cgroup_destroy(cgroup_path)

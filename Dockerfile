@@ -190,7 +190,14 @@ RUN chown -R leerie:"${HOST_GID}" /opt/leerie-image
 # use the image's /work directly, so it must be owned by leerie.
 RUN mkdir -p /work && chown leerie:"${HOST_GID}" /work
 
-USER leerie
+# Intentionally NO `USER leerie` directive — ENTRYPOINT runs as root so
+# scripts/container-entry.sh can perform the cgroup-v2 delegation chown
+# of /sys/fs/cgroup/leerie.slice before dropping privilege via
+# `runuser -u leerie -- ...`. Without root at PID 1 the chown silently
+# fails (EPERM) and per-worker memory containment is off — DESIGN §6's
+# cascade protection. The orchestrator itself runs as leerie via that
+# runuser drop (local nerdctl) or via Popen(user="leerie") in the
+# launcher's ssh-console wrapper (Fly).
 WORKDIR /work
 
 ENTRYPOINT ["/opt/leerie-image/scripts/container-entry.sh"]

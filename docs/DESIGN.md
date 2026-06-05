@@ -950,7 +950,7 @@ so the orchestrator wasn't leaking; the cascade was caused by all
 processes sharing one memcg.
 
 Each `claude -p` worker is therefore enrolled in its own child
-cgroup at `/sys/fs/cgroup/leerie-w-<sid>/` with `memory.max` set to
+cgroup at `<cgroup-root>/leerie-w-<sid>/` with `memory.max` set to
 `caps["worker_memory_max_bytes"]` (default: VM RAM split across
 `max_parallel + 1` slots, clamped to ≤ 4 GiB) and `pids.max` set
 to `caps["worker_pids_max"]` (default 256). When the worker
@@ -961,18 +961,39 @@ prevents the kernel from delaying an inevitable OOM by paging out
 worker memory to the Colima swap file.
 
 The mechanism is purely file-permission based on cgroup v2 — no
-`CAP_SYS_ADMIN`, no `--privileged`, no `systemd-run`. The launcher
-gives the container a writable `/sys/fs/cgroup` via
+`CAP_SYS_ADMIN`, no `--privileged`, no `systemd-run`. Both runtimes
+(Fly + local nerdctl) use the same delegation path:
+`scripts/container-entry.sh` is PID 1 and runs as root (the Dockerfile
+intentionally omits the `USER leerie` directive — root at PID 1 is
+required so the entrypoint's chown can succeed before privilege drop).
+The entrypoint creates `/sys/fs/cgroup/leerie.slice/` and chowns it
+(plus its `cgroup.procs` and `cgroup.subtree_control`) to the leerie
+user. The entrypoint then drops to the leerie user via
+`runuser -u leerie --` before exec'ing the orchestrator (local
+nerdctl) or sleeping as PID 1 (Fly, where the orchestrator is started
+out-of-band by the launcher's ssh-console wrapper that explicitly
+drops via `Popen(user="leerie")`). Either way the orchestrator runs
+as leerie and operates inside the delegated slice.
+
+Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
-bind-propagation=rshared`; the orchestrator's `_cgroup_probe`
-verifies this at startup and falls back to uncapped behavior with
-one warn line if delegation isn't available (older launcher,
-kernel < 5.x, custom container shape). The teardown path uses
-`cgroup.kill` (kernel ≥ 5.14) as an atomic kill of any worker-
-subtree process that survived the existing `_terminate_proc_tree`
-proc-walk — a backstop, not the primary cleanup. See
-IMPLEMENTATION.md §"Caps" for the resolution surface and
-`_cgroup_*` in `orchestrator/leerie.py` for the call sites.
+bind-propagation=rshared` in the bash launcher's nerdctl invocation —
+so the in-container entrypoint can see the host VM's cgroupfs. Fly's
+Firecracker microVM exposes cgroupfs directly with no launcher flag
+required.
+
+The orchestrator's `_detect_cgroup_root` prefers
+`/sys/fs/cgroup/leerie.slice` and falls back to `/sys/fs/cgroup`.
+`_cgroup_probe` verifies write access at the detected root and
+degrades to uncapped behavior with one warn line (naming the attempted
+root) if delegation isn't available — older kernel, missing cgroup-v2
+controllers, or an entrypoint that didn't actually run as root for
+some reason. The teardown path uses `cgroup.kill` (kernel ≥ 5.14) as
+an atomic kill of any worker-subtree process that survived the
+existing `_terminate_proc_tree` proc-walk — a backstop, not the
+primary cleanup. See IMPLEMENTATION.md §"Caps" for the resolution
+surface and `_cgroup_*` / `_detect_cgroup_root` in
+`orchestrator/leerie.py` for the call sites.
 
 Earlier versions of leerie gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made

@@ -10,7 +10,11 @@ The seed mechanism uses `git bundle` over `flyctl ssh console -C "sh
 these classes of invocation (substring matchers, so the `sh -c '...'`
 wrapper is handled transparently):
 
-  1. `-C "true"`: wait_for_fly_ssh_ready's readiness probe — exit 0.
+  1. `-C "true"`: defensive handler for any cold-path probe (today
+     seed_repo no longer probes hallpass — seed_auth's single probe is
+     the only one, and seed_auth isn't sourced here. Kept so a
+     reintroduced probe still hits a 0-exit stub instead of falling
+     through to the unknown-command branch).
   2. `-C "sh -c '...find /work...'"`: the /work content-wipe step.
      Just exit 0 (we'll let the machine-side clone create the dir).
   3. `-C "sh -c 'cat > /tmp/leerie-seed.bundle'"`: capture stdin to
@@ -75,7 +79,7 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-# wait_for_fly_ssh_ready probe.
+# Defensive hallpass-probe handler (see module docstring item 1).
 if [ "$remote_cmd" = "true" ]; then
   exit 0
 fi

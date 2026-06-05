@@ -5,9 +5,16 @@
 # /opt/leerie-image/scripts/container-entry.sh inside the container, and
 # referenced by Dockerfile's ENTRYPOINT.
 #
-# All it does: cd into the user's repo (bind-mounted at /work) and exec the
-# orchestrator. PID 1 in a container is what the kernel reaps the namespace
-# under when it exits — see docs/DESIGN.md §6 and docs/IMPLEMENTATION.md §0.5.
+# Runs as root. The Dockerfile intentionally does NOT have USER leerie —
+# we need PID 1 to be root so the cgroup-v2 delegation block below can
+# chown /sys/fs/cgroup/leerie.slice to the leerie user before privilege
+# drop. The orchestrator itself runs as leerie via the `runuser` exec at
+# the bottom (local nerdctl path) or via the launcher's Popen(user=
+# "leerie") inside the Fly orchestrator-launch wrapper (the entrypoint
+# on Fly just idles as PID 1 so the namespace stays alive).
+#
+# PID 1 in a container is what the kernel reaps the namespace under when
+# it exits — see docs/DESIGN.md §6 and docs/IMPLEMENTATION.md §0.5.
 set -e
 # Suppress core dumps from OOM-killed workers — on large codebases
 # (e.g. Next.js apps with heavy tsc + bundler memory use), `next build`
@@ -16,38 +23,72 @@ set -e
 # RLIMIT_CORE=0 at PID 1 is inherited by every worker subprocess.
 # shellcheck disable=SC3045  # ulimit -c is non-POSIX but supported by dash (Debian's /bin/sh) and bash
 ulimit -c 0
+
+# Cgroup v2 delegation. PID 1 runs as root, so chown succeeds; the
+# orchestrator subsequently runs as leerie and operates inside the
+# delegated slice. Best-effort: missing controllers or an older kernel
+# without cgroup v2 cause the chowns to fail silently — leerie keeps
+# running, just uncapped (the orchestrator's _cgroup_probe logs one
+# warn line and _cgroup_create returns None). On a container restart
+# against an already-delegated slice (Fly machine reboot reusing the
+# same cgroupfs state) the mkdir is skipped but the chowns rerun
+# idempotently — this is the right behavior if the leerie UID changed
+# across restarts. The orchestrator's _detect_cgroup_root() picks the
+# slice if this succeeded, else falls back to /sys/fs/cgroup. See
+# DESIGN §6 *Memory containment*.
+if [ -d /sys/fs/cgroup ] && [ ! -d /sys/fs/cgroup/leerie.slice ]; then
+  mkdir -p /sys/fs/cgroup/leerie.slice 2>/dev/null || true
+fi
+if [ -d /sys/fs/cgroup/leerie.slice ]; then
+  chown leerie:leerie /sys/fs/cgroup/leerie.slice 2>/dev/null || true
+  chown leerie /sys/fs/cgroup/leerie.slice/cgroup.procs 2>/dev/null || true
+  chown leerie /sys/fs/cgroup/leerie.slice/cgroup.subtree_control 2>/dev/null || true
+fi
+
 cd /work
 
-# Idempotent /work ownership fix. On the Fly path, when FLY_VM_DISK_GB
-# is set in provision.sh a per-machine Fly volume is mounted at /work
-# — and the mount masks the Dockerfile's baked `chown leerie:` layer
-# (the volume root is owned by root:root on first attach). The
-# orchestrator runs as leerie, so without this chown it would fail to
-# write into its own working dir on the first volume-backed boot.
+# /work ownership fix. On the Fly path, when FLY_VM_DISK_GB is set in
+# provision.sh a per-machine Fly volume is mounted at /work — and the
+# mount masks the Dockerfile's baked `chown leerie:` layer (the volume
+# root is owned by root:root on first attach). The orchestrator runs as
+# leerie, so without this chown it would fail to write into its own
+# working dir on the first volume-backed boot. Now that PID 1 runs as
+# root, this chown actually succeeds rather than silently no-op'ing.
 # Trailing-colon form (`chown leerie:`) matches seed-repo.sh and
 # seed-auth.sh — it resolves to leerie's primary group by GID, which
 # survives the Dockerfile's `groupadd -g $HOST_GID leerie` being
 # skipped when the base image already has a group at that GID (so no
 # group literally named "leerie" exists). On the no-volume and local
-# nerdctl paths the chown is a no-op (rootfs /work is already leerie-
-# owned from the Dockerfile, and the local bind-mount preserves host
-# ownership).
+# nerdctl paths the chown is a no-op against an already-correct /work
+# (rootfs /work is leerie-owned from image build; local bind-mount
+# preserves host ownership).
 # (DESIGN §6 *Remote disk policy*; IMPLEMENTATION §0.5 *Container shape*.)
 if getent passwd leerie >/dev/null 2>&1; then
   chown leerie: /work 2>/dev/null || true
 fi
 
-# When invoked with no args (remote/Fly path), idle as PID 1 so the
-# machine stays up. The remote launcher invokes the orchestrator
-# separately by piping a Python wrapper through
-# `flyctl ssh console -C "python3 -"` (the wrapper uses
-# subprocess.Popen with start_new_session=True + user="leerie" so the
-# orchestrator detaches cleanly with the right identity). The
-# container entrypoint just needs to keep the namespace alive. Local
-# nerdctl always passes argv (the task + flags), so this branch
-# never fires in local mode.
+# Fly path: idle as PID 1 so the machine stays up. The orchestrator is
+# invoked out-of-band by the launcher's `flyctl ssh console -C
+# "python3 -"` wrapper, which itself runs as root (ssh-console always
+# lands as root regardless of the image's USER directive) and then
+# drops to leerie via Popen(user="leerie") (see the bash leerie
+# launcher around lines 2541-2611). We drop to leerie here too for
+# hygiene — any in-container inspection (ps, /proc) sees the idle PID 1
+# as leerie, not root. Local nerdctl always passes argv (the task +
+# flags), so this branch never fires in local mode.
 if [ "$#" -eq 0 ]; then
-  exec sleep infinity
+  exec runuser -u leerie -- \
+    env HOME=/home/leerie USER=leerie LOGNAME=leerie \
+    sleep infinity
 fi
 
-exec python3 /opt/leerie-image/orchestrator/leerie.py "$@"
+# Local nerdctl path: drop to leerie before the orchestrator. We pass
+# HOME/USER/LOGNAME explicitly rather than using `runuser --login` —
+# the login form would chdir to /home/leerie and override the `cd /work`
+# invariant the orchestrator depends on (and would source the user's
+# shell profile, which could mutate PATH unpredictably). HOME is
+# load-bearing for claude (creds at ~/.claude/.credentials.json);
+# USER/LOGNAME are read by tools that introspect identity.
+exec runuser -u leerie -- \
+  env HOME=/home/leerie USER=leerie LOGNAME=leerie \
+  python3 /opt/leerie-image/orchestrator/leerie.py "$@"

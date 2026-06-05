@@ -423,7 +423,16 @@ require_fly_ssh() {
 #
 # Strategy: probe with `ssh console --pty=false -C true` against the
 # actual machine ID; success exits 0, EOF/connection errors retry.
-# Bounded by 60 s total (12 attempts × 5 s sleep).
+# Bounded by ~175 s total (12 attempts × 10 s per-probe timeout +
+# 11 × 5 s sleep between attempts).
+#
+# Called exactly once per run, from seed_auth, during cold-start of a
+# fresh machine. Post-seed_auth call sites used to re-probe before
+# bundle/rsync pipes, but the channel is demonstrably warm by then —
+# the re-probe only manufactures false-positive failures and noisy
+# logs (the 2026-06-05 investigation). Down to one probe + the
+# transports' own LEERIE_SEED_TIMEOUT_S wrappers as the authoritative
+# failure detector from there on.
 #
 # Usage:
 #   wait_for_fly_ssh_ready "$FLY_APP" "$machine_id"
@@ -432,6 +441,8 @@ wait_for_fly_ssh_ready() {
   local machine_id="$2"
   local attempts=0
   local max_attempts=12
+  local probe_exit=0
+  local last_probe_exit=0
   while [ "$attempts" -lt "$max_attempts" ]; do
     # `</dev/null` is load-bearing: if stdin is a TTY (the normal
     # case when leerie is run interactively), flyctl ssh console hangs
@@ -441,16 +452,25 @@ wait_for_fly_ssh_ready() {
     # `--kill-after=2` ensures `timeout` escalates SIGTERM to
     # SIGKILL after a 2 s grace period; some flyctl code paths
     # ignore SIGTERM while waiting on the WireGuard tunnel.
-    if timeout --kill-after=2 10 flyctl ssh console --app "$fly_app" \
-         --machine "$machine_id" --pty=false -C "true" \
-         </dev/null >/dev/null 2>&1; then
+    #
+    # Subshell + `2>/dev/null` on the subshell suppresses bash's
+    # job-control "Killed: 9" line if the foreground `timeout` child
+    # is SIGKILL'd by something outside the script — most commonly
+    # macOS Jetsam when the host is under memory pressure from
+    # concurrent leerie runs. The probe still retries; we just don't
+    # leak the alarming-looking stderr to the user.
+    ( timeout --kill-after=2 10 flyctl ssh console --app "$fly_app" \
+        --machine "$machine_id" --pty=false -C "true" \
+        </dev/null >/dev/null 2>&1 ) 2>/dev/null
+    probe_exit=$?
+    if [ "$probe_exit" -eq 0 ]; then
+      remote_log "remote: hallpass ready on $machine_id"
       return 0
     fi
+    last_probe_exit=$probe_exit
     attempts=$((attempts + 1))
     # Heartbeat every 3rd probe (~15 s) so a slow hallpass startup is
-    # visible to the user instead of looking like a silent wait. Today
-    # the function was silent until success or the full 60 s budget;
-    # users couldn't distinguish "waiting normally" from "hung."
+    # visible to the user instead of looking like a silent wait.
     if [ "$attempts" -lt "$max_attempts" ]; then
       if [ $((attempts % 3)) -eq 0 ]; then
         remote_log "remote: still waiting for hallpass on $machine_id (attempt $attempts of $max_attempts)..."
@@ -458,7 +478,15 @@ wait_for_fly_ssh_ready() {
       sleep 5
     fi
   done
-  remote_log "warning: machine $machine_id did not accept SSH within 60s"
+  # Exit 137 = WIFSIGNALED + SIGKILL. Could be `timeout --kill-after`
+  # firing on a genuinely-hung flyctl, OR an external SIGKILL (e.g.
+  # macOS Jetsam). Either way the operator benefits from knowing it's
+  # likely client-host pressure, not a real Fly outage.
+  if [ "$last_probe_exit" -eq 137 ]; then
+    remote_log "warning: machine $machine_id did not accept SSH within ~175s (last probe killed externally — possible host memory pressure on this client)"
+  else
+    remote_log "warning: machine $machine_id did not accept SSH within ~175s"
+  fi
   return 1
 }
 
