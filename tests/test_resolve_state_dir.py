@@ -17,6 +17,7 @@ write into the leerie install directory.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 from pathlib import Path
 
@@ -106,6 +107,10 @@ _validate_state_ownership() {
     fi
     printf '%s\n' "$USER_REPO" > "$dir/.owner"
     return 0
+  fi
+  if [ ! -d "$dir" ]; then
+    echo "leerie: state-dir target $dir exists but is not a directory" >&2
+    exit 1
   fi
   if [ -f "$dir/.owner" ]; then
     local recorded
@@ -536,3 +541,51 @@ def test_ownership_rejects_install_subtree(tmp_path):
     assert rc != 0
     assert "subdirectory of the leerie install dir" in stderr
     assert not (docs_subtree / ".owner").exists()
+
+
+def test_ownership_rejects_file_at_target(tmp_path):
+    """The default key is the user repo's basename. If that basename
+    collides with a FILE in the installer's clone (Dockerfile, LICENSE,
+    leerie.toml, …), the target exists but is not a directory — the
+    write to $dir/.owner would crash with a raw 'Not a directory' bash
+    error. Guard catches it with an actionable message."""
+    target = tmp_path / "Dockerfile"
+    target.write_text("FROM debian:13\n")
+    rc, _, stderr = _run_ownership(
+        "/tmp/user/Dockerfile", target, expect_fail=True
+    )
+    assert rc != 0
+    assert "exists but is not a directory" in stderr
+
+
+def test_install_subtree_list_matches_repo_top_level_dirs():
+    """The hardcoded basename list in _validate_state_ownership must
+    cover every git-tracked top-level directory in this repo. If a
+    future PR adds a top-level dir without updating the validator, a
+    user repo with that basename (installed via the installer)
+    silently corrupts the installer's clone — the exact bug
+    v0.3.21's install-subtree fix targets. This test catches that
+    drift.
+
+    Uses `git ls-tree HEAD` rather than `iterdir` because the
+    installer clones tracked content; local-only dirs (.leerie/,
+    .pytest_cache/, .claude/) are not in the install and don't need
+    protection."""
+    repo_root = Path(__file__).resolve().parent.parent
+    tracked = subprocess.run(
+        ["git", "ls-tree", "--name-only", "-d", "HEAD"],
+        cwd=repo_root, capture_output=True, text=True, check=True,
+    )
+    top_level_dirs = set(tracked.stdout.strip().splitlines())
+    launcher = (repo_root / "leerie").read_text()
+    match = re.search(
+        r'case "\$_basename" in\s*\n\s*([^)\n]+)\)',
+        launcher,
+    )
+    assert match, "could not locate the install-subtree case arm in leerie"
+    hardcoded = set(match.group(1).strip().split("|"))
+    missing = top_level_dirs - hardcoded
+    assert not missing, (
+        f"git-tracked top-level dirs not in validator's basename list: {missing}. "
+        f"Add them to _validate_state_ownership in leerie."
+    )

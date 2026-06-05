@@ -50,8 +50,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - **Per-repo state directory layout: `$HOME/.leerie/state/<sha16>-<basename>/` →
-  `$HOME/.leerie/<basename>/`** (DESIGN §10, IMPLEMENTATION §2 *Host-side
-  per-repo state directory*). The launcher's `_state_dir_default` no
+  `$HOME/.leerie/<basename>/`** (DESIGN §10 *Where coordination artifacts live*,
+  IMPLEMENTATION §2 *Host-side per-repo state directory*). The launcher's `_state_dir_default` no
   longer SHA-256-prefixes the directory name; the default is just the
   basename of the repo. Browsability wins (`ls ~/.leerie/` shows
   repo-named subtrees instead of opaque hex blobs) at the cost of a
@@ -70,7 +70,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `leerie.toml: state_dir = ...`). The same check also refuses to
   write into the leerie install directory: a target with `.git/` or a
   `leerie` executable at top level and no `runs/` subdir is treated
-  as an installer mistake, not a state dir.
+  as an installer mistake, not a state dir. Two follow-up refinements
+  extend the install-collision defenses: (1) a parent-scan that
+  catches the case where the target is a *subdirectory* of the
+  installer's clone (a user repo named e.g. `docs` resolving to
+  `$HOME/.leerie/docs/`, which IS the installer's tracked docs
+  subtree); and (2) a file-vs-directory check that catches the case
+  where the basename matches an installer-tracked *file* (e.g. a
+  user repo named `Dockerfile` or `LICENSE`). Both produce
+  actionable error messages with the same three override knobs
+  instead of raw bash errors. A defensive test guards the
+  parent-scan's hardcoded basename list against drift when future
+  PRs add new top-level directories to this repo.
 
   **No automatic migration.** Operators with state at the
   pre-cutover path (`$HOME/.leerie/state/<sha16>-<basename>/`) will

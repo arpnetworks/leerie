@@ -247,6 +247,21 @@ _validate_state_ownership() {
     printf '%s\n' "$USER_REPO" > "$dir/.owner"
     return 0
   fi
+  # A file (not a dir) at the target. Happens when the basename-only
+  # default key collides with a FILE inside the installer's clone —
+  # e.g. running leerie on a user repo named Dockerfile / LICENSE /
+  # leerie.toml resolves to $HOME/.leerie/<basename>, which is one of
+  # the installer's tracked top-level files. Catch this before the
+  # write below would crash with bash's "Not a directory" error.
+  if [ ! -d "$dir" ]; then
+    echo "leerie: state-dir target $dir exists but is not a directory" >&2
+    echo "  (probably an installer-clone file colliding with a same-named user repo)." >&2
+    echo "refusing to write run state here. pick a different path with one of:" >&2
+    echo "  --state-dir /some/path" >&2
+    echo "  LEERIE_STATE_DIR=/some/path" >&2
+    echo "  leerie.toml: state_dir = \"/some/path\"" >&2
+    exit 1
+  fi
   if [ -f "$dir/.owner" ]; then
     local recorded
     recorded="$(head -1 "$dir/.owner" 2>/dev/null || true)"
