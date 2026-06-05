@@ -319,9 +319,14 @@ seed_auth() {
   local _rebuild_hb_pid _rebuild_rc=0
   _seed_progress_bg "plugin_rebuild" &
   _rebuild_hb_pid=$!
+  # `|| _rebuild_rc=$?` captures the rc AND suppresses `set -e`
+  # (file-level `set -euo pipefail`) in one step. Without the `||`,
+  # a non-zero `flyctl ssh console` rc would abort the function
+  # before the next line, leaving _rebuild_rc=0 from the local-decl
+  # default and making the elif branches below unreachable.
   $_seed_to flyctl ssh console --app "$FLY_APP" --machine "$machine_id" --pty=false \
     -C "runuser -u leerie -- env HOME=/home/leerie PATH=/usr/local/share/mise/installs/node/lts-current/bin:/usr/bin:/bin sh -s" \
-    <<'REMOTE_SH' >/dev/null 2>&1
+    <<'REMOTE_SH' >/dev/null 2>&1 || _rebuild_rc=$?
 set -u
 mkdir -p "$HOME/.cache/leerie"
 LOG="$HOME/.cache/leerie/plugin-install.log"
@@ -334,11 +339,15 @@ INSTALLED="$HOME/.claude/plugins/installed_plugins.json"
 # entries whose source is a GitHub repo; silently skip non-github
 # sources (e.g., local-path marketplaces don't survive the trip).
 if [ -s "$KNOWN" ]; then
+  # `2>>"$LOG"` captures the python3 stderr so a JSON parse error
+  # (corrupted file, schema drift) lands in plugin-install.log
+  # instead of silently zero-iterating the while loop below.
   python3 -c '
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))
-except Exception:
+except Exception as e:
+    print(f"# JSON parse error on {sys.argv[1]}: {e}", file=sys.stderr)
     sys.exit(0)
 for entry in data.values():
     src = entry.get("source") or {}
@@ -346,7 +355,7 @@ for entry in data.values():
         repo = src.get("repo")
         if repo:
             print(repo)
-  ' "$KNOWN" | while read -r repo; do
+  ' "$KNOWN" 2>>"$LOG" | while read -r repo; do
     [ -n "$repo" ] || continue
     echo "+ claude plugin marketplace add $repo" >> "$LOG"
     claude plugin marketplace add "$repo" >> "$LOG" 2>&1 \
@@ -366,11 +375,12 @@ if [ -s "$INSTALLED" ]; then
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))
-except Exception:
+except Exception as e:
+    print(f"# JSON parse error on {sys.argv[1]}: {e}", file=sys.stderr)
     sys.exit(0)
 for spec in (data.get("plugins") or {}).keys():
     print(spec)
-  ' "$INSTALLED" | while read -r spec; do
+  ' "$INSTALLED" 2>>"$LOG" | while read -r spec; do
     [ -n "$spec" ] || continue
     echo "+ claude plugin install $spec" >> "$LOG"
     claude plugin install "$spec" >> "$LOG" 2>&1 \
@@ -378,7 +388,6 @@ for spec in (data.get("plugins") or {}).keys():
   done
 fi
 REMOTE_SH
-  _rebuild_rc=$?
   kill "$_rebuild_hb_pid" 2>/dev/null || true
   wait "$_rebuild_hb_pid" 2>/dev/null || true
   # Non-fatal regardless of rc — a missing plugin only matters if a

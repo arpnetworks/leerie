@@ -2758,23 +2758,33 @@ as a single string AND forwards host stdin.)
    small JSON metadata files (`installed_plugins.json`,
    `known_marketplaces.json`) ride along and are the source of
    truth for rebuilding. Inside one `flyctl ssh console` invocation
-   (running as the leerie user, same PATH as the pre-warm step) a
-   shell heredoc runs two phases: (a) read `known_marketplaces.json`
-   with a python3 one-liner — jq isn't in the image — emit each
-   `source.repo` and run `claude plugin marketplace add <owner>/<repo>`;
-   (b) read `installed_plugins.json` keys (e.g.,
-   `vercel@claude-plugins-official`) and run `claude plugin install`
-   per entry. Output is appended to
+   (running as the leerie user via `runuser -u leerie -- env HOME=...
+   PATH=... sh -s` — not `su -c 'sh -s'`, which has implementation-
+   specific stdin-forwarding under util-linux) a shell heredoc runs
+   two phases: (a) read `known_marketplaces.json` with a python3
+   one-liner — jq isn't in the image — emit each `source.repo` and
+   run `claude plugin marketplace add <owner>/<repo>`; (b) read
+   `installed_plugins.json` keys (e.g., `vercel@claude-plugins-official`)
+   and run `claude plugin install` per entry. Output is appended to
    `/home/leerie/.cache/leerie/plugin-install.log`. Per-plugin
    failures are logged (`WARN: <spec> install failed (continuing)`)
    but non-fatal — a missing plugin only matters if a user-supplied
    task explicitly invokes it, in which case the Claude CLI's
    existing "plugin not found in cache" skip-with-warning behavior
-   is the appropriate surface. The whole step is wrapped with
-   `|| true` so a transient marketplace fetch failure does not
-   block worker spawn. Replaces shipping ~200 MB of plugin
-   contents over the WireGuard pipe with ~30–90 s of public-egress
-   git-clone + bun-install on the Fly machine.
+   is the appropriate surface. The invocation is bracketed with the
+   same `$(_seed_timeout_prefix)` + `_seed_progress_bg
+   "plugin_rebuild"` heartbeat the main tar pipe uses (step 2 above),
+   so a stalled `flyctl ssh console` produces a clean rc 124/137
+   instead of an indefinite hang and the user sees `plugin_rebuild:
+   still streaming (Ns elapsed)` lines on the happy path. The rc is
+   captured via `|| _rebuild_rc=$?` (which both grabs the rc and
+   suppresses the file-level `set -e` on failure); the trailing
+   `remote_log` line branches on rc — `complete` on 0, "timed out
+   after Ns" on 124/137, "rc=N — continuing" on any other non-zero
+   — so the launcher log honestly reports failure surface without
+   aborting the run. Replaces shipping ~200 MB of plugin contents
+   over the WireGuard pipe with ~30–90 s of public-egress git-clone
+   + bun-install on the Fly machine.
 
 Git-push auth (SSH keys, `.netrc`, `~/.config/gh`) is **not** seeded — that
 auth lives on the host per DESIGN §6 *Finalization* and is not needed inside
