@@ -1847,16 +1847,19 @@ Coordination state must outlive the worktree that produced it.
 
 Coordination state is **per-run**, rooted at `<state-root>/runs/<run-id>/`
 (where `<state-root>` is the resolved state directory — default
-`$HOME/.leerie/state/<sha16>-<basename>/`, overridable via
-`LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir`; always
-outside the target repo). State, plan, criteria, checkpoints, logs, the
-worktrees themselves, the PR-result sidecar, and the per-subtask
-`artifacts/` directory (§5 *Artifact passing between subtasks*) all live
-under that directory. Two runs in the same repository share no
-coordination state — each has its own subtree, and neither can clobber
-the other's `state.json`, log files, or worktrees by collision. The
-state root is otherwise empty of run data; it only hosts the `runs/`
-directory.
+`$HOME/.leerie/<basename>/`, overridable via `LEERIE_STATE_DIR` /
+`--state-dir` / `leerie.toml state_dir`; always outside the target
+repo). The default key is the repo basename only; cross-repo basename
+collisions (two different abs_paths sharing a basename) are caught at
+use time via an `.owner` sidecar inside the dir that records the
+abs_path of the repo that owns it — the launcher refuses to write into
+a dir owned by a different repo and prints the override knobs. State,
+plan, criteria, checkpoints, logs, the worktrees themselves, the
+PR-result sidecar, and the per-subtask `artifacts/` directory (§5
+*Artifact passing between subtasks*) all live under the per-run subtree.
+Two runs in the same repository share no coordination state — each has
+its own `runs/<run-id>/` subtree, and neither can clobber the other's
+`state.json`, log files, or worktrees by collision.
 
 ---
 

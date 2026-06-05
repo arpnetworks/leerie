@@ -65,8 +65,8 @@ source-of-truth preference for this run — useful when the default
 Within the first few seconds you will see preflight output on stdout — git
 identity check, working-tree-clean check, a live `claude -p` smoke test —
 and leerie creates its run state directory outside the repo (default:
-`$HOME/.leerie/state/<sha16>-<basename>/`). No `.leerie/` directory appears
-inside your repo, so there is nothing to add to `.gitignore`.
+`$HOME/.leerie/<basename>/`). No `.leerie/` directory appears inside
+your repo, so there is nothing to add to `.gitignore`.
 
 ## Step 2 — Classification and clarification
 
@@ -110,7 +110,7 @@ the flag exists. The full rationale for the wave model is in
 
 The merged plan lives at `<state-root>/plan.json`; per-subtask spec
 files appear at `<state-root>/subtasks/<id>.json`. `<state-root>`
-defaults to `$HOME/.leerie/state/<sha16>-<basename>/`; override with
+defaults to `$HOME/.leerie/<basename>/`; override with
 `LEERIE_STATE_DIR`, `--state-dir`, or `state_dir =` in `leerie.toml`.
 
 ## Step 4 — Wave execution
@@ -132,7 +132,7 @@ On stdout you'll see lines like (with a hypothetical `<run-id>` of
 
 And `git worktree list` will show entries like (with `<state-root>`
 expanded to the resolved per-repo state directory — by default
-`$HOME/.leerie/state/<sha16>-<basename>/`):
+`$HOME/.leerie/<basename>/`):
 
 ```
 /your/repo                                                                            abc1234 [main]
@@ -194,7 +194,7 @@ merged on GitHub):
 
 deletes the run branch and any remaining subtask branches. The per-run
 state directory (`<state-root>/runs/<run-id>/`, where `<state-root>` is
-the resolved state directory — default `$HOME/.leerie/state/<key>/`) is
+the resolved state directory — default `$HOME/.leerie/<basename>/`) is
 kept as a smaller audit trail; `rm -rf` it manually when you no longer
 need that either. For an audit cleanup across every past run, use
 `--all-runs --branches`.

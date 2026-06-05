@@ -11,7 +11,6 @@ real container, and sources the relevant block from the launcher verbatim.
 """
 from __future__ import annotations
 
-import hashlib
 import os
 import subprocess
 from pathlib import Path
@@ -31,11 +30,9 @@ shift 4   # remaining args are simulated CLI (unused in this harness)
 
 # ---- state-dir resolution (mirrors launcher) ----------------------------
 _state_dir_default() {
-  local key
-  key="$(python3 -c \
-    "import hashlib,sys,os; p=sys.argv[1]; print(hashlib.sha256(p.encode()).hexdigest()[:16]+'-'+os.path.basename(p.rstrip('/')))" \
-    "$USER_REPO")"
-  echo "$HOME/.leerie/state/$key"
+  local basename
+  basename="$(python3 -c "import os,sys; print(os.path.basename(sys.argv[1].rstrip('/')))" "$USER_REPO")"
+  echo "$HOME/.leerie/$basename"
 }
 
 LEERIE_STATE_HOST_DIR="$(_state_dir_default)"
@@ -142,10 +139,8 @@ def _run(
 
 
 def _expected_state_host_dir(user_repo: Path, fake_home: Path) -> str:
-    abs_path = str(user_repo)
-    sha16 = hashlib.sha256(abs_path.encode()).hexdigest()[:16]
-    basename = os.path.basename(abs_path.rstrip("/"))
-    return str(fake_home) + f"/.leerie/state/{sha16}-{basename}"
+    basename = os.path.basename(str(user_repo).rstrip("/"))
+    return str(fake_home) + f"/.leerie/{basename}"
 
 
 # ── state bind-mount present in nerdctl argv ─────────────────────────────────

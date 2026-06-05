@@ -111,7 +111,7 @@ orchestrator and not used anywhere in this repo.
   `research` / `both`).
 - **Don't write to the coordination state directory from inside a subtask worktree.** The
   worktree is disposable; coordination state must outlive it. The
-  orchestrator writes to the state root (default: `$HOME/.leerie/state/<sha16>-<basename>/`,
+  orchestrator writes to the state root (default: `$HOME/.leerie/<basename>/`,
   at `/leerie-state` inside the container); workers commit code to their
   worktree branch only.
 
@@ -177,9 +177,10 @@ tests/                      pytest suite
 ./leerie --resume
 
 # Override the default per-repo state directory. Default is
-# $HOME/.leerie/state/<sha16>-<basename>/ (outside the repo, no
-# .gitignore entry needed). Set in your shell profile to pin it globally.
-export LEERIE_STATE_DIR=~/.leerie/state/myproject
+# $HOME/.leerie/<basename>/ (outside the repo, no .gitignore entry
+# needed). Cross-repo basename collisions are caught at use time via
+# an .owner sidecar. Set in your shell profile to pin globally.
+export LEERIE_STATE_DIR=~/.leerie/myproject
 
 # Override the default source-of-truth preference (`both`) with an env
 # var, the CLI flag, or a per-repo file:
@@ -340,7 +341,7 @@ Before marking a change complete:
       representative run produces a well-formed `calls.ndjson` (each line
       valid JSON with at least `call_type`, `system_prompt`, and
       `response_content` keys). Replace `<state-root>` with the resolved
-      state directory (default: `$HOME/.leerie/state/<sha16>-<basename>/`).
+      state directory (default: `$HOME/.leerie/<basename>/`).
 - [ ] `grep -q -- '--chain-submit)\|--chain-status)\|--list-chains)\|--chain-kill)\|--chain-attach)' leerie`
       — if chain launcher verbs were touched, confirm all five verb case-arms
       are still present in the launcher (see DESIGN.md §19 and

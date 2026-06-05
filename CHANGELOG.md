@@ -47,6 +47,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   baseline of 2.0–2.3 to 2.59), reducing wasted budget on
   unrelated technical debt.
 
+### Changed
+
+- **Per-repo state directory layout: `$HOME/.leerie/state/<sha16>-<basename>/` →
+  `$HOME/.leerie/<basename>/`** (DESIGN §10, IMPLEMENTATION §2 *Host-side
+  per-repo state directory*). The launcher's `_state_dir_default` no
+  longer SHA-256-prefixes the directory name; the default is just the
+  basename of the repo. Browsability wins (`ls ~/.leerie/` shows
+  repo-named subtrees instead of opaque hex blobs) at the cost of a
+  basename collision when two distinct abs_paths share a basename
+  (e.g. `~/src/myproject` and `~/work/myproject`).
+
+  Cross-repo basename collisions are caught at use time by a new
+  `_validate_state_ownership` check in the launcher. The check runs
+  once per invocation, before the verb dispatch (skipped for
+  `--version` and the `--chain-*` verbs, which don't touch local
+  state). On first claim of a fresh directory, the launcher writes
+  `<state-root>/.owner` containing the resolved repo path. On
+  subsequent runs the recorded owner must match the current repo —
+  mismatch is fatal, with a stderr message naming both paths and the
+  three override knobs (`--state-dir`, `LEERIE_STATE_DIR`,
+  `leerie.toml: state_dir = ...`). The same check also refuses to
+  write into the leerie install directory: a target with `.git/` or a
+  `leerie` executable at top level and no `runs/` subdir is treated
+  as an installer mistake, not a state dir.
+
+  **No automatic migration.** Operators with state at the
+  pre-cutover path (`$HOME/.leerie/state/<sha16>-<basename>/`) will
+  not have their runs surfaced by `leerie --list` or `leerie --resume`
+  under the new launcher. To migrate manually:
+
+  ```bash
+  mv $HOME/.leerie/state/<old-key>/ $HOME/.leerie/<basename>/
+  printf '%s\n' "$(pwd -P)" > $HOME/.leerie/<basename>/.owner
+  ```
+
+  Pre-existing state dirs that have a `runs/` or `worktrees/` subdir
+  but no `.owner` are backfilled silently — the operator's own `mv`
+  recipe above doesn't need the `printf` step on a dir that already
+  contains run state.
+
+  This repo dogfoods leerie on itself; its basename is `leerie`,
+  which sits adjacent to the installer's clone at `$HOME/.leerie/`.
+  A committed `leerie.toml` at the repo root pins this repo's state
+  to `~/.leerie/_self/` so `./leerie "task"` works zero-config for
+  maintainers.
+
 ### Fixed
 
 - **`FLY_VM_DISK_GB` now actually absorbs run-time disk growth.** The

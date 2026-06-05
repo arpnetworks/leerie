@@ -770,13 +770,15 @@ export LEERIE_SOURCE_OF_TRUTH=codebase    # or: research, both
 leerie "task" --source-of-truth codebase
 
 # Override the host-side per-repo state directory (default:
-# $HOME/.leerie/state/<sha16>-<basename>/). Each repo gets its own
-# subtree under $HOME so Colima auto-shares it. Precedence:
+# $HOME/.leerie/<basename>/). Each repo gets its own subtree under
+# $HOME so Colima auto-shares it. Cross-repo basename collisions are
+# caught at use time via the .owner sidecar (see §2 "Host-side per-repo
+# state directory"). Precedence:
 # default < leerie.toml state_dir < LEERIE_STATE_DIR env < --state-dir CLI.
-export LEERIE_STATE_DIR=~/.leerie/state/myproject
-leerie "task" --state-dir ~/.leerie/state/myproject
+export LEERIE_STATE_DIR=~/.leerie/myproject
+leerie "task" --state-dir ~/.leerie/myproject
 # Or commit a per-repo default in leerie.toml:
-#   state_dir = ~/.leerie/state/myproject
+#   state_dir = ~/.leerie/myproject
 
 # Select the execution runtime (default: local). `fly` routes each worker
 # through Fly.io machines instead of local nerdctl containers.
@@ -1051,30 +1053,32 @@ on a structurally-unrecoverable run.
 
 ### Host-side per-repo state directory
 
-Resolves `LEERIE_STATE_HOST_DIR`: the host path where this repo's leerie run
-state (`runs/`, `worktrees/`, etc.) is stored. Lives under `$HOME` so Colima
-auto-shares it without an explicit `--mount` entry; keyed by repo identity so
-each repo gets an isolated subtree, mirroring how `~/.claude/projects/`
-separates per-repo state from the shared install at `~/.claude/`.
+Resolves `LEERIE_STATE_HOST_DIR`: the host path where this repo's leerie
+run state (`runs/`, `worktrees/`, etc.) is stored. Lives under `$HOME` so
+Colima auto-shares it without an explicit `--mount` entry; keyed by repo
+basename so each repo gets a readable, isolated subtree.
 
-Default path: `$HOME/.leerie/state/<key>/` where `<key>` is
-`sha256(abs_path)[:16]-<basename>` — stable, collision-resistant, and
-human-legible without a lookup table. The default must NOT reuse
-`$LEERIE_HOME` (`~/.leerie`) verbatim, because that is the install/clone
-directory (DESIGN §TBD); state lives in a distinct `state/` subtree.
+Default path: `$HOME/.leerie/<basename>/`. The default sits adjacent to
+the installer's clone at `$HOME/.leerie/` (DESIGN §TBD) — the installer's
+files live at the top level (`leerie` executable, `.git/`, `docs/`,
+etc.), per-repo state dirs live as siblings (e.g.
+`$HOME/.leerie/myproject/`). The launcher's `_validate_state_ownership`
+check (below) catches the rare collision where a basename matches an
+installer-dir marker (`.git/` or a `leerie` executable at top level
+with no `runs/` subdir).
 
 Resolution order (lowest → highest priority):
 
-1. **Default** `$HOME/.leerie/state/<sha16>-<basename>/`. The key is computed
-   by the `_state_dir_default` helper in the launcher via
-   `hashlib.sha256(abs_path.encode()).hexdigest()[:16] + "-" + basename`.
+1. **Default** `$HOME/.leerie/<basename>/`. Computed by the
+   `_state_dir_default` helper in the launcher as just the basename of
+   `$USER_REPO`. No hashing; no `state/` segment.
 
 2. **`leerie.toml` at the repo root** with key `state_dir`. Plain
    `key=value` syntax; bare `~` and `~/`-prefixed values are expanded to
    `$HOME`:
 
    ```
-   state_dir = ~/.leerie/state/myproject
+   state_dir = ~/.leerie/myproject
    ```
 
 3. **`LEERIE_STATE_DIR`** environment variable. Overrides the default and
@@ -1083,14 +1087,31 @@ Resolution order (lowest → highest priority):
 4. **`--state-dir PATH`** CLI flag. Highest priority; overrides everything.
    Bare `~` and `~/`-prefixed values are expanded.
 
-The resolved directory is `mkdir -p`'d by the launcher on every invocation
-(alongside the other `~/.cache/leerie/*` dirs at `leerie:1827`). This
-ensures the directory exists before the container is launched and before any
-mount in a later subtask adds the host-side path.
+After resolution and before the verb dispatch, the launcher runs
+`_validate_state_ownership` against the resolved path:
 
-Resolution lives entirely in the launcher (bash); no Python counterpart —
-the path is passed to `nerdctl run` as a bind-mount volume argument once
-resolved. Tested by `tests/test_resolve_state_dir.py`.
+- **Fresh dir (does not exist):** create it and write `.owner` containing
+  `$USER_REPO`.
+- **Dir exists with matching `.owner`:** continue.
+- **Dir exists with mismatched `.owner`:** error and exit. Two different
+  repos share a basename; the operator must pick an explicit override
+  (`--state-dir` / `LEERIE_STATE_DIR` / `leerie.toml: state_dir = ...`).
+- **Dir exists, no `.owner`, contains `runs/` or `worktrees/`:** backfill
+  the `.owner` sidecar from `$USER_REPO` (covers operators upgrading from
+  the pre-`.owner` layout).
+- **Dir exists, no `.owner`, contains `.git/` at top level or a `leerie`
+  executable at top level:** error and exit. The dir looks like the
+  leerie install directory, not a state dir.
+- **Dir exists, no `.owner`, no recognizable markers (empty or
+  unrelated):** claim it by writing `.owner`.
+
+The check is skipped for `--version` and the `--chain-*` verbs (those
+talk to the chain Fly app and don't touch local state).
+
+Resolution and ownership validation live entirely in the launcher (bash);
+no Python counterpart — the path is passed to `nerdctl run` as a
+bind-mount volume argument once resolved. Tested by
+`tests/test_resolve_state_dir.py` (resolver + ownership check, 27 cases).
 
 > The CLI/env > file order follows the same session-scoped vs.
 > committed-default split as `--source-of-truth` and `--runtime`.
@@ -1101,14 +1122,15 @@ Controls where leerie writes all run state (`state.json`, `runs/`, `logs/`,
 etc.). By default, state is written to a per-repo subtree under `$HOME` —
 never inside the repo itself — so target projects do not accumulate a
 `.leerie/` directory and do not need to add anything to their `.gitignore`.
-The default path is `$HOME/.leerie/state/<sha16>-<basename>/`, giving each
-repo an isolated, human-legible subtree that mirrors how `~/.claude/projects/`
-separates per-repo state from the shared install at `~/.claude/`.
+The default path is `$HOME/.leerie/<basename>/`, giving each repo an
+isolated subtree keyed by basename. Cross-repo basename collisions are
+caught at use time via an `.owner` sidecar (see
+*Host-side per-repo state directory* above for the full check).
 
 Resolution order (lowest → highest priority):
 
-1. **Default** `$HOME/.leerie/state/<sha16>-<basename>/`. Computed from the
-   absolute path of the repo root; stable and collision-resistant.
+1. **Default** `$HOME/.leerie/<basename>/`. The basename of the
+   absolute repo path.
 
 2. **`leerie.toml` at the repo root** with key `state_dir`. Plain
    `key=value` syntax; bare `~` and `~/`-prefixed values are expanded to
@@ -3930,11 +3952,11 @@ Tests: `tests/test_chain_fly_toml.py` (validates TOML, asserts [http_service],
 ## 8. Coordination directory layout
 
 State lives under the resolved state root — by default
-`$HOME/.leerie/state/<sha16>-<basename>/`, or the path set via
-`LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir` (see §2
-*State directory* for the full resolution order). The state root is always
-outside the target repo, so no `.leerie/` directory accumulates in project
-checkouts and no `.gitignore` entry is needed. Worktrees are
+`$HOME/.leerie/<basename>/`, or the path set via `LEERIE_STATE_DIR` /
+`--state-dir` / `leerie.toml state_dir` (see §2 *State directory* for the
+full resolution order). The state root is always outside the target repo,
+so no `.leerie/` directory accumulates in project checkouts and no
+`.gitignore` entry is needed. Worktrees are
 disposable; the coordination directory outlives them.
 
 Every run's artifacts live under `<state-root>/runs/<run-id>/`. The state
@@ -3942,7 +3964,8 @@ root is otherwise empty of run data; it only hosts the `runs/` directory.
 Two concurrent runs in the same repository share no coordination state.
 
 ```
-<state-root>/          (default: $HOME/.leerie/state/<sha16>-<basename>/)
+<state-root>/          (default: $HOME/.leerie/<basename>/)
+                        also contains: .owner (sidecar — abs_path of the owning repo)
 └── runs/
     └── <run-id>/                    (or _bootstrap-<6hex> pre-classify)
         ├── state.json               run state — see field table below

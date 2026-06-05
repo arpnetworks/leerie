@@ -2629,10 +2629,10 @@ def resolve_leerie_root(repo_root: Path) -> Path:
 
     Under the standard launcher path the container is started with
     LEERIE_STATE_DIR=/leerie-state, which is the bind-mount target of
-    $LEERIE_STATE_HOST_DIR (default $HOME/.leerie/state/<sha16>-<basename>/)
-    — so all run state lives outside the repo. The unset branch only
-    fires for direct (non-launcher) Python callers like the test suite,
-    where it falls back to the legacy in-repo `.leerie/` layout.
+    $LEERIE_STATE_HOST_DIR (default $HOME/.leerie/<basename>/) — so all
+    run state lives outside the repo. The unset branch only fires for
+    direct (non-launcher) Python callers like the test suite, where it
+    falls back to the legacy in-repo `.leerie/` layout.
     """
     env = os.environ.get(STATE_DIR_ENV, "").strip()
     if env:

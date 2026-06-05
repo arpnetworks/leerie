@@ -304,7 +304,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--heal-model ALIAS` | `sonnet` | Model alias for the post-run self-heal skill. Also `LEERIE_MODEL_HEAL` or `model_heal` in `leerie.toml`. |
 | `--heal-max-rounds N` | `10` | Maximum heal-loop iterations per `call_type`. Also `LEERIE_HEAL_MAX_ROUNDS` or `heal_max_rounds` in `leerie.toml`. |
 | `--heal-success-threshold RATE` | `0.9` | Pass-rate threshold for the heal-loop SUCCESS verdict. Also `LEERIE_HEAL_SUCCESS_THRESHOLD` or `heal_success_threshold` in `leerie.toml`. |
-| `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `<state-root>/logs/<sid>.log` (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/state/<sha16>-<basename>/`). |
+| `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `<state-root>/logs/<sid>.log` (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/<basename>/`). |
 | `-v` / `-vv` | `0` (off) | Shortcuts that anchor to `normal`: `-v` = `stream`, `-vv` = `debug`. With no `-v` and no `--verbosity`, falls through to `LEERIE_VERBOSITY` / `leerie.toml` / default `stream`. |
 | `-q` / `-qq` | `0` (off) | Shortcuts that anchor to `normal`: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. With no `-q` and no `--verbosity`, falls through to the same chain as `-v`. |
 | `--telemetry` / `--no-telemetry` | on | Enable / disable telemetry NDJSON event writing. Also `LEERIE_TELEMETRY=1`/`0` or `telemetry=true`/`false` in `leerie.toml`. |
@@ -317,7 +317,7 @@ Complete reference for every CLI flag, environment variable, and
 
 | Env var | `leerie.toml` key | Description |
 |---------|---------------------|-------------|
-| `LEERIE_STATE_DIR` | `state_dir` | Override the per-repo run state directory. Unset → default `$HOME/.leerie/state/<sha16>-<basename>/` (outside the repo; no `.gitignore` entry needed in target projects). Set once in your shell profile for a global directory across all repos. |
+| `LEERIE_STATE_DIR` | `state_dir` | Override the per-repo run state directory. Unset → default `$HOME/.leerie/<basename>/` (outside the repo; no `.gitignore` entry needed in target projects). Cross-repo basename collisions are caught at use time via an `.owner` sidecar inside the dir. Set once in your shell profile for a global directory across all repos. |
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → per-worker defaults (judgment workers `opus`, acting workers — implementer, conformer — `sonnet`). |
@@ -513,7 +513,7 @@ review surface; you can also pass `--no-push` to keep finalize fully
 local.
 
 The run writes only to `<state-root>/runs/<run-id>/` (where `<state-root>`
-is the resolved state directory — default `$HOME/.leerie/state/<sha16>-<basename>/`,
+is the resolved state directory — default `$HOME/.leerie/<basename>/`,
 overridable via `LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir`;
 never inside the repo itself) and to `leerie/runs/<run-id>` plus
 `leerie/subtasks/<run-id>/<subtask-id>` branches. Phase 6 (unless
@@ -537,7 +537,7 @@ for an audit cleanup across every past run).
   answers and you are running non-interactively. Read
   `<state-root>/pending-questions.json`, write the answers to
   `<state-root>/answers.json`, then `./leerie --resume --answers <state-root>/answers.json`
-  (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/state/<sha16>-<basename>/`).
+  (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/<basename>/`).
   The plugin skill at `commands/leerie.md` handles this relay
   automatically when invoked as `/leerie`.
 

@@ -1,0 +1,6 @@
+# Dogfooding override. This repo's basename is `leerie`, so the launcher
+# default would resolve to $HOME/.leerie/leerie/ — adjacent to the
+# installer's clone at $HOME/.leerie/. Pinning state to a dedicated dir
+# keeps the layout unambiguous and lets `./leerie "task"` work zero-config
+# on this repo.
+state_dir = "~/.leerie/_self"
