@@ -30,17 +30,20 @@ ulimit -c 0
 # without cgroup v2 cause the chowns to fail silently — leerie keeps
 # running, just uncapped (the orchestrator's _cgroup_probe logs one
 # warn line and _cgroup_create returns None). On a container restart
-# against an already-delegated slice (Fly machine reboot reusing the
-# same cgroupfs state) the mkdir is skipped but the chowns rerun
-# idempotently — this is the right behavior if the leerie UID changed
-# across restarts. The orchestrator's _detect_cgroup_root() picks the
-# slice if this succeeded, else falls back to /sys/fs/cgroup. See
-# DESIGN §6 *Memory containment*.
+# that observes an already-delegated slice (local nerdctl container
+# restart on a host VM that kept its cgroupfs state across the
+# restart) the mkdir is skipped but the chowns rerun idempotently —
+# this is the right behavior if the leerie UID changed across
+# restarts. On Fly this re-entry case does not arise: Firecracker
+# microVMs reboot the kernel fresh each machine start, so the slice
+# never persists across boots. The orchestrator's
+# _detect_cgroup_root() picks the slice if this succeeded, else
+# falls back to /sys/fs/cgroup. See DESIGN §6 *Memory containment*.
 if [ -d /sys/fs/cgroup ] && [ ! -d /sys/fs/cgroup/leerie.slice ]; then
   mkdir -p /sys/fs/cgroup/leerie.slice 2>/dev/null || true
 fi
 if [ -d /sys/fs/cgroup/leerie.slice ]; then
-  chown leerie:leerie /sys/fs/cgroup/leerie.slice 2>/dev/null || true
+  chown leerie: /sys/fs/cgroup/leerie.slice 2>/dev/null || true
   chown leerie /sys/fs/cgroup/leerie.slice/cgroup.procs 2>/dev/null || true
   chown leerie /sys/fs/cgroup/leerie.slice/cgroup.subtree_control 2>/dev/null || true
 fi
