@@ -218,6 +218,20 @@ not yours. Every tool call you burn on environmental noise eats from
 the per-run worker budget and pushes the run closer to the budget-
 feasibility cap (DESIGN §13).
 
+**Do not run the full test suite or the full build (`BUILD_CMD`) as a
+verification step.** The conformer phase runs these after you exit and
+is the canonical place for them. If you need targeted evidence for a §8
+falsifier, run only the specific test file (e.g.
+`vitest run path/to/file.test.ts`) or a type-check scoped to your
+changed files — never the full suite or full build. The same
+auto-background trap that bites conformers (full test suite ~5 min,
+Bash tool backgrounds at whatever `timeout` you set, default 2 min)
+bites you: a bare `npm test` you fire will auto-background, and the
+result is rarely worth the tool-call budget. Don't fire the full command
+in the first place — the conformer will, and that work is theirs. Lint
+(`pnpm lint`, `biome check`, `eslint`) is cheap (under a few seconds)
+and is fine to run scoped or full.
+
 ### 5. Self-check against your criteria (informational)
 
 Walk your criteria file and record what you observed for each item in

@@ -11705,6 +11705,192 @@ def _conformance_clean(conf_res: dict) -> bool:
     return True
 
 
+# Per-axis regexes matching the shapes of build/lint/test commands the
+# typical Node/JS conformer worker reaches for. Used by
+# `_count_bash_axis_invocations` and `_count_orphaned_bg_axis` to surface
+# advisory warnings when a worker overrun an axis in one round, or fired
+# a fresh BLT command in response to an auto-backgrounded prior one
+# (the retry-instead-of-recover antipattern; see conformer.md §4).
+_BLT_AXIS_RES: dict[str, re.Pattern[str]] = {
+    "test":  re.compile(r"\b(?:pnpm|npm|yarn|npx)\s+(?:run\s+)?(?:test|vitest)\b"
+                        r"|\bvitest\s+run\b"),
+    "build": re.compile(r"\b(?:pnpm|npm|yarn)\s+(?:run\s+)?build\b"
+                        r"|\btsc(?:\s|$)|\bnext\s+build\b"),
+    "lint":  re.compile(r"\b(?:pnpm|npm|yarn)\s+(?:run\s+)?lint\b"
+                        r"|\bbiome\s+check\b|\beslint(?:\s|$)"),
+}
+# Exact wording the Bash tool returns when it auto-backgrounds a
+# command that exceeds the worker-supplied `timeout`. The bash_id
+# (a `b`-prefixed token) appears after the colon. Coupled with the
+# Bash tool's behavior; if Claude Code changes the wording, the
+# orphan-detection helper silently underreports, so this string
+# lives in one place and is covered by a regression test.
+_BG_RESULT_PREFIX = "Command running in background with ID:"
+_BG_ID_RE = re.compile(r"Command running in background with ID:\s*(\w+)")
+
+
+def _iter_log_tool_use(
+        log_path: Path) -> Iterator[tuple[str, dict, str]]:
+    """Yield each Bash/BashOutput/KillBash/Read `tool_use` block from a
+    per-worker JSONL log, paired with its `tool_result` content when
+    one is present. Yields tuples of (kind, input_dict, result_text)
+    where `result_text` is "" if no result was paired.
+
+    Tolerates malformed lines: any line that isn't valid JSON, or any
+    JSON event that doesn't carry the expected message/content shape,
+    is skipped silently. The JSONL log format is produced by the Claude
+    Code SDK, not by leerie itself; a parsing failure on a single line
+    must not break the advisory warning emission for the whole round."""
+    if not log_path.is_file():
+        return
+    lines = log_path.read_text().splitlines()
+    # Two passes keep the API simple — log files are at most a few MB.
+    # First collects tool_use blocks (id, kind, input) in order; second
+    # keys tool_result texts by tool_use_id and yields the joined pairs.
+    uses: list[tuple[str, str, dict]] = []  # (tool_use_id, name, input)
+    results: dict[str, str] = {}
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        try:
+            body = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        msg = body.get("message") or {}
+        # A non-dict `message` value (e.g. a top-level event with
+        # `{"message": "string"}`) would crash `msg.get("content")` —
+        # the docstring promises malformed-line tolerance, so skip.
+        if not isinstance(msg, dict):
+            continue
+        content = msg.get("content") or []
+        if not isinstance(content, list):
+            continue
+        for blk in content:
+            if not isinstance(blk, dict):
+                continue
+            t = blk.get("type")
+            if t == "tool_use":
+                name = blk.get("name", "")
+                if name in ("Bash", "BashOutput", "KillBash", "Read"):
+                    uses.append((blk.get("id", ""), name,
+                                 blk.get("input") or {}))
+            elif t == "tool_result":
+                tid = blk.get("tool_use_id", "")
+                c = blk.get("content", "")
+                if isinstance(c, list):
+                    c = " ".join(
+                        x.get("text", "") if isinstance(x, dict) else str(x)
+                        for x in c)
+                results[tid] = c or ""
+    for tid, kind, inp in uses:
+        yield kind, inp, results.get(tid, "")
+
+
+def _count_bash_axis_invocations(log_path: Path,
+                                 axis_re: re.Pattern[str]) -> int:
+    """Count distinct Bash `tool_use` invocations in `log_path` whose
+    command matches `axis_re`. Returns 0 when the log is missing or
+    contains no matching invocations. Tolerates malformed log lines."""
+    n = 0
+    for kind, inp, _result in _iter_log_tool_use(log_path):
+        if kind != "Bash":
+            continue
+        if axis_re.search(inp.get("command", "")):
+            n += 1
+    return n
+
+
+def _count_orphaned_bg_axis(log_path: Path,
+                            axis_re: re.Pattern[str]) -> list[str]:
+    """Return the bash_ids of BLT commands matching `axis_re` that
+    auto-backgrounded (tool_result starts with `_BG_RESULT_PREFIX`) and
+    were followed in the same log by **another** Bash invocation matching
+    the same axis_re — i.e., the worker fired a fresh test/build command
+    in response to a backgrounded one instead of recovering the result
+    via `BashOutput shell_id=<id>` or `Read file_path=<temp>`.
+
+    Bash invocations that auto-backgrounded and were followed by a
+    BashOutput-poll on the same shell_id, a KillBash on it, or any Read
+    of the temp output file path are *not* orphans — the model recovered
+    cleanly. Foreground commands (no auto-background result) are never
+    orphans."""
+    # Build a flat ordered list of all relevant tool_use events so we
+    # can ask "what was the next BLT-axis Bash after this backgrounded
+    # one?" with a simple index walk.
+    events: list[tuple[str, dict, str]] = list(_iter_log_tool_use(log_path))
+    orphans: list[str] = []
+    for i, (kind, inp, result) in enumerate(events):
+        if kind != "Bash":
+            continue
+        if not axis_re.search(inp.get("command", "")):
+            continue
+        if not result.startswith(_BG_RESULT_PREFIX):
+            continue
+        m = _BG_ID_RE.search(result)
+        bg_id = m.group(1) if m else ""
+        # Walk forward to the next BLT-axis Bash in this log. If the
+        # very next BLT-axis Bash matches axis_re, it's a retry. If we
+        # find a BashOutput/KillBash with this bg_id, or a Read of the
+        # temp file (the tool reports the path right after the bg id;
+        # we use a permissive substring check on the result text), it's
+        # a clean recovery and we stop searching.
+        for j in range(i + 1, len(events)):
+            kind_j, inp_j, _ = events[j]
+            if kind_j == "BashOutput" and inp_j.get("shell_id") == bg_id:
+                break  # polled — clean recovery
+            if kind_j == "KillBash" and inp_j.get("shell_id") == bg_id:
+                break  # killed — clean termination
+            if kind_j == "Read":
+                p = inp_j.get("file_path", "")
+                if bg_id and bg_id in p:
+                    break  # read the temp output file — clean recovery
+                # A different Read: keep scanning; recovery might come
+                # later or the model might still retry.
+                continue
+            if kind_j == "Bash":
+                # If the next Bash matches the same axis, it's a retry.
+                # If it's an unrelated command (e.g. `cat /tmp/...`,
+                # `git log`), keep scanning — recovery might still come.
+                cmd_j = inp_j.get("command", "")
+                if axis_re.search(cmd_j):
+                    orphans.append(bg_id)
+                    break
+                if bg_id and bg_id in cmd_j:
+                    break  # shell-inspected the bg job output — recovery
+                continue
+        # If we ran out of events with no recovery and no retry, the
+        # worker simply stopped doing things related to this axis —
+        # not an orphan-by-retry, so we do not append.
+    return orphans
+
+
+def _emit_bash_axis_warnings(log_path: Path, round_label: str,
+                             warnings: list[str]) -> None:
+    """Helper called once per conformer round: append advisory warnings
+    to `warnings` for axes that were invoked more than once in the
+    round, or whose auto-backgrounded invocations were followed by a
+    retry instead of a temp-file read or `BashOutput` poll (see
+    conformer.md §4 for the discipline)."""
+    if not log_path.is_file():
+        return
+    for axis, axis_re in _BLT_AXIS_RES.items():
+        n = _count_bash_axis_invocations(log_path, axis_re)
+        if n > 1:
+            warnings.append(
+                f"{round_label}: ran {axis.upper()}_CMD {n} times in one "
+                f"round (see {log_path}) — `run each axis exactly once "
+                "per round` per conformer.md §4; surfaced as advisory.")
+        for bg_id in _count_orphaned_bg_axis(log_path, axis_re):
+            warnings.append(
+                f"{round_label}: {axis.upper()}_CMD auto-backgrounded "
+                f"(bash_id={bg_id}) and was followed by another "
+                f"{axis.upper()}_CMD invocation — that is the "
+                "retry-instead-of-recover pattern. Set `timeout: 600000` "
+                "on the original invocation to prevent the background "
+                "trap (conformer.md §4); recover via temp-file `Read` "
+                "or `BashOutput shell_id=<id>` if it still backgrounds.")
+
+
 async def _run_conformance_phase(sid: str, leerie_dir: Path,
                                  worktree: str, subtask: dict, caps: dict,
                                  st: State, models: dict[str, str],
@@ -11775,6 +11961,15 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         for subject in unprefixed:
             warnings.append(f"conformer round {c_round}: commit subject "
                             f"missing `conformer:` prefix: {subject!r}")
+
+        # BLT-axis observability: surface advisory warnings when the
+        # worker invoked an axis more than once in one round, or fired a
+        # fresh BLT command in response to an auto-backgrounded prior
+        # one. The conformer's sid is f"{sid}-conformer" — see
+        # `run_conformer` where claude_p is called.
+        _emit_bash_axis_warnings(
+            leerie_dir / "logs" / f"{sid}-conformer.log",
+            f"conformer round {c_round}", warnings)
 
         if _conformance_clean(last_res):
             break
@@ -11936,6 +12131,13 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             warnings.append(f"final conformer round {c_round}: commit "
                             f"subject missing `conformer:` prefix: "
                             f"{subject!r}")
+
+        # BLT-axis observability: same per-round warnings as the
+        # per-subtask conformance phase. Final-conformer's sid is
+        # f"final-conformer-r{c_round}" — see the claude_p call above.
+        _emit_bash_axis_warnings(
+            leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
+            f"final conformer round {c_round}", warnings)
 
         if _conformance_clean(res):
             break

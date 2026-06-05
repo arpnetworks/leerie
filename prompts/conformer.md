@@ -125,6 +125,43 @@ is re-applied to your commits and a violation rolls them back.
 
 ### 4. Run build, lint, tests — honestly
 
+In a single conformer round you run each of `BUILD_CMD`, `LINT_CMD`,
+`TEST_CMD` **exactly once**, with that exact command string, full
+(un-scoped) — no follow-up reruns, no "let me try with
+`--reporter=verbose` to be sure," no "let me re-run with `npx vitest`
+instead of `npm test` to double-check." One invocation per axis,
+recorded. The orchestrator surfaces an advisory warning if you invoke
+any axis more than once in one round, regardless of variation.
+
+When you invoke `TEST_CMD` or `BUILD_CMD`, **pass an explicit
+`timeout` parameter of `600000` (10 minutes)** to the Bash tool —
+full test suites commonly take 3–6 minutes and the Bash tool's
+default is 2 minutes. If you omit the timeout, the tool will
+auto-background your command and return `Command running in
+background with ID: <id>` — and the temptation to fire a fresh test
+command instead of recovering the result from that background job is
+the single biggest waste pattern in this phase. Set the timeout up
+front and avoid the trap.
+
+In the rare case a command DOES auto-background (e.g., a repo's
+suite genuinely exceeds 10 min), the Bash tool tells you the output
+file path in its response. Recover the result by **reading that temp
+file** (`Read file_path="<path>"` or `cat <path>`) OR by calling
+`BashOutput shell_id="<id>"` to poll — either is correct. **What is
+NOT correct: firing a new test/build command in response to the
+backgrounded one** — that leaves the original consuming CPU while
+you start another copy of the same work. If after waiting ~15
+minutes the command is still running, use `KillBash shell_id="<id>"`
+and report the axis as `{ran: true, passed: false, command: "...",
+summary: "timed out after 15 min"}` — a legitimate honest result,
+not a reason to retry.
+
+Falsification of a specific claim about a specific file is the only
+exception to "exactly once": run a single targeted command (e.g.,
+`vitest run path/to/file.test.ts`) and clearly mark it in the bash
+command's preceding text as `# falsifier for <claim>`. Targeted
+falsifiers do not count against the once-per-round rule.
+
 For each of `BUILD_CMD`, `LINT_CMD`, `TEST_CMD` whose value is not the
 literal string `(none)`, run it once in the worktree and record the
 outcome. Each maps to one of three states in your output:
@@ -173,11 +210,17 @@ implementer and planner apply:
 1. **Falsification.** For each non-trivial claim in your output
    (e.g. "the residual is unfixable without weakening the implementer's
    work", "lint passes", "no docs drift remains"), explicitly look for
-   evidence that would *disprove* it: re-run the command, re-read the
-   rule, re-check the file. A claim earns ≥ 9.0 only when its falsifier
-   was tested and failed to disprove it. Record each falsifier in
-   `confidence.falsifiers_tested` (one entry per falsifier:
-   *"predicted X; observed Y"*).
+   evidence that would *disprove* it. Re-reading a file or rule is free;
+   **re-running `BUILD_CMD` / `LINT_CMD` / `TEST_CMD` is not** — those
+   each ran once in §4 and that result is your evidence. If §4 already
+   produced the evidence that bears on your claim (e.g. "lint passes",
+   "test suite passes"), cite the §4 result; do not re-run the full
+   axis. Re-run only a single *targeted* command (one test file, one
+   type-check on one file) when no §4 result speaks to the claim — and
+   pass `timeout: 600000` if it may exceed 2 minutes. A claim earns ≥ 9.0
+   only when its falsifier was tested and failed to disprove it. Record
+   each falsifier in `confidence.falsifiers_tested` (one entry per
+   falsifier: *"predicted X; observed Y"*).
 2. **Drift reconciliation.** If you changed your assessment during this
    pass (decided a residual was actually fixable, or vice versa), name
    the contradiction in `confidence.contradictions_reconciled` along
