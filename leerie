@@ -691,8 +691,8 @@ PY
         --runtime=*) _fin_runtime="${_a#--runtime=}" ;;
         --runtime) _fin_prev="--runtime" ;;
         # --no-verify / --no-push are valid here; the actual handling
-        # happens in the post-fetch block (~:876–882). Recognized but
-        # not acted on here.
+        # happens in the post-fetch scan loop (~:903–906). Recognized
+        # but not acted on here.
         --no-verify|--no-push) : ;;
         # Fail loudly on typos like `--foorce` — previously these were
         # silently dropped and the user thought they had passed --force.
