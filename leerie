@@ -714,6 +714,17 @@ PY
           ;;
       esac
     done
+    # Dangling `--runtime` with no value: the state-machine above set
+    # _fin_prev="--runtime" but the loop ended before the next iteration
+    # could consume the value. Without this check the downstream
+    # `[ -n "$_fin_runtime" ]` validator below would silently pass an
+    # empty runtime and the launcher would proceed with the default Fly
+    # path — a surprise the operator would not have asked for.
+    if [ -n "$_fin_prev" ]; then
+      remote_log "--finalize: $_fin_prev requires a value"
+      echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+      exit 1
+    fi
     if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ]; then
       remote_log "--finalize: --runtime must be 'local' or 'fly' (got '$_fin_runtime')"
       exit 1

@@ -259,6 +259,35 @@ def test_finalize_rejects_extra_positional(tmp_path):
     )
 
 
+def test_finalize_rejects_dangling_runtime_flag(tmp_path):
+    """`leerie --finalize <id> --runtime` (no value after the flag) is
+    a partial invocation — without this guard, the _fin_prev state
+    machine leaves _fin_runtime empty, the downstream
+    [ -n "$_fin_runtime" ] validator passes, and the launcher silently
+    proceeds with the default Fly path. The 7a41153 "strict argparse"
+    change caught --foorce-style typos but missed this case; this
+    test guards the post-loop _fin_prev check that closes it."""
+    user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
+    state_dir.mkdir()
+    result = subprocess.run(
+        ["bash", str(LEERIE), "--finalize", "some-run-id", "--runtime"],
+        cwd=str(user_repo),
+        capture_output=True, text=True,
+        env={**os.environ, "PATH": os.environ.get("PATH", ""),
+             "LEERIE_STATE_DIR": str(state_dir)},
+    )
+    assert result.returncode != 0, (
+        f"--finalize should reject a dangling --runtime flag.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "--runtime requires a value" in combined, (
+        "error message should explain that --runtime needs a value.\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
 def test_finalize_accepts_no_verify_and_no_push(tmp_path):
     """Sanity check: --no-verify and --no-push are valid --finalize
     flags (consumed by the post-fetch block at leerie:899–906) and must
