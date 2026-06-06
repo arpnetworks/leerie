@@ -57,7 +57,18 @@ re_seed() {
   # Without the fly-machine.json fallback, --resume of a paused
   # bootstrap-stage run reaches re_seed but aborts here because run.json
   # isn't minted until after classify.
-  local run_dir="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID"
+  #
+  # Honor LEERIE_STATE_HOST_DIR first (matches fetch-branch.sh:263–267).
+  # The launcher writes fly-machine.json under $LEERIE_STATE_HOST_DIR/runs/
+  # (leerie:2402–2406), not under $USER_REPO/.leerie/. The repo-local
+  # path is the fallback for setups without a state-host-dir override.
+  local host_leerie_runs
+  if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+    host_leerie_runs="$LEERIE_STATE_HOST_DIR/runs"
+  else
+    host_leerie_runs="$USER_REPO/.leerie/runs"
+  fi
+  local run_dir="$host_leerie_runs/$LEERIE_RUN_ID"
   local mid=""
   local candidate
   for candidate in "$run_dir/fly-machine.json" "$run_dir/run.json"; do

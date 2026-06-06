@@ -2326,11 +2326,15 @@ time + IANA tz. Either source produces a `reset_at: datetime | None`
 (parse failure → `None`, never a wrong-time guess) and the raw
 message. `main()`'s `except RateLimitedExit` arm: when `reset_at` is
 set, run worktree cleanup, sleep until the moment + 30s margin, then
-`os.execvp` the launcher (`<LEERIE_HOME>/leerie --resume --run-id <id>`)
-to start a fresh orchestrator process (the `--max-workers` budget is
-NOT reset across the re-exec: `worker_count` persists in state.json,
+`os.execv(sys.executable, [sys.executable, __file__, "--resume",
+"--run-id", <id>])` to re-exec the orchestrator itself (NOT the
+launcher — the launcher is not baked into the container image and
+its `--resume` path would attempt to spawn a new container; the
+orchestrator already runs inside the container with state on disk
+and accepts `--resume --run-id`). The `--max-workers` budget is NOT
+reset across the re-exec: `worker_count` persists in state.json,
 so a run that repeatedly hits the rate-limit still respects the
-user's cap);
+user's cap;
 when `reset_at` is None, print the literal message and the manual
 resume command, exit with code 75 (`EX_TEMPFAIL`).
 

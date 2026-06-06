@@ -168,3 +168,114 @@ def test_finalize_already_pushed_short_circuits(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "already pushed" in result.stderr or "already pushed" in result.stdout
+
+
+# --- Strict argparse: typos and extra positionals fail loudly --------------
+#
+# Regression cover for the silent-typo class where the launcher's
+# `--finalize` argparse (leerie:682–717) accepted any unknown `--*`
+# flag without error. The original incident: a user ran
+# `leerie --finalize <id> --foorce` (typo for --force), the launcher
+# silently dropped --foorce, _FINALIZE_FORCE stayed false,
+# force_finalize_remote was never invoked, fetch_branch correctly
+# reported "no completed unpushed run on machine," and the user thought
+# their recovery command had failed for an unrelated reason. The fix
+# adds a `--*) error; exit 1` catch-all plus a strict positional check.
+
+def test_finalize_rejects_unknown_flag(tmp_path):
+    """`leerie --finalize <id> --foorce` exits non-zero with a clear
+    'unknown flag' error and the Usage line — instead of silently
+    dropping the typo and taking the non-force fetch path."""
+    user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
+    state_dir.mkdir()
+    result = subprocess.run(
+        ["bash", str(LEERIE), "--finalize", "some-run-id", "--foorce"],
+        cwd=str(user_repo),
+        capture_output=True, text=True,
+        env={**os.environ, "PATH": os.environ.get("PATH", ""),
+             "LEERIE_STATE_DIR": str(state_dir)},
+    )
+    assert result.returncode != 0, (
+        f"--finalize should reject unknown flag --foorce.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "unknown flag: --foorce" in combined, (
+        "error message should name the unknown flag.\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_finalize_accepts_force_correctly_spelled(tmp_path):
+    """Sanity check: --force (correct spelling) is still recognized.
+    Guards against an over-aggressive catch-all that would reject the
+    real flag."""
+    user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
+    state_dir.mkdir()
+    # Pass a run-id that doesn't exist locally to make --finalize fail
+    # after argparse but before any remote call. The point is to confirm
+    # argparse does not reject --force itself.
+    result = subprocess.run(
+        ["bash", str(LEERIE), "--finalize", "nonexistent-run", "--force"],
+        cwd=str(user_repo),
+        capture_output=True, text=True,
+        env={**os.environ, "PATH": os.environ.get("PATH", ""),
+             "LEERIE_STATE_DIR": str(state_dir)},
+    )
+    # Failure is expected (no such run), but the error must NOT be
+    # "unknown flag" — the flag is valid.
+    combined = result.stdout + result.stderr
+    assert "unknown flag: --force" not in combined, (
+        "--force must be a recognized flag.\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_finalize_rejects_extra_positional(tmp_path):
+    """`leerie --finalize id1 id2` — the second positional argument is
+    not a recognized flag and shouldn't be silently ignored. Previously
+    the argparse loop would have iterated past `id2` as just-another-arg
+    that doesn't match the case statement."""
+    user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
+    state_dir.mkdir()
+    result = subprocess.run(
+        ["bash", str(LEERIE), "--finalize", "run-id-1", "run-id-2"],
+        cwd=str(user_repo),
+        capture_output=True, text=True,
+        env={**os.environ, "PATH": os.environ.get("PATH", ""),
+             "LEERIE_STATE_DIR": str(state_dir)},
+    )
+    assert result.returncode != 0, (
+        f"--finalize should reject an extra positional argument.\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    combined = result.stdout + result.stderr
+    assert "unexpected extra positional" in combined, (
+        "error message should call out the extra positional.\n"
+        f"stderr:\n{result.stderr}"
+    )
+
+
+def test_finalize_accepts_no_verify_and_no_push(tmp_path):
+    """Sanity check: --no-verify and --no-push are valid --finalize
+    flags (consumed by the post-fetch block at leerie:899–906) and must
+    pass the strict argparse without 'unknown flag' errors."""
+    user_repo = _make_user_repo(tmp_path)
+    state_dir = tmp_path / "leerie-state"
+    state_dir.mkdir()
+    for flag in ("--no-verify", "--no-push"):
+        result = subprocess.run(
+            ["bash", str(LEERIE), "--finalize", "nonexistent-run", flag],
+            cwd=str(user_repo),
+            capture_output=True, text=True,
+            env={**os.environ, "PATH": os.environ.get("PATH", ""),
+                 "LEERIE_STATE_DIR": str(state_dir)},
+        )
+        combined = result.stdout + result.stderr
+        assert f"unknown flag: {flag}" not in combined, (
+            f"{flag} must be a recognized --finalize flag.\n"
+            f"stderr:\n{result.stderr}"
+        )

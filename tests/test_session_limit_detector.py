@@ -4,7 +4,8 @@ session-limit / rate-limit message detector.
 The detector is the single load-bearing surface for the rate-limit
 auto-resume contract (DESIGN §6 *Cleanup on abnormal exit*): if it
 returns a `RateLimitedExit` with a parseable `reset_at`, main() will
-sleep until that moment and `os.execvp` into `--resume`. A wrong
+sleep until that moment and `os.execv` the orchestrator into
+`--resume` (sys.executable __file__ --resume --run-id <id>). A wrong
 parse here would produce a wrong-time sleep — strictly worse than no
 auto-resume — so the detector must be conservative: only return a
 non-None `reset_at` when every step of the parse (regex match,

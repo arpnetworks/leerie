@@ -13922,8 +13922,13 @@ def main() -> None:
         # Claude Code session-limit / rate-limit hit mid-worker. See
         # DESIGN §6 *Cleanup on abnormal exit*. Two paths:
         #   - reset_at parsed cleanly → run worktree-only cleanup,
-        #     sleep until the moment + 30s margin, then os.execvp the
-        #     launcher with --resume for a fresh orchestrator process.
+        #     sleep until the moment + 30s margin, then os.execv the
+        #     orchestrator itself (sys.executable __file__ --resume
+        #     --run-id <id>) for a fresh orchestrator process. We
+        #     re-exec the orchestrator, not the launcher: the launcher
+        #     is not baked into the container image (Dockerfile only
+        #     COPYs orchestrator/, scripts/, prompts/, .claude-plugin/)
+        #     and would try to spawn a new container if it were.
         #     The `worker_count` cap is NOT reset — it persists in
         #     state.json so a run repeatedly re-exec'ing through the
         #     rate-limit still respects the user's --max-workers cap.
@@ -13981,12 +13986,22 @@ def main() -> None:
                 interrupted_during_sleep = True
                 exit_code = 130
             if not interrupted_during_sleep:
-                launcher = str(ROOT / "leerie")
-                log(f"  auto-resuming: exec {launcher} "
+                # Re-exec the orchestrator itself, not the launcher. The
+                # launcher (a) is not baked into the container image (the
+                # Dockerfile does not COPY it — see Dockerfile:182–185) and
+                # (b) would try to launch a new container via `nerdctl run`
+                # / Fly provision if it were, because it has no inside-
+                # container sentinel. We are already inside the container
+                # with state on disk and the orchestrator's own main()
+                # accepts `--resume --run-id`; re-execing $python $__file__
+                # gives us a fresh worker budget and a fresh asyncio loop
+                # without recursing through the launcher.
+                log(f"  auto-resuming: exec orchestrator "
                     f"--resume --run-id {st.run_id}")
-                os.execvp(launcher,
-                          ["leerie", "--resume", "--run-id", st.run_id])
-                # Unreachable: execvp replaces the process.
+                os.execv(sys.executable,
+                         [sys.executable, __file__,
+                          "--resume", "--run-id", st.run_id])
+                # Unreachable: execv replaces the process.
         else:
             log(f"  could not parse reset time; "
                 f"resume manually: leerie --resume --run-id {st.run_id}")

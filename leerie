@@ -679,6 +679,7 @@ PY
     _FINALIZE_FORCE=false
     _fin_runtime=""
     _fin_prev=""
+    _fin_seen_positional=false
     for _a in "$@"; do
       if [ "$_fin_prev" = "--runtime" ]; then
         _fin_runtime="$_a"
@@ -689,6 +690,28 @@ PY
         --force) _FINALIZE_FORCE=true ;;
         --runtime=*) _fin_runtime="${_a#--runtime=}" ;;
         --runtime) _fin_prev="--runtime" ;;
+        # --no-verify / --no-push are valid here; the actual handling
+        # happens in the post-fetch block (~:876–882). Recognized but
+        # not acted on here.
+        --no-verify|--no-push) : ;;
+        # Fail loudly on typos like `--foorce` — previously these were
+        # silently dropped and the user thought they had passed --force.
+        --*)
+          remote_log "--finalize: unknown flag: $_a"
+          echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+          exit 1
+          ;;
+        *)
+          # First positional is the run-id (already read into
+          # _fin_run_id from $1). Anything after is a second positional
+          # — refuse to silently accept it.
+          if [ "$_fin_seen_positional" = "true" ]; then
+            remote_log "--finalize: unexpected extra positional: $_a"
+            echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
+            exit 1
+          fi
+          _fin_seen_positional=true
+          ;;
       esac
     done
     if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ]; then

@@ -1022,9 +1022,14 @@ above). Then:
 
 - If `reset_at` was parsed cleanly from the literal Claude Code
   message format, leerie runs the worktree-only cleanup, sleeps until
-  the reset moment + a small margin, then `os.execvp`'s the launcher
-  with `--resume --run-id <id>` to start a fresh orchestrator
-  process. The `--max-workers` budget persists across the re-exec —
+  the reset moment + a small margin, then `os.execv`'s the
+  orchestrator itself (`sys.executable __file__ --resume --run-id <id>`)
+  to start a fresh orchestrator process. We re-exec the orchestrator,
+  not the launcher: the orchestrator already runs inside the
+  container with state on disk, the launcher is not baked into the
+  container image, and the launcher's `--resume` path would try to
+  launch a new container (no inside-container sentinel exists).
+  The `--max-workers` budget persists across the re-exec —
   `worker_count` lives in state.json — so a run that repeatedly hits
   the rate-limit still respects the user's cap.
 - If the reset clause didn't parse (malformed time, unknown

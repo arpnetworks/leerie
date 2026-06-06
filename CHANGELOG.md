@@ -131,6 +131,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Rate-limit auto-resume no longer crashes with `FileNotFoundError`.**
+  When a worker hit a Claude 5-hour rate limit and the orchestrator
+  scheduled an auto-resume after the reset window, `main()` called
+  `os.execvp("leerie", [...])` to re-launch a fresh orchestrator
+  process. But the `leerie` launcher script is not baked into the
+  container image (`Dockerfile:182–185` copies only `orchestrator/`,
+  `scripts/`, `prompts/`, `.claude-plugin/`), so on Fly the exec died
+  with `FileNotFoundError: [Errno 2]` — strictly worse than no
+  auto-resume, since the orchestrator crashed instead of leaving the
+  run resumable. On local nerdctl the launcher exists by accident via
+  the host-repo bind-mount but would loop infinitely (the launcher's
+  `--resume` path calls `nerdctl run` again, with no inside-container
+  sentinel to break the recursion). The fix re-execs the orchestrator
+  itself — `os.execv(sys.executable, [sys.executable, __file__,
+  "--resume", "--run-id", st.run_id])` — which works identically on
+  both runtimes, preserves UID/GID/CWD/env across the exec, and uses
+  the orchestrator's own `--resume --run-id` argparse (line 13398) so
+  no launcher round-trip is needed. The `--max-workers` budget still
+  persists across the re-exec (lives in `state.json`). DESIGN.md §6
+  and IMPLEMENTATION.md §5 updated to match.
+
+- **`leerie --finalize` no longer silently drops typo'd flags.** The
+  argparse loop at `leerie:682–693` was a `case` statement matching
+  only `--force`, `--runtime`, `--runtime=*`; any unknown flag fell
+  through with no error. A user retrying `--force` recovery as
+  `--foorce` would see `_FINALIZE_FORCE` stay `false`, the launcher
+  would log `action=fetch` instead of `action=force-patch+fetch`,
+  `force_finalize_remote` would never run, and `fetch_branch` would
+  correctly report "no completed unpushed run on machine" — leaving
+  the user convinced their recovery command had failed for an
+  unrelated reason. The fix adds an explicit `--*) error; exit 1`
+  catch-all plus a strict extra-positional check. Valid flags
+  (`--force`, `--runtime[=]`, `--no-verify`, `--no-push`) are
+  recognized explicitly. Companion tests in
+  `tests/test_launcher_finalize_no_work.py` cover the typo path, the
+  extra-positional path, and the no-false-positive guards for the
+  real flags.
+
+- **`scripts/remote/re-seed.sh` now honors `LEERIE_STATE_HOST_DIR`.**
+  Line 60 hardcoded `$USER_REPO/.leerie/runs/$LEERIE_RUN_ID`, ignoring
+  the state-host-dir override. On the default install
+  (`LEERIE_STATE_DIR=$HOME/.leerie/<basename>/`) the launcher writes
+  `fly-machine.json` to the state dir, but `re_seed` looked in the
+  repo dir, found nothing, and aborted with
+  `re_seed: no fly_machine_id at <repo>/.leerie/runs/<id>/...`. The
+  symptom was an infinite resume loop: each `--resume` invocation
+  re-ran `seed_auth` (~90 s of plugin install) then died at `re_seed`
+  and paused the machine. The fix mirrors `fetch-branch.sh:263–267`'s
+  precedence: prefer `$LEERIE_STATE_HOST_DIR/runs` when set, fall
+  back to `$USER_REPO/.leerie/runs` otherwise. Companion tests in
+  `tests/test_re_seed.py` cover both the precedence and the fallback.
+
 - **Per-worker cgroup v2 memory containment now actually works on both
   runtimes (Fly + local nerdctl).** The Dockerfile previously had
   `USER leerie`, which caused ENTRYPOINT to run as the leerie user
