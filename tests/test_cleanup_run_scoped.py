@@ -249,3 +249,77 @@ def test_cleanup_bootstrap_removes_orphans(tmp_path):
     assert not boot1.exists()
     assert not boot2.exists()
     assert real.exists(), "non-bootstrap run dir must NOT be removed by --bootstrap"
+
+
+# --- LEERIE_STATE_DIR precedence -----------------------------------------
+#
+# Regression cover for the bug observed 2026-06-06: cleanup.sh hardcoded
+# `.leerie/runs/<id>/` relative to CWD and ignored LEERIE_STATE_DIR.
+# Inside the container LEERIE_STATE_DIR=/leerie-state is always set, so
+# the post-finalize subtask-branch cleanup invoked from
+# orchestrator/leerie.py:13085 silently no-op'd (its target path didn't
+# exist), leaving subtask branches behind.
+
+def test_cleanup_finds_run_dir_under_state_dir(tmp_path):
+    """cleanup.sh --run-id reads from $LEERIE_STATE_DIR/runs/<id>/ when
+    that env var is set — NOT from <cwd>/.leerie/runs/<id>/."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@x"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "file").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    state_dir = tmp_path / "leerie-state"
+    run_id = "feat-state-dir-test"
+    run_dir = state_dir / "runs" / run_id
+    (run_dir / "worktrees").mkdir(parents=True)
+    (run_dir / "state.json").write_text('{"task": "test"}')
+    # Deliberately do NOT create <repo>/.leerie/runs/<run_id>/ — proves the
+    # script honors LEERIE_STATE_DIR rather than falling back to the
+    # repo-local path.
+
+    import os as _os
+    env = {**_os.environ, "LEERIE_STATE_DIR": str(state_dir)}
+    r = subprocess.run(
+        [str(CLEANUP_SH), "--run-id", run_id],
+        cwd=repo, env=env, capture_output=True, text=True, check=False,
+    )
+    assert r.returncode == 0, (
+        f"cleanup.sh should find the run under LEERIE_STATE_DIR; "
+        f"stderr:\n{r.stderr}"
+    )
+    # Audit-trail invariant: state.json kept.
+    assert (run_dir / "state.json").exists()
+
+
+def test_cleanup_state_dir_unset_falls_back_to_repo(tmp_path):
+    """Without LEERIE_STATE_DIR, cleanup.sh resolves .leerie/runs/<id>/
+    relative to CWD — the legacy/in-repo behavior."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@x"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "file").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    run_id = "feat-fallback-test"
+    run_dir = repo / ".leerie" / "runs" / run_id
+    (run_dir / "worktrees").mkdir(parents=True)
+    (run_dir / "state.json").write_text('{"task": "test"}')
+
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
+    r = subprocess.run(
+        [str(CLEANUP_SH), "--run-id", run_id],
+        cwd=repo, env=env, capture_output=True, text=True, check=False,
+    )
+    assert r.returncode == 0, (
+        f"cleanup.sh fallback to .leerie/ should succeed when LEERIE_STATE_DIR "
+        f"is unset; stderr:\n{r.stderr}"
+    )
+    assert (run_dir / "state.json").exists()

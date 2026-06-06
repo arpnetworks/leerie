@@ -163,3 +163,55 @@ def test_does_not_modify_working_branch_head(tmp_path):
     assert current_before == current_after, (
         "finalize.sh switched the user off their working branch"
     )
+
+
+# --- LEERIE_STATE_DIR precedence -----------------------------------------
+#
+# Regression cover for the bug observed 2026-06-06: finalize.sh hardcoded
+# `.leerie/runs/<id>/` relative to CWD and ignored LEERIE_STATE_DIR. Inside
+# the container LEERIE_STATE_DIR=/leerie-state (set unconditionally at
+# leerie:2780); setup-run.sh wrote working-branch to that path while
+# finalize.sh looked for it at /work/.leerie/runs/<id>/working-branch
+# (nonexistent), aborting phase 6 of every resumed Fly run.
+
+def test_finalize_finds_working_branch_under_state_dir(tmp_path):
+    """When LEERIE_STATE_DIR points outside the repo, finalize.sh reads
+    working-branch from that path — NOT from <repo>/.leerie/runs/."""
+    repo = _init_repo(tmp_path)
+    _add_run_branch_with_extra_commit(repo)
+    # Put working-branch under an out-of-repo state dir.
+    state_dir = tmp_path / "leerie-state"
+    run_dir = state_dir / "runs" / "test"
+    run_dir.mkdir(parents=True)
+    (run_dir / "working-branch").write_text("main")
+    # The repo-local .leerie/ deliberately does NOT have the working-branch
+    # file — proves the script doesn't fall back to it.
+
+    import os as _os
+    env = {**_os.environ, "LEERIE_STATE_DIR": str(state_dir)}
+    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo, env=env,
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 0, (
+        f"expected exit 0; got {r.returncode}\n"
+        f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+    assert "ready to push" in r.stdout
+
+
+def test_finalize_state_dir_unset_falls_back_to_repo(tmp_path):
+    """When LEERIE_STATE_DIR is unset, finalize.sh still resolves
+    .leerie/runs/<id>/ relative to CWD (legacy/in-repo install path)."""
+    repo = _init_repo(tmp_path)
+    _add_run_branch_with_extra_commit(repo)
+    _write_working_branch_file(repo, "main")  # writes to repo/.leerie/...
+
+    # Strip LEERIE_STATE_DIR if it's in the parent env so the fallback fires.
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k != "LEERIE_STATE_DIR"}
+    r = subprocess.run([str(FINALIZE_SH), "test"], cwd=repo, env=env,
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 0, (
+        f"expected exit 0; got {r.returncode}\n"
+        f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
+    )
+    assert "ready to push" in r.stdout

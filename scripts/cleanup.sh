@@ -4,9 +4,13 @@
 # Run from the repo root. Default behavior is run-scoped: cleanup never
 # touches more than one run at a time unless --all-runs is passed.
 #
+# Paths resolve via ${LEERIE_STATE_DIR:-.leerie} (i.e. <state-root>).
+# Inside the container this is /leerie-state; on the host without an
+# override it falls back to the legacy repo-local .leerie/.
+#
 # Modes:
 #   cleanup.sh --run-id <id> [--branches | --subtask-branches]
-#     Remove .leerie/runs/<id>/worktrees/* and prune git metadata.
+#     Remove <state-root>/runs/<id>/worktrees/* and prune git metadata.
 #     With --branches also delete leerie/runs/<id> and
 #     leerie/subtasks/<id>/* branches.
 #     With --subtask-branches delete only the subtask branches and keep
@@ -14,15 +18,15 @@
 #     the PR head and must outlive the orchestrator).
 #
 #   cleanup.sh --all-runs [--branches | --subtask-branches]
-#     Same as above, applied to every directory under .leerie/runs/
+#     Same as above, applied to every directory under <state-root>/runs/
 #     (excluding _bootstrap-* — use --bootstrap for those).
 #
 #   cleanup.sh --bootstrap
-#     Remove orphaned .leerie/runs/_bootstrap-* directories (runs that
+#     Remove orphaned <state-root>/runs/_bootstrap-* directories (runs that
 #     died before classify completed and so have no stable run_id).
 #
 #   cleanup.sh  (no flag)
-#     Scans .leerie/runs/*/state.json for the most recently failed run
+#     Scans <state-root>/runs/*/state.json for the most recently failed run
 #     (most recent without finished_at), prompts y/N, cleans only that run.
 set -euo pipefail
 
