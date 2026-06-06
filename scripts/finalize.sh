@@ -12,7 +12,12 @@
 set -euo pipefail
 
 RUN_ID="${1:?usage: finalize.sh <run-id>}"
-RUN_DIR=".leerie/runs/${RUN_ID}"
+# Honor LEERIE_STATE_DIR — matches setup-run.sh:25. Without this,
+# in-container invocations (LEERIE_STATE_DIR=/leerie-state) look at
+# /work/.leerie/runs/<id>/working-branch (does not exist) instead of
+# /leerie-state/runs/<id>/working-branch (where setup-run.sh wrote it).
+LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
+RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"
 BRANCH="leerie/runs/${RUN_ID}"
 WORKING_BRANCH_FILE="${RUN_DIR}/working-branch"
 

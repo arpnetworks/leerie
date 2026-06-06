@@ -26,6 +26,12 @@
 #     (most recent without finished_at), prompts y/N, cleans only that run.
 set -euo pipefail
 
+# Honor LEERIE_STATE_DIR — matches setup-run.sh:25 and finalize.sh.
+# Without this, in-container invocations (LEERIE_STATE_DIR=/leerie-state)
+# silently scan /work/.leerie/runs/ instead of /leerie-state/runs/,
+# masking the cleanup as a no-op and leaving worktrees behind.
+LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
+
 # --- helpers -------------------------------------------------------------
 
 clean_one_run() {
@@ -43,7 +49,7 @@ clean_one_run() {
   # (full_purge) path inside the orchestrator, not this script.
   local run_id="$1"
   local branch_scope="$2"
-  local run_dir=".leerie/runs/${run_id}"
+  local run_dir="${LEERIE_ROOT}/runs/${run_id}"
 
   if [ -d "${run_dir}/worktrees" ]; then
     for d in "${run_dir}/worktrees"/*/; do
@@ -98,10 +104,10 @@ most_recent_failed_run() {
   # Find the most-recent run without finished_at. Echo run_id or "".
   local newest=""
   local newest_started=""
-  if [ ! -d .leerie/runs ]; then
+  if [ ! -d "${LEERIE_ROOT}/runs" ]; then
     return
   fi
-  for dir in .leerie/runs/*/; do
+  for dir in "${LEERIE_ROOT}"/runs/*/; do
     [ -d "$dir" ] || continue
     local base
     base="$(basename "$dir")"
@@ -176,12 +182,12 @@ BR_FLAG=0
 
 if [ "$BOOTSTRAP" = "true" ]; then
   # ----- orphaned bootstrap directories -----------------------------------
-  if [ ! -d .leerie/runs ]; then
-    echo "cleanup: no .leerie/runs/ to scan"
+  if [ ! -d "${LEERIE_ROOT}/runs" ]; then
+    echo "cleanup: no ${LEERIE_ROOT}/runs/ to scan"
     exit 0
   fi
   removed=0
-  for dir in .leerie/runs/_bootstrap-*/; do
+  for dir in "${LEERIE_ROOT}"/runs/_bootstrap-*/; do
     [ -d "$dir" ] || continue
     rm -rf "$dir"
     echo "cleanup: removed orphaned $(basename "$dir")"
@@ -195,12 +201,12 @@ fi
 
 if [ "$ALL_RUNS" = "true" ]; then
   # ----- every per-run directory (excluding _bootstrap-*) -----------------
-  if [ ! -d .leerie/runs ]; then
-    echo "cleanup: no .leerie/runs/ to clean"
+  if [ ! -d "${LEERIE_ROOT}/runs" ]; then
+    echo "cleanup: no ${LEERIE_ROOT}/runs/ to clean"
     exit 0
   fi
   cleaned=0
-  for dir in .leerie/runs/*/; do
+  for dir in "${LEERIE_ROOT}"/runs/*/; do
     [ -d "$dir" ] || continue
     base="$(basename "$dir")"
     case "$base" in _bootstrap-*) continue ;; esac
@@ -215,8 +221,8 @@ fi
 
 if [ -n "$RUN_ID" ]; then
   # ----- single-run cleanup ----------------------------------------------
-  if [ ! -d ".leerie/runs/${RUN_ID}" ]; then
-    echo "cleanup: no run directory at .leerie/runs/${RUN_ID}" >&2
+  if [ ! -d "${LEERIE_ROOT}/runs/${RUN_ID}" ]; then
+    echo "cleanup: no run directory at ${LEERIE_ROOT}/runs/${RUN_ID}" >&2
     exit 1
   fi
   clean_one_run "$RUN_ID" "$BR_FLAG"

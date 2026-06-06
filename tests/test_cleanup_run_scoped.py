@@ -56,14 +56,16 @@ def test_cleanup_declares_branches_flag():
 # --- run-scoping safety --------------------------------------------------
 
 def test_cleanup_scopes_worktree_removal_to_run_dir():
-    """--run-id only touches .leerie/runs/<id>/worktrees/, not a
-    top-level .leerie/worktrees/. The construction is via a local
-    `run_dir` variable: `run_dir=".leerie/runs/${run_id}"` then
-    `"${run_dir}/worktrees"`."""
+    """--run-id only touches <state-dir>/runs/<id>/worktrees/, not a
+    top-level <state-dir>/worktrees/. The construction is via a local
+    `run_dir` variable: `run_dir="${LEERIE_ROOT}/runs/${run_id}"` then
+    `"${run_dir}/worktrees"`. LEERIE_ROOT honors LEERIE_STATE_DIR with
+    .leerie/ as the legacy fallback — same precedence as setup-run.sh
+    and finalize.sh."""
     src = _src()
     clean_one_run = src.split("clean_one_run() {")[1].split("\n}")[0]
-    # The run_dir variable is correctly anchored under runs/.
-    assert 'run_dir=".leerie/runs/${run_id}"' in clean_one_run
+    # The run_dir variable is correctly anchored under runs/ via LEERIE_ROOT.
+    assert 'run_dir="${LEERIE_ROOT}/runs/${run_id}"' in clean_one_run
     # The worktrees path is derived from run_dir.
     assert '${run_dir}/worktrees' in clean_one_run
     # And the top-level path must NOT appear inside clean_one_run.

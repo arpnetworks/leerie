@@ -145,7 +145,47 @@ def test_finalize_references_per_run_branch():
 def test_finalize_uses_per_run_working_branch_file():
     """Working branch is recorded per-run under runs/<id>/working-branch."""
     src = _script("finalize.sh")
-    assert '.leerie/runs/${RUN_ID}' in src
     # The top-level .leerie/working-branch must not appear.
     assert "\".leerie/working-branch\"" not in src
     assert "'.leerie/working-branch'" not in src
+
+
+def test_finalize_honors_state_dir_env():
+    """finalize.sh derives RUN_DIR from LEERIE_STATE_DIR (or .leerie fallback)
+    — mirrors setup-run.sh:25. Without this, in-container invocations
+    (LEERIE_STATE_DIR=/leerie-state) look at /work/.leerie/runs/<id>/
+    instead of /leerie-state/runs/<id>/ and finalize.sh aborts with
+    'working-branch missing' during phase 6 of every Fly run that
+    reaches finalize. Regression cover for the bug observed
+    2026-06-06 on a resumed stackpulse run after wave 4 completed."""
+    src = _script("finalize.sh")
+    assert 'LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"' in src
+    assert 'RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"' in src
+    # The naked hardcoded path must not appear in executable lines.
+    non_comment = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert 'RUN_DIR=".leerie/runs/' not in non_comment
+
+
+def test_cleanup_honors_state_dir_env():
+    """cleanup.sh derives LEERIE_ROOT from LEERIE_STATE_DIR (or .leerie fallback)
+    — same pattern as finalize.sh and setup-run.sh. Without this, the
+    in-container post-finalize cleanup invocation (run_script call at
+    orchestrator/leerie.py:13085) silently no-ops because /work/.leerie/runs/
+    doesn't exist, leaving subtask branches behind."""
+    src = _script("cleanup.sh")
+    assert 'LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"' in src
+    # Every executable path reference uses ${LEERIE_ROOT}, not a hardcoded
+    # .leerie/runs/ literal.
+    non_comment = "\n".join(
+        line for line in src.splitlines() if not line.lstrip().startswith("#")
+    )
+    assert '.leerie/runs' not in non_comment, (
+        "cleanup.sh has a remaining hardcoded `.leerie/runs` literal "
+        "in an executable line — should use ${LEERIE_ROOT}/runs/ instead.\n"
+        "Lines containing it:\n" + "\n".join(
+            line for line in non_comment.splitlines()
+            if '.leerie/runs' in line
+        )
+    )

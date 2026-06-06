@@ -131,6 +131,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`scripts/finalize.sh` and `scripts/cleanup.sh` now honor
+  `LEERIE_STATE_DIR`.** Both scripts hardcoded `.leerie/runs/<id>/`
+  relative to CWD, while `scripts/setup-run.sh:25` correctly resolved
+  the run dir via `${LEERIE_STATE_DIR:-.leerie}`. The asymmetry was
+  invisible until phase 6 ran — wave 4 of a resumed Fly run was the
+  first time finalize.sh executed inside the container, and it
+  immediately aborted with `working-branch missing — run setup-run.sh
+  … first` (the file was at `/leerie-state/runs/<id>/working-branch`
+  where setup-run.sh wrote it; finalize.sh looked at
+  `/work/.leerie/runs/<id>/working-branch`). The orchestrator died
+  with rc=1, which is NOT in `decide_teardown`'s auto-sync rc set
+  (`0|10|11|75`), so wave 4's commits remained stranded on the Fly
+  machine. cleanup.sh had the same hardcoded paths, silently no-op'ing
+  the post-finalize subtask-branch cleanup invoked from
+  `orchestrator/leerie.py:13085` because `/work/.leerie/runs/` doesn't
+  exist on Fly machines. Both scripts now derive
+  `LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"` and reference
+  `${LEERIE_ROOT}/runs/...` throughout — mirrors the same pattern in
+  `setup-run.sh` and the `scripts/remote/re-seed.sh` fix shipped in
+  `ed1dae1`. Companion source-text tests in
+  `tests/test_setup_run_script_paths.py` and
+  `tests/test_cleanup_run_scoped.py` pin the new precedence.
+
 - **Rate-limit auto-resume no longer crashes with `FileNotFoundError`.**
   When a worker hit a Claude 5-hour rate limit and the orchestrator
   scheduled an auto-resume after the reset window, `main()` called
