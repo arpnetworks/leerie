@@ -61,7 +61,7 @@ def test_empty_plan_does_not_die(leerie):
 
 def test_small_plan_fits_default_cap(leerie):
     """Single subtask, single wave. Models the refactor-remove
-    1-subtask successful run (worker_count ended at 8, default cap 100)."""
+    1-subtask successful run (worker_count ended at 8, default cap 120)."""
     st = _FakeState(worker_count=3)  # classifier + planner ×2
     caps = _default_caps(leerie)
     leerie.check_budget_feasibility(st, caps, _make_subtasks(1), _make_waves(1))
@@ -69,37 +69,37 @@ def test_small_plan_fits_default_cap(leerie):
 
 def test_medium_plan_fits_default_cap(leerie):
     """13 subtasks, 3 waves. Models the feat-please-read-remote
-    successful run (worker_count=37, default cap 100). The preflight
+    successful run (worker_count=37, default cap 120). The preflight
     estimate should be conservative but still under the cap."""
     st = _FakeState(worker_count=4)  # classifier + provision + 2 planners
     caps = _default_caps(leerie)
     # Predicted: 4 + (13*2.5 + 3 + 2 + 1) = 4 + 38.5 = 42.5. ×1.15 = 48.875.
-    # Under 100.
+    # Under 120.
     leerie.check_budget_feasibility(st, caps, _make_subtasks(13), _make_waves(3))
 
 
 # ---------------------------------------------------------------------------
-# Failure path: the summarizer scenario (29 subtasks, default cap)
+# Failure path: the summarizer scenario (35 subtasks, default cap)
 # ---------------------------------------------------------------------------
 
 def test_summarizer_scenario_dies(leerie, capsys):
-    """29 subtasks, 7 waves, worker_count=8 (the upstream phases on a
-    multi-domain run). With default cap 100 and the default 2.5
-    multiplier, the estimate exceeds the cap. This is the exact
-    scenario that motivated the preflight (run
-    `feat-migrate-the-application-code-c65cbe`, 2026-06-03)."""
+    """35 subtasks, 7 waves, worker_count=8 (the upstream phases on a
+    multi-domain run). With default cap 120 and the default 2.5
+    multiplier, the estimate exceeds the cap.
+    Estimate: 8 + (35*2.5 + 7 + 2 + 1) = 8 + 97.5 = 105.5. ×1.15 = 121.3 > 120.
+    Inspired by run `feat-migrate-the-application-code-c65cbe`, 2026-06-03."""
     st = _FakeState(worker_count=8)  # classifier + provision + 4 planners + reconciler + overlap_judge
     caps = _default_caps(leerie)
     with pytest.raises(SystemExit) as exc:
         leerie.check_budget_feasibility(st, caps,
-                                        _make_subtasks(29), _make_waves(7))
+                                        _make_subtasks(35), _make_waves(7))
     # die() exit code is the third positional arg / kw `code=`
     assert exc.value.code == leerie.EXIT_BUDGET_INFEASIBLE
     err = capsys.readouterr().err
     # The message must name the subtask count, wave count, already-spent,
     # and a recommended --max-workers. Coupling-test the wording so a
     # silent rephrasing in leerie.py doesn't break docs/tests.
-    assert "29 subtask(s)" in err
+    assert "35 subtask(s)" in err
     assert "7 wave(s)" in err
     assert "8 `claude -p` call(s) already spent" in err
     assert "--max-workers" in err
@@ -155,9 +155,9 @@ def test_skip_budget_check_bypasses(leerie):
     enforcement in that case."""
     st = _FakeState(worker_count=8, skip=True)
     caps = _default_caps(leerie)
-    # No SystemExit despite the 29-subtask summarizer scenario.
+    # No SystemExit despite the 35-subtask summarizer scenario.
     leerie.check_budget_feasibility(st, caps,
-                                    _make_subtasks(29), _make_waves(7))
+                                    _make_subtasks(35), _make_waves(7))
 
 
 # ---------------------------------------------------------------------------
@@ -174,14 +174,14 @@ def test_recommended_cap_passes_when_applied(leerie, capsys):
     caps = _default_caps(leerie)
     with pytest.raises(SystemExit):
         leerie.check_budget_feasibility(st, caps,
-                                        _make_subtasks(29), _make_waves(7))
+                                        _make_subtasks(35), _make_waves(7))
     err = capsys.readouterr().err
     # Extract the recommended value from the message.
     import re
     m = re.search(r"--max-workers (\d+)", err)
     assert m is not None, f"no --max-workers <N> in error: {err!r}"
     recommended = int(m.group(1))
-    # The message includes both the original "vs --max-workers 100" mention
+    # The message includes both the original "vs --max-workers 120" mention
     # and the recommendation. The recommendation should be after "Re-run
     # with". Capture that one specifically.
     m2 = re.search(r"Re-run with --max-workers (\d+)", err)
@@ -194,7 +194,7 @@ def test_recommended_cap_passes_when_applied(leerie, capsys):
     # same scheduling point.
     st2 = _FakeState(worker_count=8)
     leerie.check_budget_feasibility(st2, new_caps,
-                                    _make_subtasks(29), _make_waves(7))
+                                    _make_subtasks(35), _make_waves(7))
 
 
 # ---------------------------------------------------------------------------

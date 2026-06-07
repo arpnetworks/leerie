@@ -16,12 +16,12 @@ def repo_root(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_default_cap_is_one_hundred(leerie):
-    assert leerie.DEFAULT_CAPS["max_total_workers"] == 100
+def test_default_cap_is_one_twenty(leerie):
+    assert leerie.DEFAULT_CAPS["max_total_workers"] == 120
 
 
 def test_default_when_nothing_set(leerie, repo_root):
-    assert leerie.resolve_max_workers(repo_root) == 100
+    assert leerie.resolve_max_workers(repo_root) == 120
 
 
 def test_file_value(leerie, repo_root):
@@ -94,9 +94,9 @@ def test_zero_file_value_dies(leerie, repo_root, capsys):
 
 def test_empty_env_treated_as_unset(leerie, repo_root, monkeypatch):
     monkeypatch.setenv("LEERIE_MAX_WORKERS", "")
-    assert leerie.resolve_max_workers(repo_root) == 100
+    assert leerie.resolve_max_workers(repo_root) == 120
 
 
 def test_whitespace_only_env_treated_as_unset(leerie, repo_root, monkeypatch):
     monkeypatch.setenv("LEERIE_MAX_WORKERS", "   ")
-    assert leerie.resolve_max_workers(repo_root) == 100
+    assert leerie.resolve_max_workers(repo_root) == 120
