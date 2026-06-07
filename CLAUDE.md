@@ -107,7 +107,7 @@ orchestrator and not used anywhere in this repo.
   points and never inside a `st.data[k] = v; st.save()` pair.
   (Cross-process contention — two orchestrators on the same run
   dir — is prevented separately by `State.__init__`'s exclusive
-  `fcntl.flock` on the run-directory inode; see DESIGN §6 *Single
+  `fcntl.flock` on the run directory; see DESIGN §6 *Single
   owner per run dir*.)
 - **Source-of-truth answers go through the validation gate in
   `gather_answers`.** Anything reading `answers["source_of_truth"]` can

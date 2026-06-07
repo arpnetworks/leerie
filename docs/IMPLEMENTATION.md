@@ -1100,9 +1100,11 @@ The lock primitive itself:
   `tmp.replace(self.path)` swap inside `save()` does not affect the
   lock. Docstring updated to make this explicit.
 - `State.rename_to`'s `os.rename(self.run_dir, new_dir)` preserves
-  the lock — the fd binds the inode, not the path. (Verified on
-  macOS Darwin 25.3 and assumed equivalent on Linux given POSIX
-  flock semantics.)
+  the lock — the fd binds the open file description, not the path.
+  (Verified on macOS Darwin 25.3. `fcntl.flock` wraps BSD `flock(2)`,
+  which Linux and macOS Darwin both implement with the same OFD-bound
+  semantics — distinct from POSIX `fcntl(F_SETLK)` byte-range locks,
+  which Python exposes separately.)
 
 Two checked construction sites that catch `StateLockedError`:
 

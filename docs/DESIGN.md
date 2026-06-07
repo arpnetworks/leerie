@@ -567,7 +567,7 @@ orchestrators have diverged in-memory views of `subtask_status`.
 
 The architectural property: **at most one orchestrator owns a run
 directory at any time.** The mechanism is an exclusive advisory flock
-on the run-directory inode, acquired in `State.__init__` and released
+on the run directory, acquired in `State.__init__` and released
 by the kernel on process exit (clean, SIGTERM, or SIGKILL — no manual
 pidfile cleanup, no `/proc` liveness check, no PID-recycling false
 positives). A second orchestrator that tries to construct `State` on
@@ -596,20 +596,24 @@ orchestrator; on local runs the host is the user's workstation. There
 is no architectural path today by which two hosts could attach to the
 same state directory simultaneously.
 
-Known limitation — microsecond race between launcher probe and
-orchestrator acquire: if the original orchestrator A briefly releases
-its lock at the exact moment a refusing `--resume` B's launcher probe
-runs (e.g. A is exiting cleanly), B's probe passes, B's orchestrator
-starts, and *then* B's `State.__init__` finds the lock has been
-re-taken by some other path. B exits `EXIT_LOCKED=75`, but the
-launcher's detached-orchestrator tail wrapper has already begun. The
-wrapper sees the pid disappear, exits 0, and `decide_teardown` routes
-the 0-rc through the sync-then-finalize-then-destroy arm — which would
-destroy A's machine. This race is microseconds wide and requires
-A to release between B's probe and B's spawn, which only happens when
-A is also exiting. The cleanest fix reserves a separate exit code for
-EXIT_LOCKED (not 75) and teaches `decide_teardown` a fourth
-disposition that leaves the machine alone. Deferred.
+Known limitation — concurrent-spawn race between two `--resume`
+launches: two `--resume` invocations fired at nearly the same instant
+(e.g. by a CI script or impatient user) each run their fast-path
+launcher probe before either orchestrator's `State.__init__` runs.
+Both probes find no lock held and both pass; both launchers spawn
+their orchestrators; the two `State.__init__` calls race in the
+kernel. The kernel picks one winner (call it A); the loser (B) gets
+`BlockingIOError` from `flock(LOCK_EX | LOCK_NB)` and exits
+`EXIT_LOCKED=75`. From B's launcher's perspective on Fly, B's
+detached-orchestrator tail wrapper has already begun. The wrapper
+sees the pid disappear, exits 0, and `decide_teardown` routes the
+0-rc through the sync-then-finalize-then-destroy arm — which would
+destroy A's machine. This race is microseconds wide and requires the
+two `--resume` invocations to bracket each other precisely; in normal
+use it is vanishingly rare. The cleanest fix reserves a separate exit
+code for `EXIT_LOCKED` (not 75) and teaches `decide_teardown` a
+fourth disposition that leaves the machine alone on receipt of that
+code. Deferred.
 
 ### Why merge, not cherry-pick
 

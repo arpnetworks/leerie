@@ -6251,7 +6251,7 @@ class State:
     """In-memory run state with atomic on-disk persistence.
 
     Single-owner-per-run-dir: `__init__` acquires an exclusive advisory
-    flock on the run directory inode and holds it for the life of the
+    flock on the run directory and holds it for the life of the
     process (released by the kernel on exit, including SIGKILL). A
     second orchestrator that tries to construct State against the same
     run_dir gets `StateLockedError`. This is the load-bearing defense
