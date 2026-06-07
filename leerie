@@ -1286,6 +1286,11 @@ for arg in "$@"; do
   if [ "$_prev" = "--run-id" ]; then
     LEERIE_RUN_ID="$arg"
   fi
+  # Positional run-id: `--resume <id>` (mirrors --stop / --kill convention).
+  # Only capture when the token doesn't start with `--` (not a flag).
+  if [ "$_prev" = "--resume" ] && [ -n "$arg" ] && [ "${arg#--}" = "$arg" ]; then
+    LEERIE_RUN_ID="$arg"
+  fi
   case "$arg" in
     --run-id=*) LEERIE_RUN_ID="${arg#--run-id=}" ;;
     --resume)   IS_RESUME=true ;;
@@ -1325,6 +1330,10 @@ for arg in "$@"; do
     case "$_prev" in
       --model-*|--effort-*) _prev=""; continue ;;
     esac
+  fi
+  # Skip positional run-id after --resume (not the task).
+  if [ "$_prev" = "--resume" ] && [ "${arg#--}" = "$arg" ]; then
+    _prev=""; continue
   fi
   # Skip any --flag (with or without =value).
   case "$arg" in
@@ -1854,12 +1863,21 @@ fi
 # declares only --inspect-dir (no -i alias — see leerie.py:6079), so we
 # intercept exactly that one form and let everything else flow through.
 prev_was_inspect=false
+_prev_was_resume=false
 for arg in "$@"; do
   if $prev_was_inspect; then
     collect_inspect_path "$arg"
     prev_was_inspect=false
     continue
   fi
+  # Consume positional run-id after --resume: rewrite to --run-id <val>
+  # so the orchestrator sees the canonical form (mirrors --stop/--kill).
+  if $_prev_was_resume && [ "${arg#--}" = "$arg" ]; then
+    _prev_was_resume=false
+    REWRITTEN_ARGS+=("--run-id" "$arg")
+    continue
+  fi
+  _prev_was_resume=false
   case "$arg" in
     --inspect-dir)
       prev_was_inspect=true
@@ -1899,6 +1917,13 @@ for arg in "$@"; do
       # Launcher-only flag; triggers `leerie --finalize` on clean exit via
       # tail_with_optional_autofinalize. The orchestrator's argparse
       # doesn't know it.
+      ;;
+    --resume)
+      # Forward --resume to the orchestrator and mark that the next
+      # non-flag positional token is the run-id (not the task).
+      REWRITTEN_ARGS+=("$arg")
+      _prev_was_resume=true
+      continue
       ;;
     *)
       REWRITTEN_ARGS+=("$arg")

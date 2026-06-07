@@ -13292,6 +13292,17 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 "resume")
             return
         if "waves" not in st.data:
+            phase = st.data.get("current_phase", "")
+            if phase == "phase 3: scheduling":
+                # Budget-feasibility check fired after schedule() but before
+                # write_plan() — plans are not persisted, so this run cannot
+                # be resumed. User must re-run fresh with a higher budget.
+                die(
+                    "cannot resume — run stopped at the budget-feasibility "
+                    "check before any work was scheduled. Plans are not "
+                    "persisted. Re-run (without --resume) with "
+                    "--skip-budget-check or a higher --max-workers."
+                )
             die("cannot resume — run did not reach the scheduling phase")
         # Refresh the preferences in case env vars or leerie.toml
         # changed since the original run started. Verbosity is

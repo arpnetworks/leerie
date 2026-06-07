@@ -716,8 +716,9 @@ leerie "Fix the login timeout bug and add a regression test"
 leerie path/to/task.md
 
 # Resume an interrupted run. Auto-picks if exactly one in-flight run exists;
-# requires --run-id otherwise (see `leerie --list` to enumerate).
+# pass the run-id (positional or via --run-id) otherwise (see `leerie --list`).
 leerie --resume
+leerie --resume bugfix-login-timeout-bug-b81e90
 leerie --resume --run-id bugfix-login-timeout-bug-b81e90
 
 # List in-flight and completed runs in this repository:
