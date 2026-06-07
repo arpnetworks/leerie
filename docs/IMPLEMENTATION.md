@@ -3287,7 +3287,8 @@ with `_bootstrap-`, routing the in-machine orchestrator to its
 That arm needs a `task` positional, which is gone from the user's
 resume argv. The launcher persists the user's original task argument
 to `$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt` on first launch
-(adjacent to the `fly-machine.json` early-promote write), and on
+(the run dir already exists — `provision_machine()` wrote `fly-machine.json`
+there first), and on
 bootstrap-stage resume — when `LEERIE_TASK_ARG` is empty in this
 invocation's argv — reads it back and appends to `REWRITTEN_ARGS`.
 Both writes are idempotent (`! -f` and "no task in argv" guards), so
@@ -3552,11 +3553,13 @@ Run-id resolution:
 
 `provision.sh` writes the PID-keyed record at
 `$LEERIE_STATE_HOST_DIR/remote/$$.json` immediately after creating the
-machine. `destroy_machine` removes it on full reap. After
-`fetch_branch` succeeds and `LEERIE_REMOTE_RUN_ID` is known, the
-launcher renames the record to
-`$LEERIE_STATE_HOST_DIR/runs/$LEERIE_REMOTE_RUN_ID/fly-machine.json` so
-post-run resume works using the run-id directly.
+machine, and also writes the run-keyed pointer
+`$LEERIE_STATE_HOST_DIR/runs/$LEERIE_REMOTE_RUN_ID/fly-machine.json`
+in the same call — before returning to the launcher — so `--resume`
+survives a Ctrl-C between `provision_machine()` returning and the
+launcher's deferred copy. `destroy_machine` removes the PID-keyed
+record on full reap. The launcher's copy (guarded by `[ ! -f ]`) is a
+no-op fallback for compatibility with older images.
 
 Schema for the record (both paths):
 
