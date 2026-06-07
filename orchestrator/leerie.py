@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import contextlib
 import copy
+import fcntl
 import hashlib
 import json
 import os
@@ -362,6 +363,14 @@ EXIT_NEEDS_ANSWERS = 10   # emitted when clarification is needed but no TTY
 # that died here re-runs from scratch with the recommended cap or a split
 # task.
 EXIT_BUDGET_INFEASIBLE = 11
+
+# Emitted when State.__init__ cannot acquire the run-directory flock
+# because another orchestrator already owns this run. Lets the launcher
+# refuse `--resume` cleanly when an orchestrator is still alive,
+# instead of silently spawning a second one that would race on
+# state.json (DESIGN §6 *Single owner per run dir*). 75 aligns with
+# the BSD sysexits.h EX_TEMPFAIL convention.
+EXIT_LOCKED = 75
 
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
 # --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
@@ -6222,20 +6231,52 @@ class _ReplayState:
         t["output_tokens"] += int(usage.get("output_tokens") or 0)
 
 
+class StateLockedError(Exception):
+    """Raised when State.__init__ cannot acquire the per-run-directory
+    flock because another orchestrator already owns this run.
+
+    The handler at the orchestrator entry point converts this into an
+    EXIT_LOCKED process exit so the launcher can route the user toward
+    `--attach` (DESIGN §6 *Single owner per run dir*)."""
+
+    def __init__(self, run_dir: Path):
+        super().__init__(f"another orchestrator already owns {run_dir}")
+        self.run_dir = run_dir
+
+
 # =========================================================================
 # run state — persisted so a run is observable and resumable
 # =========================================================================
 class State:
     """In-memory run state with atomic on-disk persistence.
 
-    No lock: every mutator runs on the single asyncio event loop, so reads and
-    writes are not preempted mid-statement. Concurrent `claude -p` workers
-    spawned via `asyncio.gather` interleave only at `await` points, which never
-    fall inside a `st.data[k] = v; st.save()` pair.
+    Single-owner-per-run-dir: `__init__` acquires an exclusive advisory
+    flock on the run directory inode and holds it for the life of the
+    process (released by the kernel on exit, including SIGKILL). A
+    second orchestrator that tries to construct State against the same
+    run_dir gets `StateLockedError`. This is the load-bearing defense
+    against the dual-orchestrator race — see DESIGN §6 *Single owner
+    per run dir* for the architecture and the failure mode it
+    prevents.
+
+    The lock is on the *directory*, not state.json: `save()`'s atomic
+    `tmp.replace(self.path)` would orphan a state.json-bound fd from
+    the new inode, opening a multi-second window where a racer could
+    acquire on the unlocked replacement. Directory inodes are never
+    replaced, so the lock fd stays valid for the process lifetime.
+    `State.rename_to`'s `os.rename` is also safe — the fd binds the
+    inode, not the path. (Verified on Linux + macOS BSD-flock.)
+
+    No async-side lock: every mutator runs on the single asyncio event
+    loop, so reads and writes are not preempted mid-statement.
+    Concurrent `claude -p` workers spawned via `asyncio.gather`
+    interleave only at `await` points, which never fall inside a
+    `st.data[k] = v; st.save()` pair.
 
     Per-run scope: every State instance is anchored at
-    `leerie_root / "runs" / run_id / state.json`. Two State instances with
-    different run_ids share no on-disk state. See DESIGN.md §6 and §10."""
+    `leerie_root / "runs" / run_id / state.json`. Two State instances
+    with different run_ids share no on-disk state. See DESIGN.md §6
+    and §10."""
 
     def __init__(
         self,
@@ -6251,6 +6292,59 @@ class State:
         self.run_dir = leerie_root / "runs" / run_id
         self.path = self.run_dir / "state.json"
         self.data: dict = {}
+        # Ensure run_dir exists so we can open it for flock. The
+        # orchestrator entry point also mkdir's the standard subdirs
+        # right after construction; this just guarantees `run_dir`
+        # itself is present before we try to flock its inode.
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self._lock_fd: int | None = None
+        self._acquire_lock()
+
+    def _acquire_lock(self) -> None:
+        """Open run_dir for flock and acquire EX|NB. Raises
+        StateLockedError if held by another process.
+
+        `from None` on the re-raise suppresses Python's automatic
+        `__context__` chain — the caller dies cleanly with just
+        StateLockedError in the traceback, no "During handling of
+        the above exception, another exception occurred..." noise."""
+        fd = os.open(self.run_dir, os.O_RDONLY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            raise StateLockedError(self.run_dir) from None
+        self._lock_fd = fd
+
+    def release_lock(self) -> None:
+        """Explicit release. Idempotent. The kernel also releases on
+        process exit; this exists for tests and for callers that want
+        deterministic teardown."""
+        if self._lock_fd is not None:
+            try:
+                os.close(self._lock_fd)
+            except Exception:
+                # Catch-all is intentional: __del__ → release_lock can
+                # fire at interpreter shutdown when the `os` module
+                # global has been set to None, raising NameError
+                # instead of OSError. The fd is closed by the kernel
+                # on process exit regardless; the catch is to suppress
+                # a noisy traceback, not to recover.
+                pass
+            self._lock_fd = None
+
+    def __del__(self) -> None:
+        # Best-effort cleanup. Python's GC may not call this on
+        # interpreter shutdown; the kernel's process-exit cleanup is
+        # the real guarantee.
+        #
+        # Use getattr because __del__ can run on a partially-constructed
+        # instance — if `__init__` raised mid-way (e.g. bad path types
+        # before `_lock_fd` was set), self.release_lock() would raise
+        # AttributeError that Python then "ignores" with a noisy
+        # traceback. The conditional sidesteps that.
+        if getattr(self, "_lock_fd", None) is not None:
+            self.release_lock()
 
     def load(self) -> bool:
         if self.path.exists():
@@ -6259,7 +6353,12 @@ class State:
         return False
 
     def save(self) -> None:
-        """Atomic write via temp-file rename."""
+        """Atomic write via temp-file rename.
+
+        The flock is on `self.run_dir`, not `self.path`, so the
+        `tmp.replace(self.path)` inode swap below does not affect lock
+        ownership. The directory inode is stable for the run's
+        lifetime."""
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=2))
         tmp.replace(self.path)   # atomic on POSIX; best-effort on Windows
@@ -6271,7 +6370,12 @@ class State:
         classifier category. Fails closed if the target directory
         already exists — that would mean two runs with the same
         microsecond `started_at` (extraordinarily unlikely, but caught
-        as a hard error rather than silently overwritten)."""
+        as a hard error rather than silently overwritten).
+
+        The flock fd binds the directory inode, not the path, so the
+        rename below preserves the lock — a competing orchestrator
+        attempting to flock the new path is still blocked. (Verified.)
+        """
         new_dir = self.leerie_root / "runs" / new_run_id
         if new_dir.exists():
             die(
@@ -13725,7 +13829,22 @@ def main() -> None:
         # concurrent invocations don't pick the same one. Renamed to the
         # final `<short_category>-<slug>-<6hex>` after classify.
         run_id = "_bootstrap-" + hashlib.sha1(now().encode()).hexdigest()[:6]
-    st = State(leerie_root, run_id)
+    try:
+        st = State(leerie_root, run_id)
+    except StateLockedError as e:
+        # Another orchestrator already owns this run dir (likely the
+        # user ran `--resume` while the original orchestrator was still
+        # alive — see DESIGN §6 *Single owner per run dir*). The
+        # launcher's flock probe should normally catch this earlier;
+        # the check here is the load-bearing one for any code path
+        # that bypasses the launcher (manual `python3 leerie.py
+        # --resume`, future verbs, etc.).
+        log(f"another orchestrator already owns run {run_id!r} "
+            f"(holding flock on {e.run_dir}). "
+            f"Tail it without spawning a duplicate: "
+            f"`leerie --attach {run_id}`. "
+            f"If the holder is wedged, kill it and retry.")
+        sys.exit(EXIT_LOCKED)
     for sub in ("", "subtasks", "criteria", "checkpoints", "logs"):
         (st.run_dir / sub).mkdir(parents=True, exist_ok=True)
 
@@ -13825,7 +13944,19 @@ def main() -> None:
     # orchestrate() flow — just pick an existing run and run the skill.
     if args.phase:
         phase_run_id = resolve_run_id(leerie_root, args.run_id)
-        phase_st = State(leerie_root, phase_run_id)
+        try:
+            phase_st = State(leerie_root, phase_run_id)
+        except StateLockedError as e:
+            # `--phase judge|heal` mutates state.json (writes
+            # `dangerously_skip_permissions` below, then runs workers
+            # that update telemetry). Running concurrently with the
+            # original orchestrator would race the same way `--resume`
+            # would. Refuse here.
+            log(f"cannot run --phase on {phase_run_id!r}: another "
+                f"orchestrator owns the run (holding flock on "
+                f"{e.run_dir}). Wait for it to finish, or kill it "
+                f"first if wedged.")
+            sys.exit(EXIT_LOCKED)
         if not phase_st.load():
             die(f"no state.json found for run {phase_run_id!r}; "
                 f"the run may not have reached the execute phase yet")

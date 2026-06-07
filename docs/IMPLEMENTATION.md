@@ -31,7 +31,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `Dockerfile` | Image recipe (Debian 13 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. Runs as **root** (the Dockerfile intentionally omits `USER leerie` so the entrypoint can perform cgroup-v2 delegation — `mkdir + chown /sys/fs/cgroup/leerie.slice` to the leerie user — before privilege drop; see DESIGN §6 *Memory containment*). `ulimit -c 0`, the cgroup delegation block, `cd /work`, and the `chown leerie: /work` step all run as root. The final exec drops to leerie via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...`: if invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately, which also drops via `Popen(user="leerie")`), the runuser exec wraps `sleep infinity` to keep the namespace alive; otherwise it wraps `python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). The explicit `env` form is used instead of `runuser --login` because the login form would chdir to `/home/leerie` and override the `cd /work` invariant. |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
-| `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-finalize-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, source `scripts/host-finalize.sh` and call `host_finalize <run-dir>` to push + open the PR with the host's auth; **only if push succeeds** does `destroy_machine` run; on push failure leave the machine RUNNING with a recovery banner pointing at `leerie --finalize <run-id>`; on sync failure same recovery pattern with `sync_failed_at` written to the sidecar), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: stop machine, write `paused_at`/`pause_reason` to the run sidecar). |
+| `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-finalize-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — note: `EXIT_LOCKED=75` from the orchestrator is remapped to `container_rc=130` by the launcher's rc=75 branch before `LEERIE_REMOTE_EXIT_RC` is exported, so the only `rc=75` that *does* reach `decide_teardown` is genuine EX_TEMPFAIL from worker rate-limit / parse-fail surfaces, not the single-owner-per-run-dir refusal; see §Single-owner-per-run-dir enforcement below — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, source `scripts/host-finalize.sh` and call `host_finalize <run-dir>` to push + open the PR with the host's auth; **only if push succeeds** does `destroy_machine` run; on push failure leave the machine RUNNING with a recovery banner pointing at `leerie --finalize <run-id>`; on sync failure same recovery pattern with `sync_failed_at` written to the sidecar), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: stop machine, write `paused_at`/`pause_reason` to the run sidecar). |
 | `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `attach.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `update_run_json()` (atomic merge of fields into `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), and `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated). Replaces four duplicated detection blocks across the remote scripts. |
 | `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch when a `fly_machine_id` is recoverable for the run-id — looked up via the dual-file resolver `_resolve_fly_machine_id_from_run_dir` at `leerie:76-94`, which tries `fly-machine.json` first then `run.json`, matching `--stop`/`--kill`/`--finalize`/`--attach`). Exports `resume_machine()`: runs `flyctl machine start` (idempotent on already-running machines via the `flyctl machine status` fallback at lines 47-53), waits for `started`, and clears `paused_at`/`pause_reason` from `run.json` if it exists. The launcher then runs the orchestrator inside the resumed machine with `--resume --run-id <id>`. |
 | `scripts/remote/attach.sh` | PTY-attach helper (invoked via `leerie --attach`). Resolves the Fly Machine ID for a given run (or the only active record under `<state-root>/remote/`) and `exec`s `flyctl ssh console` to open a real PTY into the machine over Fly's WireGuard mesh. `--tail` mode replaces the bare-shell command with `tail -F /work/.leerie/runs/<run-id>/orchestrator.log` — the canonical way to reattach to a detached run after Ctrl-C or laptop disconnect. No sshd in the image, no key management: hallpass is platform-injected by Fly. |
@@ -1063,6 +1063,76 @@ because a budget-infeasible run has no work to finalize and `--resume`
 would die at the resume guard (no `waves` field in `state.json`).
 This routing keeps the user from paying for a Fly volume indefinitely
 on a structurally-unrecoverable run.
+
+### Single-owner-per-run-dir enforcement
+
+DESIGN §6 *Single owner per run dir*. The orchestrator refuses to
+start a second instance against a run directory that another
+orchestrator already owns. Two code-surface elements implement this:
+
+- `EXIT_LOCKED = 75` constant in `orchestrator/leerie.py`. Emitted
+  via `sys.exit(EXIT_LOCKED)` (not `die()`) so the prefix is not
+  `leerie: error:` — same shape as `EXIT_NEEDS_ANSWERS`'s
+  structured non-error exit, since refused-resume is a routing
+  signal, not an error. Caller-side handlers print a
+  `leerie --attach <run-id>` hint via `log()` before exiting.
+- `StateLockedError` exception in `orchestrator/leerie.py`. Raised
+  by `State.__init__` when `fcntl.flock(LOCK_EX | LOCK_NB)` on the
+  run-directory fd fails with `BlockingIOError`. The exception
+  carries `run_dir` so callers can include the path in the user
+  message. Raised with `from None` to suppress the
+  `BlockingIOError.__context__` chain in the traceback.
+
+The lock primitive itself:
+
+- `State.__init__` opens `self.run_dir` with `os.open(..., O_RDONLY)`,
+  stores the fd on `self._lock_fd`, and acquires
+  `fcntl.flock(LOCK_EX | LOCK_NB)`. The fd is held for the life of
+  the State instance.
+- `State.release_lock()` closes the fd. Idempotent. Used by tests;
+  the production path relies on the kernel's process-exit cleanup.
+- `State.__del__` is defensive (calls `release_lock` only if
+  `_lock_fd` was set — `__init__` can raise before that field
+  exists). Best-effort; the kernel guarantees release on process
+  exit regardless.
+- `State.save` is unchanged in body. The flock is on the run
+  directory inode, not the state.json inode, so the
+  `tmp.replace(self.path)` swap inside `save()` does not affect the
+  lock. Docstring updated to make this explicit.
+- `State.rename_to`'s `os.rename(self.run_dir, new_dir)` preserves
+  the lock — the fd binds the inode, not the path. (Verified on
+  macOS Darwin 25.3 and assumed equivalent on Linux given POSIX
+  flock semantics.)
+
+Two checked construction sites that catch `StateLockedError`:
+
+- `main()` at the post-bootstrap `State(leerie_root, run_id)` call:
+  logs the message + `sys.exit(EXIT_LOCKED)`.
+- `--phase judge|heal` at the `phase_st = State(...)` call: same
+  pattern, since `--phase` mutates state and would race the same
+  way `--resume` would.
+
+The launcher heredoc (`leerie:2592-2609`) takes a fast-path flock
+probe on `run_dir` before invoking the orchestrator subprocess. On
+`BlockingIOError` the probe exits 75. The probe is advisory — the
+orchestrator's `State.__init__` flock acquire is the load-bearing
+enforcement that catches any path bypassing the launcher (manual
+`python3 leerie.py --resume`, future verbs, debugging).
+
+Host-side rc=75 branch (`leerie:2673-2698`) sets `container_rc=130`
+(not 1, not 75). decide_teardown's classifier treats `rc=130|143` as
+detach-banner (leave the machine running, print reattach hints) —
+exactly the right disposition when the original orchestrator is
+still alive. Setting `container_rc=1` or 75 would route into
+sync-then-finalize-then-destroy or pause-on-failure, both of which
+would tear down the original orchestrator's machine.
+
+`scripts/remote/attach.sh:79` honors `LEERIE_STATE_HOST_DIR`
+(falls back to `$USER_REPO/.leerie` for backward compatibility) so
+`leerie --attach <run-id>` works against the default
+`$HOME/.leerie/<basename>/` state location. The launcher exports
+this variable at line ~228 before the `--attach` fast-path dispatcher
+at line ~433 runs.
 
 ### Host-side per-repo state directory
 

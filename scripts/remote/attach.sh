@@ -76,7 +76,16 @@ fi
 # --- resolve repo root ---------------------------------------------------
 # USER_REPO is set by the launcher; fall back to PWD if invoked standalone.
 USER_REPO="${USER_REPO:-$PWD}"
-LEERIE_DIR="$USER_REPO/.leerie"
+# State dir resolution: the launcher exports LEERIE_STATE_HOST_DIR at
+# launcher line ~228 (after CLI/env/leerie.toml resolution) before the
+# --attach fast-path dispatcher at launcher line ~433 runs, so the env
+# var is reliably set when this script is exec'd. Fall back to the
+# in-repo .leerie/ directory for backward compatibility with old repos
+# that committed state in-tree. Pre-fix this was hardcoded to
+# `$USER_REPO/.leerie`, which broke --attach for the default
+# $HOME/.leerie/<basename>/ state location — the same state-dir
+# resolver pattern the rest of the launcher already followed.
+LEERIE_DIR="${LEERIE_STATE_HOST_DIR:-$USER_REPO/.leerie}"
 
 # --- preflight: flyctl required -----------------------------------------
 # Use the shared helper from lib.sh — handles auto-install + auth prompt.

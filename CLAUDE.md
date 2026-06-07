@@ -103,8 +103,12 @@ orchestrator and not used anywhere in this repo.
 - **All run state goes through the `State` class.** Never write to
   `state.json` (under `<state-root>/runs/<run-id>/`) directly —
   `State.save()` writes a temp file then `os.replace()`s it for atomicity. The orchestrator runs on a single asyncio
-  event loop, so no lock is needed: coroutines only interleave at `await`
+  event loop, so no in-process lock is needed: coroutines only interleave at `await`
   points and never inside a `st.data[k] = v; st.save()` pair.
+  (Cross-process contention — two orchestrators on the same run
+  dir — is prevented separately by `State.__init__`'s exclusive
+  `fcntl.flock` on the run-directory inode; see DESIGN §6 *Single
+  owner per run dir*.)
 - **Source-of-truth answers go through the validation gate in
   `gather_answers`.** Anything reading `answers["source_of_truth"]` can
   trust the value is in `SOURCE_OF_TRUTH_VALUES` (`codebase` /

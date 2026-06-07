@@ -2573,7 +2573,7 @@ print(json.dumps(sys.argv[1:]))
         # astimezone() then falls back to UTC.
         _host_tz="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
         _launch_script="$(cat <<PY
-import os, pwd, subprocess
+import fcntl, os, pwd, subprocess, sys
 argv = ${_launch_argv_json}
 run_id = argv[0]
 orch_args = argv[1:]
@@ -2589,6 +2589,24 @@ for d in ("/work/.leerie", "/work/.leerie/runs", run_dir):
         os.chown(d, leerie_pw.pw_uid, leerie_pw.pw_gid)
     except OSError:
         pass
+# Refuse to spawn a second orchestrator on the same run dir. The real
+# enforcement is in State.__init__ (which acquires the same flock and
+# dies with EXIT_LOCKED=75 if held). This probe is the fast-path: it
+# avoids the cost of spawning a Python process that would just die in
+# startup. Same primitive (advisory flock on run_dir) used at both
+# layers. See DESIGN §6 *Single owner per run dir*.
+_probe_fd = os.open(run_dir, os.O_RDONLY)
+try:
+    try:
+        fcntl.flock(_probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(_probe_fd, fcntl.LOCK_UN)
+    except BlockingIOError:
+        sys.stderr.write("orchestrator already running for run " + run_id + "\\n")
+        sys.stderr.write("Tail the existing run instead of spawning a duplicate:\\n")
+        sys.stderr.write("  leerie --attach " + run_id + "\\n")
+        sys.exit(75)
+finally:
+    os.close(_probe_fd)
 log_path = run_dir + "/orchestrator.log"
 pid_path = run_dir + "/orchestrator.pid"
 # Build the env from scratch — ssh-console sets HOME=/root which would
@@ -2647,11 +2665,39 @@ with open(pid_path, "w") as pid_f:
     pid_f.write(str(p.pid) + "\n")
 PY
 )"
-        if ! printf '%s' "$_launch_script" \
-             | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-                 --pty=false -C "python3 -"
-        then
-          remote_log "error: failed to start detached orchestrator on machine $LEERIE_MACHINE_ID"
+        _launch_rc=0
+        printf '%s' "$_launch_script" \
+          | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+              --pty=false -C "python3 -" \
+          || _launch_rc=$?
+        if [ "$_launch_rc" = "75" ]; then
+          # The remote launch-wrapper's flock probe fired: an orchestrator
+          # is already running for this run_id on the machine. Treat as a
+          # soft refusal — the user's work is unaffected; route them to
+          # --attach instead of synthesizing a "failed to start" error.
+          # Mirrors State.__init__'s EXIT_LOCKED=75 (DESIGN §6 *Single
+          # owner per run dir*).
+          #
+          # CRITICAL: container_rc=130 (not 1, not 75). The post-tail
+          # `export LEERIE_REMOTE_EXIT_RC="$container_rc"` (~30 lines
+          # below) propagates this into the decide_teardown trap.
+          # Routing matters here:
+          #   - rc=75 → EX_TEMPFAIL "genuine terminal exit" →
+          #     sync-then-finalize-then-destroy → kills live machine A.
+          #   - rc=1  → "*)" default → pause-on-failure → stop_machine
+          #     also kills live machine A (graceful pause, but still
+          #     interrupts the live run).
+          #   - rc=130 → "130|143)" detach banner → leaves the machine
+          #     alone and prints reattach hints (decide_teardown at
+          #     scripts/remote/provision.sh:401). Exactly what we want
+          #     when the original orchestrator is still alive.
+          remote_log "--resume refused: orchestrator already running for $LEERIE_RUN_ID on machine $LEERIE_MACHINE_ID"
+          remote_log "  The live machine is being LEFT RUNNING."
+          remote_log "  Tail it without spawning a duplicate:"
+          remote_log "    leerie --attach $LEERIE_RUN_ID --tail"
+          container_rc=130
+        elif [ "$_launch_rc" != "0" ]; then
+          remote_log "error: failed to start detached orchestrator on machine $LEERIE_MACHINE_ID (rc=$_launch_rc)"
           container_rc=1
         else
           # The PID-keyed → run-keyed pointer promotion happened earlier

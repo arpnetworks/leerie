@@ -552,6 +552,65 @@ exactly one run exists, and requires an explicit `--run-id` otherwise; the
 discovery scans `<state-root>/runs/*/state.json`. Resume never guesses across
 multiple runs.
 
+### Single owner per run dir
+
+`--resume` picks a run; but `--resume` does not by itself prevent the
+*same* run from being resumed twice. The hazard is concrete: a user
+invokes `--resume` while the original orchestrator is still alive, the
+launcher dutifully spawns a second orchestrator, and two processes now
+race on the same `state.json` and the same run-branch worktrees — both
+spawn workers, both write conformance entries, both interleave log
+lines into the same `orchestrator.log` that the launcher tails. State
+diverges; worker budget burns on duplicate work; the user sees a
+streamed log whose progress prefix oscillates because the two
+orchestrators have diverged in-memory views of `subtask_status`.
+
+The architectural property: **at most one orchestrator owns a run
+directory at any time.** The mechanism is an exclusive advisory flock
+on the run-directory inode, acquired in `State.__init__` and released
+by the kernel on process exit (clean, SIGTERM, or SIGKILL — no manual
+pidfile cleanup, no `/proc` liveness check, no PID-recycling false
+positives). A second orchestrator that tries to construct `State` on
+the same run dir gets `StateLockedError` and exits with `EXIT_LOCKED`,
+the launcher routes the user to `leerie --attach <run-id>` instead.
+
+Why the *directory* and not `state.json`: `State.save()`'s atomic
+`tmp + rename` swaps state.json's inode every save. A lock on
+state.json's fd would be orphaned from the new inode at every save,
+opening a window where a racing `--resume` could acquire on the
+unlocked replacement. Directory inodes are never replaced — the lock
+fd stays valid for the process lifetime. The bootstrap-id → final-id
+`os.rename` is also safe because flock binds the inode, not the path.
+
+Defense in depth: the launcher heredoc takes an opportunistic flock
+probe before invoking the orchestrator subprocess (fast-path refusal,
+saves the cost of spawning a Python process that would just die in
+startup). The orchestrator's `State.__init__` flock acquire is the
+load-bearing enforcement and catches anything the launcher misses
+(manual `python3 leerie.py --resume`, future verbs, debugging).
+
+What this does *not* prevent: cross-host races. The lock is per-host.
+This is fine in practice: on Fly each run is pinned to a specific
+Machine via `fly-machine.json`, and only that Machine runs the
+orchestrator; on local runs the host is the user's workstation. There
+is no architectural path today by which two hosts could attach to the
+same state directory simultaneously.
+
+Known limitation — microsecond race between launcher probe and
+orchestrator acquire: if the original orchestrator A briefly releases
+its lock at the exact moment a refusing `--resume` B's launcher probe
+runs (e.g. A is exiting cleanly), B's probe passes, B's orchestrator
+starts, and *then* B's `State.__init__` finds the lock has been
+re-taken by some other path. B exits `EXIT_LOCKED=75`, but the
+launcher's detached-orchestrator tail wrapper has already begun. The
+wrapper sees the pid disappear, exits 0, and `decide_teardown` routes
+the 0-rc through the sync-then-finalize-then-destroy arm — which would
+destroy A's machine. This race is microseconds wide and requires
+A to release between B's probe and B's spawn, which only happens when
+A is also exiting. The cleanest fix reserves a separate exit code for
+EXIT_LOCKED (not 75) and teaches `decide_teardown` a fourth
+disposition that leaves the machine alone. Deferred.
+
 ### Why merge, not cherry-pick
 
 Subtask branches are integrated into the run branch by merging, not by cherry-picking.

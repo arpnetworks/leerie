@@ -173,3 +173,120 @@ def test_rename_to_preserves_sub_directories(leerie, tmp_path):
     assert (new_rd / "criteria" / "feat-001.md").exists()
     assert (new_rd / "logs" / "classifier.log").exists()
     assert (new_rd / "logs" / "classifier.log").read_text() == "event 1\n"
+
+
+# --- run-directory flock ------------------------------------------------------
+# DESIGN §6 *Single owner per run dir*. State.__init__ acquires an
+# exclusive advisory flock on run_dir; a second instance against the
+# same dir raises StateLockedError. This is the load-bearing defense
+# against the dual-orchestrator race documented in that DESIGN
+# subsection.
+
+
+def test_state_lock_blocks_second_instance(leerie, tmp_path):
+    """Two State instances on the same run dir: second raises
+    StateLockedError. First still holds the lock and can keep
+    working (no half-released state)."""
+    sa = leerie.State(tmp_path, "feat-foo-abc123")
+    with pytest.raises(leerie.StateLockedError) as excinfo:
+        leerie.State(tmp_path, "feat-foo-abc123")
+    assert excinfo.value.run_dir == sa.run_dir
+    # sa must still be functional — the failed acquisition should not
+    # have stolen or corrupted its lock.
+    sa.data = {"task": "still works"}
+    sa.save()
+    assert (tmp_path / "runs" / "feat-foo-abc123" / "state.json").exists()
+
+
+def test_state_lock_released_on_explicit_release(leerie, tmp_path):
+    """release_lock() lets a fresh State acquire the same dir."""
+    sa = leerie.State(tmp_path, "feat-foo-abc123")
+    sa.release_lock()
+    # Now a second construction must succeed.
+    sb = leerie.State(tmp_path, "feat-foo-abc123")
+    assert sb.run_dir == sa.run_dir
+    sb.data = {"task": "second owner"}
+    sb.save()
+
+
+def test_state_lock_released_on_subprocess_exit(leerie, tmp_path):
+    """When the owning process dies, the kernel releases the flock.
+    A second invocation can then acquire — no manual cleanup needed.
+    Uses a subprocess to simulate process death (in-process release
+    is covered by test_state_lock_released_on_explicit_release)."""
+    import subprocess
+    import sys
+    from pathlib import Path
+    leerie_py = Path(leerie.__file__)
+    # Subprocess A: acquires the lock and exits cleanly (no explicit
+    # release — kernel handles it on process exit). The orchestrator
+    # is a single-file script, not a package, so we load it via
+    # importlib (matching tests/conftest.py).
+    prog = (
+        "import importlib.util\n"
+        "from pathlib import Path\n"
+        f"spec = importlib.util.spec_from_file_location('leerie', {str(leerie_py)!r})\n"
+        "mod = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(mod)\n"
+        f"mod.State(Path({str(tmp_path)!r}), 'feat-foo-abc123')\n"
+    )
+    holder = subprocess.run(
+        [sys.executable, "-c", prog],
+        capture_output=True, text=True,
+    )
+    assert holder.returncode == 0, (
+        f"holder failed: stdout={holder.stdout!r} stderr={holder.stderr!r}")
+    # Now the in-process State must be able to acquire.
+    sa = leerie.State(tmp_path, "feat-foo-abc123")
+    assert sa._lock_fd is not None
+
+
+def test_state_lock_survives_save(leerie, tmp_path):
+    """save()'s atomic tmp.replace(state.json) must not orphan the lock.
+    The lock is on run_dir (a stable inode), not on state.json (which
+    is replaced on every save). After many saves the second-instance
+    block must still hold."""
+    import json
+    sa = leerie.State(tmp_path, "feat-foo-abc123")
+    for i in range(5):
+        sa.data = {"iter": i}
+        sa.save()
+    # Confirm the saves actually wrote, not just returned cleanly —
+    # without this, a silently-swallowed save() exception would let
+    # the test pass on a broken implementation.
+    saved = json.loads(
+        (tmp_path / "runs" / "feat-foo-abc123" / "state.json").read_text())
+    assert saved == {"iter": 4}
+    # After 5 saves, a second construction must still be refused.
+    with pytest.raises(leerie.StateLockedError):
+        leerie.State(tmp_path, "feat-foo-abc123")
+
+
+def test_state_lock_survives_rename(leerie, tmp_path):
+    """rename_to() must preserve the lock. flock binds the inode, not
+    the path — `os.rename` is a path-only operation, so the fd stays
+    valid. A second instance against the renamed dir is still blocked."""
+    sa = leerie.State(tmp_path, "_bootstrap-abcdef")
+    sa.data = {"task": "x"}
+    sa.save()
+    sa.rename_to("feat-final-xyz999")
+    # New path: still locked by sa.
+    with pytest.raises(leerie.StateLockedError) as excinfo:
+        leerie.State(tmp_path, "feat-final-xyz999")
+    assert excinfo.value.run_dir == tmp_path / "runs" / "feat-final-xyz999"
+    # Old path: the directory is gone, so a new State at that path
+    # creates a fresh empty dir and acquires its own lock. (This is
+    # not a hazard — the old path no longer points at the run.)
+    sb = leerie.State(tmp_path, "_bootstrap-abcdef")
+    assert sb.run_dir != sa.run_dir
+
+
+def test_state_lock_disjoint_run_ids_do_not_block(leerie, tmp_path):
+    """The lock is per-run-dir, not global. Two State instances on
+    different run_ids must both succeed — that's the whole point of
+    per-run isolation."""
+    sa = leerie.State(tmp_path, "feat-a-aaaaaa")
+    sb = leerie.State(tmp_path, "fix-b-bbbbbb")
+    assert sa._lock_fd is not None
+    assert sb._lock_fd is not None
+    assert sa.run_dir != sb.run_dir
