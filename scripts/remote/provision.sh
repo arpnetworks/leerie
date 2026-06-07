@@ -653,8 +653,9 @@ provision_machine() {
   # available yet on
   # fresh runs because the orchestrator hasn't minted one). The file is
   # under $LEERIE_STATE_HOST_DIR/remote/<launcher-pid>.json and is removed
-  # by destroy_machine on teardown. The launcher renames it to
-  # runs/<run-id>/fly-machine.json after fetch-branch.sh runs.
+  # by destroy_machine on teardown. Also written immediately as
+  # runs/<run-id>/fly-machine.json (below) so --resume survives a Ctrl-C
+  # between provision_machine() returning and the launcher's copy.
   # (Phase 3: PTY-over-SSH attach.)
   local _state_base=""
   if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
@@ -688,6 +689,15 @@ with open(path, "w") as f:
     json.dump(data, f, indent=2)
     f.write("\n")
 PY
+    # Write run-keyed pointer immediately so --resume survives a Ctrl-C
+    # between provision_machine() returning and the launcher's deferred copy.
+    # The launcher's copy (leerie:2645-2651) is guarded by [ ! -f ] so
+    # it becomes a no-op when this write succeeds.
+    if [ -n "${LEERIE_RUN_ID:-}" ]; then
+      local run_dir="$_state_base/runs/$LEERIE_RUN_ID"
+      mkdir -p "$run_dir" 2>/dev/null || true
+      cp "$pid_record" "$run_dir/fly-machine.json" 2>/dev/null || true
+    fi
   fi
 
   # Wait until the machine is reachable.

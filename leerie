@@ -2636,12 +2636,11 @@ except Exception:
     # the machine is up, BEFORE seed_auth/seed_repo can fail. If anything
     # between here and the orchestrator-detach below errors out,
     # decide_teardown pauses the machine and the user's resume command
-    # (`leerie --resume --run-id $LEERIE_RUN_ID --runtime fly`) needs this
-    # file to resolve fly_machine_id. provision_machine writes
-    # $LEERIE_STATE_HOST_DIR/remote/$$.json unconditionally on success (provision.sh:587-613);
-    # resume_machine doesn't (the prior launcher's file is gone — different $$ —
-    # but the run-keyed pointer survives from the original provision, so the
-    # `[ ! -f "$_run_record" ]` guard makes this a no-op on resume).
+    # (`leerie --resume <run-id> --runtime fly`) needs this file to resolve
+    # fly_machine_id. provision_machine now writes fly-machine.json directly
+    # (provision.sh) so this copy is typically a no-op (guarded by
+    # `[ ! -f "$_run_record" ]`). Kept as a fallback for images predating
+    # that change and for resume_machine (which doesn't re-write the file).
     if [ "$_provisioned" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
       _pid_record="$LEERIE_STATE_HOST_DIR/remote/$$.json"
       mkdir -p "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID" 2>/dev/null || true
