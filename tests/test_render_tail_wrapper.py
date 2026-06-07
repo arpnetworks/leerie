@@ -182,3 +182,70 @@ def test_auto_finalize_token_absent_when_unset(tmp_path):
     r = _run_wrapper(tmp_path, script, "feat-q-dddddd")
     assert r.returncode == 0, r.stderr
     assert "<<" not in r.stderr.split("\n")[-2]  # no token sentinel
+
+
+# --- /proc cross-check: watcher keeps watching when pid file is stale -----
+
+def test_watcher_keeps_watching_when_proc_scan_finds_live(tmp_path):
+    """Stale-pid contagion regression test.
+
+    Fixture: pid file points to a dead pid, BUT a live process exists
+    whose argv contains both the `orchestrator/leerie.py` anchor and
+    the run-id. The watcher must NOT print the finalize banner while
+    that process is alive — only after it dies. See DESIGN §6 *Single
+    owner per run dir* — stale-pid contagion.
+    """
+    import sys as _sys
+    if _sys.platform != "linux":
+        import pytest
+        pytest.skip("/proc cross-check only meaningful on Linux")
+
+    run_id = "feat-watcher-scan-fixture-pmt7351"
+    _setup_fake_work(tmp_path, run_id, pid=999999,
+                     log_lines=["[leerie] hello"])
+    script = _render(tmp_path)
+
+    fake_orch_path = str(tmp_path / "orchestrator" / "leerie.py")
+    sleeper = subprocess.Popen(
+        ["python3", "-c", "import time; time.sleep(30)",
+         fake_orch_path, "--run-id", run_id],
+    )
+    try:
+        rewritten = script.replace("/work/", f"{tmp_path}/work/")
+        proc = subprocess.Popen(
+            ["bash", "-c", rewritten + "\n", "_", run_id],
+            env={"PATH": "/usr/bin:/bin"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True,
+        )
+        # Watcher polls every 2 s. Give it time for one or two
+        # iterations to confirm it's not bailing on the stale pid.
+        time.sleep(5)
+        # Watcher should still be running — the /proc scan finds the
+        # sleeper, so liveness is asserted regardless of the pid file.
+        assert proc.poll() is None, (
+            "watcher exited despite live /proc match; stderr so far: "
+            f"{proc.stderr.read() if proc.stderr else '?'}"
+        )
+        # Now kill the sleeper. Wait long enough for the watcher to
+        # poll (2 s) and observe the disappearance.
+        sleeper.terminate()
+        sleeper.wait(timeout=5)
+        try:
+            stdout, stderr = proc.communicate(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = proc.communicate()
+            raise AssertionError(
+                f"watcher hung after live process died; stderr: {stderr!r}"
+            )
+        assert proc.returncode == 0, stderr
+        assert "orchestrator exited" in stderr
+    finally:
+        if sleeper.poll() is None:
+            sleeper.terminate()
+            try:
+                sleeper.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                sleeper.kill()
+                sleeper.wait()

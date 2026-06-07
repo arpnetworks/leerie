@@ -596,24 +596,44 @@ orchestrator; on local runs the host is the user's workstation. There
 is no architectural path today by which two hosts could attach to the
 same state directory simultaneously.
 
-Known limitation — concurrent-spawn race between two `--resume`
-launches: two `--resume` invocations fired at nearly the same instant
-(e.g. by a CI script or impatient user) each run their fast-path
-launcher probe before either orchestrator's `State.__init__` runs.
-Both probes find no lock held and both pass; both launchers spawn
-their orchestrators; the two `State.__init__` calls race in the
-kernel. The kernel picks one winner (call it A); the loser (B) gets
-`BlockingIOError` from `flock(LOCK_EX | LOCK_NB)` and exits
-`EXIT_LOCKED=75`. From B's launcher's perspective on Fly, B's
-detached-orchestrator tail wrapper has already begun. The wrapper
-sees the pid disappear, exits 0, and `decide_teardown` routes the
-0-rc through the sync-then-finalize-then-destroy arm — which would
-destroy A's machine. This race is microseconds wide and requires the
-two `--resume` invocations to bracket each other precisely; in normal
-use it is vanishingly rare. The cleanest fix reserves a separate exit
-code for `EXIT_LOCKED` (not 75) and teaches `decide_teardown` a
-fourth disposition that leaves the machine alone on receipt of that
-code. Deferred.
+Concurrent-spawn race between two `--resume` launches and the
+stale-pid contagion: two `--resume` invocations against the same run
+(an impatient user resuming a run whose orchestrator is still alive,
+a CI retry, etc.) each pass the launcher's fast-path probe — the
+probe is `LOCK_EX | LOCK_NB` then immediate `LOCK_UN`, so it tests
+and releases — and each launcher spawns a child orchestrator. The
+two `State.__init__` calls race in the kernel; the loser (B) gets
+`BlockingIOError` and exits `EXIT_LOCKED=75`. The hazard is **not**
+the duplicate spawn (that is correctly caught) but its by-product:
+the launcher writes `orchestrator.pid` *between* `Popen` and the
+child's `State.__init__`. By the time B exits 75, B's pid is already
+in the file. The winner A's pid is overwritten with a dead pid —
+silently — and every downstream reader of `orchestrator.pid` is now
+wrong about A. `leerie --attach --tail`'s in-machine watcher prints
+a false "orchestrator exited" banner the moment B's pid is checked
+with `kill -0`; `leerie --finalize --force`'s liveness gate sees
+the same dead pid and would happily patch a `finished_at` onto A's
+state mid-run.
+
+The fix is two-sided: the launcher's `_launch_script` polls `Popen`
+briefly for `rc=75` (B's flock-loser signal) before writing the
+pid file; if the child exited 75 the file is not touched. Readers
+do not trust the pid file as the sole liveness oracle — both the
+`--attach --tail` watcher and `--finalize --force`'s liveness check
+cross-check via a `/proc` scan for any process whose argv contains
+`orchestrator/leerie.py` AND this run-id. Either anchor catching
+the live orchestrator is sufficient to declare "alive." This makes
+the pid file advisory rather than authoritative: even a future race
+or an unrelated cause that staled the file produces, at worst,
+a false-positive REFUSE (operator-visible) rather than silent
+corruption.
+
+The earlier proposal to reserve a separate exit code for
+`EXIT_LOCKED` (not 75) and teach `decide_teardown` to leave the
+machine alone on that code is orthogonal to this fix and remains
+deferred — once `orchestrator.pid` is no longer authoritative,
+the launcher's `decide_teardown` arms can no longer be misrouted
+by the stale-pid path.
 
 ### Why merge, not cherry-pick
 

@@ -3151,7 +3151,7 @@ import json, sys
 print(json.dumps(sys.argv[1:]))
 ' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}")"
 _launch_script="$(cat <<PY
-import os, pwd, subprocess
+import fcntl, os, pwd, subprocess, sys, time
 argv = ${_launch_argv_json}
 run_id = argv[0]
 orch_args = argv[1:]
@@ -3197,6 +3197,25 @@ with open(log_path, "ab") as log_f:
         group=leerie_pw.pw_gid,
         env=child_env,
     )
+# Poll briefly before recording the pid. If this Popen lost the
+# State.__init__ flock race against an already-running orchestrator
+# for this run (the concurrent-spawn race described in DESIGN §6
+# *Single owner per run dir*), the child exits 75 within ~milliseconds.
+# Writing its pid to orchestrator.pid before the race resolves would
+# overwrite the winning orchestrator's pid with a dead one — see the
+# stale-pid contagion in DESIGN §6. Budget 2s; State.__init__ on the
+# success path is microseconds (open files + flock + return), and on
+# the failure path it exits 75 immediately.
+for _ in range(10):
+    if p.poll() is not None:
+        break
+    time.sleep(0.2)
+if p.poll() == 75:
+    # Stillborn — winner still owns the run; do not touch the pid file.
+    # The launcher's existing rc=75 short-circuit (~30 lines below)
+    # routes the user to --attach. Container-rc 130 (detach banner)
+    # leaves the live machine alone.
+    sys.exit(75)
 with open(pid_path, "w") as pid_f:
     pid_f.write(str(p.pid) + "\n")
 PY
@@ -3735,12 +3754,19 @@ Two surfaces address this together:
 
 1. **`orchestrator.pid` on the machine.** The detached-launch sh wrapper
    records the orchestrator's pid in
-   `/work/.leerie/runs/<run-id>/orchestrator.pid` immediately after
-   backgrounding. `leerie --attach --tail` watches this pid (via a small
-   `while kill -0 $pid; do sleep 1; done` loop alongside the `tail -F`)
-   and, when the pid disappears, prints a one-line banner like
+   `/work/.leerie/runs/<run-id>/orchestrator.pid` after the post-`Popen`
+   poll has cleared the flock-loser case (see the launcher
+   `_launch_script` listing above and DESIGN §6 *Single owner per
+   run dir*). `leerie --attach --tail`'s in-machine watcher checks
+   liveness via two ORed signals — pid-file `kill -0` and a
+   `/proc/[0-9]*/cmdline` scan for `orchestrator/leerie.py` + run-id
+   — alongside the `tail -F`. Both must agree the orchestrator is
+   dead before the watcher prints
    `<ISO-8601> [leerie] remote: orchestrator exited — syncing run branch + state to host...`.
-   The tail then exits.
+   The tail then exits. The `/proc` scan is what closes the
+   stale-pid contagion described in DESIGN §6: even if the pid file
+   went stale (concurrent-spawn race, future cause), the scan finds
+   the real orchestrator and the watcher keeps tailing.
 2. **`leerie --finalize <run-id>`** — new launcher fast-path that runs the
    post-orchestrator block the launcher used to run inline: source
    `fetch-branch.sh`, call `fetch_branch`, source the host-side
@@ -3769,19 +3795,36 @@ into the machine via `flyctl ssh console -C "bash -lc '…'"` and runs
 1. Lists `/work/.leerie/runs/` for the single non-`_bootstrap-*` dir
    (fails clearly on multi-match).
 2. Reads `run.json`; if `finished_at` is already set, no-op (idempotent).
-3. Reads `orchestrator.pid` and checks the orchestrator process:
-   - Pid file present + `kill -0 <pid>` succeeds + `/proc/<pid>/cmdline`
-     contains `python` → orchestrator alive → **REFUSE** with a message
-     naming the live pid. (`cmdline` not `comm` because `comm` is the
-     basename of the script-launcher binary — for a pip-installed
-     `pytest` shim it is `"pytest"`, which does not contain `"python"`
-     and would let an alive orchestrator slip through the guard.
-     `cmdline` is the full execve argv, which always names the
-     interpreter explicitly.)
-   - Pid file present + `kill -0` fails (`ESRCH`) → orchestrator dead;
-     the pid file is the expected stale artifact (nothing in
-     `orchestrator/leerie.py` ever cleans it up) → safe to proceed.
-   - Pid file missing → refuse; tell the user to attach manually.
+3. Checks orchestrator liveness via two complementary signals:
+   - `/proc` cross-check (authoritative): scan `/proc/[0-9]*/cmdline`
+     for any process whose NUL-separated argv contains both the
+     literal string `orchestrator/leerie.py` AND the run-id. If
+     found → orchestrator alive → **REFUSE-ALIVE-SCAN** with a
+     message naming the scanned pid (distinct from the pid file's
+     pid for audit clarity).
+   - `orchestrator.pid` check (defensive, kept for pid-reuse audit):
+     - Pid file present + `kill -0 <pid>` succeeds + `/proc/<pid>/cmdline`
+       contains `python` → orchestrator alive → **REFUSE-ALIVE**
+       with a message naming the pid-file pid. (`cmdline` not `comm`
+       because `comm` is the basename of the script-launcher binary —
+       for a pip-installed `pytest` shim it is `"pytest"`, which does
+       not contain `"python"` and would let an alive orchestrator
+       slip through the guard. `cmdline` is the full execve argv,
+       which always names the interpreter explicitly.)
+     - Pid file present + `kill -0` fails (`ESRCH`) + `/proc` scan
+       also empty → orchestrator dead; safe to proceed.
+     - Pid file missing → refuse; tell the user to attach manually.
+
+   The `/proc` scan exists because `orchestrator.pid` is not a
+   reliable liveness oracle on its own: the launcher writes it
+   *between* `Popen` and the child's `State.__init__`, so a
+   stillborn flock-loser stamps its dead pid before the winner can
+   claim authority (see DESIGN §6 *Single owner per run dir* —
+   stale-pid contagion). The pid-file branch is retained because
+   when it speaks (pid-reuse + matching cmdline) it is more precise
+   than the scan, and a `REFUSE-ALIVE` distinct from
+   `REFUSE-ALIVE-SCAN` makes the source of the refusal observable
+   in audit logs.
 4. Patches `run.json` in-place with `finished_at = <now>`,
    `no_push = false`, `recovered_at = <now>`,
    `recovered_via = "force-finalize"`, and falls through to the normal

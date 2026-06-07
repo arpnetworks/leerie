@@ -18,25 +18,36 @@
 # path.
 #
 # Safety belt: this script REFUSES to patch a run where the orchestrator
-# process is still alive.  Predicate (verified against `leerie` launcher
-# lines 1806, 1812–1814 and `scripts/remote/lib.sh` line 221 on 2026-06-02):
+# process is still alive. Two-layered predicate; either layer firing
+# refuses the patch.
 #
-#   * The launcher's _launch_script writes orchestrator.pid immediately
-#     after subprocess.Popen returns, BEFORE the orchestrator's first phase
-#     runs — so the file is in place from the moment the orchestrator
-#     exists.
+# Layer 1 — /proc cross-check (authoritative). Scan /proc/[0-9]*/cmdline
+# for any process whose NUL-separated argv contains BOTH the literal
+# "orchestrator/leerie.py" AND the run-id (as a discrete NUL-delimited
+# token). A hit means a live orchestrator owns this run regardless of
+# what orchestrator.pid says. This layer protects against the stale-pid
+# contagion described in DESIGN §6 *Single owner per run dir*: the
+# launcher writes the pid file between Popen and State.__init__, so
+# a stillborn flock-loser's pid can land in the file while the real
+# orchestrator (the winner) keeps running.
+#
+# Layer 2 — orchestrator.pid check (defensive, pid-reuse audit).
+# Retained because it can speak when /proc cannot (test fixtures
+# without /proc, future hardening), and because a REFUSE-ALIVE
+# distinct from REFUSE-ALIVE-SCAN names the source of the refusal in
+# audit logs.
+#
+#     pid file MISSING                         → REFUSE-NOPID
+#                                                 (early failure or
+#                                                  tampering — bail to manual)
+#     pid file present + kill -0 succeeds +    → REFUSE-ALIVE
+#       /proc/<pid>/cmdline contains "python"   (defensive; covers the
+#                                                pid-reuse case)
+#     pid file present + kill -0 fails ESRCH + → SAFE (no liveness signal
+#       /proc scan also empty                    from either layer)
+#
 #   * Nothing in orchestrator/leerie.py ever deletes the pid file — it is
 #     the expected stale artifact after a clean exit.
-#
-#   Therefore on the machine:
-#     pid file MISSING                         → REFUSE (early-failure or
-#                                                 tampering — bail to manual)
-#     pid file present + kill -0 succeeds +    → REFUSE (orchestrator is
-#       /proc/<pid>/cmdline contains "python"   alive; force would race the
-#                                                running orchestrator)
-#     pid file present + kill -0 fails ESRCH   → SAFE (stale pid file from
-#                                                 a dead orchestrator; this
-#                                                 is what we expect)
 #
 # The /proc/<pid>/cmdline guard catches pid reuse — short-lived per-run
 # Fly machines make this very unlikely but it's a cheap check.
@@ -100,14 +111,23 @@ force_finalize_remote() {
   # single python3 invocation via `bash -lc`.  Single python so all
   # decisions happen atomically; no risk of a half-patched run.json.
   #
-  # The payload prints one of three sentinel lines to stdout that the
+  # The payload prints one of several sentinel lines to stdout that the
   # host-side caller parses to drive logging:
-  #   OK:<final_run_id>          — patched (or already finalized); fall through
-  #   REFUSE-ALIVE:<pid>:<comm>  — orchestrator alive; do not proceed
-  #   REFUSE-NOPID:<run_id>      — pid file missing
-  #   REFUSE-MULTI:<count>       — more than one non-bootstrap run dir
-  #   REFUSE-NONE                — no non-bootstrap run dir
-  #   ERROR:<message>            — anything else
+  #   OK:<final_run_id>               — patched (or already finalized); fall through
+  #   REFUSE-ALIVE-SCAN:<pid>:<comm>  — /proc scan found a live orchestrator
+  #                                     matching this run-id (authoritative
+  #                                     liveness signal; the pid file may
+  #                                     point at a stillborn flock-loser
+  #                                     and is not trusted alone). See DESIGN
+  #                                     §6 *Single owner per run dir* —
+  #                                     stale-pid contagion.
+  #   REFUSE-ALIVE:<pid>:<comm>       — pid file's pid is alive + looks like
+  #                                     python (defensive, post-scan check
+  #                                     for pid-reuse audit clarity)
+  #   REFUSE-NOPID:<run_id>           — pid file missing
+  #   REFUSE-MULTI:<count>            — more than one non-bootstrap run dir
+  #   REFUSE-NONE                     — no non-bootstrap run dir
+  #   ERROR:<message>                 — anything else
   local payload
   payload=$(cat <<'PYEOF'
 import json
@@ -149,6 +169,61 @@ except Exception as exc:  # noqa: BLE001
 # Idempotent — if finished_at is already set, no patch needed.
 if data.get("finished_at"):
     print(f"OK:{run_id}")
+    sys.exit(0)
+
+# /proc cross-check (authoritative liveness signal). orchestrator.pid
+# is written by the launcher between Popen and the child's
+# State.__init__ flock acquisition; if a concurrent --resume's child
+# loses the race, its dead pid can land in the file while the real
+# orchestrator (the flock winner) keeps running. The pid-file path
+# below is retained for pid-reuse audit clarity, but the /proc scan
+# is what protects against that contagion. See DESIGN §6 *Single
+# owner per run dir*.
+#
+# Two anchors must both match: (1) the literal substring
+# "orchestrator/leerie.py" (the path the launcher hard-codes when it
+# Popen's the orchestrator), AND (2) the run-id (passed as a discrete
+# NUL-delimited token via --run-id <id>, so it always appears between
+# NUL bytes — no false-positive on substring collisions).
+run_id_token = run_id.encode()
+orch_path_token = b"orchestrator/leerie.py"
+scan_hit_pid = None
+scan_hit_ident = ""
+try:
+    proc_root = pathlib.Path("/proc")
+    if proc_root.is_dir():
+        for entry in proc_root.iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                cmdline_raw = (entry / "cmdline").read_bytes()
+            except (FileNotFoundError, ProcessLookupError, PermissionError):
+                continue
+            except Exception:
+                continue
+            if not cmdline_raw:
+                continue
+            if orch_path_token not in cmdline_raw:
+                continue
+            # Run-id must appear as a discrete argv token, bounded by
+            # NUL on both sides (or at the start/end of cmdline). Avoids
+            # false matches on basename-substring collisions.
+            args = cmdline_raw.split(b"\x00")
+            if run_id_token not in args:
+                continue
+            scan_hit_pid = int(entry.name)
+            # Identify the binary for audit clarity (first argv element,
+            # basename only).
+            first = args[0].decode(errors="replace") if args else "?"
+            scan_hit_ident = first.rsplit("/", 1)[-1] if first else "?"
+            break
+except Exception:
+    # /proc not mounted or inaccessible: fall through to the pid-file
+    # path. On the Fly Linux image /proc is always present; this guard
+    # is defensive for non-Linux test environments.
+    pass
+if scan_hit_pid is not None:
+    print(f"REFUSE-ALIVE-SCAN:{scan_hit_pid}:{scan_hit_ident}")
     sys.exit(0)
 
 # Verify orchestrator process is dead.
@@ -235,7 +310,7 @@ PYEOF
   # CRLF line endings when fronted by a TTY-emulating layer).
   local sentinel
   sentinel="$(printf '%s\n' "$result" | tr -d '\r' \
-              | grep -E '^(OK|REFUSE-ALIVE|REFUSE-NOPID|REFUSE-MULTI|REFUSE-NONE|ERROR):?' \
+              | grep -E '^(OK|REFUSE-ALIVE-SCAN|REFUSE-ALIVE|REFUSE-NOPID|REFUSE-MULTI|REFUSE-NONE|ERROR):?' \
               | tail -1 || true)"
   if [ -z "$sentinel" ]; then
     remote_log "force-finalize: no sentinel in remote output:"
@@ -248,6 +323,16 @@ PYEOF
       local rid="${sentinel#OK:}"
       remote_log "force-finalize: machine=$machine run=$rid patched (finished_at + recovered_at + recovered_via=force-finalize)"
       return 0
+      ;;
+    REFUSE-ALIVE-SCAN:*)
+      local rest="${sentinel#REFUSE-ALIVE-SCAN:}"
+      local pid="${rest%%:*}"
+      local comm="${rest#*:}"
+      remote_log "force-finalize: REFUSED — /proc scan found live orchestrator pid $pid ($comm) for this run on machine $machine."
+      remote_log "  The pid file may point at a stillborn process (see DESIGN §6 *Single owner per run dir*); the scan is authoritative."
+      remote_log "  Use \`leerie --kill <run-id>\` if you really want to abandon the run, or"
+      remote_log "  \`leerie --attach <run-id>\` to inspect what it's doing first."
+      return 1
       ;;
     REFUSE-ALIVE:*)
       local rest="${sentinel#REFUSE-ALIVE:}"

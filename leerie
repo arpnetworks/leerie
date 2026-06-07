@@ -2573,7 +2573,7 @@ print(json.dumps(sys.argv[1:]))
         # astimezone() then falls back to UTC.
         _host_tz="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
         _launch_script="$(cat <<PY
-import fcntl, os, pwd, subprocess, sys
+import fcntl, os, pwd, subprocess, sys, time
 argv = ${_launch_argv_json}
 run_id = argv[0]
 orch_args = argv[1:]
@@ -2661,6 +2661,29 @@ with open(log_path, "ab") as log_f:
         group=leerie_pw.pw_gid,
         env=child_env,
     )
+# Poll briefly before recording the pid. If this Popen lost the
+# State.__init__ flock race against an already-running orchestrator
+# for this run (the concurrent-spawn race described in DESIGN §6
+# *Single owner per run dir*), the child exits 75 within
+# milliseconds. Writing its pid to orchestrator.pid before the race
+# resolves would overwrite the winning orchestrator's pid with a
+# dead one — the stale-pid contagion that breaks --attach --tail's
+# liveness check and --finalize --force's safety belt.
+#
+# Budget: 2 s (10 x 0.2 s). State.__init__'s success path opens a
+# few files and takes a flock (microseconds); the failure path
+# raises BlockingIOError and exits 75 immediately. There is no
+# slow middle ground.
+for _ in range(10):
+    if p.poll() is not None:
+        break
+    time.sleep(0.2)
+if p.poll() == 75:
+    # Stillborn flock-loser — the winner still owns the run. Do not
+    # touch the pid file. The launcher's existing rc=75 short-circuit
+    # (~30 lines below in the bash dispatcher) routes the user to
+    # --attach via container_rc=130.
+    sys.exit(75)
 with open(pid_path, "w") as pid_f:
     pid_f.write(str(p.pid) + "\n")
 PY

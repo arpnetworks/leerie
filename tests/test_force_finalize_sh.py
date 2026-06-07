@@ -298,3 +298,101 @@ def test_refuses_on_zero_non_bootstrap_dirs(tmp_path):
     )
     assert result.returncode != 0, result.stderr
     assert "NONE" in result.stderr or "no non-bootstrap" in result.stderr.lower()
+
+
+def test_refuses_when_proc_scan_finds_live_orchestrator(tmp_path):
+    """/proc cross-check catches a stale-pid contagion scenario.
+
+    Fixture: pid file points to a dead pid, BUT a live process exists
+    whose argv carries both the orchestrator path anchor and the
+    run-id. This simulates the bug we hit on funeralworks: launcher
+    wrote a stillborn child's pid (dead) while the real orchestrator
+    (the flock winner) kept running.
+
+    The /proc scan must refuse with REFUSE-ALIVE-SCAN regardless of
+    what the pid file says.
+    """
+    import sys as _sys
+    if _sys.platform != "linux":
+        # /proc only exists on Linux. On Darwin the scan finds nothing
+        # and the test would fall through to the pid-file path
+        # (test_patches_dead_run already covers that). The production
+        # target is the Fly Linux image, so Linux-only coverage is
+        # sufficient.
+        import pytest
+        pytest.skip("/proc cross-check only meaningful on Linux")
+
+    mruns = tmp_path / "runs"
+    mruns.mkdir()
+    # Use a sufficiently distinctive run-id so no other process on the
+    # CI host could plausibly false-match.
+    run_id = "feat-proc-scan-fixture-zxq9847"
+    run_dir = _make_run(mruns, run_id, pid=999_999_999)
+
+    # Spawn a sleeper subprocess whose argv contains both anchors:
+    #   orchestrator/leerie.py  AND  the run-id (as a discrete token)
+    # Use a path that contains the substring — the actual file need
+    # not exist; the scan reads /proc/<pid>/cmdline, not the file.
+    fake_orch_path = str(tmp_path / "orchestrator" / "leerie.py")
+    sleeper = subprocess.Popen(
+        ["python3", "-c", "import time; time.sleep(30)",
+         fake_orch_path, "--run-id", run_id],
+    )
+    try:
+        stub = _make_fake_flyctl(tmp_path, mruns)
+        env = {
+            "LEERIE_REPO": str(REPO_ROOT),
+            "PATH": f"{stub.parent}:{os.environ['PATH']}",
+        }
+        result = _run_bash(
+            f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
+            env=env,
+        )
+        assert result.returncode != 0, (
+            f"expected REFUSE on live /proc match; stdout={result.stdout!r} "
+            f"stderr={result.stderr!r}"
+        )
+        # New sentinel — REFUSE-ALIVE-SCAN, distinct from the existing
+        # REFUSE-ALIVE (pid-file path) for audit clarity.
+        assert "REFUSE-ALIVE-SCAN" in result.stderr or "/proc scan" in result.stderr, (
+            f"expected scan-source REFUSE; stderr={result.stderr!r}"
+        )
+        # run.json must NOT have been mutated. The /proc scan runs
+        # before any patch logic.
+        patched = json.loads((run_dir / "run.json").read_text())
+        assert "finished_at" not in patched, patched
+    finally:
+        sleeper.terminate()
+        try:
+            sleeper.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            sleeper.kill()
+            sleeper.wait()
+
+
+def test_patches_when_proc_scan_finds_nothing(tmp_path):
+    """Parallel of test_patches_dead_run with explicit /proc scan path.
+
+    Confirms the new scan does NOT false-positive when no matching
+    process exists. The run-id is unique to this test; no process on
+    the CI host can plausibly carry it.
+    """
+    mruns = tmp_path / "runs"
+    mruns.mkdir()
+    run_id = "feat-no-scan-hit-qfx8462"
+    run_dir = _make_run(mruns, run_id, pid=999_999_999)
+    stub = _make_fake_flyctl(tmp_path, mruns)
+    env = {
+        "LEERIE_REPO": str(REPO_ROOT),
+        "PATH": f"{stub.parent}:{os.environ['PATH']}",
+    }
+    result = _run_bash(
+        f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
+        env=env,
+    )
+    assert result.returncode == 0, (
+        f"expected success; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    patched = json.loads((run_dir / "run.json").read_text())
+    assert patched.get("finished_at"), patched
+    assert patched.get("recovered_via") == "force-finalize", patched

@@ -245,16 +245,53 @@ ORCH_PID="$(head -1 "$PID_FILE" 2>/dev/null)"
 ( tail -F "$LOG" 2>/dev/null ) &
 TAIL_PID=$!
 
-# Watch the orchestrator pid. When it disappears the orchestrator exited.
-# If no pid is recorded yet, treat the wrapper as "watch until killed".
-if [ -n "$ORCH_PID" ]; then
-  while kill -0 "$ORCH_PID" 2>/dev/null; do
+# Cross-check the orchestrator's liveness with two ORed signals:
+#   1. orchestrator.pid + kill -0  (cheap, may go stale)
+#   2. /proc/[0-9]*/cmdline scan for "orchestrator/leerie.py" AND the
+#      run-id as a discrete argv token (authoritative).
+# Either signal saying "alive" keeps the watcher tailing. Both
+# signals must say "dead" before we print the finalize banner. See
+# DESIGN §6 *Single owner per run dir* — stale-pid contagion — for
+# why the pid file is not trusted alone.
+#
+# POSIX-sh compatible: the wrapper runs under /bin/sh in the Fly
+# image (busybox/dash). `tr '\0' ' '` converts cmdline's NUL-separated
+# argv to space-separated text so the case pattern can match. The
+# run-id check uses bounding spaces so a basename-substring collision
+# in another process's cmdline doesn't false-positive — _argv is
+# wrapped with leading AND trailing spaces explicitly, defending
+# against the rare case where /proc/<pid>/cmdline lacks the final NUL
+# (Linux's man-page contract says it's terminated, but parallel the
+# bullet-proof split-on-NUL approach the Python side uses in
+# force-finalize.sh).
+_orch_is_alive() {
+  # Layer 1: pid file
+  if [ -n "$ORCH_PID" ] && kill -0 "$ORCH_PID" 2>/dev/null; then
+    return 0
+  fi
+  # Layer 2: /proc scan. Skip cleanly if /proc isn't mounted.
+  [ -d /proc ] || return 1
+  for _cmd in /proc/[0-9]*/cmdline; do
+    [ -r "$_cmd" ] || continue
+    _argv=" $(tr '\0' ' ' < "$_cmd" 2>/dev/null) " || continue
+    case "$_argv" in
+      *orchestrator/leerie.py*)
+        case "$_argv" in
+          *" ${ID} "*) return 0 ;;
+        esac
+        ;;
+    esac
+  done
+  return 1
+}
+if [ -n "$ORCH_PID" ] || [ -d /proc ]; then
+  while _orch_is_alive; do
     sleep 2
   done
 else
-  # No pid file. Block on the tail (it will only return if the log is
-  # truncated or removed). This is the degenerate case for very-early
-  # reattach.
+  # Neither signal source available (no pid file AND no /proc — the
+  # degenerate case for very-early reattach on a non-Linux fixture).
+  # Block on the tail until it dies.
   wait "$TAIL_PID" 2>/dev/null || true
 fi
 
