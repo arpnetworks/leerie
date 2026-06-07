@@ -736,7 +736,12 @@ This boundary is load-bearing. The container exists to bound worker
 subprocess subtrees (DESIGN §6 *Worker subtree termination*), not to
 be a git/gh client. Auth state — gh tokens, SSH agent sockets,
 Claude Code's OAuth token in macOS Keychain — lives in host
-processes that don't traverse the Lima VM boundary cleanly. Trying
+processes that don't traverse the Lima VM boundary cleanly. In
+Bedrock mode (`CLAUDE_CODE_USE_BEDROCK=1` detected in any settings
+file), the launcher additionally stages `~/.aws/` read-only so the
+AWS SDK credential chain can resolve SSO tokens inside the container;
+`awsAuthRefresh` (interactive `aws sso login`) remains a host-side
+operation enforced by a preflight check before the container starts. Trying
 to bind-mount that state into the container was a leaky workaround
 for a structural mismatch: on macOS the SSH agent socket can't cross
 the Lima VM boundary, the gh token bind mount catches stale states,

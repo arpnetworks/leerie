@@ -1915,6 +1915,73 @@ done
 # paths. Container sees normal locations; no shared host state to race.
 AUTH_MOUNTS=()
 
+# Returns 0 if any Claude settings file enables Bedrock mode
+# (CLAUDE_CODE_USE_BEDROCK=1 in the env block). Checks all three files the
+# Claude CLI merges: global settings.json, global settings.local.json, and
+# the repo-level .claude/settings.local.json. Any one of them is sufficient —
+# CLAUDE_CODE_USE_BEDROCK has no "disable" value (isEnvTruthy only matches
+# "1"/"true"/"yes"/"on"), so OR semantics are equivalent to precedence here.
+# The key is only valid inside the env block, not as a top-level settings key.
+detect_bedrock_mode() {
+  python3 - \
+    "${HOME}/.claude/settings.json" \
+    "${HOME}/.claude/settings.local.json" \
+    "${USER_REPO}/.claude/settings.local.json" \
+    2>/dev/null <<'PY'
+import json, sys
+for p in sys.argv[1:]:
+    try:
+        d = json.load(open(p))
+        if str(d.get("env", {}).get("CLAUDE_CODE_USE_BEDROCK", "")).strip().lower() in ("1", "true", "yes", "on"):
+            sys.exit(0)
+    except Exception:
+        pass
+sys.exit(1)
+PY
+}
+
+# Verifies the AWS SSO token is valid on the host before the container starts.
+# The Claude CLI's awsAuthRefresh command (aws sso login) opens a browser and
+# requires an interactive TTY — it cannot run inside a non-interactive container.
+# Catching expiry here is the only safe path; the container gets a read-only
+# snapshot of ~/.aws/ and cannot refresh tokens itself.
+bedrock_preflight() {
+  if ! command -v aws >/dev/null 2>&1; then
+    remote_log "error: Bedrock mode is enabled but 'aws' CLI not found on PATH."
+    echo "  Install the AWS CLI and re-run leerie." >&2
+    exit 1
+  fi
+  local profile
+  profile="$(python3 - \
+    "${HOME}/.claude/settings.json" \
+    "${HOME}/.claude/settings.local.json" \
+    "${USER_REPO}/.claude/settings.local.json" \
+    2>/dev/null <<'PY'
+import json, sys
+for p in sys.argv[1:]:
+    try:
+        d = json.load(open(p))
+        v = d.get("env", {}).get("AWS_PROFILE", "")
+        if v:
+            print(v); sys.exit(0)
+    except Exception:
+        pass
+PY
+  )"
+  local aws_args=()
+  [ -n "$profile" ] && aws_args+=(--profile "$profile")
+  if ! aws sts get-caller-identity "${aws_args[@]}" >/dev/null 2>&1; then
+    remote_log "error: Bedrock mode is enabled but AWS credentials are expired or missing."
+    if [ -n "$profile" ]; then
+      echo "  Run: aws sso login --profile $profile" >&2
+    else
+      echo "  Run: aws sso login  (or set AWS_PROFILE and re-run)" >&2
+    fi
+    echo "  Then re-run leerie." >&2
+    exit 1
+  fi
+}
+
 if [ ! -d "$HOME/.claude" ]; then
   remote_log "$HOME/.claude not found — run \`claude\` at least once first"
   exit 1
@@ -2079,6 +2146,31 @@ if [ -d "$HOME/.gnupg" ]; then
     find "$STAGE/.gnupg" -name '*.sock' -delete 2>/dev/null
   fi
   chmod 700 "$STAGE/.gnupg"
+fi
+
+# -- ~/.aws/ (Bedrock mode only) --
+# The Claude CLI's AWS SDK resolves credentials via pure file I/O:
+#   ~/.aws/config          — profile definition + SSO session config
+#   ~/.aws/sso/cache/*.json — cached SSO access tokens (~12 h TTL)
+#   ~/.aws/credentials     — static long-term keys (empty on SSO-only setups)
+# No aws binary is needed inside the container for normal operation.
+# cli/cache is excluded (CLI result cache; large, irrelevant to auth).
+# Mount read-only: workers never write AWS credentials.
+if detect_bedrock_mode; then
+  if [ ! -d "$HOME/.aws" ]; then
+    remote_log "error: Bedrock mode is enabled but ~/.aws/ not found on host."
+    echo "  Run 'aws configure' or 'aws sso login' first, then re-run leerie." >&2
+    exit 1
+  fi
+  bedrock_preflight
+  mkdir -p "$STAGE/.aws"
+  if command -v rsync >/dev/null 2>&1; then
+    rsync -a --exclude='cli/cache' "$HOME/.aws/" "$STAGE/.aws/"
+  else
+    cp -aR "$HOME/.aws/." "$STAGE/.aws/"
+    rm -rf "$STAGE/.aws/cli/cache"
+  fi
+  AUTH_MOUNTS+=(-v "$STAGE/.aws:/home/leerie/.aws:ro")
 fi
 
 # -- Mount each staged file/dir at its default in-container path. --
