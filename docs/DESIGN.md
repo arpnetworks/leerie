@@ -2261,9 +2261,9 @@ invocations a single run may spawn. The cheap, late check is
 `State.bump_workers()` — it raises `WorkerError` the moment the
 counter would exceed the cap. That check is necessary as a backstop,
 but it fires *during execution*, after some — sometimes most — of the
-run's compute has already been spent. A 49-subtask run with the
-default cap of 120 cannot finish; the late check discovers this around
-subtask 28, leaving the run branch with the first few waves' worth of
+run's compute has already been spent. A 63-subtask run with the
+default cap of 200 cannot finish; the late check discovers this around
+subtask 38, leaving the run branch with the first few waves' worth of
 integrated commits and the rest unrunnable.
 
 The corresponding *early* check belongs at the plan/execute boundary.

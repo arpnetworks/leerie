@@ -323,7 +323,7 @@ local setup) because nerdctl can't reach Keychain. See
   the pre-0.3 all-sonnet behavior in one knob, set `--model sonnet` or
   `LEERIE_MODEL=sonnet`.
 - `--max-workers N` — cap total `claude -p` subprocess count over the
-  run. Default: `120` (`DEFAULT_CAPS["max_total_workers"]`). Also
+  run. Default: `200` (`DEFAULT_CAPS["max_total_workers"]`). Also
   `LEERIE_MAX_WORKERS` env var or `max_workers` in `leerie.toml`
   (same precedence as `--confidence-rounds`: CLI > env > TOML > default).
   Note that the post-work conformance phase (DESIGN §9) spawns up to

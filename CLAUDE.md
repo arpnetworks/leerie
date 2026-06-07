@@ -224,7 +224,7 @@ export LEERIE_EFFORT=high                # low, medium, high, xhigh, max
 export LEERIE_CONFIDENCE_ROUNDS=12
 ./leerie "task" --confidence-rounds 12
 
-# Raise the per-run worker-invocation budget (default 120). Same precedence
+# Raise the per-run worker-invocation budget (default 200). Same precedence
 # as confidence-rounds: CLI > env > leerie.toml.
 export LEERIE_MAX_WORKERS=80
 ./leerie "task" --max-workers 80
