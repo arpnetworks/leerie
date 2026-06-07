@@ -1916,16 +1916,18 @@ done
 AUTH_MOUNTS=()
 
 # Returns 0 if any Claude settings file enables Bedrock mode
-# (CLAUDE_CODE_USE_BEDROCK=1 in the env block). Checks all three files the
+# (CLAUDE_CODE_USE_BEDROCK=1 in the env block). Checks all four files the
 # Claude CLI merges: global settings.json, global settings.local.json, and
-# the repo-level .claude/settings.local.json. Any one of them is sufficient —
-# CLAUDE_CODE_USE_BEDROCK has no "disable" value (isEnvTruthy only matches
-# "1"/"true"/"yes"/"on"), so OR semantics are equivalent to precedence here.
-# The key is only valid inside the env block, not as a top-level settings key.
+# both repo-level files (.claude/settings.json and .claude/settings.local.json).
+# Any one of them is sufficient — CLAUDE_CODE_USE_BEDROCK has no "disable" value
+# (isEnvTruthy only matches "1"/"true"/"yes"/"on"), so OR semantics are equivalent
+# to precedence here. The key is only valid inside the env block, not as a
+# top-level settings key.
 detect_bedrock_mode() {
   python3 - \
     "${HOME}/.claude/settings.json" \
     "${HOME}/.claude/settings.local.json" \
+    "${USER_REPO}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.local.json" \
     2>/dev/null <<'PY'
 import json, sys
@@ -1955,6 +1957,7 @@ bedrock_preflight() {
   profile="$(python3 - \
     "${HOME}/.claude/settings.json" \
     "${HOME}/.claude/settings.local.json" \
+    "${USER_REPO}/.claude/settings.json" \
     "${USER_REPO}/.claude/settings.local.json" \
     2>/dev/null <<'PY'
 import json, sys
