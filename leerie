@@ -2670,10 +2670,21 @@ with open(log_path, "ab") as log_f:
 # dead one — the stale-pid contagion that breaks --attach --tail's
 # liveness check and --finalize --force's safety belt.
 #
-# Budget: 2 s (10 x 0.2 s). State.__init__'s success path opens a
-# few files and takes a flock (microseconds); the failure path
-# raises BlockingIOError and exits 75 immediately. There is no
-# slow middle ground.
+# Budget: 2 s (10 x 0.2 s). The realistic time from Popen to the
+# child's State.__init__ flock attempt is ~300-500 ms (Python
+# interpreter cold start + leerie.py imports + main()'s pre-State
+# config resolution); under disk pressure it could reach ~1 s.
+# State.__init__ itself is microseconds — open the run_dir fd,
+# attempt fcntl.flock, return or raise — but the relevant budget
+# is the end-to-end time from Popen to that point. 2 s leaves
+# comfortable headroom for both paths:
+#   - Winner: child reaches State.__init__ and proceeds. Poll
+#     times out, we write the pid.
+#   - Loser: child reaches State.__init__ and exits 75. We
+#     observe rc=75 and skip the pid write.
+# The reader-side /proc cross-check in lib.sh and
+# force-finalize.sh catches any residual edge case where the
+# budget is exceeded on the loser path.
 for _ in range(10):
     if p.poll() is not None:
         break

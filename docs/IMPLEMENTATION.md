@@ -3200,12 +3200,15 @@ with open(log_path, "ab") as log_f:
 # Poll briefly before recording the pid. If this Popen lost the
 # State.__init__ flock race against an already-running orchestrator
 # for this run (the concurrent-spawn race described in DESIGN §6
-# *Single owner per run dir*), the child exits 75 within ~milliseconds.
-# Writing its pid to orchestrator.pid before the race resolves would
-# overwrite the winning orchestrator's pid with a dead one — see the
-# stale-pid contagion in DESIGN §6. Budget 2s; State.__init__ on the
-# success path is microseconds (open files + flock + return), and on
-# the failure path it exits 75 immediately.
+# *Single owner per run dir*), the child exits 75. Writing its pid
+# to orchestrator.pid before the race resolves would overwrite the
+# winning orchestrator's pid with a dead one — see the stale-pid
+# contagion in DESIGN §6. Budget 2 s: the realistic time from Popen
+# to State.__init__'s flock attempt is ~300-500 ms (Python startup
+# + leerie.py imports + main()'s pre-State config resolution), up
+# to ~1 s under disk pressure. State.__init__ itself is microseconds.
+# The reader-side /proc cross-check catches any residual case where
+# the budget is exceeded on the loser path.
 for _ in range(10):
     if p.poll() is not None:
         break
