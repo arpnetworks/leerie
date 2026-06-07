@@ -153,7 +153,7 @@ except Exception:
       printf '%s\n' "$remote_dirty" | head -10 >&2
       echo "" >&2
       echo "  These edits would be clobbered by re-seed." >&2
-      echo "  Inspect via: leerie --attach $LEERIE_RUN_ID" >&2
+      echo "  Inspect via: leerie --resume $LEERIE_RUN_ID --shell" >&2
       echo "  Or bypass:   leerie --re-seed $LEERIE_RUN_ID --force" >&2
       return 1
     fi

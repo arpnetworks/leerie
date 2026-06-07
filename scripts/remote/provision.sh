@@ -386,7 +386,7 @@ decide_teardown() {
         echo "       (--force refuses if the orchestrator is still alive.)" >&2
         echo "" >&2
         echo "    2. Or attach + inspect manually:" >&2
-        echo "         leerie --attach ${LEERIE_RUN_ID:-<run-id>}" >&2
+        echo "         leerie --resume ${LEERIE_RUN_ID:-<run-id>} --shell" >&2
         echo "" >&2
         echo "    3. When your work is safely on the host, destroy the" >&2
         echo "       machine:" >&2
@@ -412,7 +412,7 @@ decide_teardown() {
       echo "  you want to come back:" >&2
       echo "" >&2
       echo "    1. Reattach + resume tailing (most common):" >&2
-      echo "         leerie --attach ${LEERIE_RUN_ID:-<run-id>} --tail" >&2
+      echo "         leerie --resume ${LEERIE_RUN_ID:-<run-id>}" >&2
       echo "" >&2
       echo "    2. Pause the machine (graceful stop, keeps work on the" >&2
       echo "       Fly volume; resume later with leerie --resume):" >&2
@@ -455,7 +455,7 @@ decide_teardown() {
         echo "  run-id:  $LEERIE_RUN_ID" >&2
         echo "  resume:  leerie --resume --run-id $LEERIE_RUN_ID --runtime fly" >&2
       fi
-      echo "  attach:  leerie --attach ${LEERIE_RUN_ID:-<run-id>} --tail" >&2
+      echo "  attach:  leerie --resume ${LEERIE_RUN_ID:-<run-id>}" >&2
       echo "  kill:    leerie --kill ${LEERIE_RUN_ID:-<run-id>}" >&2
       if [ -n "${LEERIE_PAUSE_NOTIFY_CMD:-}" ]; then
         eval "$LEERIE_PAUSE_NOTIFY_CMD" || true
@@ -649,7 +649,8 @@ provision_machine() {
     fi
   fi
 
-  # PID-keyed pointer for `leerie --attach` (no run-id available yet on
+  # PID-keyed pointer for `leerie --resume` auto-discovery (no run-id
+  # available yet on
   # fresh runs because the orchestrator hasn't minted one). The file is
   # under $LEERIE_STATE_HOST_DIR/remote/<launcher-pid>.json and is removed
   # by destroy_machine on teardown. The launcher renames it to

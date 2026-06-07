@@ -572,7 +572,9 @@ by the kernel on process exit (clean, SIGTERM, or SIGKILL — no manual
 pidfile cleanup, no `/proc` liveness check, no PID-recycling false
 positives). A second orchestrator that tries to construct `State` on
 the same run dir gets `StateLockedError` and exits with `EXIT_LOCKED`,
-the launcher routes the user to `leerie --attach <run-id>` instead.
+the launcher routes the user to `leerie --resume <run-id>` instead
+(which, observing the live-orchestrator condition, attaches to its
+log stream rather than spawning a duplicate).
 
 Why the *directory* and not `state.json`: `State.save()`'s atomic
 `tmp + rename` swaps state.json's inode every save. A lock on
@@ -609,7 +611,7 @@ the launcher writes `orchestrator.pid` *between* `Popen` and the
 child's `State.__init__`. By the time B exits 75, B's pid is already
 in the file. The winner A's pid is overwritten with a dead pid —
 silently — and every downstream reader of `orchestrator.pid` is now
-wrong about A. `leerie --attach --tail`'s in-machine watcher prints
+wrong about A. `leerie --resume`'s in-machine tail watcher prints
 a false "orchestrator exited" banner the moment B's pid is checked
 with `kill -0`; `leerie --finalize --force`'s liveness gate sees
 the same dead pid and would happily patch a `finished_at` onto A's
@@ -619,7 +621,7 @@ The fix is two-sided: the launcher's `_launch_script` polls `Popen`
 briefly for `rc=75` (B's flock-loser signal) before writing the
 pid file; if the child exited 75 the file is not touched. Readers
 do not trust the pid file as the sole liveness oracle — both the
-`--attach --tail` watcher and `--finalize --force`'s liveness check
+`--resume` tail watcher and `--finalize --force`'s liveness check
 cross-check via a `/proc` scan for any process whose argv contains
 `orchestrator/leerie.py` AND this run-id. Either anchor catching
 the live orchestrator is sufficient to declare "alive." This makes
@@ -1221,8 +1223,9 @@ on Ctrl-C would be exactly the behavior the detach was introduced to
 prevent. The launcher therefore prints a small banner listing the
 reattach, pause, and destroy commands and exits without touching the
 machine. The user can then come back hours or days later and either
-`leerie --attach --tail` to watch progress, `leerie --stop` to pause
-cleanly, or `leerie --kill` to explicitly destroy.
+`leerie --resume <run-id>` to watch progress (the default tails the
+orchestrator log; `--shell` opens a bash shell instead), `leerie
+--stop` to pause cleanly, or `leerie --kill` to explicitly destroy.
 
 The decision lives in the launcher (`scripts/remote/provision.sh`'s
 EXIT trap), not the orchestrator. Per §6 *Worker subtree termination*
@@ -1306,11 +1309,9 @@ after `flyctl machine run` succeeds and the launcher promotes it to
 the run-keyed `fly-machine.json` once the run-id is known, so a
 crash before classify still leaves a recoverable pointer. Every
 verb that acts on a known run-id (`--stop`, `--kill`, `--finalize`,
-`--attach`, `--resume`) does the same host-side machine-id lookup:
-try `fly-machine.json` first, fall back to `run.json`. The launcher
-implements this as `_resolve_fly_machine_id_from_run_dir` in `leerie`;
-`scripts/remote/attach.sh` (a standalone script that runs before the
-launcher's helpers are sourced) inlines the same lookup shape.
+`--resume`) does the same host-side machine-id lookup: try
+`fly-machine.json` first, fall back to `run.json`. The launcher
+implements this as `_resolve_fly_machine_id_from_run_dir` in `leerie`.
 
 A sibling `task.txt` lives next to `fly-machine.json` in the same
 bootstrap dir. The launcher writes the user's positional `task`
@@ -1352,7 +1353,9 @@ LEFT RUNNING — not stopped — and a multi-line WARNING points the
 user at three recovery commands:
 
   1. `leerie --finalize <run-id>`  (retry sync + push)
-  2. `leerie --attach <run-id>`    (manual inspection)
+  2. `leerie --resume <run-id>`    (manual inspection — attaches to the
+                                  live orchestrator's log, or drops into
+                                  a shell with `--shell`)
   3. `leerie --kill <run-id>`      (destroy AFTER user confirms
                                   work is safely on host)
 
@@ -1362,15 +1365,14 @@ explicitly `--kill`. The reclassified table (line 893+) already
 documented the "destroy *after* stream-back" intent; this is the
 mechanism that enforces it.
 
-**The user-visible verb surface.** Five explicit verbs cover the
+**The user-visible verb surface.** Four explicit verbs cover the
 remote run lifecycle, each doing exactly one thing:
 
 | Verb | Effect |
 |---|---|
 | `leerie "task" --runtime fly` | Provision machine, detach orchestrator, tail log |
-| `leerie --attach <run-id> --tail` | Reattach to a running or paused run's log |
 | `leerie --stop <run-id>` | Clean pause (`flyctl machine stop`); resumable |
-| `leerie --resume --run-id <id> --runtime fly` | Wake a paused machine, re-seed dirty edits, continue |
+| `leerie --resume --run-id <id> --runtime fly` | Smart resume — wakes a paused machine, attaches to a live orchestrator, or relaunches against an alive-but-orphaned machine, automatically |
 | `leerie --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
 
 Plus `leerie --list` (unified across local and remote, with `--status
@@ -1391,34 +1393,48 @@ destructive verb was an artifact of the lifetime coupling — once the
 coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
 this terminal-side activity") and destruction needs its own verb.
 
-**Interactive attach over PTY in remote mode.** The attach channel
-is the §6 isolation boundary's terminal-side surface — not a new
-privileged channel. `leerie --attach <run-id>` `exec`s
-`flyctl ssh console` against the run's Fly Machine, which proxies
-through Fly's hallpass + WireGuard mesh and gives the user a real
-PTY at `/work`. `leerie --attach <run-id> --tail` is the same channel
-but runs `tail -F /work/.leerie/runs/<run-id>/orchestrator.log` instead
-of a shell — this is the canonical way to watch a detached run's
-progress after the initial launcher exits or after a deliberate
-Ctrl-C detach. No sshd in the image, no key management, no public
-exposure; isolation inherits from the same WireGuard mesh the
-launcher already uses for `flyctl machine exec`.
+**Smart resume in remote mode.** `--resume` is the single verb for
+re-engaging with a remote run, regardless of the run's current state.
+The launcher reads observed state and routes to the right behavior:
+
+| Machine state | Orchestrator state | `--resume` behavior |
+|---|---|---|
+| Stopped (paused) | n/a | Wake machine → re-seed → launch orchestrator → tail |
+| Running | Dead | (Re-)seed if needed → launch orchestrator → tail |
+| Running | Alive | Skip launch → tail orchestrator.log |
+
+The "machine running, orchestrator alive" branch is the §6 isolation
+boundary's terminal-side surface — not a new privileged channel.
+Detection: the launcher pipes a launch wrapper through `flyctl ssh
+console -C "python3 -"`; the wrapper takes a fast-path flock probe on
+the run directory (DESIGN §6 *Single owner per run dir*) and exits 75
+if the lock is held. The launcher's rc=75 branch pivots to attach
+behavior instead of launching a duplicate. The attach channel itself
+is `flyctl ssh console` against the run's Fly Machine, proxied
+through Fly's hallpass + WireGuard mesh, giving the user a real PTY
+at `/work`. Default behavior runs `tail -F` of the orchestrator log
+(the canonical way to watch a detached run's progress); `--shell`
+opts into the bare bash shell at `/work`. No sshd in the image, no
+key management, no public exposure; isolation inherits from the same
+WireGuard mesh the launcher already uses for `flyctl machine exec`.
 
 The orchestrator is unaware of attach — it's a launcher-host gesture
 (mirrors §6's "container/process isolation is the launcher's
 concern"). The same mechanism serves four roles:
 
-1. The "feels-local" interactive terminal — a developer can drop in
-   to inspect what a worker is doing.
+1. The "feels-local" interactive terminal — `leerie --resume <run-id>
+   --shell` drops a developer at `/work` to inspect what a worker is
+   doing.
 2. The mid-run attach mechanism — open a session against a running
    machine without disturbing PID 1 (the orchestrator). `flyctl ssh
    console` spawns an independent process; detach signals only the
    SSH session's own children.
 3. The failure-inspection surface — the paused-machine state from
    the pause-on-failure path is reachable via exactly the same
-   command. No second mechanism is needed.
+   command (`--resume` wakes the machine, then tails). No second
+   mechanism is needed.
 4. **The detached-run reattach surface** — after a Ctrl-C detach or
-   a closed-laptop disconnect, `leerie --attach <run-id> --tail` picks
+   a closed-laptop disconnect, `leerie --resume <run-id>` picks
    up the orchestrator log stream where it left off. The orchestrator
    never noticed; only the local view paused.
 
@@ -1426,13 +1442,16 @@ State contract: `scripts/remote/provision.sh` writes a PID-keyed
 record at `$LEERIE_STATE_HOST_DIR/remote/$$.json` immediately after
 provisioning, removes it in `destroy_machine`, and lets the launcher
 rename it to `$LEERIE_STATE_HOST_DIR/runs/<run-id>/fly-machine.json` after
-the run-id becomes known (via fetch-branch.sh). `leerie --attach`
+the run-id becomes known (via fetch-branch.sh). `leerie --resume`
 resolves the machine via either path. Multiple concurrent remote
-runs in the same repo are disambiguated by passing a run-id.
+runs in the same repo are disambiguated by passing a run-id; with no
+`--run-id` and a single active launcher record, `--resume` resolves
+the run-id from that record.
 
-Local mode has no attach today — `leerie --attach` errors with
-"attach is remote-only" until a parallel `scripts/local/attach.sh`
-wrapping `nerdctl exec -it <name> bash` is added.
+Local mode keeps its inline `--resume` behavior by design. Local
+runs are synchronous foreground processes (`nerdctl run --rm` with no
+backgrounding), so there is no detached container to attach to —
+`--resume` just re-execs the orchestrator against `state.json`.
 
 **Mid-run re-seed (remote mode).** Once a remote run has started, the
 host's working tree keeps evolving — the user lands new commits,

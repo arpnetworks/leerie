@@ -267,7 +267,7 @@ def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
     state back to the host can't succeed, the machine must NOT be
     destroyed — the user's paid LLM work is still on it. The user
     sees a multi-line WARNING and recovers via `leerie --finalize`,
-    `leerie --attach`, or finally `leerie --kill` once work is safe."""
+    `leerie --resume`, or finally `leerie --kill` once work is safe."""
     result, sidecar = _decide_teardown_with_rc(
         tmp_path, "0", run_id="my-run", fetch_branch_succeeds=False,
     )
@@ -285,7 +285,7 @@ def test_decide_teardown_rc0_sync_fails_keeps_machine_running(tmp_path: Path):
     # Recovery guidance must be printed.
     assert "sync from machine to host FAILED" in result.stderr
     assert "leerie --finalize my-run" in result.stderr
-    assert "leerie --attach my-run" in result.stderr
+    assert "leerie --resume my-run" in result.stderr
     assert "leerie --kill my-run" in result.stderr
 
 
@@ -296,7 +296,7 @@ def test_decide_teardown_rc130_detaches(tmp_path: Path):
     the user stopped watching the local tail — not that they want to destroy
     the run. The orchestrator on the machine is still running. The trap
     must neither destroy nor stop the machine, and must print the hints
-    that point to --attach / --stop / --kill."""
+    that point to --resume / --stop / --kill."""
     result, sidecar = _decide_teardown_with_rc(tmp_path, "130", run_id="my-run-abc")
     assert result.returncode == 0, result.stderr
     # No flyctl invocations at all — the stub never gets called.
@@ -309,7 +309,7 @@ def test_decide_teardown_rc130_detaches(tmp_path: Path):
     assert data.get("killed_at") is None
     # Detach hints must appear in stderr.
     assert "detached from run my-run-abc" in result.stderr
-    assert "leerie --attach my-run-abc --tail" in result.stderr
+    assert "leerie --resume my-run-abc" in result.stderr
     assert "leerie --stop my-run-abc" in result.stderr
     assert "leerie --kill my-run-abc" in result.stderr
 

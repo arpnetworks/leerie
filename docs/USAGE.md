@@ -226,15 +226,21 @@ schema is documented in [`IMPLEMENTATION.md`](IMPLEMENTATION.md) §8.
 
 Remote runs are designed to outlive your local terminal. The
 orchestrator runs detached inside the Fly Machine; your local terminal
-is only watching the log stream. Five verbs cover the full lifecycle:
+is only watching the log stream. Four verbs cover the full lifecycle:
 
 | You did | Leerie did | Verb to come back |
 |---|---|---|
 | `leerie "task" --runtime fly` | provisioned a Fly Machine, started the orchestrator detached, opened a tail of its log on your terminal | — (you're attached) |
-| pressed Ctrl-C | detached your local tail; orchestrator on the machine is still running | `leerie --attach <run-id> --tail` |
-| closed your laptop / lost WiFi | same as Ctrl-C — the tail broke but the orchestrator did not | `leerie --attach <run-id> --tail` |
-| ran `leerie --stop <run-id>` | stopped the machine cleanly via `flyctl machine stop`; filesystem preserved on Fly volume | `leerie --resume --run-id <id> --runtime fly` |
+| pressed Ctrl-C | detached your local tail; orchestrator on the machine is still running | `leerie --resume <run-id>` |
+| closed your laptop / lost WiFi | same as Ctrl-C — the tail broke but the orchestrator did not | `leerie --resume <run-id>` |
+| ran `leerie --stop <run-id>` | stopped the machine cleanly via `flyctl machine stop`; filesystem preserved on Fly volume | `leerie --resume <run-id> --runtime fly` |
 | ran `leerie --kill <run-id>` | destroyed the machine via `flyctl machine destroy`; run is over | start a new run; this one is gone |
+
+`leerie --resume` is a single smart-router verb: it wakes a paused
+machine, attaches to a still-alive orchestrator, or relaunches against
+an alive-but-orphaned machine — automatically, based on what it
+observes. The default action is to tail the orchestrator log; pass
+`--shell` to drop into a bash shell at `/work` instead.
 
 **The "close your laptop" workflow.** Start the run, watch it for a
 few minutes to make sure it's healthy, then Ctrl-C the tail. You'll
@@ -242,13 +248,13 @@ see a one-line banner:
 
 ```
 [leerie] detached from run <id> (machine <mid> still running)
-       reattach:  leerie --attach <id> --tail
+       reattach:  leerie --resume <id>
        pause:     leerie --stop <id>
        destroy:   leerie --kill <id>
 ```
 
-Close your laptop, go wherever. When you come back, `leerie --attach
-<id> --tail` picks up the orchestrator log where it left off. The
+Close your laptop, go wherever. When you come back, `leerie --resume
+<id>` picks up the orchestrator log where it left off. The
 orchestrator never noticed you were gone.
 
 **Listing runs.** `leerie --list` shows every run (local and remote) in

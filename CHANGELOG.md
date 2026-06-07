@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **`--attach` folded into `--resume`.** The two verbs collapsed into a
+  single smart router: `leerie --resume <run-id>` now wakes a paused
+  machine, attaches to a still-alive orchestrator, or relaunches against
+  an alive-but-orphaned machine — automatically based on the launcher's
+  observed state. Detection reuses the rc=75 signal from the existing
+  in-machine flock probe (DESIGN §6 *Single owner per run dir*).
+  Default behavior on the "alive orchestrator" branch is to tail the
+  orchestrator log; new sub-mode flags `--shell` (bash at `/work`) and
+  `--auto-finalize` (exec `leerie --finalize` on clean exit) carry
+  forward the prior `--attach` capabilities. The old `--attach
+  --all-logs` (per-worker log glob) is deferred to a follow-up; it
+  needs new plumbing in `render_tail_wrapper` and was scoped out of v1
+  to keep the diff focused. `--resume` without `--run-id` auto-discovers from
+  `$LEERIE_STATE_HOST_DIR/remote/*.json` (lifted from `attach.sh`
+  Strategy B). `scripts/remote/attach.sh` is removed; `--attach` is no
+  longer a valid launcher flag (the launcher's unknown-flag error
+  catches muscle-memory invocations). Hint strings across
+  `provision.sh`, `re-seed.sh`, `force-finalize.sh`, and the orchestrator's
+  `StateLockedError` handler updated. The new shared helper
+  `tail_with_optional_autofinalize` in `lib.sh` is used by the
+  `--resume` rc=75 pivot; the existing fresh-launch tail at
+  `leerie:2724-2754` keeps its inline payload for now (a small
+  follow-up could route it through the helper to gain
+  `--auto-finalize` support on fresh runs too). DESIGN.md §6 *The
+  user-visible verb surface* collapsed from 5 rows to 4;
+  *Interactive attach over PTY in remote mode* renamed *Smart resume
+  in remote mode*. (DESIGN §6 *Smart resume in remote mode*.)
+
 ### Added
 
 - **Planner-output budget feasibility preflight (DESIGN §13 *Budget

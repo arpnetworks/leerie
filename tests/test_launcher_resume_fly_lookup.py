@@ -4,7 +4,7 @@ Two contracts pinned here:
 
   1. The dispatch resolves the resume target via the dual-file resolver
      `_resolve_fly_machine_id_from_run_dir` (fly-machine.json then
-     run.json) — same as --stop/--kill/--finalize/--attach. Bootstrap-id
+     run.json) — same as --stop/--kill/--finalize/--resume. Bootstrap-id
      runs paused before classify don't have run.json on the host;
      fly-machine.json is the source of truth.
   2. Explicit `--resume` is strict-fail. A miss (no machine pointer, or
@@ -82,20 +82,25 @@ fi
 
 _provisioned=false
 _resumed=false
-if [ -n "$_paused_mid" ]; then
+if [ "$container_rc" -ne 0 ]; then
+  :
+elif [ -n "$_paused_mid" ]; then
   if resume_machine "$_paused_mid"; then
     _provisioned=true
     _resumed=true
   elif [ "$IS_RESUME" = "true" ]; then
     container_rc=1
   fi
-elif [ "$IS_RESUME" = "true" ]; then
+elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
   remote_log "--resume: no Fly machine pointer found for run-id $LEERIE_RUN_ID"
   echo "  Looked for: $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json" >&2
   echo "             $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json (fly_machine_id field)" >&2
   echo "  Neither exists with a usable machine id." >&2
   echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
   echo "  start a fresh run." >&2
+  container_rc=1
+elif [ "$IS_RESUME" = "true" ]; then
+  remote_log "--resume: no active remote launchers found"
   container_rc=1
 elif provision_machine; then
   _provisioned=true

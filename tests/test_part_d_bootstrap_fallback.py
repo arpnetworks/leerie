@@ -5,8 +5,8 @@ During the bootstrap window (~1 min from launch to end-of-classify),
 the host has only `.leerie/runs/_bootstrap-<id>/fly-machine.json` — the
 orchestrator has not yet written `run.json` (that lives on the Fly
 Machine). The verbs need to fall back to `fly-machine.json` for the
-`fly_machine_id` lookup, matching scripts/remote/attach.sh's
-resolution order.
+`fly_machine_id` lookup, via `_resolve_fly_machine_id_from_run_dir`
+in the launcher.
 
 These tests stub `flyctl` (records argv to flyctl.log) so we exercise
 the launcher's resolution + sidecar-update logic without touching a

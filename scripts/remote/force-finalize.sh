@@ -292,9 +292,11 @@ PYEOF
 
   # Pipe the Python source via stdin to `python3 -` on the machine. This
   # sidesteps the `flyctl ssh console --command` argv-not-shell semantics
-  # (the bug Part 1.5 fixed in attach.sh) and Python's own quoting
-  # (single vs triple, escapes) entirely — the script body never has to
-  # round-trip through a shell quoter.
+  # — `--command` execs the string as argv (not via a shell), so any
+  # shell builtin or operator needs `bash -lc '...'` wrapping with
+  # nested single-quote escaping — and Python's own quoting (single vs
+  # triple, escapes) entirely. The script body never has to round-trip
+  # through a shell quoter.
   local result
   if ! result="$(printf '%s' "$payload" \
         | flyctl ssh console --app "$app" --machine "$machine" \
@@ -331,7 +333,7 @@ PYEOF
       remote_log "force-finalize: REFUSED — /proc scan found live orchestrator pid $pid ($comm) for this run on machine $machine."
       remote_log "  The pid file may point at a stillborn process (see DESIGN §6 *Single owner per run dir*); the scan is authoritative."
       remote_log "  Use \`leerie --kill <run-id>\` if you really want to abandon the run, or"
-      remote_log "  \`leerie --attach <run-id>\` to inspect what it's doing first."
+      remote_log "  \`leerie --resume <run-id>\` to tail/inspect what it's doing first."
       return 1
       ;;
     REFUSE-ALIVE:*)
@@ -340,20 +342,20 @@ PYEOF
       local comm="${rest#*:}"
       remote_log "force-finalize: REFUSED — orchestrator pid $pid ($comm) is still alive on machine $machine."
       remote_log "  Use \`leerie --kill <run-id>\` if you really want to abandon the run, or"
-      remote_log "  \`leerie --attach <run-id>\` to inspect what it's doing first."
+      remote_log "  \`leerie --resume <run-id>\` to tail/inspect what it's doing first."
       return 1
       ;;
     REFUSE-NOPID:*)
       local rid="${sentinel#REFUSE-NOPID:}"
       remote_log "force-finalize: REFUSED — run $rid has no orchestrator.pid on machine $machine."
       remote_log "  This usually means the orchestrator failed very early (before phase_classify)."
-      remote_log "  Attach manually with \`leerie --attach\` to inspect, then \`--kill\` when done."
+      remote_log "  Attach manually with \`leerie --resume <run-id> --shell\` to inspect, then \`--kill\` when done."
       return 1
       ;;
     REFUSE-MULTI:*)
       local count="${sentinel#REFUSE-MULTI:}"
       remote_log "force-finalize: REFUSED — $count non-bootstrap run dirs on machine $machine; can't pick one."
-      remote_log "  Attach manually to disambiguate."
+      remote_log "  Attach manually with \`leerie --resume <run-id> --shell\` to disambiguate."
       return 1
       ;;
     REFUSE-NONE)

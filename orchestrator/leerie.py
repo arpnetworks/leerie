@@ -6236,8 +6236,10 @@ class StateLockedError(Exception):
     flock because another orchestrator already owns this run.
 
     The handler at the orchestrator entry point converts this into an
-    EXIT_LOCKED process exit so the launcher can route the user toward
-    `--attach` (DESIGN §6 *Single owner per run dir*)."""
+    EXIT_LOCKED process exit; the launcher's rc=75 pivot then attaches
+    the user to the live orchestrator's log stream via the smart
+    `--resume` router (DESIGN §6 *Single owner per run dir*, *Smart
+    resume in remote mode*)."""
 
     def __init__(self, run_dir: Path):
         super().__init__(f"another orchestrator already owns {run_dir}")
@@ -13842,7 +13844,7 @@ def main() -> None:
         log(f"another orchestrator already owns run {run_id!r} "
             f"(holding flock on {e.run_dir}). "
             f"Tail it without spawning a duplicate: "
-            f"`leerie --attach {run_id}`. "
+            f"`leerie --resume {run_id}`. "
             f"If the holder is wedged, kill it and retry.")
         sys.exit(EXIT_LOCKED)
     for sub in ("", "subtasks", "criteria", "checkpoints", "logs"):

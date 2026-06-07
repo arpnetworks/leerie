@@ -65,10 +65,10 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 
 # --- _resolve_fly_machine_id_from_run_dir -------------------------------
 # Read fly_machine_id from a run's host-side sidecar. Tries
-# fly-machine.json first, then run.json — mirrors the resolution order
-# in scripts/remote/attach.sh so the `--stop`/`--kill`/`--finalize`
-# fast-paths also work during the in-flight bootstrap window (when the
-# host has fly-machine.json but no run.json yet — DESIGN §6 Detached
+# fly-machine.json first, then run.json — the dual-order shared by
+# every host-side verb (`--stop`/`--kill`/`--finalize`/`--resume`) so
+# they all work during the in-flight bootstrap window (when the host
+# has fly-machine.json but no run.json yet — DESIGN §6 Detached
 # orchestrator (remote mode)).
 #
 # Echoes the machine id to stdout, empty string on miss. Used by
@@ -430,16 +430,6 @@ PY
       set -- "${_list_rest[@]}"
     fi
     ;;
-  --attach)
-    # Fast-path: open a PTY into a running/paused Fly Machine.
-    # (DESIGN §6 *Interactive attach over PTY in remote mode*.)
-    # Routed before any runtime preflight — attach doesn't need a
-    # local container, only flyctl + WireGuard reachability.
-    shift
-    USER_REPO="${USER_REPO:-$PWD}"
-    export USER_REPO
-    exec "$LEERIE_REPO/scripts/remote/attach.sh" "$@"
-    ;;
   --re-seed)
     # Fast-path: re-rsync the host's working tree into a paused/running
     # Fly Machine. (Phase 4: mid-run re-rsync correction.) Runs before
@@ -526,7 +516,7 @@ PY
     . "$LEERIE_REPO/scripts/remote/provision.sh"
     require_flyctl || exit 1
     # Try fly-machine.json first (in-flight bootstrap case), then
-    # run.json — matches scripts/remote/attach.sh's resolution order.
+    # run.json — via the shared dual-file resolver above.
     LEERIE_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_stop_run_dir")"
     if [ -z "$LEERIE_MACHINE_ID" ]; then
       remote_log "--stop: $_stop_run_id has no fly_machine_id (was it a local run?)"
@@ -597,7 +587,7 @@ PY
       fi
       if [ -d "$_kill_run_dir" ] && [ -z "$_kill_machine_id" ]; then
         # Try fly-machine.json first (in-flight bootstrap case), then
-        # run.json — matches scripts/remote/attach.sh's resolution order.
+        # run.json — via the shared dual-file resolver.
         _kill_machine_id="$(_resolve_fly_machine_id_from_run_dir "$_kill_run_dir")"
       fi
     fi
@@ -862,7 +852,7 @@ except Exception:
       . "$LEERIE_REPO/scripts/remote/fetch-branch.sh"
       require_flyctl || exit 1
       # Try fly-machine.json first (in-flight bootstrap case), then
-      # run.json — matches scripts/remote/attach.sh's resolution order.
+      # run.json — via the shared dual-file resolver.
       LEERIE_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_fin_run_dir")"
       if [ -z "$LEERIE_MACHINE_ID" ]; then
         remote_log "--finalize: $_fin_run_id has no fly_machine_id and is not already synced"
@@ -1266,6 +1256,23 @@ for arg in "$@"; do
     --force)      RE_SEED_FORCE=true ;;
   esac
 done
+
+# --- --resume smart-router sub-mode flags -------------------------------
+# Launcher-only flags consumed by the rc=75 pivot (DESIGN §6 *Smart
+# resume in remote mode*). Both are stripped from REWRITTEN_ARGS below
+# so the orchestrator's argparse never sees them.
+#   --shell           drop into bash at /work instead of tailing the log
+#   --auto-finalize   exec `leerie --finalize` on clean orchestrator exit
+RESUME_SHELL=false
+RESUME_AUTO_FINALIZE=false
+for arg in "$@"; do
+  case "$arg" in
+    --shell)         RESUME_SHELL=true ;;
+    --auto-finalize) RESUME_AUTO_FINALIZE=true ;;
+  esac
+done
+export RESUME_SHELL
+export RESUME_AUTO_FINALIZE
 
 # --- extract --run-id (passed through to orchestrator) -----------------
 # The launcher needs the run-id early in the RUNTIME=fly branch so the
@@ -1883,6 +1890,16 @@ for arg in "$@"; do
       # Launcher-only flag (legacy alias for --runtime fly); consumed by
       # the runtime-mode knob above. The orchestrator's argparse doesn't know it.
       ;;
+    --shell)
+      # Launcher-only flag; opts into bash shell on the --resume rc=75 pivot
+      # (DESIGN §6 *Smart resume in remote mode*). The orchestrator's
+      # argparse doesn't know it.
+      ;;
+    --auto-finalize)
+      # Launcher-only flag; triggers `leerie --finalize` on clean exit via
+      # tail_with_optional_autofinalize. The orchestrator's argparse
+      # doesn't know it.
+      ;;
     *)
       REWRITTEN_ARGS+=("$arg")
       ;;
@@ -2333,22 +2350,82 @@ if [ "$RUNTIME" = "fly" ]; then
     # shellcheck disable=SC1090
     . "$FETCH_SCRIPT"
 
+    # --resume auto-discovery (Phase 1). Runs only when --resume was
+    # passed and no explicit --run-id is set. Scans the per-launcher
+    # records under $LEERIE_STATE_HOST_DIR/remote/*.json for entries
+    # whose recorded launcher_pid is still alive (kill -0). Exactly
+    # one match resolves LEERIE_RUN_ID and continues; multiple match
+    # lists them and exits; zero matches falls through (the existing
+    # zero-match error path at the elif below fires when both
+    # LEERIE_RUN_ID and _paused_mid stay empty). DESIGN §6 *Smart
+    # resume in remote mode*.
+    if [ -z "$LEERIE_RUN_ID" ] && [ "$IS_RESUME" = "true" ]; then
+      _active_records=()
+      if [ -d "$LEERIE_STATE_HOST_DIR/remote" ]; then
+        for _record_file in "$LEERIE_STATE_HOST_DIR/remote"/*.json; do
+          [ -e "$_record_file" ] || continue
+          _launcher_pid="$(basename "$_record_file" .json)"
+          if [ -n "$_launcher_pid" ] && kill -0 "$_launcher_pid" 2>/dev/null; then
+            _active_records+=("$_record_file")
+          fi
+        done
+      fi
+      case "${#_active_records[@]}" in
+        0)
+          # No active records. Fall through to the existing zero-match
+          # error path below by leaving LEERIE_RUN_ID empty.
+          ;;
+        1)
+          LEERIE_RUN_ID="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("run_id") or "")
+except Exception:
+    pass
+' "${_active_records[0]}" 2>/dev/null || true)"
+          export LEERIE_RUN_ID
+          if [ -n "$LEERIE_RUN_ID" ]; then
+            remote_log "--resume: auto-discovered run-id $LEERIE_RUN_ID from active launcher record"
+          fi
+          ;;
+        *)
+          remote_log "--resume: multiple active launches — pass --run-id to disambiguate:"
+          for _f in "${_active_records[@]}"; do
+            python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(f'  pid={d.get(\"launcher_pid\",\"?\")} run={d.get(\"run_id\",\"?\")} machine={d.get(\"fly_machine_id\",\"?\")}')
+except Exception:
+    pass
+" "$_f" >&2 || true
+          done
+          container_rc=1
+          ;;
+      esac
+    fi
+
     # Resume path: if a machine pointer exists for this run-id, resume
     # the existing Fly Machine instead of provisioning a new one.
     # (DESIGN §6 Remote pause-on-failure.) Uses the dual-file resolver
     # at leerie:76 — fly-machine.json first, then run.json — to mirror
-    # the existing --stop/--kill/--finalize/--attach behavior. For
+    # the existing --stop/--kill/--finalize/--resume behavior. For
     # bootstrap-id runs paused before classify, run.json may not exist
     # on the host; fly-machine.json is the source of truth.
     _paused_mid=""
-    if [ -n "$LEERIE_RUN_ID" ]; then
+    if [ -n "$LEERIE_RUN_ID" ] && [ "$container_rc" -eq 0 ]; then
       _paused_mid="$(_resolve_fly_machine_id_from_run_dir \
                        "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID")"
     fi
 
     _provisioned=false
     _resumed=false
-    if [ -n "$_paused_mid" ]; then
+    if [ "$container_rc" -ne 0 ]; then
+      # Auto-discovery printed a multi-match list and set container_rc=1
+      # already. Skip the resume/provision decision — nothing to do.
+      :
+    elif [ -n "$_paused_mid" ]; then
       if resume_machine "$_paused_mid"; then
         _provisioned=true
         _resumed=true
@@ -2359,7 +2436,7 @@ if [ "$RUNTIME" = "fly" ]; then
         # a duplicate — exit with the failure so the user knows.
         container_rc=1
       fi
-    elif [ "$IS_RESUME" = "true" ]; then
+    elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
       # --resume against a run-id with no machine pointer anywhere
       # (no fly-machine.json, no run.json with fly_machine_id). Either
       # the run-id is a typo or the run was already cleaned up. Fail
@@ -2369,6 +2446,16 @@ if [ "$RUNTIME" = "fly" ]; then
       echo "  Looked for: $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json" >&2
       echo "             $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json (fly_machine_id field)" >&2
       echo "  Neither exists with a usable machine id." >&2
+      echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
+      echo "  start a fresh run." >&2
+      container_rc=1
+    elif [ "$IS_RESUME" = "true" ]; then
+      # --resume with no --run-id AND auto-discovery found zero active
+      # records. Distinct from the per-id error above — no run to point
+      # at, so list-style guidance is the right next step.
+      remote_log "--resume: no active remote launchers found"
+      echo "  No records under $LEERIE_STATE_HOST_DIR/remote/ and" >&2
+      echo "  no --run-id was given." >&2
       echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
@@ -2603,7 +2690,7 @@ try:
     except BlockingIOError:
         sys.stderr.write("orchestrator already running for run " + run_id + "\\n")
         sys.stderr.write("Tail the existing run instead of spawning a duplicate:\\n")
-        sys.stderr.write("  leerie --attach " + run_id + "\\n")
+        sys.stderr.write("  leerie --resume " + run_id + "\\n")
         sys.exit(75)
 finally:
     os.close(_probe_fd)
@@ -2667,7 +2754,7 @@ with open(log_path, "ab") as log_f:
 # *Single owner per run dir*), the child exits 75 within
 # milliseconds. Writing its pid to orchestrator.pid before the race
 # resolves would overwrite the winning orchestrator's pid with a
-# dead one — the stale-pid contagion that breaks --attach --tail's
+# dead one — the stale-pid contagion that breaks --resume's tail
 # liveness check and --finalize --force's safety belt.
 #
 # Budget: 2 s (10 x 0.2 s). The realistic time from Popen to the
@@ -2692,8 +2779,8 @@ for _ in range(10):
 if p.poll() == 75:
     # Stillborn flock-loser — the winner still owns the run. Do not
     # touch the pid file. The launcher's existing rc=75 short-circuit
-    # (~30 lines below in the bash dispatcher) routes the user to
-    # --attach via container_rc=130.
+    # (~30 lines below in the bash dispatcher) pivots the user's --resume
+    # to the live-orchestrator attach path via container_rc=130.
     sys.exit(75)
 with open(pid_path, "w") as pid_f:
     pid_f.write(str(p.pid) + "\n")
@@ -2706,29 +2793,44 @@ PY
           || _launch_rc=$?
         if [ "$_launch_rc" = "75" ]; then
           # The remote launch-wrapper's flock probe fired: an orchestrator
-          # is already running for this run_id on the machine. Treat as a
-          # soft refusal — the user's work is unaffected; route them to
-          # --attach instead of synthesizing a "failed to start" error.
+          # is already running for this run_id on the machine. This is
+          # the "smart resume" pivot point (DESIGN §6 *Smart resume in
+          # remote mode*): rather than spawning a duplicate, attach to
+          # the live stream — `--shell` opens a bash session at /work,
+          # otherwise tail orchestrator.log via render_tail_wrapper.
           # Mirrors State.__init__'s EXIT_LOCKED=75 (DESIGN §6 *Single
           # owner per run dir*).
           #
           # CRITICAL: container_rc=130 (not 1, not 75). The post-tail
-          # `export LEERIE_REMOTE_EXIT_RC="$container_rc"` (~30 lines
-          # below) propagates this into the decide_teardown trap.
-          # Routing matters here:
+          # `export LEERIE_REMOTE_EXIT_RC="$container_rc"` propagates
+          # this into the decide_teardown trap. Routing matters:
           #   - rc=75 → EX_TEMPFAIL "genuine terminal exit" →
           #     sync-then-finalize-then-destroy → kills live machine A.
           #   - rc=1  → "*)" default → pause-on-failure → stop_machine
           #     also kills live machine A (graceful pause, but still
           #     interrupts the live run).
           #   - rc=130 → "130|143)" detach banner → leaves the machine
-          #     alone and prints reattach hints (decide_teardown at
-          #     scripts/remote/provision.sh:401). Exactly what we want
-          #     when the original orchestrator is still alive.
-          remote_log "--resume refused: orchestrator already running for $LEERIE_RUN_ID on machine $LEERIE_MACHINE_ID"
-          remote_log "  The live machine is being LEFT RUNNING."
-          remote_log "  Tail it without spawning a duplicate:"
-          remote_log "    leerie --attach $LEERIE_RUN_ID --tail"
+          #     alone (decide_teardown at scripts/remote/provision.sh:401).
+          #     Exactly what we want when the original orchestrator is
+          #     still alive.
+          if [ "$RESUME_SHELL" = "true" ]; then
+            remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
+            _shell_payload="cd /work && PS1='leerie@$LEERIE_RUN_ID:\\w\\$ ' exec bash --noprofile --norc -i"
+            _shell_payload_q="$(printf %s "$_shell_payload" | sed "s/'/'\\\\''/g")"
+            flyctl ssh console \
+              --app "$FLY_APP" \
+              --machine "$LEERIE_MACHINE_ID" \
+              --command "bash -lc '$_shell_payload_q'" || true
+          else
+            remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
+            _tail_script="$(render_tail_wrapper)"
+            tail_with_optional_autofinalize \
+              "$_tail_script" \
+              "$LEERIE_RUN_ID" \
+              "$LEERIE_MACHINE_ID" \
+              "$FLY_APP" \
+              "$RESUME_AUTO_FINALIZE" || true
+          fi
           container_rc=130
         elif [ "$_launch_rc" != "0" ]; then
           remote_log "error: failed to start detached orchestrator on machine $LEERIE_MACHINE_ID (rc=$_launch_rc)"
@@ -2750,9 +2852,9 @@ PY
           # orchestrator-pid exit prints a finalize hint and ends.
           remote_log "remote: tailing orchestrator log (Ctrl-C to detach — orchestrator keeps running)"
 
-          # The remote tail wrapper is shared with `leerie --attach --tail`
-          # via render_tail_wrapper in scripts/remote/lib.sh (already
-          # sourced above). It handles the `_bootstrap-<6hex>` →
+          # The remote tail wrapper is shared with `leerie --resume`'s
+          # rc=75 pivot via render_tail_wrapper in scripts/remote/lib.sh
+          # (already sourced above). It handles the `_bootstrap-<6hex>` →
           # final-id rename transparently and prints the finalize hint
           # when the orchestrator pid disappears.
           _tail_script="$(render_tail_wrapper)"

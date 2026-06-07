@@ -312,6 +312,90 @@ fi
 TAIL_SH
 }
 
+# --- tail_with_optional_autofinalize ------------------------------------
+# Run a render_tail_wrapper payload against a Fly Machine via
+# `flyctl ssh console`, optionally with AUTO_FINALIZE token plumbing.
+#
+# Call sites today:
+#   - The launcher's fresh-launch tail (after starting the orchestrator).
+#   - The launcher's `--resume` smart router rc=75 pivot (when the
+#     orchestrator is already alive and we're attaching to the live
+#     log stream rather than spawning a duplicate).
+#
+# Both code paths use this helper to avoid two divergent copies of the
+# token-grep-and-exec dance; the helper is the load-bearing surface
+# tested by tests/test_resume_attach.py.
+#
+# Args:
+#   $1 _tail_script   POSIX-sh payload from render_tail_wrapper (stdout).
+#   $2 _run_id        Run-id to tail (becomes LEERIE_TAIL_RUN_ID inside).
+#   $3 _machine_id    Fly Machine id.
+#   $4 _app           Fly app name.
+#   $5 _do_auto       "true" to enable AUTO_FINALIZE token plumbing.
+#
+# Behavior when $5="true": captures stderr through a tee + tempfile,
+# greps for `<<LEERIE_AUTOFIN_$$>>${RUN_ID}` (emitted by
+# render_tail_wrapper's last-line stderr hook), and on clean rc=0
+# execs `${LEERIE_REPO}/leerie --finalize <final_id>` on the host so
+# the host's gh/git auth performs the push. The function then exits
+# (never returns) — either via the exec, or via `exit $rc` on
+# non-zero rc / missing token. The auto-finalize exec replaces this
+# script entirely; the launcher's `decide_teardown` trap coexists
+# because it's idempotent (LEERIE_TEARDOWN_DONE guards re-entry).
+#
+# Behavior when $5="false": runs the tail stream normally and returns
+# the flyctl exit code. Caller handles the rc.
+tail_with_optional_autofinalize() {
+  local _tail_script="$1" _run_id="$2" _machine_id="$3" _app="$4" _do_auto="$5"
+  local _tail_invocation _token _stderr_capture _rc final_id
+
+  _tail_invocation="LEERIE_TAIL_RUN_ID='$_run_id'; export LEERIE_TAIL_RUN_ID"
+
+  if [ "$_do_auto" = "true" ]; then
+    _token="<<LEERIE_AUTOFIN_$$>>"
+    _stderr_capture="$(mktemp -t leerie-tail.XXXXXX)"
+    # NOTE: no `trap '... EXIT'` here. This function is *sourced* into
+    # the launcher's shell (the launcher sources lib.sh, then calls this
+    # via the rc=75 pivot), and the launcher already has
+    # `trap 'decide_teardown' EXIT INT TERM` registered by provision.sh.
+    # An EXIT trap here would clobber decide_teardown and the Fly
+    # machine would never receive its host-side teardown disposition.
+    # Instead, clean up the tempfile inline before each terminal path.
+    _tail_invocation="${_tail_invocation}
+AUTO_FINALIZE_TOKEN='$_token'; export AUTO_FINALIZE_TOKEN
+$_tail_script"
+    # Capture the pipeline rc without toggling `set -e`. Toggling here
+    # would silently re-enable -e on shells that had it off (like the
+    # test harness), causing this function's `return $_rc` to terminate
+    # the *caller*. Use `|| _rc=$?` instead.
+    _rc=0
+    printf '%s' "$_tail_invocation" \
+      | flyctl ssh console --app "$_app" --machine "$_machine_id" --pty=false -C "sh -s" \
+        2> >(tee "$_stderr_capture" >&2) \
+      || _rc=$?
+    if [ "$_rc" -eq 0 ]; then
+      final_id="$(grep -oE "${_token}[^ ]+" "$_stderr_capture" 2>/dev/null \
+                  | tail -1 | sed "s|^${_token}||")"
+      if [ -n "$final_id" ]; then
+        remote_log "auto-finalize: running 'leerie --finalize $final_id'"
+        rm -f "$_stderr_capture"
+        exec "${LEERIE_REPO}/leerie" --finalize "$final_id"
+      fi
+    fi
+    # `return`, not `exit`: this is a sourced function. `exit` here
+    # would terminate the launcher shell, bypassing the rc=75 pivot's
+    # `container_rc=130` assignment and the decide_teardown detach
+    # banner. The caller decides what to do with the rc.
+    rm -f "$_stderr_capture"
+    return "$_rc"
+  else
+    _tail_invocation="${_tail_invocation}
+$_tail_script"
+    printf '%s' "$_tail_invocation" \
+      | flyctl ssh console --app "$_app" --machine "$_machine_id" --pty=false -C "sh -s"
+  fi
+}
+
 # --- require_flyctl ------------------------------------------------------
 # Ensure flyctl is on PATH and authenticated, auto-installing if missing.
 #

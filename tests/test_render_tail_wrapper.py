@@ -1,10 +1,11 @@
 """Tests for `render_tail_wrapper` in scripts/remote/lib.sh.
 
 The helper emits a POSIX-sh wrapper script that runs inside a Fly
-Machine. Both leerie's initial-launch tail and scripts/remote/attach.sh
---tail use it. These tests exercise the wrapper in a tmp_path "fake
-machine" filesystem (no actual Fly Machine; the script's only
-dependencies are local files and `tail -F`).
+Machine. Both leerie's initial-launch tail and the `--resume` smart
+router rc=75 pivot (via `tail_with_optional_autofinalize`) use it.
+These tests exercise the wrapper in a tmp_path "fake machine"
+filesystem (no actual Fly Machine; the script's only dependencies are
+local files and `tail -F`).
 
 Coverage:
   - Bootstrap-id input → waits for rename → reads handover → re-tails final
