@@ -322,6 +322,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.leerie/` fallback to accurately describe it as the
   non-containerized invocation path.
 
+### Fixed
+
+- Removed stale docstring reference to deleted
+  `test_launcher_remote_knob.py` in `test_launcher_no_push_skips.py`.
+
 ## [0.2.6] - 2026-06-01
 
 This release fixes a hard failure on `--runtime fly` against any repo
