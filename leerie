@@ -859,33 +859,52 @@ except Exception:
         exit 1
       fi
       export LEERIE_MACHINE_ID
-      # Action log (P2d) — name the path being taken so post-mortems are
-      # shorter.
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/force-finalize.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/collect-subtrees.sh"
+
       if [ "$_FINALIZE_FORCE" = "true" ]; then
-        remote_log "finalize: machine=$LEERIE_MACHINE_ID run=$_fin_run_id action=force-patch+fetch"
-      else
-        remote_log "finalize: machine=$LEERIE_MACHINE_ID run=$_fin_run_id action=fetch"
-      fi
-      # --finalize --force: patch finished_at on the machine before
-      # fetch_branch scans for it. Refuses on alive orchestrator pid;
-      # idempotent on already-finalized runs.
-      if [ "$_FINALIZE_FORCE" = "true" ]; then
-        # shellcheck disable=SC1091
-        . "$LEERIE_REPO/scripts/remote/force-finalize.sh"
-        if ! force_finalize_remote "$FLY_APP" "$LEERIE_MACHINE_ID"; then
-          remote_log "error: --force could not patch the run on machine $LEERIE_MACHINE_ID"
+        # --force path: stop the orchestrator (if alive), patch finished_at,
+        # collect un-integrated subtask branches, then fetch.
+        remote_log "finalize: machine=$LEERIE_MACHINE_ID run=$_fin_run_id action=force-stop+collect+fetch"
+        FORCE_STOP=1 force_finalize_remote "$FLY_APP" "$LEERIE_MACHINE_ID" || {
+          remote_log "error: --force could not stop/patch the run on machine $LEERIE_MACHINE_ID"
+          exit 1
+        }
+        # Integrate un-merged subtask branches on the machine.
+        collect_subtrees_remote "$FLY_APP" "$LEERIE_MACHINE_ID" || {
+          remote_log "warning: subtree collection failed; proceeding with whatever is on the run branch"
+        }
+        remote_log "--finalize: streaming completed run from machine $LEERIE_MACHINE_ID"
+        if ! fetch_branch; then
+          remote_log "error: fetch_branch failed after force-stop + collect"
           exit 1
         fi
-      fi
-      remote_log "--finalize: streaming completed run from machine $LEERIE_MACHINE_ID"
-      if ! fetch_branch; then
-        remote_log "error: fetch_branch failed"
-        if [ "$_FINALIZE_FORCE" != "true" ]; then
-          remote_log "  If the orchestrator died before writing finished_at, retry with:"
-          remote_log "    leerie --finalize $_fin_run_id --force"
-          remote_log "  (--force refuses if the orchestrator is still alive.)"
+      else
+        # Non-force path: try fetch_branch first (normal clean-exit case).
+        # If it fails, auto-recover: patch finished_at (refuses if alive),
+        # collect subtrees, retry fetch.
+        remote_log "finalize: machine=$LEERIE_MACHINE_ID run=$_fin_run_id action=fetch"
+        if ! fetch_branch; then
+          remote_log "--finalize: fetch_branch found no finalized run; attempting recovery"
+          if force_finalize_remote "$FLY_APP" "$LEERIE_MACHINE_ID"; then
+            # Orchestrator is dead; patched finished_at. Collect subtrees.
+            collect_subtrees_remote "$FLY_APP" "$LEERIE_MACHINE_ID" || {
+              remote_log "warning: subtree collection failed; proceeding with whatever is on the run branch"
+            }
+            remote_log "--finalize: streaming completed run from machine $LEERIE_MACHINE_ID"
+            if ! fetch_branch; then
+              remote_log "error: fetch_branch failed after recovery patch + collect"
+              exit 1
+            fi
+          else
+            remote_log "  The orchestrator may still be alive. To stop it and finalize, run:"
+            remote_log "    leerie --finalize $_fin_run_id --force"
+            remote_log "  (--force SIGTERMs the orchestrator process, then collects subtrees.)"
+            exit 1
+          fi
         fi
-        exit 1
       fi
       # fetch_branch sets LEERIE_REMOTE_RUN_ID to the discovered final run-id
       # (which may differ from $_fin_run_id if the user passed a bootstrap

@@ -665,6 +665,10 @@ leerie/
 │       │                           provision); seed_repo(): git bundle parent + submodules
 │       │                           piped via ssh-console → machine clones from bundles on disk,
 │       │                           then rsync's dirty delta + .claude/ — no in-machine git clone
+│       ├── collect-subtrees.sh     Subtree collection (sourced by `leerie --finalize`);
+│       │                           collect_subtrees_remote(): SSHes a bash payload that runs
+│       │                           setup-run.sh + integrate.sh for un-merged subtask branches
+│       │                           on the machine; conflicts are skipped and reported via sentinels
 │       └── fetch-branch.sh        Post-run stream-back (sourced by decide_teardown BEFORE
 │                                   destroy_machine on clean exit, and by `leerie --finalize`);
 │                                   fetch_branch(): git bundle pipe + state tar-pipe → host repo
@@ -3815,10 +3819,25 @@ existing `LEERIE_REMOTE_RUN_ID` plumbing migrates the host-side dir
 or no-match falls through to the original error, augmented with a hint
 to run `leerie --list`.
 
-**`leerie --finalize <run-id> --force`** recovers a run whose
-orchestrator died before writing `finished_at`. The launcher SSHes
-into the machine via `flyctl ssh console -C "bash -lc '…'"` and runs
-`scripts/remote/force-finalize.sh`, which:
+**`leerie --finalize <run-id>`** (non-force) first tries
+`fetch_branch` (the normal clean-exit case: orchestrator wrote
+`finished_at`). If that fails, the launcher auto-recovers: it calls
+`force_finalize_remote` (which checks whether the orchestrator is dead
+and patches `finished_at` — see liveness checks below), then
+`collect_subtrees_remote` to integrate un-merged subtask branches on
+the machine, then retries `fetch_branch`. If the orchestrator is still
+alive, the launcher refuses with a hint to use `--force`.
+
+**`leerie --finalize <run-id> --force`** extends the recovery to runs
+where the orchestrator is still alive. The launcher calls
+`force_finalize_remote` with `FORCE_STOP=1`, which SIGTERMs the
+orchestrator process *inside the machine* (the process, NOT the
+machine — the machine must stay running for the subsequent collection
+and fetch steps), waits for it to die (polling `/proc`; escalates to
+SIGKILL after 30 s), patches `finished_at`, then falls through.
+The launcher then calls `collect_subtrees_remote` and `fetch_branch`.
+
+**Liveness checks** (`scripts/remote/force-finalize.sh`):
 
 1. Lists `/work/.leerie/runs/` for the single non-`_bootstrap-*` dir
    (fails clearly on multi-match).
@@ -3827,13 +3846,12 @@ into the machine via `flyctl ssh console -C "bash -lc '…'"` and runs
    - `/proc` cross-check (authoritative): scan `/proc/[0-9]*/cmdline`
      for any process whose NUL-separated argv contains both the
      literal string `orchestrator/leerie.py` AND the run-id. If
-     found → orchestrator alive → **REFUSE-ALIVE-SCAN** with a
-     message naming the scanned pid (distinct from the pid file's
-     pid for audit clarity).
+     found → orchestrator alive → **REFUSE-ALIVE-SCAN** (or
+     **STOPPED** if `FORCE_STOP=1`).
    - `orchestrator.pid` check (defensive, kept for pid-reuse audit):
      - Pid file present + `kill -0 <pid>` succeeds + `/proc/<pid>/cmdline`
-       contains `python` → orchestrator alive → **REFUSE-ALIVE**
-       with a message naming the pid-file pid. (`cmdline` not `comm`
+       contains `python` → orchestrator alive → **REFUSE-ALIVE** (or
+       **STOPPED** if `FORCE_STOP=1`). (`cmdline` not `comm`
        because `comm` is the basename of the script-launcher binary —
        for a pip-installed `pytest` shim it is `"pytest"`, which does
        not contain `"python"` and would let an alive orchestrator
@@ -3859,12 +3877,28 @@ into the machine via `flyctl ssh console -C "bash -lc '…'"` and runs
    `recovered_via = "force-finalize"`, and falls through to the normal
    `fetch_branch` flow.
 
+Sentinels: `OK:<run_id>`, `STOPPED:<run_id>:<pid>` (killed then
+patched), `STOP-FAILED:<run_id>:<pid>`, `REFUSE-ALIVE-SCAN:*`,
+`REFUSE-ALIVE:*`, `REFUSE-NOPID:*`, `REFUSE-MULTI:*`, `REFUSE-NONE`,
+`ERROR:*`.
+
+**Subtree collection** (`scripts/remote/collect-subtrees.sh`):
+`collect_subtrees_remote` SSHes a bash payload that discovers
+un-integrated subtask branches on the machine and merges them into the
+run branch via `setup-run.sh` (idempotent) + `integrate.sh`.
+Conflicts are aborted (`git merge --abort`) and skipped — no LLM
+integrator is available outside the orchestrator. Wave ordering from
+`state.json` is used when available (earlier waves first); falls back
+to alphabetical. Sentinels: `COLLECTED-ALL:<run_id>:<count>`,
+`COLLECTED:<run_id>:<integrated>:<skipped>:<skipped_sids>`,
+`COLLECTED-NONE:<run_id>`, `COLLECT-ERROR:<message>`.
+
 The synthesized audit fields (`recovered_at`, `recovered_via`) preserve
 provenance of forced recoveries so post-mortems can distinguish them
 from naturally-finalized runs.
 
 `--finalize` logs the action it took before SSHing in:
-`finalize: machine=<id> run=<id> action=<fetch|fetch+force-patch|already-synced>`
+`finalize: machine=<id> run=<id> action=<fetch|force-stop+collect+fetch|already-synced>`
 so post-mortems of future failures are shorter.
 
 This matches the convention that destructive and side-effecting actions

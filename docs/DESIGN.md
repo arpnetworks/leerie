@@ -792,13 +792,38 @@ push + PR sit between them on the host:
 or orchestrator crash before `phase_finalize` leaves a run that
 `fetch-branch.sh` cannot discover (its predicate requires
 `finished_at` set + `pushed_at` unset). For these cases, `leerie
---finalize <run-id> --force` SSHes into the machine, verifies the
+--finalize <run-id>` SSHes into the machine, verifies the
 orchestrator process is dead (via the `orchestrator.pid` file and
 `/proc/<pid>/cmdline`), patches `finished_at` into `run.json` along with
 audit fields `recovered_at` and `recovered_via="force-finalize"`, and
-then falls through to the normal finalize flow. The pid check is the
-safety belt: if the orchestrator is still alive, `--force` refuses with
-a message naming the live pid. This makes the manual "attach, hand-edit
+then falls through to the normal finalize flow. If the orchestrator is
+still alive, the non-force path refuses with a message naming the
+live pid and suggests `--force`.
+
+**Subtree collection.** When the orchestrator dies mid-wave, subtask
+branches (`leerie/subtasks/<run-id>/<sid>`) may have committed work
+that was never integrated into the run branch. `--finalize` detects
+un-integrated subtask branches on the machine, runs `setup-run.sh` to
+ensure the staging worktree exists, and merges each un-integrated
+branch via `integrate.sh`. Conflicts are skipped (no LLM integrator
+is available outside the orchestrator) and reported — the user gets
+every subtask that merges cleanly, which is the common case because
+same-wave subtasks are assigned to the same wave precisely because
+they are independent. The collection step runs after the `finished_at`
+patch and before `fetch_branch` streams the result to the host.
+
+**`--force`: stop the orchestrator, then collect.** `leerie --finalize
+<run-id> --force` extends the recovery path to runs where the
+orchestrator is still alive. It SIGTERMs the orchestrator process
+inside the machine (the *process*, not the machine — the machine must
+stay running for the subsequent collection and fetch steps), waits for
+it to die (polling `/proc`; escalates to SIGKILL after 30 s), then
+proceeds with the same subtree-collection and `finished_at`-patch
+flow. The orchestrator's SIGTERM handler runs
+`_cleanup_on_abnormal_exit(full_purge=False)`, which removes worktrees
+but preserves all branches — `setup-run.sh` (idempotent) recreates the
+staging worktree, and the collection step integrates from the preserved
+branches. This makes the manual "attach, hand-edit
 JSON, re-run" recovery procedure (last documented in
 `docs/IMPLEMENTATION.md` §6) unnecessary while preserving the audit
 trail of recovered runs.

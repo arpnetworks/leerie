@@ -75,7 +75,7 @@
 # tests/test_force_finalize_sh.py::test_refuses_when_pid_alive gates on
 # sys.platform == "linux" for the same reason.
 #
-# Usage (sourced by the leerie launcher's --finalize --force fast-path):
+# Usage (sourced by the leerie launcher's --finalize path):
 #
 #   source scripts/remote/force-finalize.sh
 #   force_finalize_remote "$FLY_APP" "$LEERIE_MACHINE_ID"
@@ -83,11 +83,16 @@
 # Environment consumed:
 #   FLY_APP             — Fly.io app name (e.g. "leerie")
 #   LEERIE_MACHINE_ID   — ID of the Fly Machine to SSH into
+#   FORCE_STOP          — when "1", SIGTERM the orchestrator instead of
+#                          refusing on alive.  The process is killed, NOT
+#                          the machine.  Falls through to patch after death.
 #
 # Exit semantics:
 #   0  — patch succeeded (or run was already finalized; idempotent)
+#        Sentinel: OK:<run_id> or STOPPED:<run_id>:<pid>
 #   1  — refused (orchestrator alive, pid file missing, ambiguous run dirs,
 #        SSH failure, JSON parse error on the remote side)
+#        Sentinel: REFUSE-*, STOP-FAILED:*, ERROR:*
 #
 # After this returns 0, the caller (`leerie --finalize`) falls through to
 # the normal fetch_branch path.
@@ -114,6 +119,8 @@ force_finalize_remote() {
   # The payload prints one of several sentinel lines to stdout that the
   # host-side caller parses to drive logging:
   #   OK:<final_run_id>               — patched (or already finalized); fall through
+  #   STOPPED:<run_id>:<pid>          — FORCE_STOP killed the orchestrator, then patched
+  #   STOP-FAILED:<run_id>:<pid>      — FORCE_STOP could not kill the orchestrator
   #   REFUSE-ALIVE-SCAN:<pid>:<comm>  — /proc scan found a live orchestrator
   #                                     matching this run-id (authoritative
   #                                     liveness signal; the pid file may
@@ -133,8 +140,12 @@ force_finalize_remote() {
 import json
 import os
 import pathlib
+import signal
 import sys
 import time
+
+force_stop = os.environ.get("FORCE_STOP") == "1"
+stopped_pid = None
 
 runs_dir = pathlib.Path("/work/.leerie/runs")
 if not runs_dir.is_dir():
@@ -222,9 +233,51 @@ except Exception:
     # path. On the Fly Linux image /proc is always present; this guard
     # is defensive for non-Linux test environments.
     pass
+
+def _stop_pid(target_pid: int, label: str) -> bool:
+    """SIGTERM target_pid, wait up to 30 s, escalate to SIGKILL.
+    Returns True when the process is confirmed dead."""
+    try:
+        os.kill(target_pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    for _ in range(30):
+        time.sleep(1)
+        try:
+            os.kill(target_pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+    # Escalate to SIGKILL.
+    try:
+        os.kill(target_pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    for _ in range(5):
+        time.sleep(1)
+        try:
+            os.kill(target_pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+    return False
+
 if scan_hit_pid is not None:
-    print(f"REFUSE-ALIVE-SCAN:{scan_hit_pid}:{scan_hit_ident}")
-    sys.exit(0)
+    if not force_stop:
+        print(f"REFUSE-ALIVE-SCAN:{scan_hit_pid}:{scan_hit_ident}")
+        sys.exit(0)
+    # FORCE_STOP: kill the orchestrator process, then fall through to patch.
+    if _stop_pid(scan_hit_pid, scan_hit_ident):
+        stopped_pid = scan_hit_pid
+    else:
+        print(f"STOP-FAILED:{run_id}:{scan_hit_pid}")
+        sys.exit(0)
 
 # Verify orchestrator process is dead.
 pid_path = run_dir / "orchestrator.pid"
@@ -266,8 +319,15 @@ if alive:
     # the orchestrator (a python process).  On short-lived Fly machines
     # collision is unlikely but the check is cheap.
     if is_python:
-        print(f"REFUSE-ALIVE:{pid}:{ident}")
-        sys.exit(0)
+        if not force_stop:
+            print(f"REFUSE-ALIVE:{pid}:{ident}")
+            sys.exit(0)
+        # FORCE_STOP: kill the orchestrator process.
+        if _stop_pid(pid, ident):
+            stopped_pid = pid
+        else:
+            print(f"STOP-FAILED:{run_id}:{pid}")
+            sys.exit(0)
     # If it's NOT python, treat the pid file as a stale collision and
     # proceed.  Log this in audit fields below.
 
@@ -285,7 +345,12 @@ if data.get("no_push") is True:
 tmp_path = run_json_path.with_suffix(".json.tmp")
 tmp_path.write_text(json.dumps(data, indent=2) + "\n")
 os.replace(tmp_path, run_json_path)
-print(f"OK:{run_id}")
+# Emit STOPPED sentinel when the process was killed via FORCE_STOP,
+# otherwise the normal OK sentinel.
+if stopped_pid is not None:
+    print(f"STOPPED:{run_id}:{stopped_pid}")
+else:
+    print(f"OK:{run_id}")
 sys.exit(0)
 PYEOF
 )
@@ -297,10 +362,16 @@ PYEOF
   # nested single-quote escaping — and Python's own quoting (single vs
   # triple, escapes) entirely. The script body never has to round-trip
   # through a shell quoter.
+  # When the caller exports FORCE_STOP=1, propagate it into the remote
+  # env so the Python payload SIGTERMs the orchestrator instead of refusing.
+  local remote_cmd="python3 -"
+  if [ "${FORCE_STOP:-}" = "1" ]; then
+    remote_cmd="bash -lc 'FORCE_STOP=1 exec python3 -'"
+  fi
   local result
   if ! result="$(printf '%s' "$payload" \
         | flyctl ssh console --app "$app" --machine "$machine" \
-            --pty=false -C "python3 -" 2>&1)"; then
+            --pty=false -C "$remote_cmd" 2>&1)"; then
     remote_log "force-finalize: SSH to machine $machine failed"
     remote_log "  output: $result"
     return 1
@@ -312,7 +383,7 @@ PYEOF
   # CRLF line endings when fronted by a TTY-emulating layer).
   local sentinel
   sentinel="$(printf '%s\n' "$result" | tr -d '\r' \
-              | grep -E '^(OK|REFUSE-ALIVE-SCAN|REFUSE-ALIVE|REFUSE-NOPID|REFUSE-MULTI|REFUSE-NONE|ERROR):?' \
+              | grep -E '^(OK|STOPPED|STOP-FAILED|REFUSE-ALIVE-SCAN|REFUSE-ALIVE|REFUSE-NOPID|REFUSE-MULTI|REFUSE-NONE|ERROR):?' \
               | tail -1 || true)"
   if [ -z "$sentinel" ]; then
     remote_log "force-finalize: no sentinel in remote output:"
@@ -325,6 +396,22 @@ PYEOF
       local rid="${sentinel#OK:}"
       remote_log "force-finalize: machine=$machine run=$rid patched (finished_at + recovered_at + recovered_via=force-finalize)"
       return 0
+      ;;
+    STOPPED:*)
+      local rest="${sentinel#STOPPED:}"
+      local rid="${rest%%:*}"
+      local spid="${rest#*:}"
+      remote_log "force-finalize: machine=$machine run=$rid — stopped orchestrator pid $spid, then patched (finished_at + recovered_at + recovered_via=force-finalize)"
+      return 0
+      ;;
+    STOP-FAILED:*)
+      local rest="${sentinel#STOP-FAILED:}"
+      local rid="${rest%%:*}"
+      local spid="${rest#*:}"
+      remote_log "force-finalize: STOP-FAILED — could not kill orchestrator pid $spid for run $rid on machine $machine."
+      remote_log "  The process did not die after SIGTERM + SIGKILL. Inspect manually with"
+      remote_log "  \`leerie --resume <run-id> --shell\`, then \`--kill\` when done."
+      return 1
       ;;
     REFUSE-ALIVE-SCAN:*)
       local rest="${sentinel#REFUSE-ALIVE-SCAN:}"
