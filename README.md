@@ -194,7 +194,7 @@ leerie "task" --clarify
 # set to "codebase", "research", or "both".
 leerie "task" --answers answers.json
 
-# Override caps (defaults: 200 total workers, 2 in parallel per wave).
+# Override caps (defaults: 200 total workers, 10 in parallel per wave).
 # --max-workers also reads LEERIE_MAX_WORKERS or max_workers in
 # leerie.toml; --max-parallel is CLI-only.
 leerie "task" --max-workers 80 --max-parallel 4
@@ -289,7 +289,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
 | `--clarify` | off | Opt into surfacing intent questions to the user. Default: questions are dropped after the classifier's codebase→research filter, and the implementer makes a documented best-effort decision. Also `LEERIE_CLARIFY` env var or `clarify = true` in `leerie.toml`. |
 | `--max-workers N` | `200` | Cap on total `claude -p` invocations across the run. Also `LEERIE_MAX_WORKERS` env var or `max_workers` in `leerie.toml`. |
-| `--max-parallel N` | `2` | Cap on concurrent workers within a wave. Lowered from 4 in May 2026 because subprocess fan-out inside each worker (vitest pools, webpack workers, etc.) is unbounded; raise this on machines with ≥16 GiB RAM. |
+| `--max-parallel N` | `10` | Cap on concurrent workers within a wave. Per-worker cgroup containment keeps an OOM inside one worker's cgroup; users on smaller VMs can opt down. |
 | `--worker-memory-max SIZE` | auto | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Bounds RAM the worker subtree may consume; OOMs stay inside the worker cgroup rather than cascading to sshd / orchestrator. Auto-derived from `/proc/meminfo` when unset (VM RAM / `max_parallel+1`, capped at 4 GiB). Also `LEERIE_WORKER_MEMORY_MAX` or `worker_memory_max` in `leerie.toml`. |
 | `--confidence-rounds N` | `8` | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `LEERIE_CONFIDENCE_ROUNDS` and `leerie.toml`. |
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |

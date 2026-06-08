@@ -94,20 +94,12 @@ MIN_CLAUDE_CLI = (2, 1, 22)
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
     "max_total_workers": 200,       # hard ceiling on claude -p invocations
-    # Concurrent workers within a wave. Lowered from 4 to 2 because the
-    # subprocess fan-out *inside* each `claude -p` worker (Bash tool, the
-    # Task tool's background-job pattern, toolchain children like vitest
-    # pools / webpack workers / tsc) is unbounded — the only orchestrator-
-    # side knob that bounds total in-flight memory load is the worker count.
-    # At max_parallel=4 a typical Next.js repo can run 3+ concurrent Node
-    # toolchain processes (each 1-2 GiB RSS) before leerie even notices, which
-    # is exactly the load profile that OOM'd the finalmemoriam run.
-    # max_parallel=2 keeps the worst-case peak within reach of a 16 GiB VM.
-    # Users with larger VMs / lighter toolchains can opt up via --max-parallel.
-    # Per-worker cgroup containment (DESIGN §6 *Memory containment*) is the
-    # other half of the fix: with both, an OOM stays inside one worker's
-    # cgroup instead of cascading to sshd / lima-guestagent.
-    "max_parallel": 2,              # concurrent workers within a wave
+    # Concurrent workers within a wave. Per-worker cgroup containment
+    # (DESIGN §6 *Memory containment*) keeps an OOM inside one worker's
+    # cgroup, so wave-level parallelism can be high without cascading to
+    # sshd / lima-guestagent. Users on smaller VMs can opt down via
+    # --max-parallel.
+    "max_parallel": 10,             # concurrent workers within a wave
     # Per-subtask re-spawn budget. Consumed by BOTH context-exhaustion
     # handoffs and DESIGN §11 mid-execution clarifications — a subtask
     # that mixes the two is still bounded by this single cap, so "ask
