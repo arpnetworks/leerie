@@ -12,7 +12,7 @@ run.json — turning a successful no-op into a `push-failed` row in
 The check lives entirely in the bash launcher (`leerie`), so this test
 invokes a minimal bash harness that mirrors the exact block from the
 launcher's host-side finalize step. Analogous to
-`test_launcher_remote_knob.py` and `test_finalize_sh_behavior.py`.
+`test_finalize_sh_behavior.py`.
 """
 from __future__ import annotations
 
