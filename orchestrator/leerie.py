@@ -99,7 +99,7 @@ DEFAULT_CAPS = {
     # cgroup, so wave-level parallelism can be high without cascading to
     # sshd / lima-guestagent. Users on smaller VMs can opt down via
     # --max-parallel.
-    "max_parallel": 10,             # concurrent workers within a wave
+    "max_parallel": 5,              # concurrent workers within a wave
     # Per-subtask re-spawn budget. Consumed by BOTH context-exhaustion
     # handoffs and DESIGN §11 mid-execution clarifications — a subtask
     # that mixes the two is still bounded by this single cap, so "ask

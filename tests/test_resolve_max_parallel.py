@@ -16,12 +16,12 @@ def repo_root(tmp_path, monkeypatch):
     return tmp_path
 
 
-def test_default_cap_is_ten(leerie):
-    assert leerie.DEFAULT_CAPS["max_parallel"] == 10
+def test_default_cap_is_five(leerie):
+    assert leerie.DEFAULT_CAPS["max_parallel"] == 5
 
 
 def test_default_when_nothing_set(leerie, repo_root):
-    assert leerie.resolve_max_parallel(repo_root) == 10
+    assert leerie.resolve_max_parallel(repo_root) == 5
 
 
 def test_file_value(leerie, repo_root):
@@ -94,9 +94,9 @@ def test_zero_file_value_dies(leerie, repo_root, capsys):
 
 def test_empty_env_treated_as_unset(leerie, repo_root, monkeypatch):
     monkeypatch.setenv("LEERIE_MAX_PARALLEL", "")
-    assert leerie.resolve_max_parallel(repo_root) == 10
+    assert leerie.resolve_max_parallel(repo_root) == 5
 
 
 def test_whitespace_only_env_treated_as_unset(leerie, repo_root, monkeypatch):
     monkeypatch.setenv("LEERIE_MAX_PARALLEL", "   ")
-    assert leerie.resolve_max_parallel(repo_root) == 10
+    assert leerie.resolve_max_parallel(repo_root) == 5
