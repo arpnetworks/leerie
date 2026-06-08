@@ -7,7 +7,7 @@
 # at `<state-root>/runs/<run-id>/worktrees/staging`.
 #
 # State root: $LEERIE_STATE_DIR when set (centralized, outside the repo);
-# falls back to `.leerie` (repo-relative, legacy behavior).
+# falls back to `.leerie` (repo-relative; used by tests and direct invocations).
 #
 # GENUINELY idempotent: if `leerie/runs/<run-id>` already exists (a run
 # is in progress, or this is a --resume), the branch is LEFT WHERE IT IS.

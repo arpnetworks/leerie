@@ -1,13 +1,8 @@
 """Tests for the --runtime / LEERIE_RUNTIME / leerie.toml `runtime` launcher knob.
 
-config-004 added a canonical RUNTIME variable that supersedes the legacy
-REMOTE/--remote interface.  The parsing logic lives in the bash launcher
-(`leerie`), so these tests use a minimal bash harness that mirrors the exact
-resolution block and echoes the resolved RUNTIME value.
-
-The legacy --remote / LEERIE_REMOTE / leerie.toml `remote=true` aliases are also
-tested here because they map to RUNTIME=fly and the two knobs interact via
-the backward-compat alias path.
+The parsing logic lives in the bash launcher (`leerie`), so these tests use a
+minimal bash harness that mirrors the exact resolution block and echoes the
+resolved RUNTIME value.
 """
 from __future__ import annotations
 
@@ -18,13 +13,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Bash harness that mirrors the RUNTIME resolution block from `leerie`.
 # Precedence (lowest → highest): default → TOML → env → CLI.
-# The block order matches the fixed launcher:
-#   1. default RUNTIME=local
-#   2. legacy leerie.toml remote=true → RUNTIME=fly
-#   3. canonical leerie.toml runtime=...
-#   4. legacy LEERIE_REMOTE env alias → RUNTIME=fly
-#   5. canonical LEERIE_RUNTIME env
-#   6. CLI --remote (legacy) / --runtime=VALUE / --runtime VALUE
 _HARNESS = r"""
 #!/usr/bin/env bash
 set -euo pipefail
@@ -34,16 +22,6 @@ shift   # remaining args are simulated CLI
 RUNTIME=local
 
 if [ -f "$USER_REPO/leerie.toml" ]; then
-  # step 2: legacy toml
-  toml_remote="$(awk '/^[[:space:]]*remote[[:space:]]*=/ {
-                        gsub(/^[[:space:]]*remote[[:space:]]*=[[:space:]]*/, "", $0);
-                        gsub(/^"|"$/, "", $0);
-                        print; exit
-                      }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
-  case "${toml_remote:-}" in
-    1|true|TRUE|yes|YES) RUNTIME=fly ;;
-  esac
-  # step 3: canonical toml
   toml_runtime="$(awk '/^[[:space:]]*runtime[[:space:]]*=/ {
                          gsub(/^[[:space:]]*runtime[[:space:]]*=[[:space:]]*/, "", $0);
                          gsub(/^"|"$/, "", $0);
@@ -59,12 +37,6 @@ if [ -f "$USER_REPO/leerie.toml" ]; then
   esac
 fi
 
-# step 4: legacy env alias
-case "${LEERIE_REMOTE:-}" in
-  1|true|TRUE|yes|YES) RUNTIME=fly ;;
-esac
-
-# step 5: canonical env
 case "${LEERIE_RUNTIME:-}" in
   local|fly) RUNTIME="${LEERIE_RUNTIME}" ;;
   "")        : ;;
@@ -74,10 +46,9 @@ case "${LEERIE_RUNTIME:-}" in
     ;;
 esac
 
-# step 6+7: CLI (--runtime=VALUE form)
+# CLI (--runtime=VALUE form)
 for arg in "$@"; do
   case "$arg" in
-    --remote)          RUNTIME=fly ;;
     --runtime=local)   RUNTIME=local ;;
     --runtime=fly)     RUNTIME=fly ;;
     --runtime=*)
@@ -87,7 +58,7 @@ for arg in "$@"; do
   esac
 done
 
-# step 7b: two-arg form --runtime VALUE
+# two-arg form --runtime VALUE
 prev_was_runtime=false
 for arg in "$@"; do
   if $prev_was_runtime; then
@@ -235,36 +206,4 @@ def test_env_wins_over_toml(tmp_path):
 def test_cli_wins_over_toml(tmp_path):
     (tmp_path / "leerie.toml").write_text("runtime = fly\n")
     out, _ = _run(tmp_path, {}, ["--runtime=local"])
-    assert out == "local"
-
-
-# ── legacy backward-compat aliases ────────────────────────────────────────────
-
-
-def test_legacy_env_leerie_remote_maps_to_fly(tmp_path):
-    out, _ = _run(tmp_path, {"LEERIE_REMOTE": "1"}, [])
-    assert out == "fly"
-
-
-def test_legacy_cli_remote_maps_to_fly(tmp_path):
-    out, _ = _run(tmp_path, {}, ["--remote"])
-    assert out == "fly"
-
-
-def test_legacy_toml_remote_true_maps_to_fly(tmp_path):
-    (tmp_path / "leerie.toml").write_text("remote = true\n")
-    out, _ = _run(tmp_path, {}, [])
-    assert out == "fly"
-
-
-def test_canonical_env_beats_legacy_env(tmp_path):
-    """LEERIE_RUNTIME=local beats LEERIE_REMOTE=1 because canonical is resolved after."""
-    out, _ = _run(tmp_path, {"LEERIE_REMOTE": "1", "LEERIE_RUNTIME": "local"}, [])
-    assert out == "local"
-
-
-def test_canonical_toml_beats_legacy_toml(tmp_path):
-    """runtime=local wins over remote=true in the same leerie.toml."""
-    (tmp_path / "leerie.toml").write_text("remote = true\nruntime = local\n")
-    out, _ = _run(tmp_path, {}, [])
     assert out == "local"

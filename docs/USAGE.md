@@ -406,14 +406,9 @@ leerie --chain-submit \
   --wave-b-runs prompts/02-write-migration.md,prompts/03-update-api-layer.md \
   --target ~/src/myrepo
 
-# Legacy alias: --runs is equivalent to --wave-a-runs (Wave A only).
-# Use this shape when every task is independent and runs in parallel.
-leerie --chain-submit \
-  --runs prompts/01-refactor-data-model.md,prompts/02-write-migration.md,prompts/03-update-api-layer.md \
-  --target ~/src/myrepo
 ```
 
-Each `--wave-a-runs` / `--wave-b-runs` / `--runs` value is a
+Each `--wave-a-runs` / `--wave-b-runs` value is a
 comma-separated list of prompt-file paths (resolved on the host).
 `--target` is the local path of the repository to run against; it
 defaults to `$PWD` when omitted. `leerie-chain` receives a `POST

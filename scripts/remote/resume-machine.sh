@@ -87,7 +87,7 @@ resume_machine() {
   fi
 
   # Clear the pause sentinels so the run no longer renders as
-  # paused in `leerie --list-paused` once the resume succeeds.
+  # paused in `leerie --list --status paused` once the resume succeeds.
   if [ -n "${USER_REPO:-}" ] && [ -n "${LEERIE_RUN_ID:-}" ]; then
     local sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
     if [ -f "$sidecar" ]; then

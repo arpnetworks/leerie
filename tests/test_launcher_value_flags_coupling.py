@@ -117,7 +117,6 @@ _LAUNCHER_ONLY_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     "--local-build",
     "--no-re-seed",
     "--force",
-    "--remote",  # legacy alias for --runtime fly
 })
 
 

@@ -1856,11 +1856,6 @@ def _check_claude_cli_version() -> None:
         )
 
 
-# `_check_gh_cli` was removed when finalize moved to the host launcher
-# (DESIGN §6 *Finalization*). The launcher does `gh auth status` + the
-# origin check itself, before spinning up the container — auth state
-# lives on the host, so the check belongs there.
-
 
 # --- run identifier (DESIGN §6 "The run identifier") --------------------
 #
@@ -2576,12 +2571,6 @@ def list_runs(
     _render_run_table(rows)
 
 
-def list_paused_runs(leerie_root: Path) -> None:
-    """Deprecated alias: routes through `list_runs(status_filter=
-    "paused")`. The new equivalent is `leerie --list --status
-    paused`. Kept for backward-compat."""
-    list_runs(leerie_root, status_filter="paused")
-
 
 def _read_toml_key(path: Path, key: str) -> str | None:
     """Read a single `key = value` from a flat leerie.toml. Returns
@@ -2644,7 +2633,7 @@ def resolve_leerie_root(repo_root: Path) -> Path:
     $LEERIE_STATE_HOST_DIR (default $HOME/.leerie/<basename>/) — so all
     run state lives outside the repo. The unset branch only fires for
     direct (non-launcher) Python callers like the test suite, where it
-    falls back to the legacy in-repo `.leerie/` layout.
+    falls back to the in-repo `.leerie/` layout (used by tests and direct invocations).
     """
     env = os.environ.get(STATE_DIR_ENV, "").strip()
     if env:
@@ -10116,7 +10105,7 @@ def _build_unresolved_retry_prompt(
 def _validate_unresolved_must_include(
     output: dict,
     unresolved: list[dict],
-    attempt_1_output: dict | None = None,
+    attempt_1_output: dict | None,
 ) -> list[str]:
     """For each unresolved (sid, tag), check the reconciler's revised
     output addresses it via one of: rename on that sid+tag, added_provides
@@ -10149,9 +10138,8 @@ def _validate_unresolved_must_include(
     structural constraint and the run aborts cleanly.
 
     `attempt_1_output` is the failing first-attempt reconciler output
-    (in scope as `output` at the call site). Optional only for
-    backward-compat with existing tests that don't pass it; production
-    code always passes it.
+    (in scope as `output` at the call site). Pass `None` when no
+    attempt-1 output is available (no pre-revert tag lookup occurs).
     """
     # Build a (consumer_sid → pre_revert_tag) lookup from attempt-1's
     # renames so we can accept the pre-revert tag alongside the
@@ -13578,9 +13566,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     help=f"with --list, restrict the table to runs whose "
                          f"derived status matches STATE. One of: "
                          f"{', '.join(RUN_STATUSES)}.")
-    ap.add_argument("--list-paused", action="store_true", dest="list_paused",
-                    help="DEPRECATED: alias for --list --status paused. "
-                         "Kept for backward-compat; prefer the explicit form.")
     ap.add_argument("--answers", metavar="FILE",
                     help="JSON file of pre-supplied clarification answers")
     ap.add_argument("--clarify", action="store_true",
@@ -13816,9 +13801,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "reports to <run-dir>/<heal-dir>/.")
     args = ap.parse_args()
 
-    # --list / --list-paused short-circuit everything else: read
-    # <state-root>/runs/* and exit. No git/CLI checks needed; the user might
-    # be inspecting runs from outside a git repo.
+    # --list short-circuits everything else: read <state-root>/runs/* and
+    # exit. No git/CLI checks needed; the user might be inspecting runs
+    # from outside a git repo.
     if args.list_runs:
         leerie_root = resolve_leerie_root(Path(os.getcwd()))
         list_runs(
@@ -13826,10 +13811,6 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             status_filter=args.status_filter,
             runtime_filter=args.runtime,
         )
-        return
-    if args.list_paused:
-        leerie_root = resolve_leerie_root(Path(os.getcwd()))
-        list_paused_runs(leerie_root)
         return
 
     if not shutil.which("claude"):

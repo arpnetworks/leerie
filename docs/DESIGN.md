@@ -1407,9 +1407,8 @@ remote run lifecycle, each doing exactly one thing:
 | `leerie --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
 
 Plus `leerie --list` (unified across local and remote, with `--status
-<state>` and `--runtime <local|fly>` filtering as orthogonal axes —
-`--list-paused` becomes a deprecated alias for `--list --status
-paused`). Status describes the run's lifecycle (`paused`, `killed`,
+<state>` and `--runtime <local|fly>` filtering as orthogonal axes).
+Status describes the run's lifecycle (`paused`, `killed`,
 `done`, `sync-failed`, `in-progress`, `done-pushed-pr`, ...); runtime
 describes where it ran (`local` or `fly`). `--list --runtime fly`
 short-circuits in the launcher and queries Fly directly via `flyctl
@@ -2885,12 +2884,6 @@ rationale behind the CLI-subprocess shape that makes this natural):
 leerie --chain-submit \
        --wave-a-runs prompts/fetch.txt,prompts/lint.txt \
        --wave-b-runs prompts/summarize.txt,prompts/publish.txt \
-       --target ~/src/enric/summarizer
-
-# Legacy alias: --runs is equivalent to --wave-a-runs (Wave A only).
-# Use this shape when the chain has no Wave B consumers.
-leerie --chain-submit \
-       --runs prompts/run-1.txt,prompts/run-2.txt,prompts/run-3.txt \
        --target ~/src/enric/summarizer
 
 leerie --chain-status <chain-id>

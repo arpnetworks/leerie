@@ -303,7 +303,7 @@ Flags:
 | `--no-auto-publish` | `LEERIE_NO_AUTO_PUBLISH=1` | off | Skip the probe entirely; trust the operator to have published the image. The run still proceeds; if the tag is missing, `provision_machine` fails as before. |
 
 The flag is consumed by the launcher and not forwarded to the
-orchestrator (same convention as `--no-runtime-install` and `--remote`).
+orchestrator (same convention as `--no-runtime-install`).
 
 Note the key paths inside the container:
 
@@ -738,7 +738,6 @@ leerie "task" --runtime fly
 export LEERIE_RUNTIME=fly
 # Or commit to leerie.toml for a per-repo default:
 #   runtime = fly
-# Legacy aliases still work (--remote, LEERIE_REMOTE=1, leerie.toml remote=true).
 
 # Skip pre-push hooks at finalize (the user's explicit override; defaults off).
 # Affects only the final `git push`; worker `git commit` operations inside
@@ -869,10 +868,6 @@ leerie --chain-submit \
   --wave-a-runs prompts/fetch.txt,prompts/lint.txt \
   --wave-b-runs prompts/publish.txt \
   --target ~/src/myrepo
-
-# Legacy alias: --runs is equivalent to --wave-a-runs (Wave A only).
-# Use this shape for chains with no Wave B consumers.
-leerie --chain-submit --runs prompts/run-1.txt,prompts/run-2.txt --target ~/src/myrepo
 
 # Check status of a chain. Prints the JSON response from GET /chains/<id>.
 leerie --chain-status <chain-id>
@@ -1795,7 +1790,7 @@ container.
 
 | Verb | Flags | API call |
 |------|-------|----------|
-| `leerie --chain-submit` | one or more of `--wave-a-runs <files>`, `--wave-b-runs <files>`; legacy alias `--runs <files>` = Wave A only; `--target <repo>` (optional, defaults to `$USER_REPO` or `$PWD`) | `POST /chains` — body is `{"runs": [{"prompt": ..., "wave": "a" \| "b"}, ...], "target": "..."}` built with `python3 -c '...'`. Each `--runs`/`--wave-*-runs` value is a comma-separated list of *prompt file paths*; the launcher reads each file and sends its contents as the prompt (DESIGN.md §19 *Wave A and Wave B sequencing*). |
+| `leerie --chain-submit` | one or more of `--wave-a-runs <files>`, `--wave-b-runs <files>`; `--target <repo>` (optional, defaults to `$USER_REPO` or `$PWD`) | `POST /chains` — body is `{"runs": [{"prompt": ..., "wave": "a" \| "b"}, ...], "target": "..."}` built with `python3 -c '...'`. Each `--wave-*-runs` value is a comma-separated list of *prompt file paths*; the launcher reads each file and sends its contents as the prompt (DESIGN.md §19 *Wave A and Wave B sequencing*). |
 | `leerie --chain-status <chain-id>` | positional `<chain-id>` | `GET /chains/<chain-id>` |
 | `leerie --list-chains` | none | `GET /chains` — returns `{"chains": [...]}` (summary rows; no run details) |
 | `leerie --chain-kill <chain-id>` | positional `<chain-id>` | `DELETE /chains/<chain-id>` — server destroys every still-running per-run Fly machine via `fly_client.destroy_machine`, transitions the chain to `'cancelled'`, returns `{"chain": <snapshot>}` (or `{"chain": ..., "warnings": [...]}` on partial Fly-side failure). Idempotent on already-terminal chains. |
@@ -1803,10 +1798,9 @@ container.
 
 All five verbs exit non-zero on missing required args or when a positional
 argument looks like a flag (starts with `--`). `--chain-submit` exits non-zero
-when none of `--runs`/`--wave-a-runs`/`--wave-b-runs` are passed, when
-`--runs` and `--wave-a-runs` are both passed (mutually exclusive — both mean
-Wave A), when a referenced prompt file does not exist or is empty, or when
-an unrecognised flag is passed.
+when none of `--wave-a-runs`/`--wave-b-runs` are passed, when a referenced
+prompt file does not exist or is empty, or when an unrecognised flag is
+passed.
 
 The launcher/server route contract is enforced mechanically by
 `tests/test_chain_server.py::TestLauncherServerCoupling` — it greps every
@@ -1993,7 +1987,7 @@ All in `leerie.py`, in execution order. This is the concrete catalogue behind
 | `git user.email` / `user.name` set | commits would fail silently without identity |
 | working tree clean | dirty tree → ambiguous diffs, corrupt merge history |
 | `claude --version` ≥ `MIN_CLAUDE_CLI` (currently `(2, 1, 22)`) | CLI too old for `--json-schema` (introduced for `claude -p` in v2.1.22) — replaces the cryptic "unknown option" message a stale CLI used to produce |
-| `_check_gh_cli(no_push)` — `gh` installed, `gh auth status` ok, `origin` remote present | finalize would fail at push/PR after the full run already ran. Short-circuited when `--no-push` is passed (env / TOML mirrors). |
+| `gh auth status` + `origin` remote (launcher bash, before container) | finalize would fail at push/PR after the full run already ran. Short-circuited when `--no-push` is passed (env / TOML mirrors). |
 | live `claude -p` smoke test | auth failure or network problem |
 
 Run-id collisions are detected outside preflight because the final `run_id` is only known after `phase_classify` returns. There are two natural collision points:
@@ -2848,7 +2842,7 @@ different call site — see *Remote execution mode* below.
 checks `git rev-parse --is-inside-work-tree`, `shutil.which gh`,
 `gh auth status`, and `git remote get-url origin` BEFORE spinning up
 the container. Each failure dies with the same actionable message
-the orchestrator's `_check_gh_cli` used to print, plus the `--no-push`
+actionable messages about each failure, plus the `--no-push`
 escape hatch. The orchestrator no longer runs these checks; they
 moved to the host where the auth state actually lives.
 
@@ -2873,22 +2867,16 @@ run all hooks).
 execution to Fly.io Machines instead of the local `nerdctl run`. The
 Colima/containerd preflight block is gated on `RUNTIME=local` and skipped
 entirely when `RUNTIME=fly`. `--runtime` flows through `REWRITTEN_ARGS`
-to the orchestrator's argparse; `--remote` (legacy) is consumed and not
-forwarded.
+to the orchestrator's argparse.
 
 Resolution order (highest priority first):
 
-1. **`--runtime local|fly`** CLI flag (canonical). Passed through to the
+1. **`--runtime local|fly`** CLI flag. Passed through to the
    orchestrator so both the launcher and the orchestrator share the same
    resolved value.
 2. **`LEERIE_RUNTIME`** environment variable, values `local` | `fly`.
 3. **`leerie.toml`** at the repo root, `runtime = local|fly`.
-4. **`--remote`** CLI flag (legacy alias for `--runtime fly`; consumed,
-   not forwarded).
-5. **`LEERIE_REMOTE`** environment variable (boolean: `1`/`true`/`TRUE`/`yes`/`YES`;
-   legacy alias).
-6. **`leerie.toml`** `remote = true` (legacy alias).
-7. **Default `local`** — local `nerdctl run` is used when unset.
+4. **Default `local`** — local `nerdctl run` is used when unset.
 
 Invalid values in env or TOML are rejected immediately with an error
 message and exit 1 before any preflight runs.
@@ -3750,12 +3738,6 @@ Changes:
   those whose derived status matches. `<state>` accepts any value in
   `RUN_STATUSES` (see list above). Invalid values produce an
   argparse error listing the allowed set.
-- `--list-paused` is deprecated. The existing flag continues to work
-  and `list_paused_runs` is kept as a thin alias that calls
-  `list_runs(leerie_root, status_filter="paused")` — preserves every
-  existing import site and test against `list_paused_runs`. `--help`
-  marks `--list-paused` as deprecated and recommends `--list --status
-  paused`.
 - `--list --runtime fly` is intercepted by the launcher (bash) before
   the orchestrator dispatch and queries Fly directly via `flyctl
   machines list --app <FLY_APP> --json`. Renders a `machine_id |
@@ -3928,18 +3910,16 @@ orchestrator, and never start a container. `LEERIE_CHAIN_URL` sets the
 base URL (default: `http://localhost:8080`).
 
 - **`leerie --chain-submit [--wave-a-runs <files>] [--wave-b-runs <files>]
-  [--runs <files>] [--target <repo>]`** — POST `/chains`. Each
-  `--wave-*-runs` / `--runs` value is a comma-separated list of prompt-file
+  [--target <repo>]`** — POST `/chains`. Each
+  `--wave-*-runs` value is a comma-separated list of prompt-file
   paths; the launcher reads each file and emits one
   `{"prompt": <file contents>, "wave": "a" | "b"}` object per file in the
-  request body. `--runs` is preserved as a back-compat alias for Wave A and
-  is mutually exclusive with `--wave-a-runs`. `--target` is the repo path
+  request body. `--target` is the repo path
   (defaults to `$USER_REPO` or `$PWD`). The launcher converts the values to
   a JSON body via `python3 -c '...'` and passes it to `curl -X POST`. Exits
-  non-zero when none of `--runs` / `--wave-a-runs` / `--wave-b-runs` are
-  passed, when `--runs` and `--wave-a-runs` are both passed, when a
-  referenced prompt file does not exist or is empty, or when an unknown
-  flag is passed.
+  non-zero when none of `--wave-a-runs` / `--wave-b-runs` are
+  passed, when a referenced prompt file does not exist or is empty, or
+  when an unknown flag is passed.
 
 - **`leerie --chain-status <chain-id>`** — GET `/chains/<chain-id>` and
   print the JSON response. Exits non-zero when `<chain-id>` is missing or
@@ -3954,7 +3934,7 @@ base URL (default: `http://localhost:8080`).
   (streaming endpoint). Exits non-zero when `<chain-id>` is missing or
   looks like a flag.
 
-`--runs` and `--target` are intentionally absent from `_value_flags` in the
+`--target` is intentionally absent from `_value_flags` in the
 launcher (the table at `leerie:942-947` that tells the main dispatch how to
 skip value tokens when forwarding to the orchestrator's argparse). Chain
 verbs consume these flags inline and never reach the forwarding path;
@@ -4299,7 +4279,7 @@ A corrupt sidecar is flagged but does not block the rest of the system; `leerie 
 
 `RUN_STATUSES` in `leerie.py` declares the ten values; a test coupling check asserts the tuple matches every value `_derive_run_status` can return.
 
-`leerie --list --status <state>` filters the table to runs whose derived status matches. `<state>` accepts any value in `RUN_STATUSES`; invalid values produce an argparse error listing the allowed set. `leerie --list-paused` is a deprecated alias for `leerie --list --status paused` and continues to work. Both short-circuit before any git/CLI preflight, the same as `--list`.
+`leerie --list --status <state>` filters the table to runs whose derived status matches. `<state>` accepts any value in `RUN_STATUSES`; invalid values produce an argparse error listing the allowed set. `--list` short-circuits before any git/CLI preflight.
 
 `state.json` fields. This table is canonical: every field the orchestrator
 writes to `st.data` must appear here, and every field listed here must be

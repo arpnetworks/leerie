@@ -1,10 +1,10 @@
 """Tests for chain launcher verbs added per QUEUE_JOBS.md Option-1 CLI shape.
 
 Verifies that each chain verb dispatches correctly to the leerie-chain HTTP API
-(curl stubbed) and that --runs/--target are NOT in _value_flags.
+(curl stubbed) and that --target is NOT in _value_flags.
 
 Verbs under test:
-  --chain-submit   POST /chains with --runs / --wave-{a,b}-runs and --target
+  --chain-submit   POST /chains with --wave-{a,b}-runs and --target
   --chain-status   GET  /chains/<id>
   --list-chains    GET  /chains
   --chain-kill     DELETE /chains/<id>
@@ -13,7 +13,7 @@ Verbs under test:
 The --chain-submit launcher reads each prompt-file path it receives and
 sends the file's contents (one {prompt, wave} object per file) in the
 JSON body — these tests create real prompt files in tmp_path and pass
-their absolute paths to --runs/--wave-*-runs.
+their absolute paths to --wave-*-runs.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def _stub_curl(tmp_path: Path, response: str = '{"ok":true}', rc: int = 0) -> Pa
 
 def _write_prompts(tmp_path: Path, names: list[str]) -> str:
     """Create one prompt file per name under tmp_path and return them
-    as a comma-separated absolute-path string suitable for --runs."""
+    as a comma-separated absolute-path string suitable for --wave-a-runs."""
     paths: list[str] = []
     for n in names:
         p = tmp_path / n
@@ -90,7 +90,7 @@ def test_chain_submit_posts_to_chains_endpoint(tmp_path: Path):
     runs = _write_prompts(tmp_path, ["prompts/run-1.txt", "prompts/run-2.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--runs", runs,
+        "--wave-a-runs", runs,
         "--target", "/tmp/my-repo",
     ])
     assert result.returncode == 0, result.stderr
@@ -105,7 +105,7 @@ def test_chain_submit_includes_prompts_in_payload(tmp_path: Path):
     runs = _write_prompts(tmp_path, ["a.txt", "b.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--runs", runs,
+        "--wave-a-runs", runs,
         "--target", "/tmp/repo",
     ])
     assert result.returncode == 0, result.stderr
@@ -120,26 +120,12 @@ def test_chain_submit_includes_target_in_payload(tmp_path: Path):
     runs = _write_prompts(tmp_path, ["run.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--runs", runs,
+        "--wave-a-runs", runs,
         "--target", "/my/special/repo",
     ])
     assert result.returncode == 0, result.stderr
     invoc = _curl_invocations(tmp_path)
     assert "/my/special/repo" in invoc
-
-
-def test_chain_submit_legacy_runs_designates_wave_a(tmp_path: Path):
-    """--runs (legacy alias) makes every prompt a Wave A run."""
-    runs = _write_prompts(tmp_path, ["legacy.txt"])
-    result = _run_launcher(tmp_path, [
-        "--chain-submit",
-        "--runs", runs,
-        "--target", "/tmp/repo",
-    ])
-    assert result.returncode == 0, result.stderr
-    invoc = _curl_invocations(tmp_path)
-    assert '"wave": "a"' in invoc
-    assert '"wave": "b"' not in invoc
 
 
 def test_chain_submit_wave_a_and_b_split(tmp_path: Path):
@@ -160,24 +146,11 @@ def test_chain_submit_wave_a_and_b_split(tmp_path: Path):
     assert "prompt content for wave_b/p3.txt" in invoc
 
 
-def test_chain_submit_runs_and_wave_a_runs_are_mutually_exclusive(tmp_path: Path):
-    """--runs and --wave-a-runs together is an error (both mean wave A)."""
-    a = _write_prompts(tmp_path, ["a.txt"])
-    b = _write_prompts(tmp_path, ["b.txt"])
-    result = _run_launcher(tmp_path, [
-        "--chain-submit",
-        "--runs", a,
-        "--wave-a-runs", b,
-    ])
-    assert result.returncode != 0
-    assert "mutually exclusive" in result.stderr
-
-
 def test_chain_submit_missing_prompt_file_errors(tmp_path: Path):
-    """A --runs path that does not exist is a hard error, not a silent drop."""
+    """A --wave-a-runs path that does not exist is a hard error, not a silent drop."""
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--runs", str(tmp_path / "does-not-exist.txt"),
+        "--wave-a-runs", str(tmp_path / "does-not-exist.txt"),
         "--target", "/tmp/repo",
     ])
     assert result.returncode != 0
@@ -190,25 +163,25 @@ def test_chain_submit_empty_prompt_file_errors(tmp_path: Path):
     empty.write_text("")
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--runs", str(empty),
+        "--wave-a-runs", str(empty),
         "--target", "/tmp/repo",
     ])
     assert result.returncode != 0
     assert "empty" in result.stderr
 
 
-def test_chain_submit_requires_runs(tmp_path: Path):
-    """--chain-submit without --runs/--wave-*-runs exits non-zero with an error."""
+def test_chain_submit_requires_wave_runs(tmp_path: Path):
+    """--chain-submit without --wave-*-runs exits non-zero with an error."""
     result = _run_launcher(tmp_path, ["--chain-submit", "--target", "/tmp/repo"])
     assert result.returncode != 0
-    assert "--runs" in result.stderr or "wave" in result.stderr.lower()
+    assert "wave" in result.stderr.lower()
 
 
 def test_chain_submit_target_optional(tmp_path: Path):
     """--chain-submit without --target succeeds (target defaults to USER_REPO)."""
     runs = _write_prompts(tmp_path, ["run.txt"])
     result = _run_launcher(tmp_path, [
-        "--chain-submit", "--runs", runs,
+        "--chain-submit", "--wave-a-runs", runs,
     ])
     assert result.returncode == 0, result.stderr
     invoc = _curl_invocations(tmp_path)
@@ -220,7 +193,7 @@ def test_chain_submit_rejects_unknown_flags(tmp_path: Path):
     """--chain-submit rejects unknown flags."""
     runs = _write_prompts(tmp_path, ["a.txt"])
     result = _run_launcher(tmp_path, [
-        "--chain-submit", "--runs", runs, "--bogus",
+        "--chain-submit", "--wave-a-runs", runs, "--bogus",
     ])
     assert result.returncode != 0
 
@@ -343,22 +316,18 @@ def test_chain_attach_rejects_flag_as_id(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------
-# Value-flags coupling: --runs and --target must NOT be in _value_flags
+# Value-flags coupling: --target must NOT be in _value_flags
 # ---------------------------------------------------------------------------
 
 def test_chain_flags_absent_from_value_flags():
-    """--runs and --target are launcher-fast-path flags, not forwarded to the
-    orchestrator argparse, so they must NOT appear in _value_flags."""
+    """--target is a launcher-fast-path flag, not forwarded to the
+    orchestrator argparse, so it must NOT appear in _value_flags."""
     import re
     src = LAUNCHER.read_text()
     m = re.search(r'_value_flags="\s*([^"]+?)"', src, flags=re.DOTALL)
     assert m, "could not find _value_flags= assignment in launcher"
     raw = m.group(1).replace("\\\n", " ")
     flags = {w for w in raw.split() if w.startswith("--")}
-    assert "--runs" not in flags, (
-        "--runs must NOT be in _value_flags: chain verbs are launcher-handled "
-        "fast-paths, not forwarded to the orchestrator argparse"
-    )
     assert "--target" not in flags, (
         "--target must NOT be in _value_flags: chain verbs are launcher-handled "
         "fast-paths, not forwarded to the orchestrator argparse"

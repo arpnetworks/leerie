@@ -307,7 +307,7 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 # (default: http://localhost:8080). These verbs are launcher fast-paths
 # (like --kill) — they never start a container and do not forward to the
 # Python orchestrator. --wave-a-runs / --wave-b-runs are the canonical
-# flags (legacy alias: --runs = Wave A only):
+# flags:
 ./leerie --chain-submit \
   --wave-a-runs "prompts/fetch.md,prompts/lint.md" \
   --wave-b-runs "prompts/publish.md" \
@@ -325,7 +325,7 @@ export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
 `resolve_runtime`, `gather_answers` validation gate, `_retryable_failure`,
 `check_merge_committed`, `validate_result`, `validate_plan`,
-`_validate_run_json`, `_derive_run_status`, `list_paused_runs`)
+`_validate_run_json`, `_derive_run_status`)
 including a coupling test that the
 retry-policy markers match the live check-function strings. The
 remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,

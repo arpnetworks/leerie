@@ -6,7 +6,7 @@
 #
 # Paths resolve via ${LEERIE_STATE_DIR:-.leerie} (i.e. <state-root>).
 # Inside the container this is /leerie-state; on the host without an
-# override it falls back to the legacy repo-local .leerie/.
+# override it falls back to the repo-local .leerie/ (used by tests and non-containerized invocations).
 #
 # Modes:
 #   cleanup.sh --run-id <id> [--branches | --subtask-branches]

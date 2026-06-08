@@ -245,10 +245,6 @@ leerie --chain-submit \
   --wave-b-runs prompts/publish.md \
   --target ~/src/myrepo
 
-# Legacy alias: --runs is equivalent to --wave-a-runs (Wave A only).
-# Use this when the chain has no Wave B consumers.
-leerie --chain-submit --runs prompts/run-a.md,prompts/run-b.md --target ~/src/myrepo
-
 # Check status of a running or completed chain:
 leerie --chain-status <chain-id>
 
@@ -285,7 +281,6 @@ Complete reference for every CLI flag, environment variable, and
 | `--run-id ID` | — | Select a specific run by id (e.g., for `--resume` or `--phase` when multiple runs are in flight). |
 | `--list` | off | Enumerate in-flight and completed runs in this repository (run id, started, status, branch). |
 | `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `LEERIE_NO_PUSH` / `leerie.toml`. |
-| `--remote` | off | **Legacy alias for `--runtime fly`.** Maps to `RUNTIME=fly` in the launcher and is consumed before `REWRITTEN_ARGS`, so the orchestrator never sees it. Also `LEERIE_REMOTE` env var or `remote = true` in `leerie.toml`. Prefer `--runtime fly` in new invocations. |
 | `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
 | `--clarify` | off | Opt into surfacing intent questions to the user. Default: questions are dropped after the classifier's codebase→research filter, and the implementer makes a documented best-effort decision. Also `LEERIE_CLARIFY` env var or `clarify = true` in `leerie.toml`. |
@@ -315,7 +310,6 @@ Complete reference for every CLI flag, environment variable, and
 | `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
 | `--version` | — | Print `leerie <version>` and exit. |
 | `--status STATE` | — | With `--list`, restrict the table to runs whose derived status matches STATE. |
-| `--list-paused` | off | **Deprecated:** alias for `--list --status paused`. Prefer the explicit form. |
 | `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` or `skip_overlap_judge` in `leerie.toml`. |
 | `--skip-budget-check` | off | Skip the post-schedule budget-feasibility preflight (DESIGN §13). The runtime backstop in `State.bump_workers()` still fires. Also `LEERIE_SKIP_BUDGET_CHECK` or `skip_budget_check` in `leerie.toml`. |
 | `--dangerously-skip-permissions` | off | Pass `--dangerously-skip-permissions` to every `claude -p` worker, including judgment workers that run in the real repo cwd. Waives DESIGN §12 read-only enforcement. Also `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` or `dangerously_skip_permissions` in `leerie.toml`. |
@@ -370,7 +364,6 @@ flags); run `leerie --help` inside a container or see below.
 | `LEERIE_INSPECT_DIRS` | `inspect_dirs` | Extra directories the inspect-bucket workers (classifier, planner, reconciler, provision) may read; forwarded as `--add-dir`. Env value is colon-separated; TOML value is comma-separated. Overridden by `--inspect-dir` (repeatable). Unset → none. |
 | `LEERIE_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. Unset → default `stream`. |
 | `LEERIE_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. Unset → default `false` (push + PR happen). |
-| `LEERIE_REMOTE` | `remote` | Route execution to a remote backend instead of local `nerdctl run` (truthy → remote). Overridden by `--remote`. Unset → default `false` (local container run). |
 | `LEERIE_CLARIFY` | `clarify` | Sticky opt-in to surfacing intent questions to the user (truthy → on). Overridden by `--clarify`. Unset → default `false`. |
 | `LEERIE_MODEL_JUDGE` | `model_judge` | Model alias for the post-run judge skill. Overridden by `--judge-model`. Unset → default `sonnet`. |
 | `LEERIE_MODEL_HEAL` | `model_heal` | Model alias for the post-run self-heal skill. Overridden by `--heal-model`. Unset → default `sonnet`. |

@@ -45,14 +45,6 @@ bash "${CLAUDE_PLUGIN_ROOT}/leerie" --chain-submit \
   --target <repo-path-or-url>
 ```
 
-For chains with only Wave A runs (no consumer wave), the legacy `--runs`
-alias is preserved and is equivalent to `--wave-a-runs`:
-
-```
-bash "${CLAUDE_PLUGIN_ROOT}/leerie" --chain-submit \
-  --runs <path/to/a1.txt,path/to/a2.txt>
-```
-
 Capture the returned chain id (the `id` field of the JSON response) so
 follow-up verbs can reference it.
 

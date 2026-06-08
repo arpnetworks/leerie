@@ -1008,21 +1008,16 @@ PY
     # POST /chains with runs (each {prompt, wave}) and target.
     # DESIGN.md §19 Wave A/B sequencing requires every run to carry an
     # explicit wave; --wave-a-runs and --wave-b-runs are the canonical
-    # split. --runs is preserved as a back-compat alias and is treated
-    # as Wave A (so the legacy "all parallel, no Wave B" shape still works).
-    # Each --runs/--wave-*-runs value is a comma-separated list of prompt
-    # *file paths*; the launcher reads each file and sends its contents
-    # as the prompt (per QUEUE_JOBS.md "Prompts passed at chain-submit time").
+    # split. Each value is a comma-separated list of prompt *file paths*;
+    # the launcher reads each file and sends its contents as the prompt
+    # (per QUEUE_JOBS.md "Prompts passed at chain-submit time").
     # LEERIE_CHAIN_URL sets the base URL (default: http://localhost:8080).
     shift
-    _cs_runs=""
     _cs_wave_a=""
     _cs_wave_b=""
     _cs_target="${USER_REPO:-$PWD}"
     while [ "$#" -gt 0 ]; do
       case "$1" in
-        --runs) _cs_runs="${2:-}"; shift 2 ;;
-        --runs=*) _cs_runs="${1#--runs=}"; shift ;;
         --wave-a-runs) _cs_wave_a="${2:-}"; shift 2 ;;
         --wave-a-runs=*) _cs_wave_a="${1#--wave-a-runs=}"; shift ;;
         --wave-b-runs) _cs_wave_b="${2:-}"; shift 2 ;;
@@ -1033,19 +1028,9 @@ PY
         *) remote_log "--chain-submit: unexpected argument: $1"; exit 1 ;;
       esac
     done
-    # --runs is the legacy alias for Wave A. Forbid mixing it with
-    # --wave-a-runs to avoid silent surprises.
-    if [ -n "$_cs_runs" ] && [ -n "$_cs_wave_a" ]; then
-      remote_log "--chain-submit: --runs and --wave-a-runs are mutually exclusive"
-      exit 1
-    fi
-    if [ -n "$_cs_runs" ]; then
-      _cs_wave_a="$_cs_runs"
-    fi
     if [ -z "$_cs_wave_a" ] && [ -z "$_cs_wave_b" ]; then
-      remote_log "--chain-submit: at least one of --runs, --wave-a-runs, --wave-b-runs is required"
+      remote_log "--chain-submit: at least one of --wave-a-runs, --wave-b-runs is required"
       echo "  Usage: leerie --chain-submit --wave-a-runs <f1,f2,...> [--wave-b-runs <f3,...>] [--target <repo>]" >&2
-      echo "         leerie --chain-submit --runs <f1,f2,...> [--target <repo>]    (legacy: all Wave A)" >&2
       exit 1
     fi
     _chain_url="${LEERIE_CHAIN_URL:-http://localhost:8080}"
@@ -1371,26 +1356,12 @@ export LEERIE_TASK_ARG
 # Resolves RUNTIME=local|fly. Precedence: CLI --runtime > LEERIE_RUNTIME env
 # > leerie.toml `runtime` key > default `local`. Mirrors the orchestrator's
 # resolve_runtime() (leerie.py) so the launcher routes correctly before the
-# container starts.
-#
-# Backward-compat aliases: --remote / LEERIE_REMOTE / leerie.toml `remote=true`
-# map to RUNTIME=fly. The --remote flag is consumed here and not forwarded;
-# --runtime is NOT consumed — it flows through REWRITTEN_ARGS to the
-# orchestrator's own argparse.
+# container starts. --runtime is NOT consumed — it flows through
+# REWRITTEN_ARGS to the orchestrator's own argparse.
 RUNTIME=local
-# Precedence (lowest → highest): default → legacy-toml → canonical-toml →
-# legacy-env → canonical-env → CLI.  TOML is resolved first so env overrides it.
+# Precedence (lowest → highest): default → toml → env → CLI.
+# TOML is resolved first so env overrides it.
 if [ -f "$USER_REPO/leerie.toml" ]; then
-  # legacy: remote = true
-  toml_remote="$(awk '/^[[:space:]]*remote[[:space:]]*=/ {
-                        gsub(/^[[:space:]]*remote[[:space:]]*=[[:space:]]*/, "", $0);
-                        gsub(/^"|"$/, "", $0);
-                        print; exit
-                      }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
-  case "${toml_remote:-}" in
-    1|true|TRUE|yes|YES) RUNTIME=fly ;;
-  esac
-  # canonical: runtime = local|fly
   toml_runtime="$(awk '/^[[:space:]]*runtime[[:space:]]*=/ {
                          gsub(/^[[:space:]]*runtime[[:space:]]*=[[:space:]]*/, "", $0);
                          gsub(/^"|"$/, "", $0);
@@ -1405,11 +1376,6 @@ if [ -f "$USER_REPO/leerie.toml" ]; then
       ;;
   esac
 fi
-# env alias (legacy) — overrides TOML
-case "${LEERIE_REMOTE:-}" in
-  1|true|TRUE|yes|YES) RUNTIME=fly ;;
-esac
-# env (canonical) — overrides TOML and legacy env alias
 case "${LEERIE_RUNTIME:-}" in
   local|fly) RUNTIME="${LEERIE_RUNTIME}" ;;
   "")        : ;;
@@ -1419,11 +1385,8 @@ case "${LEERIE_RUNTIME:-}" in
     ;;
 esac
 # CLI (highest priority) — scanned before REWRITTEN_ARGS loop below.
-# --remote sets RUNTIME=fly (legacy). --runtime=VALUE / --runtime VALUE set
-# RUNTIME directly and also flow through to the orchestrator.
 for arg in "$@"; do
   case "$arg" in
-    --remote)           RUNTIME=fly ;;
     --runtime=local)    RUNTIME=local ;;
     --runtime=fly)      RUNTIME=fly ;;
     --runtime=*)
@@ -1450,9 +1413,6 @@ for arg in "$@"; do
     prev_was_runtime=true
   fi
 done
-# Maintain backward-compat REMOTE alias consumed downstream.
-REMOTE=false
-[ "$RUNTIME" = "fly" ] && REMOTE=true
 
 # --- FLY_VM_DISK_GB (opt-in per-machine Fly volume size in GB) ------------
 # Resolution ladder (highest → lowest):
@@ -1923,10 +1883,6 @@ for arg in "$@"; do
       ;;
     --force)
       # Launcher-only flag (Phase 4); bypasses re_seed's safety check.
-      ;;
-    --remote)
-      # Launcher-only flag (legacy alias for --runtime fly); consumed by
-      # the runtime-mode knob above. The orchestrator's argparse doesn't know it.
       ;;
     --shell)
       # Launcher-only flag; opts into bash shell on the --resume rc=75 pivot

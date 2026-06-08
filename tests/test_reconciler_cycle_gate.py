@@ -1257,7 +1257,7 @@ def test_validate_unresolved_must_include_accepts_rename(leerie):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
 
 def test_validate_unresolved_must_include_accepts_added_provides(leerie):
@@ -1271,7 +1271,7 @@ def test_validate_unresolved_must_include_accepts_added_provides(leerie):
         "added_subtasks": [], "dropped_requires": [],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
 
 def test_validate_unresolved_must_include_accepts_added_subtask_with_provides(leerie):
@@ -1286,7 +1286,7 @@ def test_validate_unresolved_must_include_accepts_added_subtask_with_provides(le
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
 
 def test_validate_unresolved_must_include_accepts_unresolvable(leerie):
@@ -1301,7 +1301,7 @@ def test_validate_unresolved_must_include_accepts_unresolvable(leerie):
         "unresolvable": [{"sid": "deps-008", "tag": "cdk-stacks-authored",
                           "reason": "no real producer in this plan"}],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
 
 def test_validate_unresolved_must_include_accepts_dropped_requires(leerie):
@@ -1320,7 +1320,7 @@ def test_validate_unresolved_must_include_accepts_dropped_requires(leerie):
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
 
 def test_validate_unresolved_must_include_dropped_requires_pre_revert_tag(leerie):
@@ -1543,7 +1543,7 @@ def test_validate_unresolved_must_include_rejects_unrelated_op(leerie):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = leerie._validate_unresolved_must_include(output, unresolved)
+    unaddressed = leerie._validate_unresolved_must_include(output, unresolved, None)
     assert unaddressed == ["deps/deps-008 requires 'cdk-stacks-authored'"]
 
 
@@ -2565,7 +2565,7 @@ def test_validate_unresolved_must_include_accepts_conditional_drop(leerie):
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
 
 
 def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(leerie):
@@ -2581,7 +2581,7 @@ def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
     }
-    unaddressed = leerie._validate_unresolved_must_include(output, unresolved)
+    unaddressed = leerie._validate_unresolved_must_include(output, unresolved, None)
     assert len(unaddressed) == 1
     assert "deps-004" in unaddressed[0]
     assert "email-provider-is-ses" in unaddressed[0]
