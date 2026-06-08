@@ -788,11 +788,25 @@ push + PR sit between them on the host:
    sync-failure recovery path (work is preserved; the user destroys
    manually via `leerie --kill <run-id>` when satisfied).
 
-**Recovery when the orchestrator dies before `finished_at`.** A worker
-or orchestrator crash before `phase_finalize` leaves a run that
-`fetch-branch.sh` cannot discover (its predicate requires
-`finished_at` set + `pushed_at` unset). For these cases, `leerie
---finalize <run-id>` SSHes into the machine, verifies the
+**Controlled exits write `finished_at` eagerly.** `die()` raises
+`SystemExit`; `main()`'s `except SystemExit` handler writes
+`finished_at` to both `state.json` and `run.json` (best-effort,
+guarded by `st is not None`) before re-raising. This is necessary
+because the Fly tail wrapper always exits 0 — it polls the
+orchestrator pid and has no channel for the orchestrator's exit code —
+so `decide_teardown` takes the clean-exit branch and `fetch_branch`
+needs `finished_at` to discover the run. Without this write, every
+post-setup `die()` (e.g. "unresolved subtasks") triggers the
+sync-failure banner. The value is idempotent on `--resume`:
+`phase_finalize` overwrites it with the real completion time if the
+run succeeds on retry.
+
+**Recovery when the orchestrator dies before `finished_at`.** An
+uncontrolled exit — SIGKILL, OOM, power loss, or any crash that
+bypasses the `except SystemExit` handler — before `phase_finalize`
+leaves a run that `fetch-branch.sh` cannot discover (its predicate
+requires `finished_at` set + `pushed_at` unset). For these cases,
+`leerie --finalize <run-id>` SSHes into the machine, verifies the
 orchestrator process is dead (via the `orchestrator.pid` file and
 `/proc/<pid>/cmdline`), patches `finished_at` into `run.json` along with
 audit fields `recovered_at` and `recovered_via="force-finalize"`, and

@@ -4232,7 +4232,7 @@ discovery without parsing the full `state.json`):
 | `branch` | str | the run branch — always `leerie/runs/<run_id>` |
 | `working_branch` | str | the branch HEAD-at-run-start; used as the PR base (leerie does not merge into it locally) |
 | `started_at` | ISO-8601 str | wall-clock start time (also mirrored in `state.json`) |
-| `finished_at` | ISO-8601 str \| null | wall-clock end time, set at finalize success |
+| `finished_at` | ISO-8601 str \| null | wall-clock end time. Set at finalize success on the normal path; also set by the `except SystemExit` handler in `main()` for `die()` exits that fire after the run directory exists (on Fly, the tail wrapper exits 0 regardless of the orchestrator's exit code, so `fetch_branch`'s discovery script needs `finished_at` to find the run). Idempotent on `--resume` — `phase_finalize` overwrites it with the real completion time if the run succeeds on retry. |
 | `task` | str | the task description (mirrored from `state.json`) |
 | `pushed_at` | ISO-8601 str \| null | when the run branch was pushed to `origin`; null until push runs |
 | `push_error` | str \| null | captured `git push` stderr if the push failed; mutually exclusive with `pushed_at` being set |
@@ -4272,7 +4272,7 @@ A corrupt sidecar is flagged but does not block the rest of the system; `leerie 
 | `done-pushed-pr` | `pr_url` is set | the happy path: PR open, work merged locally |
 | `done-pushed-no-pr` | `pushed_at` set but `pr_url` not | rare: push succeeded, PR wasn't attempted (e.g., gh removed between push and PR) |
 | `sync-failed` | `sync_failed_at` set (and no `killed_at`) | the orchestrator finished but `fetch_branch` failed; the Fly machine is still running with un-synced work. Run `leerie --finalize <id>` to retry sync + push, or `leerie --resume <id>` to inspect manually (default tails the log; `--shell` opens a bash session); only `leerie --kill <id>` once work is safely on host. (DESIGN §6 *Remote pause-on-failure* — sync-before-destroy contract.) |
-| `done` | `finished_at` set, no `pushed_at` | the user passed `--no-push`; push manually if desired |
+| `done` | `finished_at` set, no `pushed_at` | the user passed `--no-push`, or the orchestrator exited via `die()` after the run directory was created (e.g. unresolved subtasks). In the latter case, `--resume` re-enters `phase_execute` normally — `finished_at` is overwritten on success. |
 | `paused` | `paused_at` is set | inspect/attach to the Fly Machine, then `leerie --resume --run-id <id> --runtime fly` (DESIGN §6 *Remote pause-on-failure*) |
 | `killed` | `killed_at` is set | terminal state — the machine was destroyed by `leerie --kill`. Not resumable; start a new run instead. |
 | `in-progress` | none of the above | the run is still active (or died very early); resume with `--resume --run-id <id>` |

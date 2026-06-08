@@ -14222,6 +14222,19 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # preflight die() before setup-run.sh ran).
         abnormal = True
         full_purge = False
+        # On Fly the tail wrapper exits 0 regardless of the orchestrator's
+        # exit code, so decide_teardown takes the clean-exit branch and
+        # fetch_branch's discovery script requires finished_at in run.json.
+        # Without this write, every post-setup die() leaves the run
+        # undiscoverable and the sync fails with "no completed unpushed
+        # run found on machine."
+        if st is not None and st.run_dir is not None:
+            try:
+                st.data["finished_at"] = now()
+                st.save()
+                _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
+            except Exception:
+                pass
         raise
     except BaseException as e:
         # Anything else (genuinely unhandled exception in orchestrate,
