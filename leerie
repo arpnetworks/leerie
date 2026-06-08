@@ -2187,7 +2187,11 @@ fi
 # No aws binary is needed inside the container for normal operation.
 # cli/cache is excluded (CLI result cache; large, irrelevant to auth).
 # Mount read-only: workers never write AWS credentials.
+_BEDROCK_ACTIVE=false
+_BEDROCK_PROFILE=""
+_BEDROCK_REGION=""
 if detect_bedrock_mode; then
+  _BEDROCK_ACTIVE=true
   if [ ! -d "$HOME/.aws" ]; then
     remote_log "error: Bedrock mode is enabled but ~/.aws/ not found on host."
     echo "  Run 'aws configure' or 'aws sso login' first, then re-run leerie." >&2
@@ -2202,6 +2206,45 @@ if detect_bedrock_mode; then
     rm -rf "$STAGE/.aws/cli/cache"
   fi
   AUTH_MOUNTS+=(-v "$STAGE/.aws:/home/leerie/.aws:ro")
+  # Belt-and-suspenders: also inject Bedrock env vars explicitly so
+  # claude -p workers activate Bedrock via process.env rather than relying
+  # solely on the settings.json env block (which may not be applied by all
+  # claude binary versions or in all cwd contexts inside the container).
+  AUTH_MOUNTS+=(-e "CLAUDE_CODE_USE_BEDROCK=1")
+  # Extract AWS_PROFILE and AWS_REGION from settings files (last-match-wins,
+  # same merge order Claude CLI uses: userSettings < projectSettings < localSettings).
+  _BEDROCK_PROFILE="$(python3 - \
+    "${HOME}/.claude/settings.json" \
+    "${USER_REPO}/.claude/settings.json" \
+    "${USER_REPO}/.claude/settings.local.json" \
+    2>/dev/null <<'PY'
+import json, sys
+v = ""
+for p in sys.argv[1:]:
+    try:
+        nv = json.load(open(p)).get("env", {}).get("AWS_PROFILE", "")
+        if nv: v = nv
+    except Exception: pass
+print(v)
+PY
+  )"
+  _BEDROCK_REGION="$(python3 - \
+    "${HOME}/.claude/settings.json" \
+    "${USER_REPO}/.claude/settings.json" \
+    "${USER_REPO}/.claude/settings.local.json" \
+    2>/dev/null <<'PY'
+import json, sys
+v = ""
+for p in sys.argv[1:]:
+    try:
+        nv = json.load(open(p)).get("env", {}).get("AWS_REGION", "")
+        if nv: v = nv
+    except Exception: pass
+print(v)
+PY
+  )"
+  [ -n "$_BEDROCK_PROFILE" ] && AUTH_MOUNTS+=(-e "AWS_PROFILE=$_BEDROCK_PROFILE")
+  [ -n "$_BEDROCK_REGION" ]  && AUTH_MOUNTS+=(-e "AWS_REGION=$_BEDROCK_REGION")
 fi
 
 # -- Mount each staged file/dir at its default in-container path. --
@@ -2843,6 +2886,16 @@ child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 # (e.g. /etc/localtime not a symlink), the substitution yields ""
 # and Python's astimezone() falls back to UTC — same as today.
 child_env["TZ"] = "${_host_tz}"
+# Belt-and-suspenders Bedrock activation: inject env vars explicitly so
+# claude -p workers use Bedrock via process.env regardless of whether the
+# settings.json env block is applied by the in-container claude binary.
+# Variables are substituted host-side (heredoc is unquoted <<PY).
+if "${_BEDROCK_ACTIVE}" == "true":
+    child_env["CLAUDE_CODE_USE_BEDROCK"] = "1"
+    if "${_BEDROCK_PROFILE}":
+        child_env["AWS_PROFILE"] = "${_BEDROCK_PROFILE}"
+    if "${_BEDROCK_REGION}":
+        child_env["AWS_REGION"] = "${_BEDROCK_REGION}"
 # Ensure the launcher's PATH includes the mise-managed claude binary.
 # (The Dockerfile installs claude into the mise-managed node prefix;
 # fly's hallpass ssh session inherits a minimal PATH that may not
