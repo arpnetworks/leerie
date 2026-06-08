@@ -161,6 +161,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Fly `fetch_branch` no longer fails after orchestrator `die()` exits.**
+  `die()` raises `SystemExit`; the `except SystemExit` handler in
+  `main()` now writes `finished_at` to both `state.json` and `run.json`
+  (best-effort, guarded by `st is not None`) before re-raising. On Fly,
+  the tail wrapper always exits 0 (it polls the orchestrator pid and has
+  no channel for the exit code), so `decide_teardown` takes the
+  clean-exit branch and `fetch_branch`'s discovery script requires
+  `finished_at` to find the run. Without this write, every post-setup
+  `die()` (e.g. "wave 1 has unresolved subtasks") triggered the
+  sync-failure banner and required manual `--finalize --force` recovery.
+  The `--force` path remains for uncontrolled exits (SIGKILL, OOM,
+  power loss) where the handler never ran. Idempotent on `--resume` —
+  `phase_finalize` overwrites `finished_at` on success.
+
+- **Bootstrap resume copies `fly-machine.json` to promoted dir.** When
+  `mv` was skipped during bootstrap-to-final rename (promoted dir
+  already existed from state sync), `fly-machine.json` was left behind
+  in the bootstrap dir, causing `re_seed` to fail to resolve the
+  machine id on the next resume.
+
 - **`scripts/finalize.sh` and `scripts/cleanup.sh` now honor
   `LEERIE_STATE_DIR`.** Both scripts hardcoded `.leerie/runs/<id>/`
   relative to CWD, while `scripts/setup-run.sh:25` correctly resolved
