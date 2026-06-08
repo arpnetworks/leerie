@@ -2632,6 +2632,13 @@ except Exception:
         if [ -d "$_host_boot_dir" ] && [ ! -d "$_host_final_dir" ]; then
           mv "$_host_boot_dir" "$_host_final_dir" 2>/dev/null || true
         fi
+        # If mv was skipped (promoted dir already existed from state sync),
+        # ensure fly-machine.json lands in the promoted dir so re_seed can
+        # resolve fly_machine_id without a second resume.
+        if [ -d "$_host_final_dir" ] && [ ! -f "$_host_final_dir/fly-machine.json" ] && \
+           [ -f "$_host_boot_dir/fly-machine.json" ]; then
+          cp "$_host_boot_dir/fly-machine.json" "$_host_final_dir/fly-machine.json" 2>/dev/null || true
+        fi
         # Rewrite LEERIE_RUN_ID and any `--run-id <bootstrap>` element in
         # REWRITTEN_ARGS (the user typed `--resume --run-id <bootstrap>`,
         # the loop at line ~920 passed it through).
