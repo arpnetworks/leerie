@@ -395,6 +395,12 @@ CONFIDENCE_ROUNDS_FILE = SOURCE_OF_TRUTH_FILE
 MAX_WORKERS_ENV = "LEERIE_MAX_WORKERS"
 MAX_WORKERS_FILE = SOURCE_OF_TRUTH_FILE
 
+# max-parallel preference. Same resolution shape as max_workers.
+# CLI --max-parallel wins; then LEERIE_MAX_PARALLEL env; then
+# max_parallel in leerie.toml; then DEFAULT_CAPS fallback.
+MAX_PARALLEL_ENV = "LEERIE_MAX_PARALLEL"
+MAX_PARALLEL_FILE = SOURCE_OF_TRUTH_FILE
+
 # Per-worker memory cap (cgroup v2 memory.max). Same resolution shape:
 # CLI --worker-memory-max wins; then LEERIE_WORKER_MEMORY_MAX env; then
 # worker_memory_max in leerie.toml; then auto-derive from /proc/meminfo
@@ -2780,6 +2786,38 @@ def resolve_max_workers(repo_root: Path,
             die(f"{cfg}: max_workers={file_val!r} is not a positive integer")
         return n
     return DEFAULT_CAPS["max_total_workers"]
+
+
+def resolve_max_parallel(repo_root: Path,
+                         cli_value: int | None = None) -> int:
+    """Resolve the max-parallel cap. Order:
+    --max-parallel CLI flag → LEERIE_MAX_PARALLEL env var → leerie.toml →
+    DEFAULT_CAPS["max_parallel"]. argparse validates `cli_value` is a
+    positive int via `type=_positive_int` so it is trusted when set.
+    env and file values are rejected via die() when not a positive int —
+    bad config caught at startup, not mid-run."""
+    if cli_value is not None:
+        return cli_value
+    env = os.environ.get(MAX_PARALLEL_ENV, "").strip()
+    if env:
+        try:
+            n = int(env)
+        except ValueError:
+            die(f"{MAX_PARALLEL_ENV}={env!r} is not a positive integer")
+        if n < 1:
+            die(f"{MAX_PARALLEL_ENV}={env!r} is not a positive integer")
+        return n
+    cfg = repo_root / MAX_PARALLEL_FILE
+    file_val = _read_toml_key(cfg, "max_parallel")
+    if file_val is not None:
+        try:
+            n = int(file_val)
+        except ValueError:
+            die(f"{cfg}: max_parallel={file_val!r} is not a positive integer")
+        if n < 1:
+            die(f"{cfg}: max_parallel={file_val!r} is not a positive integer")
+        return n
+    return DEFAULT_CAPS["max_parallel"]
 
 
 _MEMORY_SUFFIX_MULTIPLIER = {
@@ -13583,9 +13621,11 @@ def main() -> None:
                          f"(default {DEFAULT_CAPS['max_total_workers']}); "
                          f"also {MAX_WORKERS_ENV} and max_workers in "
                          "leerie.toml")
-    ap.add_argument("--max-parallel", type=int,
-                    help=f"override concurrent workers per wave "
-                         f"(default {DEFAULT_CAPS['max_parallel']})")
+    ap.add_argument("--max-parallel", type=_positive_int, metavar="N",
+                    help=f"concurrent workers per wave "
+                         f"(default {DEFAULT_CAPS['max_parallel']}); "
+                         f"also {MAX_PARALLEL_ENV} and max_parallel in "
+                         "leerie.toml")
     ap.add_argument("--confidence-rounds", type=_positive_int, metavar="N",
                     help=f"how many evidence-gate rounds each planner / "
                          f"implementer may run before exiting blocked "
@@ -13788,8 +13828,8 @@ def main() -> None:
     # a bad --max-workers via _positive_int.
     caps["max_total_workers"] = resolve_max_workers(
         Path(os.getcwd()), args.max_workers)
-    if args.max_parallel:
-        caps["max_parallel"] = args.max_parallel
+    caps["max_parallel"] = resolve_max_parallel(
+        Path(os.getcwd()), args.max_parallel)
     # Resolve confidence_rounds across CLI / env / TOML / default. The
     # resolver die()s on a bad env or TOML value; argparse already rejected
     # a bad --confidence-rounds via _positive_int.

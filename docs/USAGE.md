@@ -334,9 +334,11 @@ local setup) because nerdctl can't reach Keychain. See
   a subtask failure, but earlier subtasks would have hit it first and
   aborted the run.
 - `--max-parallel N` — cap concurrent implementers per wave. Default:
-  `10` (`DEFAULT_CAPS["max_parallel"]`). Per-worker cgroup containment
-  keeps an OOM inside one worker's cgroup, so high wave-level
-  parallelism is safe. Users on smaller VMs can opt down.
+  `10` (`DEFAULT_CAPS["max_parallel"]`). Also `LEERIE_MAX_PARALLEL`
+  env var or `max_parallel` in `leerie.toml` (same precedence as
+  `--max-workers`). Per-worker cgroup containment keeps an OOM inside
+  one worker's cgroup, so high wave-level parallelism is safe. Users
+  on smaller VMs can opt down.
 - `--clarify` — opt into surfacing intent questions to the user
   (default: off). Without it the classifier's filter still runs but
   surviving questions are dropped, and the implementer makes a

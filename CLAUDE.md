@@ -229,6 +229,11 @@ export LEERIE_CONFIDENCE_ROUNDS=12
 export LEERIE_MAX_WORKERS=80
 ./leerie "task" --max-workers 80
 
+# Override concurrent workers per wave (default 10). Same precedence:
+# CLI > env > leerie.toml.
+export LEERIE_MAX_PARALLEL=6
+./leerie "task" --max-parallel 6
+
 # Skip the live `claude -p` smoke test during development:
 ./leerie "task" --skip-smoke
 
