@@ -262,12 +262,24 @@ export LEERIE_MAX_PARALLEL=6
 # `dangerously_skip_permissions = true` in leerie.toml):
 ./leerie "task" --dangerously-skip-permissions
 
+# Pick a PR template when the repo has multiple in PULL_REQUEST_TEMPLATE/.
+# Also LEERIE_PR_TEMPLATE or `pr_template` in leerie.toml.
+./leerie "task" --pr-template feature
+
+# Override the model for the finalize-time PR-writer worker (default sonnet).
+# Also LEERIE_MODEL_PR_WRITER or `model_pr_writer` in leerie.toml.
+./leerie "task" --pr-writer-model opus
+
+# Filter `--list` output by run status:
+./leerie --list --status paused
+./leerie --list --status seed-failed
+
 # Verbosity: default is `stream` (one-line summary per worker event).
 # Per-worker logs are always written to <state-root>/logs/<sid>.log.
 ./leerie "task" -q       # normal (pre-streaming terse output)
 ./leerie "task" -qq      # quiet (errors + phase boundaries only)
 ./leerie "task" -vv      # debug (raw event payloads + tool I/O)
-export LEERIE_VERBOSITY=normal  # sticky default
+export LEERIE_VERBOSITY=normal  # override (default is stream)
 
 # Bound the seed_auth tar pipe over `flyctl ssh console` against the
 # known flyctl-stalls-without-exiting failure mode. Default 600 s

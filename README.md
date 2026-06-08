@@ -196,7 +196,8 @@ leerie "task" --answers answers.json
 
 # Override caps (defaults: 200 total workers, 10 in parallel per wave).
 # --max-workers also reads LEERIE_MAX_WORKERS or max_workers in
-# leerie.toml; --max-parallel is CLI-only.
+# leerie.toml; --max-parallel also reads LEERIE_MAX_PARALLEL or
+# max_parallel in leerie.toml.
 leerie "task" --max-workers 80 --max-parallel 4
 export LEERIE_MAX_WORKERS=80
 
@@ -289,7 +290,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
 | `--clarify` | off | Opt into surfacing intent questions to the user. Default: questions are dropped after the classifier's codebase→research filter, and the implementer makes a documented best-effort decision. Also `LEERIE_CLARIFY` env var or `clarify = true` in `leerie.toml`. |
 | `--max-workers N` | `200` | Cap on total `claude -p` invocations across the run. Also `LEERIE_MAX_WORKERS` env var or `max_workers` in `leerie.toml`. |
-| `--max-parallel N` | `10` | Cap on concurrent workers within a wave. Per-worker cgroup containment keeps an OOM inside one worker's cgroup; users on smaller VMs can opt down. |
+| `--max-parallel N` | `10` | Cap on concurrent workers within a wave. Per-worker cgroup containment keeps an OOM inside one worker's cgroup; users on smaller VMs can opt down. Also `LEERIE_MAX_PARALLEL` env var or `max_parallel` in `leerie.toml`. |
 | `--worker-memory-max SIZE` | auto | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Bounds RAM the worker subtree may consume; OOMs stay inside the worker cgroup rather than cascading to sshd / orchestrator. Auto-derived from `/proc/meminfo` when unset (VM RAM / `max_parallel+1`, capped at 4 GiB). Also `LEERIE_WORKER_MEMORY_MAX` or `worker_memory_max` in `leerie.toml`. |
 | `--confidence-rounds N` | `8` | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `LEERIE_CONFIDENCE_ROUNDS` and `leerie.toml`. |
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |
@@ -297,7 +298,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--runtime VALUE` | `local` | `local` / `fly`. Execution backend for per-subtask worker containers. Overrides `LEERIE_RUNTIME` and `leerie.toml`. |
 | `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, provision) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
 | `--model ALIAS` | per-worker (judgment: `opus`; acting workers — implementer, conformer: `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
-| `--model-<worker> ALIAS` | per-worker default (`implementer`, `conformer` → `sonnet`; everything else → `opus`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `provision`, `implementer`, `integrator`, `conformer`. Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
+| `--model-<worker> ALIAS` | per-worker default (`implementer`, `conformer` → `sonnet`; everything else → `opus`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`. Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
 | `--effort LEVEL` | per-worker (judgment: `high`; acting workers — implementer, conformer: inherit Claude default) | `low` / `medium` / `high` / `xhigh` / `max`. Reasoning-depth dial forwarded to `claude -p --effort`. Pins judgment workers to a consistent depth across runs to reduce same-job variance (e.g. planner subtask-count drift). IMPLEMENTATION.md §2 "Effort selection". |
 | `--effort-<worker> LEVEL` | per-worker default (judgment workers → `high`; acting workers → inherit Claude default) | Per-worker override. `<worker>` is one of the orchestrator workers (same set as `--model-<worker>`). Overrides `--effort`, `LEERIE_EFFORT`, and `leerie.toml`. |
 | `--judge-model ALIAS` | `sonnet` | Model alias for the post-run judge skill. Also `LEERIE_MODEL_JUDGE` or `model_judge` in `leerie.toml`. |
@@ -312,6 +313,47 @@ Complete reference for every CLI flag, environment variable, and
 | `--judge-dir DIR` | `judge-out` | Subdirectory name under the run dir for LLM judge output. Also `LEERIE_JUDGE_DIR` or `judge_dir` in `leerie.toml`. |
 | `--heal-dir DIR` | `heal-out` | Subdirectory name under the run dir for LLM self-heal output. Also `LEERIE_HEAL_DIR` or `heal_dir` in `leerie.toml`. |
 | `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
+| `--version` | — | Print `leerie <version>` and exit. |
+| `--status STATE` | — | With `--list`, restrict the table to runs whose derived status matches STATE. |
+| `--list-paused` | off | **Deprecated:** alias for `--list --status paused`. Prefer the explicit form. |
+| `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` or `skip_overlap_judge` in `leerie.toml`. |
+| `--skip-budget-check` | off | Skip the post-schedule budget-feasibility preflight (DESIGN §13). The runtime backstop in `State.bump_workers()` still fires. Also `LEERIE_SKIP_BUDGET_CHECK` or `skip_budget_check` in `leerie.toml`. |
+| `--dangerously-skip-permissions` | off | Pass `--dangerously-skip-permissions` to every `claude -p` worker, including judgment workers that run in the real repo cwd. Waives DESIGN §12 read-only enforcement. Also `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` or `dangerously_skip_permissions` in `leerie.toml`. |
+| `--pr-template NAME` | none | When the target repo has multiple PR templates in `PULL_REQUEST_TEMPLATE/`, pick this one by basename (with or without `.md`). Also `LEERIE_PR_TEMPLATE` or `pr_template` in `leerie.toml`. |
+| `--pr-writer-model ALIAS` | `sonnet` | Model alias for the finalize-time PR title + body writer. Also `LEERIE_MODEL_PR_WRITER` or `model_pr_writer` in `leerie.toml`. |
+
+### Launcher verbs
+
+These flags are handled by the bash launcher before the container starts.
+They are not visible in `leerie --help` (which shows only orchestrator
+flags); run `leerie --help` inside a container or see below.
+
+**Lifecycle (remote mode):**
+
+| Flag | Description |
+|------|-------------|
+| `--stop <run-id> [--runtime fly]` | Pause a remote Fly machine. Resumable via `--resume`. |
+| `--kill <run-id> [--force]` | Destroy a remote machine permanently. `--force` skips confirmation. Also accepts `--machine-id <id> [--app <app>]` for orphan cleanup. |
+| `--finalize <run-id> [--force] [--no-verify] [--no-push]` | Post-detach finalization: collect un-integrated subtask branches on the machine, fetch the run branch, then push + open PR on the host. Without `--force`, requires the orchestrator to be dead. `--force` SIGTERMs a live orchestrator first, then collects and fetches. |
+| `--re-seed <run-id> [--force]` | Mid-run host→machine re-rsync of dirty delta. `--force` bypasses the safety check that refuses to clobber machine-side uncommitted edits. |
+
+**Resume modifiers (used with `--resume`):**
+
+| Flag | Description |
+|------|-------------|
+| `--shell` | Drop into a bash shell at `/work` on the machine instead of tailing the orchestrator log. |
+| `--auto-finalize` | On clean orchestrator exit, automatically run `leerie --finalize`. |
+| `--no-re-seed` | Skip the automatic re-seed of dirty delta on resume. |
+
+**Build and runtime:**
+
+| Flag | Description |
+|------|-------------|
+| `--state-dir PATH` | Override the per-repo state directory. Also `LEERIE_STATE_DIR` env var or `state_dir` in `leerie.toml`. |
+| `--fly-disk-gb N` | Provision a Fly volume of N GB mounted at `/home/leerie`. Also `FLY_VM_DISK_GB` env var. |
+| `--no-runtime-install` | Skip auto-install of container runtime (Colima / nerdctl / containerd). Also `LEERIE_NO_RUNTIME_INSTALL`. |
+| `--no-auto-publish` | Skip the image-publish probe on startup. Also `LEERIE_NO_AUTO_PUBLISH`. |
+| `--local-build` | Force local `nerdctl build` instead of the Fly remote builder. Also `LEERIE_LOCAL_BUILD`. |
 
 ### Environment variables and `leerie.toml` keys
 
@@ -321,7 +363,7 @@ Complete reference for every CLI flag, environment variable, and
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → per-worker defaults (judgment workers `opus`, acting workers — implementer, conformer — `sonnet`). |
-| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `provision`, `implementer`, `integrator`, `conformer`. Unset → `implementer` and `conformer` → `sonnet`; everything else → `opus`. |
+| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`. Unset → `implementer` and `conformer` → `sonnet`; everything else → `opus`. |
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `high`, acting workers inherit Claude default. |
 | `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `high`; acting workers (implementer, conformer) inherit Claude default. |
 | `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
@@ -338,6 +380,26 @@ Complete reference for every CLI flag, environment variable, and
 | `LEERIE_TELEMETRY_DIR` | `telemetry_dir` | Subdirectory name under the run dir for telemetry NDJSON events. Overridden by `--telemetry-dir`. Unset → default `events`. |
 | `LEERIE_JUDGE_DIR` | `judge_dir` | Subdirectory name under the run dir for LLM judge output. Overridden by `--judge-dir`. Unset → default `judge-out`. |
 | `LEERIE_HEAL_DIR` | `heal_dir` | Subdirectory name under the run dir for LLM self-heal output. Overridden by `--heal-dir`. Unset → default `heal-out`. |
+| `LEERIE_MAX_WORKERS` | `max_workers` | Total worker-invocation budget. Overridden by `--max-workers`. Unset → default `200`. |
+| `LEERIE_MAX_PARALLEL` | `max_parallel` | Concurrent workers per wave. Overridden by `--max-parallel`. Unset → default `10`. |
+| `LEERIE_WORKER_MEMORY_MAX` | `worker_memory_max` | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Overridden by `--worker-memory-max`. Unset → auto-derived from `/proc/meminfo`. |
+| `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` | `dangerously_skip_permissions` | Waive §12 read-only enforcement on judgment workers (truthy → on). Overridden by `--dangerously-skip-permissions`. Unset → default `false`. |
+| `LEERIE_SKIP_OVERLAP_JUDGE` | `skip_overlap_judge` | Skip the phase 2¾ plan-overlap judge on multi-planner runs (truthy → skip). Overridden by `--skip-overlap-judge`. Unset → default `false`. |
+| `LEERIE_SKIP_BUDGET_CHECK` | `skip_budget_check` | Skip the post-schedule budget-feasibility preflight (truthy → skip). Overridden by `--skip-budget-check`. Unset → default `false`. |
+| `LEERIE_PR_TEMPLATE` | `pr_template` | PR template basename for repos with multiple templates. Overridden by `--pr-template`. Unset → alphabetically first `.md`. |
+| `LEERIE_MODEL_PR_WRITER` | `model_pr_writer` | Model alias for the finalize-time PR writer. Overridden by `--pr-writer-model`. Unset → default `sonnet`. |
+| `LEERIE_WORKER_DEBUG` | — | Enable debug-level logging injection (`DEBUG=*`, `ANTHROPIC_LOG=debug`) into worker processes. Truthy → on. |
+| `LEERIE_FLY_APP` | — | Fly.io app name used by launcher verbs (`--stop`, `--kill`, `--finalize`, etc.). Unset → default `leerie`. Launcher-only. |
+| `LEERIE_CHAIN_URL` | — | Base URL for the leerie-chain HTTP API. Unset → default `http://localhost:8080`. Launcher-only. |
+| `LEERIE_SEED_TIMEOUT_S` | — | Timeout in seconds for `seed_auth` / `seed_repo` bulk transfers over `flyctl ssh console`. Unset → default `600` (10 min). Launcher-only. |
+| `LEERIE_PROGRESS_INTERVAL_S` | — | Heartbeat cadence in seconds for "still streaming" lines during bulk transfers. Set to `0` to suppress. Unset → default `10`. Launcher-only. |
+| `LEERIE_MACHINE_START_TIMEOUT` | — | Timeout in seconds for Fly machine start. Unset → default `120`. Launcher-only. |
+| `LEERIE_PAUSE_NOTIFY_CMD` | — | Shell command to `eval` when a Fly machine pauses on failure. Unset → no notification. Launcher-only. |
+| `LEERIE_NO_RUNTIME_INSTALL` | — | Skip auto-install of container runtime (truthy → skip). Also `--no-runtime-install`. Launcher-only. |
+| `LEERIE_NO_AUTO_PUBLISH` | — | Skip image publish probe (truthy → skip). Also `--no-auto-publish`. Launcher-only. |
+| `LEERIE_LOCAL_BUILD` | — | Force local image build instead of Fly remote builder (truthy → local). Also `--local-build`. Launcher-only. |
+| `LEERIE_NONINTERACTIVE` | — | Suppress interactive prompts in runtime-install and auth flows (truthy → non-interactive). Launcher-only. |
+| `FLY_VM_DISK_GB` | — | Provision a Fly volume of this many GB. Also `--fly-disk-gb`. Launcher-only. |
 | `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | — | **Claude Code CLI variable**, not consumed by leerie. Set to `70` to backstop worker auto-compaction. |
 
 ### Precedence
@@ -366,7 +428,7 @@ rationale behind these orders and the full validation contract.
 
 ## Worker types
 
-Leerie spawns seven kinds of `claude -p` worker. Each is a separate
+Leerie spawns eight kinds of `claude -p` worker. Each is a separate
 subprocess; there is no in-session agent nesting.
 
 | Worker | Prompt source | Default model | Runs per task | Returns |
@@ -374,16 +436,21 @@ subprocess; there is no in-session agent nesting.
 | `classifier` | `prompts/classifier.md` | opus | 1 | category set + intent questions |
 | `planner` | `prompts/planner.md` | opus | one per category (parallel) | subtask list with deps |
 | `reconciler` | `prompts/reconciler.md` | opus | 0, 1, or up to 3 (retried up to twice when its first attempt closes a dependency cycle or leaves unresolved tags) | eight arrays — `renames` / `added_provides` / `added_subtasks` / `conditional_drops` / `dropped_requires` (resolution; `conditional_drops` drops a planner-emitted consumer subtask whose own intent declares it conditional on an unresolvable in_plan precondition; `dropped_requires` removes an over-specified `requires` entry — an aggregate or coarser synonym of what the consumer itself provides — and ALSO plays a cycle-breaking role on retry); `dependency_edges` / `merged_subtasks` (cycle-breaking-only, used on retry when leerie's gates detect a cycle); `unresolvable` (escape hatch). DESIGN §5 |
+| `plan_overlap_judge` | `prompts/plan_overlap_judge.md` | opus | 0 or 1 (phase 2¾, multi-planner runs only; auto-skipped on single-planner runs) | cross-domain surface overlap analysis. DESIGN §5 |
 | `provision` | `prompts/provision.md` | opus | 0 or 1 (spawned only when the deterministic lockfile-detection table abstains — Java/Gradle, bare `pyproject.toml`, polyglot Makefile) | install recipe (argv-allowlisted) executed via `mise exec --`. See DESIGN §6½ |
 | `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `leerie/subtasks/<run-id>/<subtask-id>` branch |
 | `conformer` | `prompts/conformer.md` | sonnet | one per subtask, only on the implementer's success path | advisory `conformance_warnings` on the subtask result; doc/test/rule-fix commits prefixed `conformer:` on the same branch (DESIGN §9 *Post-work conformance*) |
 | `integrator` | `prompts/integrator.md` | opus | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
 
+Additionally, `pr_writer` (`prompts/pr_writer.md`, default sonnet) runs
+at finalize when the run will push — it produces the PR title and body.
+It is not in `WORKER_TYPES` but has a dedicated `--pr-writer-model` flag.
+
 **Per-worker model defaults:** judgment workers (classifier, planner,
-reconciler, provision, integrator) default to Opus; the acting workers
-(implementer, conformer) default to Sonnet — their job is concrete
-subtask execution where throughput matters more than broad-context
-judgment. To revert to the
+reconciler, plan_overlap_judge, provision, integrator) default to Opus;
+the acting workers (implementer, conformer) default to Sonnet — their
+job is concrete subtask execution where throughput matters more than
+broad-context judgment. To revert to the
 all-Sonnet pattern of earlier versions, set `LEERIE_MODEL=sonnet` or
 pass `--model sonnet`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §2
 *Model selection* for the full precedence table.

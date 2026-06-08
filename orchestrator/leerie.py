@@ -13534,8 +13534,25 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(prog="leerie", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        prog="leerie", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""\
+launcher verbs (handled before the container starts):
+  --stop <run-id>       pause a remote Fly machine (resumable via --resume)
+  --kill <run-id>       destroy a remote machine permanently (--force skips prompt)
+  --finalize <run-id>   post-detach finalization (fetch branch + push + PR)
+  --re-seed <run-id>    mid-run host-to-machine re-rsync (--force bypasses safety)
+  --shell               drop into bash on resume instead of tailing the log
+  --auto-finalize       auto-finalize on clean orchestrator exit during resume
+  --no-re-seed          skip auto-reseed on resume
+  --fly-disk-gb N       provision a Fly volume of N GB
+  --state-dir PATH      override per-repo state directory
+  --no-runtime-install  skip container runtime auto-install
+  --no-auto-publish     skip image publish probe
+  --local-build         force local image build (not Fly remote builder)
+
+See README.md "Launcher verbs" for full details and sub-flags.""")
     ap.add_argument("--version", action="version",
                     version=f"leerie {_read_version()}",
                     help="print the leerie version and exit")

@@ -2453,8 +2453,9 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | per-worker cgroup PIDs cap (`worker_pids_max`) | 256 | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Catches runaway fork-bomb behavior in tool subtrees. |
 | auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap. See §3 *Auth/quota backoff*. |
 
-`--max-turns` by worker: classifier 60, planner 100, integrator 60,
-implementer 120, conformer 60, judge 40, heal patch_generator 40. For
+`--max-turns` by worker: classifier 60, planner 100, reconciler 30,
+plan_overlap_judge 30, provision 30, integrator 60, implementer 120,
+conformer 60, judge 40, heal patch_generator 40, pr_writer 20. For
 the implementer, 120 turns and 90 minutes both apply — whichever trips
 first. The conformer cap is lower than the implementer's because its
 scope is narrower (read a diff, read a small set of rules files, update

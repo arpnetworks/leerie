@@ -59,9 +59,10 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 #
 # `--help` is NOT short-circuited: forwarding it through the container makes
 # the orchestrator's argparse render the full flag list (worker model
-# overrides, telemetry knobs, etc.), which a launcher-side summary would
-# silently truncate. The first --help pays a one-time image-build cost; every
-# subsequent invocation reuses the cached image and starts in ~2s.
+# overrides, telemetry knobs, etc.) plus an epilog listing launcher-only
+# verbs (--stop, --kill, --finalize, etc.). The first --help pays a
+# one-time image-build cost; every subsequent invocation reuses the cached
+# image and starts in ~2s.
 
 # --- _resolve_fly_machine_id_from_run_dir -------------------------------
 # Read fly_machine_id from a run's host-side sidecar. Tries
