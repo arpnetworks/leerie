@@ -8,8 +8,10 @@
 # leaving subtask branches with committed work that was never integrated into
 # the run branch.  This script discovers those branches, runs `setup-run.sh`
 # to ensure the staging worktree exists, and merges each un-integrated branch
-# via `integrate.sh`.  Conflicts are skipped (no LLM integrator is available
-# outside the orchestrator) and reported.
+# via `integrate.sh`.  Conflicts are resolved by spawning a `claude -p`
+# integrator worker (same prompt and schema as the orchestrator's
+# `integrate_wave`).  Branches the integrator cannot resolve are skipped
+# and reported.
 #
 # Usage (sourced by the leerie launcher's --finalize path):
 #
@@ -52,7 +54,8 @@ collect_subtrees_remote() {
   # The payload runs on the machine as bash.  It discovers the run-id,
   # ensures the staging worktree exists via setup-run.sh, lists subtask
   # branches, filters already-integrated ones, and merges the rest via
-  # integrate.sh.  Conflicts are aborted and skipped.
+  # integrate.sh.  Conflicts are resolved by a `claude -p` integrator
+  # worker; unresolvable conflicts are skipped.
   #
   # The scripts are baked into the image at /opt/leerie-image/scripts/.
   local payload
@@ -191,41 +194,111 @@ for sid in "${sorted_remaining[@]}"; do
 done
 
 staging="${LEERIE_STATE_DIR}/runs/${run_id}/worktrees/staging"
+leerie_dir="${LEERIE_STATE_DIR}/runs/${run_id}"
+integrator_prompt="${SCRIPTS}/../prompts/integrator.md"
+integrator_schema='{"type":"object","required":["incoming_subtask","status"],"properties":{"incoming_subtask":{"type":"string"},"status":{"type":"string","enum":["resolved","design-conflict","failed"]},"resolution_summary":{"type":"string"},"diagnosis":{"type":["string","null"]}}}'
+
 integrated_count=0
+resolved_count=0
 skipped_count=0
 skipped_sids=""
+integrated_so_far=""
+
+_skip() {
+  skipped_count=$((skipped_count + 1))
+  if [ -n "$skipped_sids" ]; then
+    skipped_sids="${skipped_sids},${1}"
+  else
+    skipped_sids="$1"
+  fi
+}
 
 for sid in "${integrate_order[@]}"; do
+  branch="${subtask_prefix}${sid}"
   rc=0
   bash "$SCRIPTS/integrate.sh" "$sid" "$run_id" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
     integrated_count=$((integrated_count + 1))
-  elif [ "$rc" -eq 1 ]; then
-    # Conflict — abort the merge and continue.
-    (cd "$staging" && git merge --abort 2>/dev/null || true)
-    skipped_count=$((skipped_count + 1))
-    if [ -n "$skipped_sids" ]; then
-      skipped_sids="${skipped_sids},${sid}"
+    if [ -n "$integrated_so_far" ]; then
+      integrated_so_far="${integrated_so_far}, ${sid}"
     else
-      skipped_sids="$sid"
+      integrated_so_far="$sid"
+    fi
+  elif [ "$rc" -eq 1 ]; then
+    # Conflict — staging worktree is mid-merge. Spawn integrator.
+    if [ ! -f "$integrator_prompt" ]; then
+      (cd "$staging" && git merge --abort 2>/dev/null || true)
+      _skip "$sid"
+      continue
+    fi
+    user_prompt="Resolve the in-progress merge conflict in this worktree.
+LEERIE_DIR is ${leerie_dir}.
+Incoming subtask: ${sid}
+Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
+
+    claude_out=""
+    claude_rc=0
+    claude_out=$(cd "$staging" && claude -p "$user_prompt" \
+      --append-system-prompt "$(cat "$integrator_prompt")" \
+      --output-format json \
+      --json-schema "$integrator_schema" \
+      --allowedTools "Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit" \
+      --max-turns 60 \
+      --model opus \
+      --effort high \
+      --dangerously-skip-permissions 2>/dev/null) || claude_rc=$?
+
+    if [ "$claude_rc" -ne 0 ]; then
+      (cd "$staging" && git merge --abort 2>/dev/null || true)
+      _skip "$sid"
+      continue
+    fi
+
+    # Extract status from structured_output.
+    status=$(printf '%s' "$claude_out" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+    so = d.get("structured_output") or {}
+    print(so.get("status", ""))
+except Exception:
+    print("")
+' 2>/dev/null || true)
+
+    if [ "$status" = "resolved" ]; then
+      # Verify the merge was actually committed.
+      merge_head_rc=0
+      (cd "$staging" && git rev-parse --verify --quiet MERGE_HEAD 2>/dev/null) || merge_head_rc=$?
+      staged_files=""
+      staged_files=$(cd "$staging" && git diff --cached --name-only 2>/dev/null || true)
+      if [ "$merge_head_rc" -ne 0 ] && [ -z "$staged_files" ]; then
+        resolved_count=$((resolved_count + 1))
+        if [ -n "$integrated_so_far" ]; then
+          integrated_so_far="${integrated_so_far}, ${sid}"
+        else
+          integrated_so_far="$sid"
+        fi
+      else
+        (cd "$staging" && git merge --abort 2>/dev/null || true)
+        _skip "$sid"
+      fi
+    else
+      (cd "$staging" && git merge --abort 2>/dev/null || true)
+      _skip "$sid"
     fi
   else
     # Precondition failure (exit 2) or other error — skip.
-    skipped_count=$((skipped_count + 1))
-    if [ -n "$skipped_sids" ]; then
-      skipped_sids="${skipped_sids},${sid}"
-    else
-      skipped_sids="$sid"
-    fi
+    _skip "$sid"
   fi
 done
 
+total_integrated=$((integrated_count + resolved_count))
 if [ "$skipped_count" -eq 0 ]; then
-  echo "COLLECTED-ALL:${run_id}:${integrated_count}"
-elif [ "$integrated_count" -eq 0 ]; then
+  echo "COLLECTED-ALL:${run_id}:${total_integrated}"
+elif [ "$total_integrated" -eq 0 ]; then
   echo "COLLECTED:${run_id}:0:${skipped_count}:${skipped_sids}"
 else
-  echo "COLLECTED:${run_id}:${integrated_count}:${skipped_count}:${skipped_sids}"
+  echo "COLLECTED:${run_id}:${total_integrated}:${skipped_count}:${skipped_sids}"
 fi
 exit 0
 BASH_EOF

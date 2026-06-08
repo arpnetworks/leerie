@@ -3887,8 +3887,12 @@ patched), `STOP-FAILED:<run_id>:<pid>`, `REFUSE-ALIVE-SCAN:*`,
 `collect_subtrees_remote` SSHes a bash payload that discovers
 un-integrated subtask branches on the machine and merges them into the
 run branch via `setup-run.sh` (idempotent) + `integrate.sh`.
-Conflicts are aborted (`git merge --abort`) and skipped — no LLM
-integrator is available outside the orchestrator. Wave ordering from
+Conflicts are resolved by spawning `claude -p` with the integrator
+prompt and schema (same invocation as `integrate_wave()` in the
+orchestrator). The integrator runs in the staging worktree with the
+merge left in-progress. On success, the merge commit is verified
+(`MERGE_HEAD` must not exist, no staged-but-uncommitted changes). On
+failure, the merge is aborted and the branch is skipped. Wave ordering from
 `state.json` is used when available (earlier waves first); falls back
 to alphabetical. Sentinels: `COLLECTED-ALL:<run_id>:<count>`,
 `COLLECTED:<run_id>:<integrated>:<skipped>:<skipped_sids>`,

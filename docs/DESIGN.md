@@ -805,12 +805,13 @@ branches (`leerie/subtasks/<run-id>/<sid>`) may have committed work
 that was never integrated into the run branch. `--finalize` detects
 un-integrated subtask branches on the machine, runs `setup-run.sh` to
 ensure the staging worktree exists, and merges each un-integrated
-branch via `integrate.sh`. Conflicts are skipped (no LLM integrator
-is available outside the orchestrator) and reported — the user gets
-every subtask that merges cleanly, which is the common case because
-same-wave subtasks are assigned to the same wave precisely because
-they are independent. The collection step runs after the `finished_at`
-patch and before `fetch_branch` streams the result to the host.
+branch via `integrate.sh`. Conflicts are resolved by spawning a
+`claude -p` integrator worker — the same prompt, schema, and
+verification as the orchestrator's `integrate_wave()`. The machine
+has `claude` CLI, the integrator prompt, and seeded auth. Branches
+the integrator cannot resolve (design-conflict or failed) are skipped
+and reported. The collection step runs after the `finished_at` patch
+and before `fetch_branch` streams the result to the host.
 
 **`--force`: stop the orchestrator, then collect.** `leerie --finalize
 <run-id> --force` extends the recovery path to runs where the
