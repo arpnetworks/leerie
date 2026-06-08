@@ -5,6 +5,14 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.20]
+
+### Changed
+
+- **`max_parallel` default lowered from 10 to 5.** Reduces the default
+  concurrent-workers-per-wave cap. Users on larger VMs can opt back up
+  via `--max-parallel`.
+
 ## [Unreleased]
 
 ### Changed
