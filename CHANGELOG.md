@@ -310,6 +310,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   longer silently starts a new run; it tells the user the pointer
   is missing.
 
+### Removed
+
+- **All legacy backwards-compatibility shims.** Removed `--list-paused`
+  (use `--list --status paused`), `--remote` / `LEERIE_REMOTE` /
+  `leerie.toml remote=true` (use `--runtime fly` / `LEERIE_RUNTIME` /
+  `runtime=fly`), and `--runs` chain-submit alias (use `--wave-a-runs`).
+  Deleted `_check_gh_cli` tombstone comment, tightened the
+  `attempt_1_output` parameter on `_validate_unresolved_must_include`
+  from optional to required, and reworded "legacy" labels on the
+  `.leerie/` fallback to accurately describe it as the
+  non-containerized invocation path.
+
 ## [0.2.6] - 2026-06-01
 
 This release fixes a hard failure on `--runtime fly` against any repo
