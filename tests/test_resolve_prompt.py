@@ -12,8 +12,8 @@ import pytest
 
 
 @pytest.mark.parametrize("call_type", [
-    "classifier", "planner", "reconciler", "provision", "implementer",
-    "integrator", "conformer",
+    "classifier", "planner", "reconciler", "plan_overlap_judge", "provision",
+    "implementer", "integrator", "conformer",
 ])
 def test_resolve_prompt_returns_valid_triple(leerie, call_type):
     kind, content, hint = leerie.resolve_prompt(call_type)

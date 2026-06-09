@@ -1688,7 +1688,7 @@ worker communicate through a strict contract:
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a checkpoint,
 so its failure is converted into a handoff: a fresh implementer can continue.
-The **classifier, planner, reconciler, provision, and integrator** have no partial-progress
+The **classifier, planner, reconciler, plan_overlap_judge, provision, and integrator** have no partial-progress
 artifact to hand off — there is nothing for a successor to continue from — so
 their hard failure aborts the run with state saved for `--resume`. The
 **conformer** has commits but its phase is advisory, so a hard failure surfaces
@@ -2170,7 +2170,7 @@ concrete enforcement points — which function checks what, at which phase — a
 catalogued in `IMPLEMENTATION.md`.
 
 One enforcement point — the mechanical "judgment workers (classifier, planner,
-reconciler, provision) cannot mutate state because they run in the real repo
+reconciler, plan_overlap_judge, provision) cannot mutate state because they run in the real repo
 cwd without `--dangerously-skip-permissions`" guarantee — has an explicit
 opt-out: `leerie --dangerously-skip-permissions`. The flag is named identically
 to the underlying Claude Code CLI flag, on purpose: choosing it means the user
@@ -2312,9 +2312,9 @@ matches the same precedence chain as `--skip-smoke` and
 
 ## 14. Telemetry, judging, and self-healing
 
-Every LLM call in Leerie passes through one of the seven worker types in
-`WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `provision`,
-`implementer`, `integrator`, or `conformer`. Each worker type is a distinct **call type** — a
+Every LLM call in Leerie passes through one of the eight worker types in
+`WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
+`provision`, `implementer`, `integrator`, or `conformer`. Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
 worker role, no overlap, no gap.

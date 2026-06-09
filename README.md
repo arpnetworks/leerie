@@ -217,7 +217,8 @@ export LEERIE_SOURCE_OF_TRUTH=codebase    # or: research, both
 leerie "task" --source-of-truth codebase
 
 # Choose the model. Without overrides, judgment workers (classifier /
-# planner / reconciler / integrator) default to opus and the acting
+# planner / reconciler / plan_overlap_judge / provision / integrator)
+# default to opus and the acting
 # workers (implementer, conformer) default to sonnet — see
 # docs/IMPLEMENTATION.md §2 "Model selection" for the full env-var /
 # CLI-flag / TOML-key table.
@@ -291,7 +292,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |
 | `--source-of-truth VALUE` | `both` | `codebase` / `research` / `both`. Overrides `LEERIE_SOURCE_OF_TRUTH` and `leerie.toml`. |
 | `--runtime VALUE` | `local` | `local` / `fly`. Execution backend for per-subtask worker containers. Overrides `LEERIE_RUNTIME` and `leerie.toml`. |
-| `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, provision) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
+| `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
 | `--model ALIAS` | per-worker (judgment: `opus`; acting workers — implementer, conformer: `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
 | `--model-<worker> ALIAS` | per-worker default (`implementer`, `conformer` → `sonnet`; everything else → `opus`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`. Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
 | `--effort LEVEL` | per-worker (judgment: `high`; acting workers — implementer, conformer: inherit Claude default) | `low` / `medium` / `high` / `xhigh` / `max`. Reasoning-depth dial forwarded to `claude -p --effort`. Pins judgment workers to a consistent depth across runs to reduce same-job variance (e.g. planner subtask-count drift). IMPLEMENTATION.md §2 "Effort selection". |
@@ -361,7 +362,7 @@ details and sub-flags.
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `high`, acting workers inherit Claude default. |
 | `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `high`; acting workers (implementer, conformer) inherit Claude default. |
 | `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
-| `LEERIE_INSPECT_DIRS` | `inspect_dirs` | Extra directories the inspect-bucket workers (classifier, planner, reconciler, provision) may read; forwarded as `--add-dir`. Env value is colon-separated; TOML value is comma-separated. Overridden by `--inspect-dir` (repeatable). Unset → none. |
+| `LEERIE_INSPECT_DIRS` | `inspect_dirs` | Extra directories the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) may read; forwarded as `--add-dir`. Env value is colon-separated; TOML value is comma-separated. Overridden by `--inspect-dir` (repeatable). Unset → none. |
 | `LEERIE_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. Unset → default `stream`. |
 | `LEERIE_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. Unset → default `false` (push + PR happen). |
 | `LEERIE_CLARIFY` | `clarify` | Sticky opt-in to surfacing intent questions to the user (truthy → on). Overridden by `--clarify`. Unset → default `false`. |

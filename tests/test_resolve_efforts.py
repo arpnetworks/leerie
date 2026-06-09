@@ -22,8 +22,8 @@ import argparse
 import pytest
 
 
-WORKERS = ("classifier", "planner", "reconciler", "provision",
-           "implementer", "integrator", "conformer")
+WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
+           "provision", "implementer", "integrator", "conformer")
 
 # The expected default per worker, with no overrides. Judgment workers
 # get "high"; acting workers (implementer, conformer) resolve to None.
@@ -31,6 +31,7 @@ DEFAULTS: dict[str, str | None] = {
     "classifier": "high",
     "planner":    "high",
     "reconciler": "high",
+    "plan_overlap_judge": "high",
     "provision":  "high",
     "integrator": "high",
     "implementer": None,
@@ -63,7 +64,7 @@ def test_all_unset_defaults_per_worker(leerie, repo_root):
     worker_slice = {w: efforts[w] for w in WORKERS}
     assert worker_slice == DEFAULTS
     assert leerie.EFFORT_DEFAULT is None
-    # Five judgment workers default to high; nothing else.
+    # Six judgment workers default to high; nothing else.
     assert leerie.EFFORT_DEFAULT_PER_WORKER.get("planner") == "high"
     assert leerie.EFFORT_DEFAULT_PER_WORKER.get("classifier") == "high"
     assert "implementer" not in leerie.EFFORT_DEFAULT_PER_WORKER

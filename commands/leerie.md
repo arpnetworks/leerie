@@ -68,7 +68,7 @@ dependencies on the user's behalf.
    `both`). They can pin the model with `--model sonnet|opus|haiku` (env:
    `LEERIE_MODEL`); per-worker overrides via `--model-<worker>` /
    `LEERIE_MODEL_<WORKER>`. Per-worker defaults: judgment workers
-   (classifier, planner, reconciler, provision, integrator) default to `opus`;
+   (classifier, planner, reconciler, plan_overlap_judge, provision, integrator) default to `opus`;
    acting workers (implementer, conformer) default to `sonnet`.
    Then resume:
 

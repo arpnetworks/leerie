@@ -1387,7 +1387,7 @@ can dial up or down at resume time without editing state.
 ### Inspect directories
 
 Extra directories the inspect-bucket workers (classifier, planner,
-reconciler, provision) may read. Forwarded to each `claude -p` invocation as
+reconciler, plan_overlap_judge, provision) may read. Forwarded to each `claude -p` invocation as
 one `--add-dir` flag per entry. Use this when a task references a
 sibling repo outside the current repo cwd — for example, "compare
 how beacon and leerie handle X, beacon is at `~/src/enric/beacon`":
@@ -1651,7 +1651,7 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Twelve worker types, each independently overridable:
+Eleven worker types (plus the global override), each independently overridable:
 
 | Worker             | env var                           | CLI flag                     | TOML key                  |
 |--------------------|-----------------------------------|------------------------------|---------------------------|
@@ -4486,7 +4486,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `<state-root>/runs/` |
-| `call_type` | str | one of the schema keys `claude_p()` accepts: the seven `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `provision`, `implementer`, `integrator`, `conformer`) plus the three post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`) |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the eight `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`) plus the three post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
@@ -4536,7 +4536,7 @@ Every `call_type` resolves to a file under `prompts/`. The heal loop's
 patch-generator worker calls
 `resolve_prompt(call_type: str) -> tuple[str, str, str]` to load a
 worker's system prompt: given any member of `WORKER_TYPES` (the
-self-heal target set is the seven main-loop workers, not the post-run
+self-heal target set is the eight main-loop workers, not the post-run
 workers), it returns `(source_kind, content, location_hint)` where
 `source_kind` is `"file"`, `content` is the prompt body, and
 `location_hint` is the relative path `"prompts/<call_type>.md"`.

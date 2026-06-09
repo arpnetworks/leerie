@@ -48,7 +48,7 @@ def _entries(bucket: str) -> list[str]:
 
 def test_inspect_tools_has_bash_patterns(leerie):
     """At least one Bash(<verb>:*) pattern must be present — that's the
-    whole point of the bucket. Without it, classifier/planner/reconciler/provision
+    whole point of the bucket. Without it, classifier/planner/reconciler/plan_overlap_judge/provision
     can't run ls/find/cat without per-call permission prompts (which are
     never granted in -p mode)."""
     entries = _entries(leerie.INSPECT_TOOLS)

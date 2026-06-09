@@ -311,10 +311,11 @@ local setup) because nerdctl can't reach Keychain. See
   committed per-repo default; outranked by env and CLI.
 - `--model sonnet|opus|haiku` — model for every worker this run.
   Without any override the per-worker defaults apply: judgment workers
-  (classifier, planner, reconciler, provision, integrator) run on `opus`; the
-  acting workers (implementer, conformer) run on `sonnet`. Per-worker
-  `--model-classifier`, `--model-planner`, `--model-reconciler`,
-  `--model-provision`, `--model-implementer`, `--model-integrator`,
+  (classifier, planner, reconciler, plan_overlap_judge, provision, integrator)
+  run on `opus`; the acting workers (implementer, conformer) run on `sonnet`.
+  Per-worker `--model-classifier`, `--model-planner`, `--model-reconciler`,
+  `--model-plan_overlap_judge`, `--model-provision`, `--model-implementer`,
+  `--model-integrator`,
   `--model-conformer` flags override the global default. Env-var equivalents are
   `LEERIE_MODEL` (and `LEERIE_MODEL_<WORKER>` for the per-worker
   overrides); TOML keys are `model` / `model_<worker>` in

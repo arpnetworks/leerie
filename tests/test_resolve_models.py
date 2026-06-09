@@ -11,9 +11,10 @@ Per-worker precedence (highest first):
   8. MODEL_DEFAULT (opus)
 
 The judgment-vs-implementation default split was introduced when the
-reconciler worker landed: classifier / planner / reconciler / integrator
-all default to opus, implementer / conformer default to sonnet (cost
-mitigation for workers that run most often).
+reconciler worker landed: classifier / planner / reconciler /
+plan_overlap_judge / provision / integrator all default to opus,
+implementer / conformer default to sonnet (cost mitigation for workers
+that run most often).
 """
 from __future__ import annotations
 

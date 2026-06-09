@@ -333,7 +333,7 @@ INSPECT_TOOLS = (
 ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit"
 
 # --inspect-dir preference: extra directories to grant the inspect-bucket
-# workers (classifier, planner, reconciler, provision) read access to via the
+# workers (classifier, planner, reconciler, plan_overlap_judge, provision) read access to via the
 # Claude Code CLI's --add-dir flag. Without this, Read/Grep/Glob and the
 # allowlisted Bash verbs in INSPECT_TOOLS are sandboxed to the repo cwd,
 # so cross-repo references like "~/src/enric/beacon" fail with "blocked,
@@ -2910,8 +2910,8 @@ def resolve_dangerously_skip_permissions(
     dangerously_skip_permissions in leerie.toml → False.
 
     When True, EVERY claude -p worker — including the judgment workers
-    (classifier, planner, reconciler, provision) that run in the real
-    repo cwd, not an isolated worktree — is invoked with
+    (classifier, planner, reconciler, plan_overlap_judge, provision) that run
+    in the real repo cwd, not an isolated worktree — is invoked with
     --dangerously-skip-permissions. This waives the DESIGN §12
     mechanical enforcement that planners stay read-only; trust shifts
     onto the prompts. Off by default; users opting in are making one
@@ -5811,7 +5811,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     `planner-bug-fixing`, `integrator-feat-001`, `conformer-feat-003`).
 
     `add_dirs` are extra paths forwarded to the CLI as `--add-dir` entries.
-    Used by the inspect bucket (classifier, planner, reconciler, provision)
+    Used by the inspect bucket (classifier, planner, reconciler, plan_overlap_judge, provision)
     so the `Read`/`Grep`/`Glob` sandbox and the allowlisted `Bash` verbs can
     reach sibling repos referenced in the task description. Resolved by
     `resolve_inspect_dirs()` and persisted under `st.data["inspect_dirs"]`
@@ -13418,7 +13418,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     help="DANGEROUS: pass --dangerously-skip-permissions "
                          "to EVERY claude -p worker — including the "
                          "judgment workers (classifier, planner, "
-                         "reconciler, provision) that run in the real "
+                         "reconciler, plan_overlap_judge, provision) "
+                         "that run in the real "
                          "repo cwd, not an isolated worktree. Waives "
                          "the DESIGN §12 mechanical enforcement that "
                          "they stay read-only. Use only on repos you "
@@ -13487,7 +13488,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     ap.add_argument("--inspect-dir", action="append", metavar="PATH",
                     dest="inspect_dir",
                     help="extra directory the inspect-bucket workers "
-                         "(classifier, planner, reconciler, provision) may read. "
+                         "(classifier, planner, reconciler, plan_overlap_judge, provision) may read. "
                          "Forwarded to `claude -p` as --add-dir. Repeatable. "
                          "Use for sibling repos referenced in the task that "
                          "live outside the current repo cwd. Default: none. "
