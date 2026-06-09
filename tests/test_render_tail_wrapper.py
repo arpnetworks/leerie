@@ -14,6 +14,8 @@ Coverage:
 """
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -135,6 +137,7 @@ def test_watcher_keeps_watching_when_proc_scan_finds_live(tmp_path):
         ["python3", "-c", "import time; time.sleep(30)",
          fake_orch_path, "--run-id", run_id],
     )
+    proc = None
     try:
         rewritten = script.replace("/work/", f"{tmp_path}/work/")
         proc = subprocess.Popen(
@@ -142,6 +145,7 @@ def test_watcher_keeps_watching_when_proc_scan_finds_live(tmp_path):
             env={"PATH": "/usr/bin:/bin"},
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True,
+            start_new_session=True,
         )
         # Watcher polls every 2 s. Give it time for one or two
         # iterations to confirm it's not bailing on the stale pid.
@@ -159,14 +163,21 @@ def test_watcher_keeps_watching_when_proc_scan_finds_live(tmp_path):
         try:
             stdout, stderr = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
-            proc.kill()
-            stdout, stderr = proc.communicate()
+            # Kill the entire process group — bash's background
+            # `(tail -F ...) &` child inherits the test's pipes and
+            # keeps them open after bash dies, so proc.kill() alone
+            # would leave communicate() blocked on EOF forever.
+            os.killpg(proc.pid, signal.SIGKILL)
+            stdout, stderr = proc.communicate(timeout=5)
             raise AssertionError(
                 f"watcher hung after live process died; stderr: {stderr!r}"
             )
         assert proc.returncode == 0, stderr
         assert "orchestrator exited" in stderr
     finally:
+        if proc is not None and proc.poll() is None:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=5)
         if sleeper.poll() is None:
             sleeper.terminate()
             try:

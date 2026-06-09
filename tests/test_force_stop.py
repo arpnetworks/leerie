@@ -152,9 +152,13 @@ def test_force_stop_kills_alive_pid(tmp_path):
             env=env,
         )
         assert result.returncode == 0, (
-            f"expected success after killing pid; stderr={result.stderr}"
+            f"expected success after killing pid; "
+            f"rc={result.returncode} stdout={result.stdout!r} stderr={result.stderr!r}"
         )
-        assert "stopped" in result.stderr.lower(), result.stderr
+        assert "stopped" in result.stderr.lower(), (
+            f"expected 'stopped' in stderr; "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}"
+        )
 
         patched = json.loads((run_dir / "run.json").read_text())
         assert patched.get("finished_at"), patched
