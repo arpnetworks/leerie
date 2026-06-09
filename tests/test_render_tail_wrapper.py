@@ -52,16 +52,30 @@ def _run_wrapper(tmp_path: Path, script: str, run_id: str,
                  timeout: float = 5.0) -> subprocess.CompletedProcess:
     """Run the wrapper with run_id as $1. The wrapper hard-codes
     /work/... so we use a `sed` rewrite to point at $tmp_path/work for
-    the test."""
+    the test.
+
+    Uses start_new_session + killpg so background children spawned by
+    the wrapper (e.g. ``tail -F``) are killed together with bash.
+    Without this, orphaned background processes keep the test's pipes
+    open and block communicate() / subprocess.run indefinitely."""
     rewritten = script.replace("/work/", f"{tmp_path}/work/")
     env = {"PATH": "/usr/bin:/bin"}
     if env_extra:
         env.update(env_extra)
-    return subprocess.run(
+    proc = subprocess.Popen(
         ["bash", "-c", rewritten + "\n", "_", run_id],
         env=env,
-        capture_output=True, text=True, timeout=timeout, check=False,
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
     )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(proc.pid, signal.SIGKILL)
+        stdout, stderr = proc.communicate(timeout=5)
+        raise
+    return subprocess.CompletedProcess(proc.args, proc.returncode,
+                                       stdout, stderr)
 
 
 # --- emission contract ----------------------------------------------------
