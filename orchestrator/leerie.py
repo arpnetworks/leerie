@@ -2518,6 +2518,28 @@ def resolve_leerie_root(repo_root: Path) -> Path:
     return (repo_root / ".leerie").resolve()
 
 
+def _resolve_enum_pref(repo_root: Path, cli_value: str | None, *,
+                       env_var: str, file_key: str, file_name: str,
+                       allowed: frozenset[str] | tuple[str, ...],
+                       default: str) -> str:
+    """Shared resolution for enum-valued prefs. CLI > env > file > default.
+    Bad env or file values die() at startup. Mirrors _resolve_bool_pref."""
+    if cli_value:
+        return cli_value
+    env = os.environ.get(env_var, "").strip()
+    if env:
+        if env not in allowed:
+            die(f"{env_var}={env!r} is not one of {allowed}")
+        return env
+    cfg = repo_root / file_name
+    file_val = _read_toml_key(cfg, file_key)
+    if file_val is not None:
+        if file_val not in allowed:
+            die(f"{cfg}: {file_key}={file_val!r} is not one of {allowed}")
+        return file_val
+    return default
+
+
 def resolve_source_of_truth(repo_root: Path,
                             cli_value: str | None = None) -> str:
     """Resolve the source-of-truth preference. Order:
@@ -2526,22 +2548,11 @@ def resolve_source_of_truth(repo_root: Path,
     choices=, so it is trusted when set. env and file values are
     rejected via die() if not in SOURCE_OF_TRUTH_VALUES — a bad
     config is caught at startup, not during a planner run."""
-    if cli_value:
-        return cli_value
-    env = os.environ.get(SOURCE_OF_TRUTH_ENV, "").strip()
-    if env:
-        if env not in SOURCE_OF_TRUTH_VALUES:
-            die(f"{SOURCE_OF_TRUTH_ENV}={env!r} is not one of "
-                f"{SOURCE_OF_TRUTH_VALUES}")
-        return env
-    cfg = repo_root / SOURCE_OF_TRUTH_FILE
-    file_val = _read_toml_key(cfg, "source_of_truth")
-    if file_val is not None:
-        if file_val not in SOURCE_OF_TRUTH_VALUES:
-            die(f"{cfg}: source_of_truth={file_val!r} is not one of "
-                f"{SOURCE_OF_TRUTH_VALUES}")
-        return file_val
-    return "both"
+    return _resolve_enum_pref(
+        repo_root, cli_value,
+        env_var=SOURCE_OF_TRUTH_ENV, file_key="source_of_truth",
+        file_name=SOURCE_OF_TRUTH_FILE,
+        allowed=SOURCE_OF_TRUTH_VALUES, default="both")
 
 
 def resolve_runtime(repo_root: Path,
@@ -2551,22 +2562,28 @@ def resolve_runtime(repo_root: Path,
     argparse validates `cli_value` via choices=, so it is trusted when set.
     env and file values are rejected via die() if not in RUNTIME_VALUES — a
     bad config is caught at startup, not during a worker run."""
-    if cli_value:
-        return cli_value
-    env = os.environ.get(RUNTIME_ENV, "").strip()
+    return _resolve_enum_pref(
+        repo_root, cli_value,
+        env_var=RUNTIME_ENV, file_key="runtime",
+        file_name=RUNTIME_FILE,
+        allowed=RUNTIME_VALUES, default="local")
+
+
+def _resolve_str_pref(repo_root: Path, cli_value: str | None, *,
+                      env_var: str, file_key: str, file_name: str,
+                      default: str | None) -> str | None:
+    """Shared resolution for unvalidated string prefs. CLI > env > file >
+    default. No enum check — value is free-form. Mirrors _resolve_bool_pref."""
+    if cli_value and cli_value.strip():
+        return cli_value.strip()
+    env = os.environ.get(env_var, "").strip()
     if env:
-        if env not in RUNTIME_VALUES:
-            die(f"{RUNTIME_ENV}={env!r} is not one of "
-                f"{RUNTIME_VALUES}")
         return env
-    cfg = repo_root / RUNTIME_FILE
-    file_val = _read_toml_key(cfg, "runtime")
-    if file_val is not None:
-        if file_val not in RUNTIME_VALUES:
-            die(f"{cfg}: runtime={file_val!r} is not one of "
-                f"{RUNTIME_VALUES}")
-        return file_val
-    return "local"
+    cfg = repo_root / file_name
+    file_val = _read_toml_key(cfg, file_key)
+    if file_val is not None and file_val.strip():
+        return file_val.strip()
+    return default
 
 
 def resolve_pr_template(repo_root: Path,
@@ -2578,16 +2595,39 @@ def resolve_pr_template(repo_root: Path,
     No validation against MODEL_VALUES-style enum since the choice is
     free-form (depends on the target repo's directory contents); the
     template-discovery helper validates existence later."""
-    if cli_value:
+    return _resolve_str_pref(
+        repo_root, cli_value,
+        env_var=PR_TEMPLATE_ENV, file_key="pr_template",
+        file_name=PR_TEMPLATE_FILE, default=None)
+
+
+def _resolve_positive_int_pref(repo_root: Path, cli_value: int | None, *,
+                               env_var: str, file_key: str, file_name: str,
+                               default: int) -> int:
+    """Shared resolution for positive-int prefs. CLI > env > file > default.
+    Bad env or file values die() at startup. Mirrors _resolve_bool_pref."""
+    if cli_value is not None:
         return cli_value
-    env = os.environ.get(PR_TEMPLATE_ENV, "").strip()
+    env = os.environ.get(env_var, "").strip()
     if env:
-        return env
-    cfg = repo_root / PR_TEMPLATE_FILE
-    file_val = _read_toml_key(cfg, "pr_template")
+        try:
+            n = int(env)
+        except ValueError:
+            die(f"{env_var}={env!r} is not a positive integer")
+        if n < 1:
+            die(f"{env_var}={env!r} is not a positive integer")
+        return n
+    cfg = repo_root / file_name
+    file_val = _read_toml_key(cfg, file_key)
     if file_val is not None:
-        return file_val
-    return None
+        try:
+            n = int(file_val)
+        except ValueError:
+            die(f"{cfg}: {file_key}={file_val!r} is not a positive integer")
+        if n < 1:
+            die(f"{cfg}: {file_key}={file_val!r} is not a positive integer")
+        return n
+    return default
 
 
 def resolve_confidence_rounds(repo_root: Path,
@@ -2598,28 +2638,11 @@ def resolve_confidence_rounds(repo_root: Path,
     `cli_value` is a positive int via `type=`, so it is trusted when set.
     env and file values are rejected via die() when not a positive int —
     bad config caught at startup, not during a planner run."""
-    if cli_value is not None:
-        return cli_value
-    env = os.environ.get(CONFIDENCE_ROUNDS_ENV, "").strip()
-    if env:
-        try:
-            n = int(env)
-        except ValueError:
-            die(f"{CONFIDENCE_ROUNDS_ENV}={env!r} is not a positive integer")
-        if n < 1:
-            die(f"{CONFIDENCE_ROUNDS_ENV}={env!r} is not a positive integer")
-        return n
-    cfg = repo_root / CONFIDENCE_ROUNDS_FILE
-    file_val = _read_toml_key(cfg, "confidence_rounds")
-    if file_val is not None:
-        try:
-            n = int(file_val)
-        except ValueError:
-            die(f"{cfg}: confidence_rounds={file_val!r} is not a positive integer")
-        if n < 1:
-            die(f"{cfg}: confidence_rounds={file_val!r} is not a positive integer")
-        return n
-    return DEFAULT_CAPS["confidence_rounds"]
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=CONFIDENCE_ROUNDS_ENV, file_key="confidence_rounds",
+        file_name=CONFIDENCE_ROUNDS_FILE,
+        default=DEFAULT_CAPS["confidence_rounds"])
 
 
 def resolve_max_workers(repo_root: Path,
@@ -2630,28 +2653,11 @@ def resolve_max_workers(repo_root: Path,
     int via `type=int` so it is trusted when set. env and file values are
     rejected via die() when not a positive int — bad config caught at
     startup, not mid-run."""
-    if cli_value is not None:
-        return cli_value
-    env = os.environ.get(MAX_WORKERS_ENV, "").strip()
-    if env:
-        try:
-            n = int(env)
-        except ValueError:
-            die(f"{MAX_WORKERS_ENV}={env!r} is not a positive integer")
-        if n < 1:
-            die(f"{MAX_WORKERS_ENV}={env!r} is not a positive integer")
-        return n
-    cfg = repo_root / MAX_WORKERS_FILE
-    file_val = _read_toml_key(cfg, "max_workers")
-    if file_val is not None:
-        try:
-            n = int(file_val)
-        except ValueError:
-            die(f"{cfg}: max_workers={file_val!r} is not a positive integer")
-        if n < 1:
-            die(f"{cfg}: max_workers={file_val!r} is not a positive integer")
-        return n
-    return DEFAULT_CAPS["max_total_workers"]
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=MAX_WORKERS_ENV, file_key="max_workers",
+        file_name=MAX_WORKERS_FILE,
+        default=DEFAULT_CAPS["max_total_workers"])
 
 
 def resolve_max_parallel(repo_root: Path,
@@ -2662,28 +2668,11 @@ def resolve_max_parallel(repo_root: Path,
     positive int via `type=_positive_int` so it is trusted when set.
     env and file values are rejected via die() when not a positive int —
     bad config caught at startup, not mid-run."""
-    if cli_value is not None:
-        return cli_value
-    env = os.environ.get(MAX_PARALLEL_ENV, "").strip()
-    if env:
-        try:
-            n = int(env)
-        except ValueError:
-            die(f"{MAX_PARALLEL_ENV}={env!r} is not a positive integer")
-        if n < 1:
-            die(f"{MAX_PARALLEL_ENV}={env!r} is not a positive integer")
-        return n
-    cfg = repo_root / MAX_PARALLEL_FILE
-    file_val = _read_toml_key(cfg, "max_parallel")
-    if file_val is not None:
-        try:
-            n = int(file_val)
-        except ValueError:
-            die(f"{cfg}: max_parallel={file_val!r} is not a positive integer")
-        if n < 1:
-            die(f"{cfg}: max_parallel={file_val!r} is not a positive integer")
-        return n
-    return DEFAULT_CAPS["max_parallel"]
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=MAX_PARALLEL_ENV, file_key="max_parallel",
+        file_name=MAX_PARALLEL_FILE,
+        default=DEFAULT_CAPS["max_parallel"])
 
 
 _MEMORY_SUFFIX_MULTIPLIER = {
@@ -2993,22 +2982,11 @@ def resolve_verbosity(repo_root: Path,
     to `normal` (the pre-streaming behavior), not to VERBOSITY_DEFAULT,
     so -v means "show me the streaming feature" rather than "bump above
     the default by one"."""
-    if cli_value:
-        return cli_value
-    env = os.environ.get(VERBOSITY_ENV, "").strip()
-    if env:
-        if env not in VERBOSITY_VALUES:
-            die(f"{VERBOSITY_ENV}={env!r} is not one of "
-                f"{VERBOSITY_VALUES}")
-        return env
-    cfg = repo_root / VERBOSITY_FILE
-    file_val = _read_toml_key(cfg, "verbosity")
-    if file_val is not None:
-        if file_val not in VERBOSITY_VALUES:
-            die(f"{cfg}: verbosity={file_val!r} is not one of "
-                f"{VERBOSITY_VALUES}")
-        return file_val
-    return VERBOSITY_DEFAULT
+    return _resolve_enum_pref(
+        repo_root, cli_value,
+        env_var=VERBOSITY_ENV, file_key="verbosity",
+        file_name=VERBOSITY_FILE,
+        allowed=VERBOSITY_VALUES, default=VERBOSITY_DEFAULT)
 
 
 def verbosity_from_shortcuts(verbose: int, quiet: int) -> str | None:
@@ -3208,16 +3186,10 @@ def resolve_telemetry_subdir(repo_root: Path,
     telemetry_dir in leerie.toml → TELEMETRY_SUBDIR_DEFAULT ("events").
     The value is a plain directory name (or relative path) appended to
     the run dir — not validated against the filesystem at resolve time."""
-    if cli_value and cli_value.strip():
-        return cli_value.strip()
-    env = os.environ.get(TELEMETRY_SUBDIR_ENV, "").strip()
-    if env:
-        return env
-    cfg = repo_root / TELEMETRY_SUBDIR_FILE
-    file_val = _read_toml_key(cfg, "telemetry_dir")
-    if file_val is not None and file_val.strip():
-        return file_val.strip()
-    return TELEMETRY_SUBDIR_DEFAULT
+    return _resolve_str_pref(
+        repo_root, cli_value,
+        env_var=TELEMETRY_SUBDIR_ENV, file_key="telemetry_dir",
+        file_name=TELEMETRY_SUBDIR_FILE, default=TELEMETRY_SUBDIR_DEFAULT)
 
 
 def resolve_judge_dir(repo_root: Path, cli_value: str | None = None) -> str:
@@ -3226,16 +3198,10 @@ def resolve_judge_dir(repo_root: Path, cli_value: str | None = None) -> str:
     judge_dir in leerie.toml → JUDGE_DIR_DEFAULT ("judge-out").
     The value is a plain directory name (or relative path) appended to
     the run dir — not validated against the filesystem at resolve time."""
-    if cli_value and cli_value.strip():
-        return cli_value.strip()
-    env = os.environ.get(JUDGE_DIR_ENV, "").strip()
-    if env:
-        return env
-    cfg = repo_root / JUDGE_DIR_FILE
-    file_val = _read_toml_key(cfg, "judge_dir")
-    if file_val is not None and file_val.strip():
-        return file_val.strip()
-    return JUDGE_DIR_DEFAULT
+    return _resolve_str_pref(
+        repo_root, cli_value,
+        env_var=JUDGE_DIR_ENV, file_key="judge_dir",
+        file_name=JUDGE_DIR_FILE, default=JUDGE_DIR_DEFAULT)
 
 
 def resolve_heal_dir(repo_root: Path, cli_value: str | None = None) -> str:
@@ -3244,16 +3210,10 @@ def resolve_heal_dir(repo_root: Path, cli_value: str | None = None) -> str:
     heal_dir in leerie.toml → HEAL_DIR_DEFAULT ("heal-out").
     The value is a plain directory name (or relative path) appended to
     the run dir — not validated against the filesystem at resolve time."""
-    if cli_value and cli_value.strip():
-        return cli_value.strip()
-    env = os.environ.get(HEAL_DIR_ENV, "").strip()
-    if env:
-        return env
-    cfg = repo_root / HEAL_DIR_FILE
-    file_val = _read_toml_key(cfg, "heal_dir")
-    if file_val is not None and file_val.strip():
-        return file_val.strip()
-    return HEAL_DIR_DEFAULT
+    return _resolve_str_pref(
+        repo_root, cli_value,
+        env_var=HEAL_DIR_ENV, file_key="heal_dir",
+        file_name=HEAL_DIR_FILE, default=HEAL_DIR_DEFAULT)
 
 
 def resolve_heal_max_rounds(repo_root: Path, cli_value: int | None = None) -> int:
@@ -3261,28 +3221,11 @@ def resolve_heal_max_rounds(repo_root: Path, cli_value: int | None = None) -> in
     --heal-max-rounds CLI flag → LEERIE_HEAL_MAX_ROUNDS env var →
     heal_max_rounds in leerie.toml → HEAL_MAX_ROUNDS_DEFAULT (10).
     An invalid (non-positive) value in env or file is rejected via die()."""
-    if cli_value is not None:
-        return cli_value
-    env = os.environ.get(HEAL_MAX_ROUNDS_ENV, "").strip()
-    if env:
-        try:
-            v = int(env)
-        except ValueError:
-            die(f"{HEAL_MAX_ROUNDS_ENV}={env!r} is not a positive integer")
-        if v <= 0:
-            die(f"{HEAL_MAX_ROUNDS_ENV}={env!r} must be a positive integer")
-        return v
-    cfg = repo_root / HEAL_MAX_ROUNDS_FILE
-    file_val = _read_toml_key(cfg, "heal_max_rounds")
-    if file_val is not None:
-        try:
-            v = int(file_val)
-        except ValueError:
-            die(f"{cfg}: heal_max_rounds={file_val!r} is not a positive integer")
-        if v <= 0:
-            die(f"{cfg}: heal_max_rounds={file_val!r} must be a positive integer")
-        return v
-    return HEAL_MAX_ROUNDS_DEFAULT
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=HEAL_MAX_ROUNDS_ENV, file_key="heal_max_rounds",
+        file_name=HEAL_MAX_ROUNDS_FILE,
+        default=HEAL_MAX_ROUNDS_DEFAULT)
 
 
 def resolve_heal_success_threshold(repo_root: Path,
@@ -6083,6 +6026,19 @@ async def replay_capture(record: dict, *,
     return (envelope, structured)
 
 
+def _accumulate_telemetry(data: dict, envelope: dict) -> None:
+    """Accumulate run-weight signals from a worker envelope into `data`.
+    Shared between State and _ReplayState."""
+    t = data.setdefault("telemetry", {"calls": 0, "cost_usd": 0.0,
+                                       "input_tokens": 0,
+                                       "output_tokens": 0})
+    t["calls"] += 1
+    t["cost_usd"] += float(envelope.get("total_cost_usd") or 0.0)
+    usage = envelope.get("usage") or {}
+    t["input_tokens"] += int(usage.get("input_tokens") or 0)
+    t["output_tokens"] += int(usage.get("output_tokens") or 0)
+
+
 class _ReplayState:
     """Minimal State-alike for replay_capture: no persistent writes.
 
@@ -6111,14 +6067,7 @@ class _ReplayState:
 
     def add_telemetry(self, envelope: dict) -> None:
         self.last_envelope = envelope
-        t = self.data.setdefault("telemetry", {"calls": 0, "cost_usd": 0.0,
-                                               "input_tokens": 0,
-                                               "output_tokens": 0})
-        t["calls"] += 1
-        t["cost_usd"] += float(envelope.get("total_cost_usd") or 0.0)
-        usage = envelope.get("usage") or {}
-        t["input_tokens"] += int(usage.get("input_tokens") or 0)
-        t["output_tokens"] += int(usage.get("output_tokens") or 0)
+        _accumulate_telemetry(self.data, envelope)
 
 
 class StateLockedError(Exception):
@@ -6267,14 +6216,7 @@ class State:
         """Accumulate run-weight signals from a worker envelope. On a
         subscription the dollar figure is not billed, but it and the token
         counts are a useful proxy for how heavy the run is."""
-        t = self.data.setdefault("telemetry", {"calls": 0, "cost_usd": 0.0,
-                                               "input_tokens": 0,
-                                               "output_tokens": 0})
-        t["calls"] += 1
-        t["cost_usd"] += float(envelope.get("total_cost_usd") or 0.0)
-        usage = envelope.get("usage") or {}
-        t["input_tokens"] += int(usage.get("input_tokens") or 0)
-        t["output_tokens"] += int(usage.get("output_tokens") or 0)
+        _accumulate_telemetry(self.data, envelope)
         self.save()
 
 

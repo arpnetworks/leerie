@@ -65,6 +65,22 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 # image and starts in ~2s.
 
 
+# Read a single top-level key from a JSON file. Prints the value
+# (empty string if absent/null/error). Used by --finalize to avoid
+# repeating the same python3 one-liner.
+_json_get() {
+  local file="$1" key="$2"
+  python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    v = d.get(sys.argv[2])
+    print(v if v is not None else "")
+except Exception:
+    pass
+' "$file" "$key"
+}
+
 # Read volume_id from a run's host-side sidecar. provision.sh persists
 # volume_id into both fly-machine.json and run.json. --kill consults
 # this so the volume is reaped alongside the machine instead of
@@ -694,14 +710,7 @@ PY
     # exists, i.e. after fetch_branch has run at least once).
     _fin_sidecar="$_fin_run_dir/run.json"
     if [ -f "$_fin_sidecar" ]; then
-      _already="$(python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    print("yes" if d.get("pushed_at") else "")
-except Exception:
-    pass
-' "$_fin_sidecar")"
+      _already="$(_json_get "$_fin_sidecar" "pushed_at")"
       if [ -n "$_already" ]; then
         remote_log "--finalize: run $_fin_run_id is already pushed; nothing to do."
         exit 0
@@ -728,23 +737,9 @@ except Exception:
     #       short-circuit on no_push=true.
     _already_synced="false"
     if [ -f "$_fin_run_dir/run.json" ] && [ -f "$_fin_run_dir/state.json" ]; then
-      _has_finished="$(python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    print("yes" if d.get("finished_at") else "")
-except Exception:
-    pass
-' "$_fin_run_dir/run.json")"
+      _has_finished="$(_json_get "$_fin_run_dir/run.json" "finished_at")"
       if [ -n "$_has_finished" ]; then
-        _run_branch="$(python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    print(d.get("branch") or "")
-except Exception:
-    pass
-' "$_fin_run_dir/run.json")"
+        _run_branch="$(_json_get "$_fin_run_dir/run.json" "branch")"
         _run_no_push="$(python3 -c '
 import json, sys
 try:
@@ -884,14 +879,7 @@ except Exception:
       # non-existent branch.
       if [ "$_FINALIZE_NO_PUSH" = "false" ]; then
         _fetched_run_json="$_fetched_run_dir/run.json"
-        _fetched_run_branch="$(python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    print(d.get("branch") or "")
-except Exception:
-    pass
-' "$_fetched_run_json" 2>/dev/null || true)"
+        _fetched_run_branch="$(_json_get "$_fetched_run_json" "branch" 2>/dev/null || true)"
         if [ -f "$_fetched_run_json" ] && [ -n "$_fetched_run_branch" ] && \
            git -C "$USER_REPO" rev-parse --verify "refs/heads/$_fetched_run_branch" >/dev/null 2>&1; then
           python3 - "$_fetched_run_json" <<'PY'
