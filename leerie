@@ -64,7 +64,6 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 # one-time image-build cost; every subsequent invocation reuses the cached
 # image and starts in ~2s.
 
-# _resolve_fly_machine_id_from_run_dir removed: run_id IS the machine ID.
 
 # Read volume_id from a run's host-side sidecar. provision.sh persists
 # volume_id into both fly-machine.json and run.json. --kill consults
@@ -1216,15 +1215,14 @@ done
 export LEERIE_RUN_ID
 export IS_RESUME
 
-# --- extract the task positional (for bootstrap-stage resume) -----------
+# --- extract the task positional (for pre-classify resume) ----------------
 # The orchestrator's argparse takes a single optional positional `task`.
-# On a remote-mode bootstrap-stage resume, the in-machine orchestrator
-# has no state.json (classify never ran), and the launcher strips
-# --resume so the orchestrator routes to the fresh-launch branch. That
-# branch requires a task. The user's original `leerie "<task>"` is gone
-# from the resume invocation's argv, so we persist it at first-launch
-# (a few sections down) and read it back here on subsequent bootstrap
-# resumes. This block only extracts what the user typed THIS time.
+# On a remote-mode pre-classify resume, the in-machine orchestrator has
+# no state.json (classify never ran) and needs the task argument. The
+# user's original `leerie "<task>"` is gone from the resume invocation's
+# argv, so we persist it at first-launch (a few sections down) and read
+# it back here on subsequent resumes. This block only extracts what the
+# user typed THIS time.
 #
 # Walk $@ skipping flag values for any --flag that takes one. The
 # orchestrator's --model-<W> and --effort-<W> per-worker overrides
