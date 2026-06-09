@@ -83,15 +83,6 @@ def test_resolve_multiple_runs_wrong_explicit_dies(leerie, tmp_path):
         leerie.resolve_run_id(tmp_path, "feat-nope-zzz999")
 
 
-def test_resolve_ignores_bootstrap_runs(leerie, tmp_path):
-    """A bootstrap directory (pre-classify) is not a real run — resolution
-    treats it as not existing. If only a bootstrap dir exists, resolve dies."""
-    _make_run(tmp_path, "_bootstrap-abcdef",
-              {"task": "bootstrap", "started_at": "2026-05-26T10:00:00+00:00"})
-    with pytest.raises(SystemExit):
-        leerie.resolve_run_id(tmp_path, None)
-
-
 def test_resolve_message_includes_available_runs(leerie, tmp_path, capsys):
     """When resolution fails, the error should list available run ids so
     the user can copy-paste one — not just 'try again'."""
@@ -104,54 +95,6 @@ def test_resolve_message_includes_available_runs(leerie, tmp_path, capsys):
     err = capsys.readouterr().err
     assert "feat-foo-abc123" in err
     assert "fix-bar-def456" in err
-
-
-# --- F1 carve-out: explicit _bootstrap-* ids are accepted ---------------
-# Pre-classify resume scenario: user paused a remote run via
-# `leerie --stop _bootstrap-XXX` before phase_classify completed. The
-# run dir on the machine is still _bootstrap-XXX. discover_runs filters
-# these dirs, so without the carve-out, --resume --run-id _bootstrap-XXX
-# dies with "no runs found". The carve-out in resolve_run_id allows
-# explicit naming of a bootstrap dir as long as state.json exists.
-
-def test_resolve_explicit_bootstrap_id_accepted_when_state_json_exists(leerie, tmp_path):
-    """Pre-classify resume: --run-id _bootstrap-XXX is honored when the
-    dir exists with a state.json, even though discover_runs filters it."""
-    _make_run(tmp_path, "_bootstrap-abc123",
-              {"task": "x", "started_at": "2026-05-26T10:00:00+00:00"})
-    assert leerie.resolve_run_id(tmp_path, "_bootstrap-abc123") == "_bootstrap-abc123"
-
-
-def test_resolve_bootstrap_id_without_state_json_still_dies(leerie, tmp_path):
-    """The carve-out requires state.json. A bootstrap dir with only
-    e.g. fly-machine.json (the host-side D2 case during in-flight pause)
-    is NOT a valid resume target — there's no orchestrator state yet."""
-    # Make the dir but NO state.json.
-    rd = tmp_path / "runs" / "_bootstrap-empty00"
-    rd.mkdir(parents=True)
-    (rd / "fly-machine.json").write_text('{"fly_machine_id": "mach-x"}')
-    with pytest.raises(SystemExit):
-        leerie.resolve_run_id(tmp_path, "_bootstrap-empty00")
-
-
-def test_resolve_bootstrap_id_not_named_explicit_still_filtered(leerie, tmp_path):
-    """Without an explicit --run-id, bootstrap dirs are still filtered.
-    A repo with only a bootstrap dir + no explicit --run-id dies the
-    same way as an empty repo. Regression guard for the carve-out
-    being narrowly-scoped to the explicit-name case."""
-    _make_run(tmp_path, "_bootstrap-abc123",
-              {"task": "x", "started_at": "2026-05-26T10:00:00+00:00"})
-    with pytest.raises(SystemExit):
-        leerie.resolve_run_id(tmp_path, None)
-
-
-def test_resolve_bootstrap_id_does_not_match_wrong_name(leerie, tmp_path):
-    """A non-matching --run-id _bootstrap-XXX still dies, even with the
-    carve-out — the dir must actually exist."""
-    _make_run(tmp_path, "_bootstrap-real123",
-              {"task": "x", "started_at": "2026-05-26T10:00:00+00:00"})
-    with pytest.raises(SystemExit):
-        leerie.resolve_run_id(tmp_path, "_bootstrap-fake999")
 
 
 # --- Change 4: orphan run dirs (seed_auth failed before state.json) -----

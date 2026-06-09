@@ -32,8 +32,8 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/container-entry.sh` | Container PID 1. Runs as **root** (the Dockerfile intentionally omits `USER leerie` so the entrypoint can perform cgroup-v2 delegation — `mkdir + chown /sys/fs/cgroup/leerie.slice` to the leerie user — before privilege drop; see DESIGN §6 *Memory containment*). `ulimit -c 0`, the cgroup delegation block, `cd /work`, and the `chown leerie: /work` step all run as root. The final exec drops to leerie via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...`: if invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately, which also drops via `Popen(user="leerie")`), the runuser exec wraps `sleep infinity` to keep the namespace alive; otherwise it wraps `python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). The explicit `env` form is used instead of `runuser --login` because the login form would chdir to `/home/leerie` and override the `cd /work` invariant. |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
 | `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-finalize-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — note: `EXIT_LOCKED=75` from the orchestrator is remapped to `container_rc=130` by the launcher's rc=75 branch before `LEERIE_REMOTE_EXIT_RC` is exported, so the only `rc=75` that *does* reach `decide_teardown` is genuine EX_TEMPFAIL from worker rate-limit / parse-fail surfaces, not the single-owner-per-run-dir refusal; see §Single-owner-per-run-dir enforcement below — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, source `scripts/host-finalize.sh` and call `host_finalize <run-dir>` to push + open the PR with the host's auth; **only if push succeeds** does `destroy_machine` run; on push failure leave the machine RUNNING with a recovery banner pointing at `leerie --finalize <run-id>`; on sync failure same recovery pattern with `sync_failed_at` written to the sidecar), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: stop machine, write `paused_at`/`pause_reason` to the run sidecar). |
-| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `update_run_json()` (atomic merge of fields into `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated), `render_tail_wrapper()` (emits a POSIX-sh wrapper script that tails `orchestrator.log`, follows the bootstrap-id → final-id rename, and watches orchestrator liveness via OR of pid-file `kill -0` and `/proc/[0-9]*/cmdline` scan for `orchestrator/leerie.py`+run-id — the cross-check closes the stale-pid contagion of DESIGN §6 *Single owner per run dir*), and `tail_with_optional_autofinalize()` (wraps `render_tail_wrapper` + `flyctl ssh console` with optional `AUTO_FINALIZE_TOKEN` plumbing: on clean exit, captures stderr through `tee`, greps for the token to extract the final run-id, then `exec`s `leerie --finalize <id>` on the host — used by both the fresh-launch tail and the `--resume` rc=75 pivot). Replaces four duplicated detection blocks across the remote scripts. |
-| `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch when a `fly_machine_id` is recoverable for the run-id — looked up via the dual-file resolver `_resolve_fly_machine_id_from_run_dir` at `leerie:76-94`, which tries `fly-machine.json` first then `run.json`, matching `--stop`/`--kill`/`--finalize`/`--resume`). Exports `resume_machine()`: runs `flyctl machine start` (idempotent on already-running machines via the `flyctl machine status` fallback at lines 47-53), waits for `started`, and clears `paused_at`/`pause_reason` from `run.json` if it exists. The launcher then runs the orchestrator inside the resumed machine with `--resume --run-id <id>`. |
+| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `update_run_json()` (atomic merge of fields into `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated), `render_tail_wrapper()` (emits a POSIX-sh wrapper script that tails `orchestrator.log` and watches orchestrator liveness via OR of pid-file `kill -0` and `/proc/[0-9]*/cmdline` scan for `orchestrator/leerie.py`+run-id — the cross-check closes the stale-pid contagion of DESIGN §6 *Single owner per run dir*), and `tail_with_optional_autofinalize()` (wraps `render_tail_wrapper` + `flyctl ssh console` with optional `AUTO_FINALIZE_TOKEN` plumbing: on clean exit, captures stderr through `tee`, greps for the token to extract the final run-id, then `exec`s `leerie --finalize <id>` on the host — used by both the fresh-launch tail and the `--resume` rc=75 pivot). Replaces four duplicated detection blocks across the remote scripts. |
+| `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch — the run-id IS the machine ID, so no lookup is needed). Exports `resume_machine()`: runs `flyctl machine start` (idempotent on already-running machines via the `flyctl machine status` fallback at lines 47-53), waits for `started`, and clears `paused_at`/`pause_reason` from `run.json` if it exists. The launcher then runs the orchestrator inside the resumed machine with `--resume --run-id <id>`. |
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Exports `re_seed()`: reads `fly_machine_id` from the run sidecar, wakes the machine via `flyctl machine start` if stopped, runs a safety check that refuses re-seed when machine-side `/work` has uncommitted tracked changes (unless `LEERIE_RE_SEED_FORCE=1`), then calls `seed_repo_dirty` from `seed-repo.sh`. Invoked by the launcher's `--re-seed <run-id>` fast-path and by the auto-re-seed step in the `--resume <run-id> --runtime fly` flow. |
 | `scripts/remote/seed-auth.sh` | Seeds Claude config + git identity into the provisioned Fly Machine. Tar-pipes the host's `$STAGE` (Keychain-extracted OAuth credentials + projects-stripped `~/.claude.json` + `.claude/` subdirs, with `.claude/local`, `.claude/plugins/cache`, and `.claude/plugins/marketplaces` skipped; `~/.aws/` also included when Bedrock mode is enabled — see `$STAGE/.aws` mount row above; `.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc`, `.ssh`, `.gnupg`, and `.config` are explicitly excluded from the tar — those are git/push auth that lives on the host per DESIGN §6 *Finalization* — ~408 MB host npm install duplicated by the Dockerfile's globally-installed claude binary, plus the bulky plugin cache that's rebuilt on the remote post-tar via `claude plugin marketplace add` + `claude plugin install` from the seeded `installed_plugins.json` / `known_marketplaces.json`) to `/home/leerie/` via `flyctl ssh console -C "tar -xzC /home/leerie"` (gzip on both ends). The tar pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts that have GNU `timeout`; no-op fallback otherwise) so a stalled `flyctl ssh console` session — observed mode where flyctl never exits even though the remote tar made progress — produces a clean rc 124/137 instead of hanging forever. rc 124/137 triggers a one-shot `flyctl agent restart` retry; if the retry also stalls, the function returns 1 and leerie's existing PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*). A background heartbeat (`_seed_progress_bg`) logs "seed_auth: still streaming (Ns elapsed)" every `LEERIE_PROGRESS_INTERVAL_S` seconds (default 10) so the user sees activity rather than a silent multi-minute wait. Writes git identity to `/home/leerie/.gitconfig` (not `--global`, which would land in `/root/.gitconfig` under the ssh-console session's default root user). Pre-warms `claude --version` once as the leerie user so the orchestrator's preflight call hits warm caches (the FIRST claude invocation on a cold Fly machine takes ~17 s — Node + statsig cold start — and would otherwise exceed the orchestrator's preflight timeout). |
 | `scripts/remote/seed-repo.sh` | Two-phase bundle + delta repo seeding helper (sourced by the `leerie` launcher after `provision_machine()` succeeds). Exports `seed_repo_clone` (wipe `/work` contents but preserve the inode; create `git bundle` for the parent and each submodule; pipe each bundle via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"` — `sh -c` is required because bare `cat > ...` fails on flyctl's `-C`; have the machine `git clone` from the parent bundle, wire submodule URLs to their per-submodule bundles, run `git -c protocol.file.allow=always submodule update --recursive` — `protocol.file.allow` is required by git 2.38+ for file://-style submodule URLs per CVE-2022-39253 — then chown to leerie; clean up the bundle tmpfiles), `seed_repo_dirty` (rsync the dirty/untracked delta plus force-included `.claude/`, used by both fresh-seed delta and the Phase 4 `re-seed.sh` flow), and the wrapper `seed_repo`. Bundles sidestep macOS BSD tar's NFC→NFD filename normalization, which corrupted submodule working trees containing non-ASCII filenames on the Linux receiver. No in-machine `git clone` from origin — Fly machines deliberately receive no GitHub credentials. The parent-bundle pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts with GNU `timeout`; no-op fallback otherwise) and surrounded by a `_seed_progress_bg` background heartbeat; on rc 124/137 (timeout fired) the function returns 1 with a "flyctl ssh console likely stalled" diagnosis so leerie's PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*) matching the seed_auth pattern. A second `_seed_progress_bg` covers the submodule-bundle `git submodule foreach --recursive` batch so the user sees activity across multi-submodule transfers instead of a silent pause. |
@@ -1097,16 +1097,9 @@ The lock primitive itself:
   directory inode, not the state.json inode, so the
   `tmp.replace(self.path)` swap inside `save()` does not affect the
   lock. Docstring updated to make this explicit.
-- `State.rename_to`'s `os.rename(self.run_dir, new_dir)` preserves
-  the lock — the fd binds the open file description, not the path.
-  (Verified on macOS Darwin 25.3. `fcntl.flock` wraps BSD `flock(2)`,
-  which Linux and macOS Darwin both implement with the same OFD-bound
-  semantics — distinct from POSIX `fcntl(F_SETLK)` byte-range locks,
-  which Python exposes separately.)
-
 Two checked construction sites that catch `StateLockedError`:
 
-- `main()` at the post-bootstrap `State(leerie_root, run_id)` call:
+- `main()` at the `State(leerie_root, run_id)` call:
   logs the message + `sys.exit(EXIT_LOCKED)`.
 - `--phase judge|heal` at the `phase_st = State(...)` call: same
   pattern, since `--phase` mutates state and would race the same
@@ -1937,7 +1930,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 
 | Phase | Function(s) | What it does |
 |-------|-------------|--------------|
-| Preflight | `preflight` | git identity, clean working tree, `claude` CLI version, live `claude -p` smoke test. Run-id collisions are detected later in the flow (filesystem side in `State.rename_to()` post-classify; git side in `setup-run.sh`'s branch-creation step) — they cannot be checked in preflight because the final `run_id` isn't known until phase_classify completes. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `--resume` |
+| Preflight | `preflight` | git identity, clean working tree, `claude` CLI version, live `claude -p` smoke test. Run-id collisions are detected at two points: filesystem side in `State.__init__` (the run dir is created at container start since the run-id is the container/machine ID); git side in `setup-run.sh`'s branch-creation step. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `--resume` |
 | 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 9-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive |
 |   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ "Worker-driven install"). Always runs; runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.leerie-setup.sh` hook if present → `synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — workers run install commands themselves in their own worktrees (not the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `run_streaming` so their output is visible live. Skipped on `--resume` (whole fresh-run else-branch is); the env var is re-exported from persisted state on resume. |
 |   • Clarify *(optional)* | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`). Intent questions from the classifier are dropped by default; pass `--clarify` to surface them. With `--clarify` + interactive: collect; with `--clarify` + non-interactive: write `pending-questions.json`, exit code 10 (DESIGN §11) |
@@ -1990,14 +1983,14 @@ All in `leerie.py`, in execution order. This is the concrete catalogue behind
 | `gh auth status` + `origin` remote (launcher bash, before container) | finalize would fail at push/PR after the full run already ran. Short-circuited when `--no-push` is passed (env / TOML mirrors). |
 | live `claude -p` smoke test | auth failure or network problem |
 
-Run-id collisions are detected outside preflight because the final `run_id` is only known after `phase_classify` returns. There are two natural collision points:
+Run-id collisions are detected at two natural collision points:
 
 | Check | Where | Catches |
 |-------|-------|---------|
-| `State.rename_to(new_run_id)` refuses if the target dir exists | `orchestrate()` after `phase_classify` | `<state-root>/runs/<run-id>/` already exists on disk |
+| `State.__init__` refuses if the run dir is locked by another process | container start | Another orchestrator already owns this `<state-root>/runs/<run-id>/` |
 | `setup-run.sh` preserves an existing `leerie/runs/<run-id>` branch instead of creating it | wave-execute phase | A pre-existing branch with the same name (treated as a resume; the run picks up wherever the branch was left) |
 
-The bootstrap directory `<state-root>/runs/_bootstrap-<6hex>/` is used until classify completes; the rename is atomic on POSIX same-filesystem.
+The run-id is the container/machine ID (DESIGN §6), known at container creation time. No temporary directory or rename is needed.
 
 `--skip-smoke` bypasses only the live smoke test (used by the test harness); the CLI version check and the `gh` check still run because they are local and read-only, and skipping them would defer a confusing failure to mid-run.
 
@@ -2791,7 +2784,7 @@ Every script takes a `RUN_ID` as its first positional argument (after any flags)
 | `new-worktree.sh <id> <run-id>` | Creates `leerie/subtasks/<run-id>/<id>` worktree at `${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/worktrees/<id>` branched off the current `leerie/runs/<run-id>` tip; reuses an existing worktree/branch if present (resume after handoff). Prints the absolute worktree path. The run-branch (`leerie/runs/…`) and subtask-branch (`leerie/subtasks/…`) prefixes are deliberately disjoint so neither is an ancestor ref of the other — git's loose ref store cannot hold a ref AT a path and another ref UNDER that same path simultaneously. |
 | `integrate.sh <id> <run-id>` | From repo root, inside the run-branch worktree (`${LEERIE_STATE_DIR:-.leerie}/runs/<run-id>/worktrees/staging`): `git merge --no-ff leerie/subtasks/<run-id>/<id>`. Exit 0 clean; exit 1 on conflict, leaving the worktree mid-merge for an integrator; exit 2 on precondition failure (run-branch worktree or subtask branch missing) — `integrate_wave` treats exit 2 as fatal via `die()` and does *not* spawn an integrator, since the worktree-less case would fail in confusing ways. |
 | `finalize.sh <run-id>` | Run-branch verifier. Exits 0 if `refs/heads/leerie/runs/<run-id>` exists and contains at least one commit beyond the working branch; exits non-zero with a diagnosis otherwise. The working branch is **never** modified — leerie does not merge into it locally; the PR is the proposed integration. The push and PR step lives in the **host launcher** (`leerie` bash script), not in the container — it runs after `nerdctl run` exits cleanly, using the host's own `git push` + `gh pr create` against the host's auth state. See "Host-side finalize" below. |
-| `cleanup.sh [--run-id <id> \| --all-runs \| --bootstrap] [--branches \| --subtask-branches]` | Default (no flag): scans `<state-root>/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `<state-root>/runs/` (excluding `_bootstrap-*`). `--bootstrap` removes orphaned `_bootstrap-*` directories (runs that died before classify completed; not enumerable by `discover_runs`). `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches *and* subtask branches (`leerie/runs/<id>` and `leerie/subtasks/<id>/*`). `--subtask-branches` deletes only the subtask branches and keeps `leerie/runs/<id>` (the post-finalize default — the run branch is the PR head and must outlive the orchestrator). Without either flag, all branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh`. Ctrl-C and every other abnormal exit in the orchestrator also preserve state — they call `_cleanup_on_abnormal_exit(full_purge=False)`. There is no `full_purge=True` call site today; the flag is retained as a future hook for an explicit-purge gesture, but no current code path uses it. |
+| `cleanup.sh [--run-id <id> \| --all-runs] [--branches \| --subtask-branches]` | Default (no flag): scans `<state-root>/runs/*/state.json` for the most-recently-failed run (most recent without `finished_at`), confirms y/N, then removes only that run's worktrees + prunes git metadata. State dir stays as audit. `--run-id <id>` is an explicit single-run cleanup (worktrees only). `--all-runs` runs the same per-run cleanup across every run dir under `<state-root>/runs/`. `--branches` (combinable with `--run-id` or `--all-runs`) additionally deletes the matching run branches *and* subtask branches (`leerie/runs/<id>` and `leerie/subtasks/<id>/*`). `--subtask-branches` deletes only the subtask branches and keeps `leerie/runs/<id>` (the post-finalize default — the run branch is the PR head and must outlive the orchestrator). Without either flag, all branches are kept as an audit trail. State dirs are always preserved by `cleanup.sh`. Ctrl-C and every other abnormal exit in the orchestrator also preserve state — they call `_cleanup_on_abnormal_exit(full_purge=False)`. There is no `full_purge=True` call site today; the flag is retained as a future hook for an explicit-purge gesture, but no current code path uses it. |
 
 A run branch `leerie/runs/<run-id>` is never reset once created — this is the invariant `--resume` depends on. See `DESIGN.md` §6 ("the run branch is the resume contract").
 
@@ -3150,7 +3143,7 @@ os.makedirs(run_dir, exist_ok=True)
 leerie_pw = pwd.getpwnam("leerie")
 # /work/.leerie and /work/.leerie/runs were created as root by
 # os.makedirs above; chown all three so the orchestrator
-# (running as leerie) can rename bootstrap → final id later.
+# (running as leerie) can write state files later.
 for d in ("/work/.leerie", "/work/.leerie/runs", run_dir):
     try: os.chown(d, leerie_pw.pw_uid, leerie_pw.pw_gid)
     except OSError: pass
@@ -3275,30 +3268,22 @@ clean terminal exits (rc=0/10/75: `_try_fetch_branch_for_teardown` runs
 machine RUNNING for user recovery), **detach** for SIGINT/SIGTERM,
 **pause** for other non-zero rc.
 
-**Bootstrap-stage resume — `--resume` is host-only, task is recovered
+**Pre-classify resume — `--resume` is host-only, task is recovered
 from `task.txt`.** `leerie --resume` on the host means "wake the paused
 Fly machine"; the in-machine orchestrator interprets the same flag as
-"resume state from disk." On a bootstrap-stage resume (run-id still
-`_bootstrap-<6hex>`, classify never ran on the machine, no `state.json`
-exists), the orchestrator's `--resume` branch would die in
-`resolve_run_id` with `does not match any known run`. The launcher
-filters `--resume` out of `REWRITTEN_ARGS` when `LEERIE_RUN_ID` starts
-with `_bootstrap-`, routing the in-machine orchestrator to its
-`elif args.run_id and args.run_id.startswith("_bootstrap-"):` arm at
-`orchestrator/leerie.py:12592` (honors the id, creates fresh State).
-That arm needs a `task` positional, which is gone from the user's
-resume argv. The launcher persists the user's original task argument
-to `$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt` on first launch
-(the run dir already exists — `provision_machine()` wrote `fly-machine.json`
-there first), and on
-bootstrap-stage resume — when `LEERIE_TASK_ARG` is empty in this
-invocation's argv — reads it back and appends to `REWRITTEN_ARGS`.
-Both writes are idempotent (`! -f` and "no task in argv" guards), so
-an explicit re-supplied task on the resume command line wins. Post-
-classify resumes (final id `<cat>-<slug>-<6hex>`) bypass the strip
-entirely (the bootstrap-prefix guard is False) and the orchestrator's
-normal `--resume` → `state.json.task` path applies. `task.txt` is
-launcher-side; the orchestrator never reads it.
+"resume state from disk." Since the run-id is the machine ID from the
+start (DESIGN §6), the launcher always has a valid run-id at resume time.
+If classify never ran (no `state.json` exists), the orchestrator's
+`--resume` branch needs a `task` positional, which is gone from the
+user's resume argv. The launcher persists the user's original task
+argument to `$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt` on
+first launch (the run dir already exists — `provision_machine()` wrote
+`fly-machine.json` there first), and on pre-classify resume — when
+`LEERIE_TASK_ARG` is empty in this invocation's argv — reads it back
+and appends to `REWRITTEN_ARGS`. Both writes are idempotent (`! -f`
+and "no task in argv" guards), so an explicit re-supplied task on the
+resume command line wins. `task.txt` is launcher-side; the orchestrator
+never reads it.
 
 The launcher's task extractor walks `$@` once at startup, skipping
 the value of any `--flag` that takes one. The list of value-taking
@@ -3789,18 +3774,12 @@ Two surfaces address this together:
    the run branch is already pushed (`pushed_at` set), it short-
    circuits with "already finalized."
 
-**`leerie --finalize` accepts either id.** The launcher resolves
-`<run-id>` against `$LEERIE_STATE_HOST_DIR/runs/<run-id>/` locally to pick up
-`fly-machine.json` and the partial sidecar. When `<run-id>` is the
-**final id** (e.g. `feat-foo-abc123`) but only the bootstrap dir
-exists locally (the orchestrator died before its host-side sync wrote
-the final dir), the launcher falls back to the sibling `_bootstrap-*`
-dir that has `fly-machine.json` and proceeds via that machine. Once
-`fetch_branch` discovers the actual final id on the machine, the
-existing `LEERIE_REMOTE_RUN_ID` plumbing migrates the host-side dir
-(launcher lines 1684–1700 already do this for `--resume`). Multi-match
-or no-match falls through to the original error, augmented with a hint
-to run `leerie --list`.
+**`leerie --finalize` resolves the run-id directly.** The launcher
+resolves `<run-id>` against `$LEERIE_STATE_HOST_DIR/runs/<run-id>/`
+locally to pick up `fly-machine.json` and the partial sidecar. Since
+the run-id IS the machine ID (DESIGN §6), no fallback lookup is
+needed. No-match falls through to an error augmented with a hint to
+run `leerie --list`.
 
 **`leerie --finalize <run-id>`** (non-force) first tries
 `fetch_branch` (the normal clean-exit case: orchestrator wrote
@@ -3822,7 +3801,7 @@ The launcher then calls `collect_subtrees_remote` and `fetch_branch`.
 
 **Liveness checks** (`scripts/remote/force-finalize.sh`):
 
-1. Lists `/work/.leerie/runs/` for the single non-`_bootstrap-*` dir
+1. Lists `/work/.leerie/runs/` for the single run dir
    (fails clearly on multi-match).
 2. Reads `run.json`; if `finished_at` is already set, no-op (idempotent).
 3. Checks orchestrator liveness via two complementary signals:
@@ -4161,7 +4140,7 @@ Two concurrent runs in the same repository share no coordination state.
 <state-root>/          (default: $HOME/.leerie/<basename>/)
                         also contains: .owner (sidecar — abs_path of the owning repo)
 └── runs/
-    └── <run-id>/                    (or _bootstrap-<6hex> pre-classify)
+    └── <run-id>/                    (container/machine ID — known from creation)
         ├── state.json               run state — see field table below
         ├── run.json                 sidecar — see field table below
         ├── working-branch           the branch HEAD-at-run-start; used as the PR base (leerie does not merge into it locally)
@@ -4217,11 +4196,10 @@ Two concurrent runs in the same repository share no coordination state.
                     └── scores.json          per-sample per-replay pass/fail verdicts
 ```
 
-The bootstrap directory `_bootstrap-<6hex>` is the same shape; on Phase-1
-completion, the orchestrator atomically renames it to the final
-`<run-id>` directory once `run_id` is derived from the classifier output.
-Open file handles (per-worker logs in particular) survive the rename
-because POSIX file handles reference inodes, not paths.
+The `<run-id>` is the container/machine ID assigned by the container
+runtime at creation time (DESIGN §6). There is no temporary directory
+or rename step — the run directory is created with its final name from
+the start.
 
 `run.json` fields (a minimal sidecar enabling `leerie --list` and resume
 discovery without parsing the full `state.json`):

@@ -163,15 +163,11 @@ WRAPPER
 
 # --- render_tail_wrapper -------------------------------------------------
 # Emit a POSIX-sh script (to stdout) that:
-#   1. If $1 looks like a bootstrap id (`_bootstrap-<hex>`), waits for the
-#      orchestrator to rename the run dir, then reads the handover file
-#      (`/work/.leerie/launcher-<bootstrap>.runid`) for the final id.
-#      Otherwise treats $1 as the final id directly.
-#   2. Tails the orchestrator log at the final path.
-#   3. Watches the orchestrator pid (from orchestrator.pid). When the pid
+#   1. Tails the orchestrator log for the given run id.
+#   2. Watches the orchestrator pid (from orchestrator.pid). When the pid
 #      disappears the orchestrator has exited cleanly. The wrapper kills
 #      the tail and prints the finalize banner.
-#   4. If AUTO_FINALIZE_TOKEN is set in the wrapper's environment, prints
+#   3. If AUTO_FINALIZE_TOKEN is set in the wrapper's environment, prints
 #      that token on the *last* line of stderr instead of (after) the
 #      banner; callers can grep for the token to trigger
 #      `leerie --finalize` automatically. Decoupled from the wrapper itself
@@ -202,8 +198,6 @@ if [ -z "$ID" ]; then
   echo "$(date +%FT%T%z | sed 's/\(..\)$/:\1/') [leerie] remote: render_tail_wrapper got empty run-id (LEERIE_TAIL_RUN_ID unset and \$1 empty)" >&2
   exit 2
 fi
-HANDOVER="/work/.leerie/launcher-${ID}.runid"
-
 # Wait briefly for the orchestrator to write its log file. Without this,
 # `tail -F` against a not-yet-existent file just spins.
 LOG="/work/.leerie/runs/${ID}/orchestrator.log"
@@ -211,33 +205,6 @@ for _ in 1 2 3 4 5 6 7 8 9 10; do
   [ -f "$LOG" ] && break
   sleep 1
 done
-
-# If we were given a bootstrap id, the orchestrator will rename the run
-# dir at end-of-classify. Tail the bootstrap log; when the bootstrap dir
-# disappears, read the handover file for the final id and re-target.
-case "$ID" in
-  _bootstrap-*)
-    ( tail -F "$LOG" 2>/dev/null ) &
-    TAIL_PID=$!
-    while [ -d "/work/.leerie/runs/${ID}" ]; do
-      sleep 1
-    done
-    kill "$TAIL_PID" 2>/dev/null || true
-    wait "$TAIL_PID" 2>/dev/null || true
-    if [ ! -f "$HANDOVER" ]; then
-      echo "$(date +%FT%T%z | sed 's/\(..\)$/:\1/') [leerie] remote: bootstrap dir gone but no handover at $HANDOVER" >&2
-      exit 2
-    fi
-    FINAL="$(head -1 "$HANDOVER" 2>/dev/null)"
-    if [ -z "$FINAL" ]; then
-      echo "$(date +%FT%T%z | sed 's/\(..\)$/:\1/') [leerie] remote: handover file empty at $HANDOVER" >&2
-      exit 2
-    fi
-    echo "$(date +%FT%T%z | sed 's/\(..\)$/:\1/') [leerie] remote: run-id promoted to ${FINAL}" >&2
-    ID="$FINAL"
-    LOG="/work/.leerie/runs/${ID}/orchestrator.log"
-    ;;
-esac
 
 PID_FILE="/work/.leerie/runs/${ID}/orchestrator.pid"
 ORCH_PID="$(head -1 "$PID_FILE" 2>/dev/null)"

@@ -25,7 +25,6 @@ import asyncio
 import contextlib
 import copy
 import fcntl
-import hashlib
 import json
 import os
 import re
@@ -1859,85 +1858,12 @@ def _check_claude_cli_version() -> None:
 
 # --- run identifier (DESIGN §6 "The run identifier") --------------------
 #
-# A run_id namespaces a single leerie invocation across its branch
-# (`leerie/runs/<run-id>`), state directory (`<state-root>/runs/<run-id>/`),
-# and PR title (`leerie: <run-id>`). Built from three deterministic
-# inputs known by the end of Phase 1: short-category abbrev, sanitized
-# task slug, and a 6-hex digest of `started_at`. Two concurrent runs
-# in the same repo produce two different run_ids by construction.
-
-# Limit on the kebab-case task slug embedded in the run_id. 30 chars
-# leaves enough room for short_category (≤7 chars) + slug + shortid (6)
-# + dashes (2) to fit under most filesystems' branch-name length sanity.
-SLUG_MAX_LEN = 30
-
-def _sanitize_slug(task: str, max_len: int = SLUG_MAX_LEN) -> str:
-    """Turn a freeform task description into a kebab-case slug safe for
-    git branch names, filesystem directory names, and JSON keys.
-
-    Rules:
-    - lowercase
-    - replace any non-[a-z0-9-] with '-'
-    - collapse repeated '-'
-    - strip leading/trailing '-' and '.'
-    - reject if the result contains '..' (path-traversal guard)
-    - truncate to `max_len` on a '-' boundary so we never cut a word in half;
-      fall back to a hard truncate if the slug has no dashes within `max_len`
-    - if the result is empty (all-symbols task), return 'task' as a fallback
-
-    Pure function: same input → same output. No I/O.
-    """
-    if not isinstance(task, str):
-        task = "" if task is None else str(task)
-    # Lowercase + non-alphanumeric → '-'. Keep digits, lowercase ASCII, '-'.
-    s = re.sub(r"[^a-z0-9-]+", "-", task.lower())
-    # Collapse repeated dashes.
-    s = re.sub(r"-+", "-", s)
-    # Strip leading/trailing dashes and dots.
-    s = s.strip("-.")
-    # Defensive: reject any residual '..' even after stripping (shouldn't
-    # happen given the substitution, but the cost of the check is zero).
-    if ".." in s:
-        s = s.replace("..", "-")
-        s = re.sub(r"-+", "-", s).strip("-.")
-    if not s:
-        return "task"
-    if len(s) <= max_len:
-        return s
-    # Word-boundary truncate: find the last '-' within the limit so we
-    # don't slice a word mid-character.
-    cut = s.rfind("-", 0, max_len + 1)
-    if cut <= 0:
-        return s[:max_len].rstrip("-.")
-    return s[:cut].rstrip("-.")
-
-
-def compute_run_id(categories: list[str], task: str, started_at: str) -> str:
-    """Compose the deterministic run identifier from a category list, the
-    task description, and the run start timestamp. See DESIGN §6.
-
-    The first entry in `categories` decides the short prefix; it must
-    appear in CATEGORY_ABBREV (i.e., be one of the CATEGORIES). If
-    the list is empty or has no recognized category, falls back to 'misc'
-    — this is defensive only; phase_classify already dies before this
-    function is reached when the classifier returns no recognized
-    category, so 'misc' should never appear in a real run.
-
-    `started_at` is hashed with sha1 and truncated to 6 hex chars for the
-    shortid. The hash is a stable function of the microsecond-precision
-    timestamp, so two invocations cannot collide unless they share the
-    same `started_at` to the microsecond — extraordinarily unlikely, and
-    detected at the directory-rename step as a hard preflight failure.
-
-    Pure function: deterministic given the inputs."""
-    short = "misc"
-    for cat in categories or []:
-        if cat in CATEGORY_ABBREV:
-            short = CATEGORY_ABBREV[cat]
-            break
-    slug = _sanitize_slug(task)
-    shortid = hashlib.sha1((started_at or "").encode("utf-8")).hexdigest()[:6]
-    return f"{short}-{slug}-{shortid}"
+# A run_id is the container/machine ID assigned by the container runtime:
+# Fly machine ID for --runtime fly, nerdctl container ID for local runs.
+# The launcher passes it to the orchestrator via --run-id; the orchestrator
+# never generates its own. The same string appears in three places: branch
+# name (`leerie/runs/<run-id>`), state dir (`<state-root>/runs/<run-id>/`),
+# and PR body.
 
 
 def compute_run_branch(run_id: str) -> str:
@@ -2156,9 +2082,8 @@ def _write_run_json(run_dir: Path, **fields) -> None:
 
 def discover_runs(leerie_root: Path) -> list[dict]:
     """Enumerate `<state-root>/runs/*/state.json`, returning one summary
-    dict per discovered run. Skip the `_bootstrap-*` directories silently
-    (those are pre-classify, not real runs). Malformed state.json files
-    are skipped with a logged warning, never raising.
+    dict per discovered run. Malformed state.json files are skipped with
+    a logged warning, never raising.
 
     Also enumerate **orphan** run dirs: directories that have a
     `fly-machine.json` (written by the launcher the moment Fly machine
@@ -2199,8 +2124,6 @@ def discover_runs(leerie_root: Path) -> list[dict]:
     out: list[dict] = []
     for entry in runs_dir.iterdir():
         if not entry.is_dir():
-            continue
-        if entry.name.startswith("_bootstrap-"):
             continue
         state_path = entry / "state.json"
         if not state_path.is_file():
@@ -2248,7 +2171,7 @@ def discover_runs(leerie_root: Path) -> list[dict]:
 
 
 def resolve_run_id(leerie_root: Path, cli_run_id: str | None) -> str:
-    """Pick the run_id to operate on. Used by `--resume` and `--list`.
+    """Pick the run_id to operate on. Used by `--resume`.
 
     Policy (DESIGN §6 "the run branch is the resume contract"):
     - If `cli_run_id` is given, it must exactly match an existing run.
@@ -2257,29 +2180,12 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None) -> str:
       where there's only one run in flight.
     - Else die: multiple runs and no `--run-id` is ambiguous.
 
-    Bootstrap-id carve-out: when `cli_run_id` is `_bootstrap-<hex>` AND
-    a matching dir exists on disk with a `state.json`, accept it even
-    though `discover_runs` filters bootstrap dirs by default. This
-    handles the narrow case where the user paused a remote run via
-    `leerie --stop` *before* phase_classify completed: the run dir on
-    the machine is still `_bootstrap-<hex>`, the handover file doesn't
-    exist yet, and the launcher's E1 logic correctly leaves
-    LEERIE_RUN_ID alone. The orchestrator then needs to resume against
-    the bootstrap dir without dying. DESIGN §6 *Detached orchestrator
-    (remote mode)*.
-
     Never guesses across multiple runs. `--resume` against an ambiguous
     repo is a hard error, not a heuristic."""
     runs = discover_runs(leerie_root)
     if cli_run_id is not None:
         for r in runs:
             if r["run_id"] == cli_run_id:
-                return cli_run_id
-        # Bootstrap-id carve-out (see docstring): allow explicit
-        # _bootstrap-* even though discover_runs filters those out.
-        if cli_run_id.startswith("_bootstrap-"):
-            candidate = leerie_root / "runs" / cli_run_id
-            if (candidate / "state.json").is_file():
                 return cli_run_id
         available = ", ".join(r["run_id"] for r in runs) or "(none)"
         die(
@@ -2464,18 +2370,13 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
     return "in-progress"
 
 
-def _collect_run_rows(leerie_root: Path) -> list[tuple[str, str, str, str, str]]:
-    """Build (run_id, started_at, status, machine, branch) rows for every
+def _collect_run_rows(leerie_root: Path) -> list[tuple[str, str, str, str, bool]]:
+    """Build (run_id, started_at, status, branch, is_fly) rows for every
     run under `leerie_root/runs/`. Pure data-gathering; rendering is the
-    caller's concern. `machine` is the Fly Machine ID for remote runs and
-    empty string for local runs.
-
-    For orphan rows (status `seed-failed`), `machine` is read from
-    `fly-machine.json` since run.json doesn't exist yet — this is what
-    lets `--list` show the user the ID of the Fly machine they need to
-    stop or resume after a pre-classify failure."""
+    caller's concern. `is_fly` is True when the run has Fly runtime
+    artifacts (fly_machine_id in run.json or fly-machine.json present)."""
     runs = discover_runs(leerie_root)
-    rows: list[tuple[str, str, str, str, str]] = []
+    rows: list[tuple[str, str, str, str, bool]] = []
     for state in runs:
         run_id = state["run_id"]
         run_dir = leerie_root / "runs" / run_id
@@ -2491,48 +2392,23 @@ def _collect_run_rows(leerie_root: Path) -> list[tuple[str, str, str, str, str]]
         status = _derive_run_status(run_json, state)
         started_at = state.get("started_at") or "—"
         branch = (run_json or {}).get("branch") or compute_run_branch(run_id)
-        machine = (run_json or {}).get("fly_machine_id") or ""
-        # Orphan fallback: pre-classify runs have no run.json yet, so
-        # pull the machine id from fly-machine.json instead. Same file
-        # the launcher reads for `./leerie --resume`.
-        if not machine and state.get("_orphan"):
-            fly_sidecar = run_dir / "fly-machine.json"
-            if fly_sidecar.is_file():
-                try:
-                    fly_parsed = json.loads(fly_sidecar.read_text())
-                    if isinstance(fly_parsed, dict):
-                        machine = fly_parsed.get("fly_machine_id") or ""
-                except (OSError, ValueError):
-                    machine = ""
-        rows.append((run_id[:50], started_at, status, machine, branch))
+        is_fly = bool((run_json or {}).get("fly_machine_id")
+                      or (run_dir / "fly-machine.json").is_file())
+        rows.append((run_id, started_at, status, branch, is_fly))
     return rows
 
 
-def _render_run_table(rows: list[tuple[str, str, str, str, str]]) -> None:
-    """Print rows as a columnar table with auto-sized columns. The
-    `machine` column is auto-hidden when no row has a non-empty value."""
-    has_machine = any(r[3] for r in rows)
-    if has_machine:
-        w_id = max(len("run_id"), *(len(r[0]) for r in rows))
-        w_st = max(len("started_at"), *(len(r[1]) for r in rows))
-        w_status = max(len("status"), *(len(r[2]) for r in rows))
-        w_mach = max(len("machine"), *(len(r[3]) for r in rows))
-        w_br = max(len("branch"), *(len(r[4]) for r in rows))
-        fmt = f"{{:<{w_id}}}  {{:<{w_st}}}  {{:<{w_status}}}  {{:<{w_mach}}}  {{:<{w_br}}}"
-        print(fmt.format("run_id", "started_at", "status", "machine", "branch"))
-        print(fmt.format("-" * w_id, "-" * w_st, "-" * w_status, "-" * w_mach, "-" * w_br))
-        for r in rows:
-            print(fmt.format(r[0], r[1], r[2], r[3], r[4]))
-    else:
-        w_id = max(len("run_id"), *(len(r[0]) for r in rows))
-        w_st = max(len("started_at"), *(len(r[1]) for r in rows))
-        w_status = max(len("status"), *(len(r[2]) for r in rows))
-        w_br = max(len("branch"), *(len(r[4]) for r in rows))
-        fmt = f"{{:<{w_id}}}  {{:<{w_st}}}  {{:<{w_status}}}  {{:<{w_br}}}"
-        print(fmt.format("run_id", "started_at", "status", "branch"))
-        print(fmt.format("-" * w_id, "-" * w_st, "-" * w_status, "-" * w_br))
-        for r in rows:
-            print(fmt.format(r[0], r[1], r[2], r[4]))
+def _render_run_table(rows: list[tuple[str, str, str, str, bool]]) -> None:
+    """Print rows as a columnar table with auto-sized columns."""
+    w_id = max(len("run_id"), *(len(r[0]) for r in rows))
+    w_st = max(len("started_at"), *(len(r[1]) for r in rows))
+    w_status = max(len("status"), *(len(r[2]) for r in rows))
+    w_br = max(len("branch"), *(len(r[3]) for r in rows))
+    fmt = f"{{:<{w_id}}}  {{:<{w_st}}}  {{:<{w_status}}}  {{:<{w_br}}}"
+    print(fmt.format("run_id", "started_at", "status", "branch"))
+    print(fmt.format("-" * w_id, "-" * w_st, "-" * w_status, "-" * w_br))
+    for r in rows:
+        print(fmt.format(r[0], r[1], r[2], r[3]))
 
 
 def list_runs(
@@ -2548,16 +2424,17 @@ def list_runs(
     Filters compose:
       `status_filter` restricts to rows whose derived status matches.
       `runtime_filter` restricts to rows by execution backend: 'fly'
-      means rows with a non-empty fly_machine_id; 'local' means rows
-      without. Both are validated against argparse `choices=` before
+      means rows with Fly runtime artifacts (fly_machine_id in run.json
+      or fly-machine.json present); 'local' means rows without. Both
+      are validated against argparse `choices=` before
       this is called; unknown values render an empty table."""
     rows = _collect_run_rows(leerie_root)
     if status_filter is not None:
         rows = [r for r in rows if r[2] == status_filter]
     if runtime_filter == "fly":
-        rows = [r for r in rows if r[3]]
+        rows = [r for r in rows if r[4]]
     elif runtime_filter == "local":
-        rows = [r for r in rows if not r[3]]
+        rows = [r for r in rows if not r[4]]
     if not rows:
         msg = "no runs"
         if status_filter is not None:
@@ -3673,8 +3550,7 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     #    run; they no longer apply now that each run namespaces its
     #    branches as leerie/runs/<run-id> (and subtask branches as
     #    leerie/subtasks/<run-id>/<sid>) and its worktrees under the
-    #    per-run dir. A run_id collision is detected separately at
-    #    State.rename_to() (filesystem side) and during setup-run.sh
+    #    per-run dir. A run_id collision is detected during setup-run.sh
     #    (git side). See DESIGN.md §6 and §14 ("single-clone parallelism").
 
     # 4. claude CLI version is recent enough for `--json-schema` in -p mode.
@@ -5863,13 +5739,8 @@ async def _memory_sampler(st: "State",
     sample-write is exception-guarded, and an exception thrown anywhere
     inside the loop body is swallowed (telemetry that crashes the
     orchestrator is worse than no telemetry)."""
-    # Re-resolve `st.run_dir` every tick — the orchestrator atomically
-    # renames the run dir from `_bootstrap-<6hex>` to the final
-    # `<run-id>` at the end of phase_classify (State.rename_to mutates
-    # st.run_dir). Capturing the Path once would silently strand every
-    # sample after the rename, since the bootstrap directory no longer
-    # exists and `open("a")` would raise FileNotFoundError (swallowed
-    # by the except below).
+    # Re-resolve `st.run_dir` every tick — defensive against any future
+    # mutation of st.run_dir.
     while True:
         try:
             out = st.run_dir / "memory.ndjson"
@@ -6285,8 +6156,6 @@ class State:
     the new inode, opening a multi-second window where a racer could
     acquire on the unlocked replacement. Directory inodes are never
     replaced, so the lock fd stays valid for the process lifetime.
-    `State.rename_to`'s `os.rename` is also safe — the fd binds the
-    inode, not the path. (Verified on Linux + macOS BSD-flock.)
 
     No async-side lock: every mutator runs on the single asyncio event
     loop, so reads and writes are not preempted mid-statement.
@@ -6383,31 +6252,6 @@ class State:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self.data, indent=2))
         tmp.replace(self.path)   # atomic on POSIX; best-effort on Windows
-
-    def rename_to(self, new_run_id: str) -> None:
-        """Atomically rename the run dir to a new run_id. Used by
-        orchestrate() after phase_classify to promote the bootstrap dir
-        (`_bootstrap-<6hex>`) to the final run_id derived from the
-        classifier category. Fails closed if the target directory
-        already exists — that would mean two runs with the same
-        microsecond `started_at` (extraordinarily unlikely, but caught
-        as a hard error rather than silently overwritten).
-
-        The flock fd binds the directory inode, not the path, so the
-        rename below preserves the lock — a competing orchestrator
-        attempting to flock the new path is still blocked. (Verified.)
-        """
-        new_dir = self.leerie_root / "runs" / new_run_id
-        if new_dir.exists():
-            die(
-                f"run_id collision: {new_dir} already exists. "
-                "This is extraordinarily unlikely; rerun, or "
-                f"`--resume --run-id {new_run_id}` to continue the existing run."
-            )
-        os.rename(self.run_dir, new_dir)
-        self.run_id = new_run_id
-        self.run_dir = new_dir
-        self.path = new_dir / "state.json"
 
     def bump_workers(self, caps: dict) -> None:
         self.data["worker_count"] = self.data.get("worker_count", 0) + 1
@@ -13370,67 +13214,27 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
         await phase_classify(task, st, caps, args.clarify, models, efforts)
-        # Now that classification has chosen a category, promote the
-        # bootstrap dir to its final per-run name (DESIGN §6 "The run
-        # identifier"). The rename is atomic on POSIX same-filesystem;
-        # state.save() opens-writes-closes per call so no long-lived
-        # handle straddles it. POSIX file handles already opened inside
-        # phase_classify's worker (the classifier log under logs/)
-        # survive the rename because they reference inodes, not paths.
-        if st.run_id.startswith("_bootstrap-"):
-            bootstrap_run_id = st.run_id
-            final_run_id = compute_run_id(
-                st.data.get("categories", []), task, st.data["started_at"])
-            log(f"run id: {final_run_id}")
-            st.rename_to(final_run_id)
-            # Handover file for the remote-mode launcher's tail wrapper. The
-            # launcher generated the bootstrap id host-side and is tailing
-            # `<state-root>/runs/<bootstrap_id>/orchestrator.log`. After this rename
-            # that path is gone; the launcher's wrapper polls
-            # `<state-root>/launcher-<bootstrap_id>.runid` to discover the final id
-            # and re-targets the tail. See DESIGN §6 *Detached orchestrator
-            # (remote mode)*. Safe (and harmless) for local runs — the file
-            # is just never read.
-            try:
-                handover = st.leerie_root / f"launcher-{bootstrap_run_id}.runid"
-                handover.write_text(final_run_id + "\n")
-            except OSError:
-                pass
-            # All subsequent calls in this function pass the new dir;
-            # phase_execute / phase_finalize internally re-derive their
-            # working dir from st.path.parent, so they automatically
-            # pick up the new location.
-            leerie_dir = st.run_dir
-            # Initialize run.json with the immutable run-identity fields
-            # (run_id, branch, working_branch, started_at, task) so
-            # `leerie --list` can enumerate this run from the moment
-            # it has a stable identity — not only after finalize.
-            # working_branch is HEAD-at-classify-time; setup-run.sh
-            # records the same value to <state-root>/runs/<id>/working-branch
-            # later, but we capture it here so a run that fails
-            # before phase_execute still has a recoverable run.json.
-            head_proc = await run_proc(
-                ["git", "rev-parse", "--abbrev-ref", "HEAD"])
-            working_branch = (head_proc.stdout.strip()
-                              if head_proc.returncode == 0 else "")
-            # Persist into st.data so downstream code (pr_writer payload,
-            # final-tree conformance pass DIFF_BASE) can read it without
-            # re-querying git. The same value is mirrored to run.json
-            # below and to <state-root>/runs/<id>/working-branch by
-            # setup-run.sh; this is the in-memory copy of all three.
-            st.data["working_branch"] = working_branch
-            st.save()
-            _write_run_json(
-                st.run_dir,
-                run_id=final_run_id,
-                branch=compute_run_branch(final_run_id),
-                working_branch=working_branch,
-                started_at=st.data["started_at"],
-                task=task,
-            )
+        log(f"run id: {st.run_id}")
+        # Initialize run.json with the immutable run-identity fields
+        # (run_id, branch, working_branch, started_at, task) so
+        # `leerie --list` can enumerate this run from the moment
+        # it has a stable identity — not only after finalize.
+        head_proc = await run_proc(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+        working_branch = (head_proc.stdout.strip()
+                          if head_proc.returncode == 0 else "")
+        st.data["working_branch"] = working_branch
+        st.save()
+        _write_run_json(
+            st.run_dir,
+            run_id=st.run_id,
+            branch=compute_run_branch(st.run_id),
+            working_branch=working_branch,
+            started_at=st.data["started_at"],
+            task=task,
+        )
         # Provision per-repo deps (DESIGN §6½). Runs after classify (so a
-        # docs-only run can short-circuit) and after the run-id rename
-        # (so state writes go to the final run dir). On `--resume` the
+        # docs-only run can short-circuit). On `--resume` the
         # entire else-branch is skipped, so phase_provision never re-fires.
         await phase_provision(Path(os.getcwd()), st, caps, models, efforts)
         # gather_answers blocks on input(). That's fine here: no concurrent
@@ -13564,10 +13368,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "enumerate.")
     ap.add_argument("--list", action="store_true", dest="list_runs",
                     help="enumerate in-flight and completed runs in this "
-                         "repository (run id, started, status, machine, "
-                         "branch). The machine column auto-hides when no "
-                         "remote runs are present. Exits without running "
-                         "orchestrate. Default: off")
+                         "repository (run id, started, status, branch). "
+                         "Exits without running orchestrate. Default: off")
     ap.add_argument("--status", metavar="STATE", dest="status_filter",
                     choices=RUN_STATUSES,
                     help=f"with --list, restrict the table to runs whose "
@@ -13855,30 +13657,18 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                  or resolve_verbosity(Path(os.getcwd()), None))
 
     # The on-disk layout is per-run: every run gets its own subdirectory
-    # `leerie_root/runs/<run-id>/` (see DESIGN.md §6, §10). For a fresh
-    # run we don't know the final run_id until phase_classify has chosen
-    # a category, so state lives in `_bootstrap-<6hex>/` until then; the
-    # rename to the final run_id happens in orchestrate() after classify.
+    # `leerie_root/runs/<run-id>/` (see DESIGN.md §6, §10). The run_id
+    # is the container/machine ID — the launcher always passes it via
+    # --run-id.
     leerie_root = resolve_leerie_root(Path(os.getcwd()))
     leerie_root.mkdir(parents=True, exist_ok=True)
     (leerie_root / "runs").mkdir(parents=True, exist_ok=True)
     if args.resume:
-        # Auto-pick if exactly one run exists; die with the available list
-        # if multiple are in flight unless --run-id picks one explicitly.
         run_id = resolve_run_id(leerie_root, args.run_id)
-    elif args.run_id and args.run_id.startswith("_bootstrap-"):
-        # Launcher-supplied bootstrap id (DESIGN §6 *Detached orchestrator
-        # (remote mode)*). The remote-mode launcher generates the bootstrap
-        # id host-side so it can start tailing `orchestrator.log` before the
-        # orchestrator has produced output. We honor it verbatim — the
-        # subsequent `State.rename_to` after phase_classify promotes it to
-        # the final `<short_category>-<slug>-<6hex>` as usual.
+    elif args.run_id:
         run_id = args.run_id
     else:
-        # Bootstrap directory: keyed on the current wall-clock time so two
-        # concurrent invocations don't pick the same one. Renamed to the
-        # final `<short_category>-<slug>-<6hex>` after classify.
-        run_id = "_bootstrap-" + hashlib.sha1(now().encode()).hexdigest()[:6]
+        die("--run-id is required (the launcher passes the container/machine ID)")
     try:
         st = State(leerie_root, run_id)
     except StateLockedError as e:

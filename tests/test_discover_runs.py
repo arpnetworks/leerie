@@ -57,18 +57,6 @@ def test_discover_runs_multiple_runs_sorted_newest_first(leerie, tmp_path):
     ]
 
 
-def test_discover_runs_skips_bootstrap_dirs(leerie, tmp_path):
-    """`_bootstrap-<hex>/` directories are pre-classify scratch space;
-    they should never appear in discovery results."""
-    _make_run(tmp_path, "_bootstrap-abc123",
-              {"task": "in-progress", "started_at": "2026-05-26T13:00:00+00:00"})
-    _make_run(tmp_path, "feat-foo-def456",
-              {"task": "real", "started_at": "2026-05-26T10:00:00+00:00"})
-    runs = leerie.discover_runs(tmp_path)
-    assert len(runs) == 1
-    assert runs[0]["run_id"] == "feat-foo-def456"
-
-
 def test_discover_runs_skips_non_dirs(leerie, tmp_path):
     """A regular file in `runs/` is not a run; ignore it silently."""
     (tmp_path / "runs").mkdir()
@@ -113,7 +101,7 @@ def test_discover_runs_surfaces_orphan_with_fly_machine_json(leerie, tmp_path):
         "fly_app": "leerie",
         "fly_machine_id": "287061da360d78",
         "started_at": "2026-06-04T19:20:58+00:00",
-        "run_id": "_bootstrap-bbd47f",
+        "run_id": "feat-seed-died-abc123",
     })
     runs = leerie.discover_runs(tmp_path)
     assert len(runs) == 1
@@ -122,23 +110,6 @@ def test_discover_runs_surfaces_orphan_with_fly_machine_json(leerie, tmp_path):
     assert runs[0]["started_at"] == "2026-06-04T19:20:58+00:00"
     # path points at fly-machine.json (state.json doesn't exist).
     assert runs[0]["path"].endswith("/fly-machine.json")
-
-
-def test_discover_runs_skips_bootstrap_orphans(leerie, tmp_path):
-    """_bootstrap-* dirs are always pre-classify scratch; even when they
-    have fly-machine.json (the launcher writes it before promotion to a
-    real run id), they are not real runs and must not be surfaced via
-    the orphan path. resolve_run_id's existing _bootstrap-* carve-out
-    handles them when explicitly named via --run-id."""
-    _make_orphan(tmp_path, "_bootstrap-abc123", {
-        "fly_machine_id": "286d2d0b3e7798",
-        "started_at": "2026-06-04T19:18:27+00:00",
-    })
-    _make_run(tmp_path, "feat-foo-def456",
-              {"task": "real", "started_at": "2026-05-26T10:00:00+00:00"})
-    runs = leerie.discover_runs(tmp_path)
-    assert len(runs) == 1
-    assert runs[0]["run_id"] == "feat-foo-def456"
 
 
 def test_discover_runs_skips_malformed_fly_machine_json(leerie, tmp_path, capsys):

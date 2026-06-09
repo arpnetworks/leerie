@@ -8,7 +8,6 @@ filesystem (no actual Fly Machine; the script's only dependencies are
 local files and `tail -F`).
 
 Coverage:
-  - Bootstrap-id input → waits for rename → reads handover → re-tails final
   - Final-id input → tails directly
   - Pid disappearance → wrapper exits with finalize hint
   - AUTO_FINALIZE_TOKEN env var → token line emitted with final id
@@ -70,7 +69,6 @@ def test_render_emits_non_empty_script(tmp_path):
     assert "tail -F" in out
     assert "orchestrator.log" in out
     assert "orchestrator.pid" in out
-    assert "_bootstrap-" in out  # bootstrap-id branch present
     assert "AUTO_FINALIZE_TOKEN" in out
 
 
@@ -85,80 +83,6 @@ def test_final_id_tails_directly_until_pid_dies(tmp_path):
     r = _run_wrapper(tmp_path, script, "feat-x-aaaaaa")
     assert r.returncode == 0, r.stderr
     assert "orchestrator exited" in r.stderr
-
-
-# --- bootstrap id branch (without rename — wrapper should fail with the
-# documented handover-missing error) ---------------------------------------
-
-def test_bootstrap_id_without_handover_errors(tmp_path):
-    """Bootstrap id input with no handover file when the dir disappears
-    → exit 2 with the documented error."""
-    _setup_fake_work(tmp_path, "_bootstrap-abc123", pid=None,
-                     log_lines=["[leerie] bootstrap"])
-    script = _render(tmp_path)
-
-    # Spawn the wrapper and immediately rm the bootstrap dir to simulate
-    # the rename without writing a handover file.
-    rewritten = script.replace("/work/", f"{tmp_path}/work/")
-    proc = subprocess.Popen(
-        ["bash", "-c", rewritten + "\n", "_", "_bootstrap-abc123"],
-        env={"PATH": "/usr/bin:/bin"},
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True,
-    )
-    # Let the wrapper enter its tail loop briefly, then yank the dir.
-    time.sleep(0.5)
-    bootstrap_dir = tmp_path / "work" / ".leerie" / "runs" / "_bootstrap-abc123"
-    log_path = bootstrap_dir / "orchestrator.log"
-    log_path.unlink()
-    bootstrap_dir.rmdir()
-    try:
-        stdout, stderr = proc.communicate(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-        raise AssertionError(f"wrapper hung; stderr so far: {stderr!r}")
-    assert proc.returncode == 2, stderr
-    assert "no handover at" in stderr or "bootstrap dir gone but no handover" in stderr
-
-
-# --- bootstrap → handover → final ----------------------------------------
-
-def test_bootstrap_id_resolves_via_handover(tmp_path):
-    """Bootstrap id → wrapper waits for dir to disappear → reads
-    handover file → re-tails final log → exits when pid disappears."""
-    _setup_fake_work(tmp_path, "_bootstrap-def456", pid=None,
-                     log_lines=["[leerie] bootstrap"])
-    final_dir = _setup_fake_work(tmp_path, "feat-y-bbbbbb", pid=999999,
-                                 log_lines=["[leerie] promoted"])
-    # Pre-write the handover file (this is what the orchestrator would
-    # write at end of phase_classify).
-    handover = tmp_path / "work" / ".leerie" / "launcher-_bootstrap-def456.runid"
-    handover.parent.mkdir(parents=True, exist_ok=True)
-    handover.write_text("feat-y-bbbbbb\n")
-
-    script = _render(tmp_path)
-    rewritten = script.replace("/work/", f"{tmp_path}/work/")
-    proc = subprocess.Popen(
-        ["bash", "-c", rewritten + "\n", "_", "_bootstrap-def456"],
-        env={"PATH": "/usr/bin:/bin"},
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True,
-    )
-    time.sleep(0.5)
-    # Yank the bootstrap dir to trigger the rename branch.
-    bootstrap_dir = tmp_path / "work" / ".leerie" / "runs" / "_bootstrap-def456"
-    (bootstrap_dir / "orchestrator.log").unlink()
-    bootstrap_dir.rmdir()
-    try:
-        stdout, stderr = proc.communicate(timeout=10)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        stdout, stderr = proc.communicate()
-        raise AssertionError(f"wrapper hung; stderr so far: {stderr!r}")
-    assert proc.returncode == 0, stderr
-    assert "promoted to feat-y-bbbbbb" in stderr
-    assert "orchestrator exited" in stderr
 
 
 # --- auto-finalize token --------------------------------------------------

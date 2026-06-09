@@ -31,16 +31,16 @@ FETCH_SH = REPO_ROOT / "scripts" / "remote" / "fetch-branch.sh"
 
 # --- Coupling tests: source-level assertions ---------------------------------
 
-def test_launcher_paused_mid_uses_state_host_dir():
-    """The _paused_mid resolver in the --resume fly dispatch must
-    use LEERIE_STATE_HOST_DIR/runs/, not USER_REPO/.leerie/runs/."""
+def test_launcher_paused_mid_uses_run_id_directly():
+    """The _paused_mid resolver in the --resume fly dispatch must set
+    _paused_mid from LEERIE_RUN_ID directly (run_id IS the machine ID)."""
     launcher = LEERIE.read_text()
     assert (
-        '$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID")"'
+        '_paused_mid="$LEERIE_RUN_ID"'
         in launcher
     ), (
-        "Resume dispatch must resolve machine pointer from "
-        "LEERIE_STATE_HOST_DIR/runs/, not USER_REPO/.leerie/runs/."
+        "Resume dispatch must set _paused_mid from LEERIE_RUN_ID directly "
+        "(run_id IS the machine ID — no resolver needed)."
     )
 
 
@@ -61,18 +61,6 @@ def test_launcher_sidecar_writes_use_state_host_dir():
     )
     assert '$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt' in launcher, (
         "task.txt must be written under LEERIE_STATE_HOST_DIR/runs/"
-    )
-
-
-def test_launcher_bootstrap_migration_uses_state_host_dir():
-    """The bootstrap→final-id migration (host-side mv) must use
-    LEERIE_STATE_HOST_DIR, not USER_REPO/.leerie."""
-    launcher = LEERIE.read_text()
-    assert '$LEERIE_STATE_HOST_DIR/runs/${_bootstrap_pid}' in launcher, (
-        "Bootstrap host dir must be under LEERIE_STATE_HOST_DIR/runs/"
-    )
-    assert '$LEERIE_STATE_HOST_DIR/runs/${_final_id}' in launcher, (
-        "Final host dir must be under LEERIE_STATE_HOST_DIR/runs/"
     )
 
 
@@ -176,7 +164,7 @@ def test_stop_resolves_run_dir_from_state_host_dir(tmp_path: Path):
     state_dir = tmp_path / "leerie-state"
     _make_flyctl_stub_auth_only(tmp_path)
 
-    run_id = "_bootstrap-aa1234"
+    run_id = "aa1234bb5678cc90"
     run_dir = state_dir / "runs" / run_id
     run_dir.mkdir(parents=True)
     (run_dir / "fly-machine.json").write_text(json.dumps({
@@ -221,7 +209,7 @@ def test_stop_does_not_find_run_dir_under_user_repo(tmp_path: Path):
     user_repo = _make_user_repo(tmp_path)
     state_dir = tmp_path / "leerie-state"  # empty — no runs here
 
-    run_id = "_bootstrap-bb5678"
+    run_id = "bb5678cc90dd1234"
     # Place fixture in OLD location (user_repo/.leerie/runs/).
     old_run_dir = user_repo / ".leerie" / "runs" / run_id
     old_run_dir.mkdir(parents=True)

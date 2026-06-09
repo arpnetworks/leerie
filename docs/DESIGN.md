@@ -483,26 +483,29 @@ two of them touch the same file.
 
 ### The run identifier
 
-Every run has a unique identifier `run_id`, derived deterministically from
-three inputs known by the end of Phase 1:
+Every run has a unique identifier `run_id` that is the container/machine ID
+assigned by the container runtime:
 
-- the first classified category (a short abbreviation — `feat`, `bugfix`,
-  `refactor`, etc.),
-- a sanitized kebab-case slug of the task description (≤30 chars, word-
-  boundary truncated),
-- a 6-character hex digest of the run's start timestamp (microsecond
-  precision).
+- **Fly runtime**: the machine ID returned by `flyctl machine run`
+  (e.g. `e286535ab70d89`).
+- **Local runtime**: the container ID written by `nerdctl run --cidfile`
+  (full 64-character hex digest).
 
-The result looks like `feat-add-telemetry-skills-a3f7c2`. It is the same
-string in three places: the run branch name (`leerie/runs/<run-id>`), the
-per-run state directory (`<state-root>/runs/<run-id>/`), and the title of the
-PR opened at finalize. A user looking at any of the three can grep for the
-others.
+The ID is known at container creation time — before the orchestrator starts.
+There is no deferred computation and no rename. The launcher passes the ID
+to the orchestrator via `--run-id`.
+
+The same string appears in three places: the run branch name
+(`leerie/runs/<run-id>`), the per-run state directory
+(`<state-root>/runs/<run-id>/`), and the PR body. A user looking at any of the
+three can grep for the others; for Fly runs the run_id is also the machine
+ID visible in the Fly dashboard.
 
 A run identifier is *per-run*, not per-repository. Two concurrent invocations
 in the same repository produce two different `run_id`s — their branches,
-state directories, worktrees, and PRs are disjoint by construction. There
-is no shared "staging" namespace that two runs could collide on.
+state directories, worktrees, and PRs are disjoint by construction (each
+container/machine gets its own unique ID from the runtime). There is no
+shared "staging" namespace that two runs could collide on.
 
 ### The run branch as an integration buffer
 
@@ -581,8 +584,7 @@ Why the *directory* and not `state.json`: `State.save()`'s atomic
 state.json's fd would be orphaned from the new inode at every save,
 opening a window where a racing `--resume` could acquire on the
 unlocked replacement. Directory inodes are never replaced — the lock
-fd stays valid for the process lifetime. The bootstrap-id → final-id
-`os.rename` is also safe because flock binds the inode, not the path.
+fd stays valid for the process lifetime.
 
 Defense in depth: the launcher heredoc takes an opportunistic flock
 probe before invoking the orchestrator subprocess (fast-path refusal,
@@ -842,14 +844,6 @@ branches. This makes the manual "attach, hand-edit
 JSON, re-run" recovery procedure (last documented in
 `docs/IMPLEMENTATION.md` §6) unnecessary while preserving the audit
 trail of recovered runs.
-
-Additionally, `leerie --finalize` accepts either the **bootstrap id**
-(`_bootstrap-<6hex>`) or the **final run-id** (e.g.
-`feat-foo-abc123`). When the user passes the final id but only the
-bootstrap dir exists locally (the orchestrator died before host sync),
-the launcher resolves the machine via the bootstrap dir's
-`fly-machine.json` and lets the existing `LEERIE_REMOTE_RUN_ID`
-plumbing migrate the dir to the final id after `fetch_branch` runs.
 
 The local-runtime path runs the same `host_finalize` block inline in
 the launcher (no trap is needed; the launcher and the pusher are the
@@ -1343,35 +1337,13 @@ Six sidecar fields on `run.json` capture remote lifecycle state:
 - `sync_fail_reason` — short tag accompanying `sync_failed_at`
   (`sync-failed-on-clean-exit`).
 
-These fields live on `run.json` once the orchestrator on the machine
-has minted a final run-id and synced state back. Before that — i.e.,
-during the bootstrap window when the run dir is still
-`_bootstrap-<hex>` and `run.json` has not yet been written on the
-host — the `fly_machine_id` pointer lives on
-`<state-root>/runs/<run-id>/fly-machine.json` instead. `provision.sh`
-writes a PID-keyed pointer at `<state-root>/remote/$$.json` immediately
-after `flyctl machine run` succeeds and the launcher promotes it to
-the run-keyed `fly-machine.json` once the run-id is known, so a
-crash before classify still leaves a recoverable pointer. Every
-verb that acts on a known run-id (`--stop`, `--kill`, `--finalize`,
-`--resume`) does the same host-side machine-id lookup: try
-`fly-machine.json` first, fall back to `run.json`. The launcher
-implements this as `_resolve_fly_machine_id_from_run_dir` in `leerie`.
-
-A sibling `task.txt` lives next to `fly-machine.json` in the same
-bootstrap dir. The launcher writes the user's positional `task`
-argument there on first launch — just the raw task string, no JSON
-envelope. On a bootstrap-stage resume the user's argv has no task
-(they typed `leerie --resume --run-id <bootstrap-id> --runtime fly`,
-nothing else); the launcher strips `--resume` so the orchestrator
-routes to its fresh-launch branch, which requires a task. Without
-`task.txt` the user would have to retype the original task on every
-retry. The persist is idempotent (`! -f` guard) and the restore is
-guarded by "no task in argv" so an explicit re-supplied task on the
-resume command line wins over the file. The orchestrator never reads
-`task.txt`; once a final id has been minted and `state.json` is
-written, `state.json.task` is the source of truth and `task.txt`
-becomes a vestigial breadcrumb.
+These fields live on `run.json`. Since the run_id is the machine ID
+(known at provision time), the run directory is created immediately
+after `flyctl machine run` succeeds. `provision.sh` writes
+`fly-machine.json` to the run directory as a crash-recovery pointer;
+`run.json` is written later by the orchestrator. Every verb that acts
+on a known run-id (`--stop`, `--kill`, `--finalize`, `--resume`) can
+use the run_id directly as the machine ID — no lookup needed.
 
 `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive — a
 run cannot be in more than one terminal-or-paused state.

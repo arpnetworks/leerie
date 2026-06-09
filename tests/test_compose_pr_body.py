@@ -51,7 +51,7 @@ def test_compose_pr_body_renders_task_verbatim(leerie):
 
 def test_compose_pr_body_uses_first_category(leerie):
     """When multiple categories were assigned, the body shows the primary
-    one (consistent with how `compute_run_id` derives the abbrev)."""
+    one (consistent with how the run-id prefix is derived)."""
     body = leerie.compose_pr_body(_full_state(), "feat-foo-abc123")
     assert "feature-implementation" in body
 

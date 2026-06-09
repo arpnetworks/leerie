@@ -132,8 +132,8 @@ force_finalize_remote() {
   #                                     python (defensive, post-scan check
   #                                     for pid-reuse audit clarity)
   #   REFUSE-NOPID:<run_id>           — pid file missing
-  #   REFUSE-MULTI:<count>            — more than one non-bootstrap run dir
-  #   REFUSE-NONE                     — no non-bootstrap run dir
+  #   REFUSE-MULTI:<count>            — more than one run dir
+  #   REFUSE-NONE                     — no run dir
   #   ERROR:<message>                 — anything else
   local payload
   payload=$(cat <<'PYEOF'
@@ -152,10 +152,10 @@ if not runs_dir.is_dir():
     print("ERROR:no /work/.leerie/runs on machine")
     sys.exit(1)
 
-# Discover the single non-bootstrap run dir.
+# Discover the single run dir.
 candidates = [
     p for p in runs_dir.iterdir()
-    if p.is_dir() and not p.name.startswith("_bootstrap-")
+    if p.is_dir()
 ]
 if len(candidates) == 0:
     print("REFUSE-NONE")
@@ -441,12 +441,12 @@ PYEOF
       ;;
     REFUSE-MULTI:*)
       local count="${sentinel#REFUSE-MULTI:}"
-      remote_log "force-finalize: REFUSED — $count non-bootstrap run dirs on machine $machine; can't pick one."
+      remote_log "force-finalize: REFUSED — $count run dirs on machine $machine; can't pick one."
       remote_log "  Attach manually with \`leerie --resume <run-id> --shell\` to disambiguate."
       return 1
       ;;
     REFUSE-NONE)
-      remote_log "force-finalize: REFUSED — no non-bootstrap run dir on machine $machine."
+      remote_log "force-finalize: REFUSED — no run dir on machine $machine."
       remote_log "  The orchestrator likely never reached phase_classify."
       return 1
       ;;

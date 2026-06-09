@@ -85,13 +85,24 @@ if [ "$#" -eq 0 ]; then
     sleep infinity
 fi
 
-# Local nerdctl path: drop to leerie before the orchestrator. We pass
-# HOME/USER/LOGNAME explicitly rather than using `runuser --login` —
-# the login form would chdir to /home/leerie and override the `cd /work`
-# invariant the orchestrator depends on (and would source the user's
-# shell profile, which could mutate PATH unpredictably). HOME is
-# load-bearing for claude (creds at ~/.claude/.credentials.json);
-# USER/LOGNAME are read by tools that introspect identity.
+# Local nerdctl path: inject the container ID as --run-id so the
+# orchestrator uses it as its run_id. The launcher wrote a cidfile
+# at /run/leerie-cidfile via nerdctl --cidfile; nerdctl writes it
+# before PID 1 starts, so it's available here.
+if [ -f /run/leerie-cidfile ]; then
+  _cid="$(cat /run/leerie-cidfile)"
+  if [ -n "$_cid" ]; then
+    set -- --run-id "$_cid" "$@"
+  fi
+fi
+
+# Drop to leerie before the orchestrator. We pass HOME/USER/LOGNAME
+# explicitly rather than using `runuser --login` — the login form would
+# chdir to /home/leerie and override the `cd /work` invariant the
+# orchestrator depends on (and would source the user's shell profile,
+# which could mutate PATH unpredictably). HOME is load-bearing for
+# claude (creds at ~/.claude/.credentials.json); USER/LOGNAME are read
+# by tools that introspect identity.
 exec runuser -u leerie -- \
   env HOME=/home/leerie USER=leerie LOGNAME=leerie \
   python3 /opt/leerie-image/orchestrator/leerie.py "$@"

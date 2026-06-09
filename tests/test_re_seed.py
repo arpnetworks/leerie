@@ -190,117 +190,29 @@ def test_re_seed_requires_run_id(tmp_path: Path):
     assert "LEERIE_RUN_ID" in result.stderr
 
 
-def test_re_seed_requires_sidecar(tmp_path: Path):
-    """re_seed errors when the run.json sidecar is missing."""
-    user_repo = tmp_path / "user-repo"
-    user_repo.mkdir()
-    result = _run_bash(
-        f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_RUN_ID": "nonexistent",
-        },
-    )
-    assert result.returncode != 0
-    assert "run.json" in result.stderr
+def test_re_seed_uses_run_id_as_machine_id(tmp_path: Path):
+    """re_seed uses LEERIE_RUN_ID directly as the machine ID (run_id =
+    machine_id per DESIGN §6) — no sidecar resolution needed.
 
-
-def test_re_seed_requires_fly_machine_id(tmp_path: Path):
-    """re_seed errors when the sidecar exists but has no fly_machine_id."""
-    user_repo = tmp_path / "user-repo"
-    run_dir = user_repo / ".leerie" / "runs" / "my-run"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run.json").write_text(json.dumps({"run_id": "my-run"}))
-    result = _run_bash(
-        f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
-        env={
-            "USER_REPO": str(user_repo),
-            "LEERIE_RUN_ID": "my-run",
-        },
-    )
-    assert result.returncode != 0
-    assert "fly_machine_id" in result.stderr
-
-
-def test_re_seed_honors_state_host_dir(tmp_path: Path):
-    """re_seed reads fly-machine.json from $LEERIE_STATE_HOST_DIR/runs/,
-    not $USER_REPO/.leerie/runs/, when the env var is set.
-
-    Regression cover for the bug where re-seed.sh hardcoded
-    $USER_REPO/.leerie/runs/$LEERIE_RUN_ID and ignored
-    LEERIE_STATE_HOST_DIR — symptom was an infinite resume loop on hosts
-    with a custom state dir (the default $HOME/.leerie/<basename>/), since
-    the launcher writes fly-machine.json under the state dir but re_seed
-    looked in the repo dir. The fix mirrors fetch-branch.sh:263–267's
-    precedence.
-
-    Asserts re_seed reaches `machine start` against the machine id from
-    the state-dir sidecar — proving the resolution succeeded. The repo
-    dir is left empty to prove it's not being consulted.
+    Asserts re_seed reaches `machine start` against the LEERIE_RUN_ID
+    value.
     """
     repo = tmp_path / "user-repo"
     _make_git_repo(repo)
-    # Repo .leerie/ dir intentionally absent — proves re_seed doesn't fall
-    # back to it when LEERIE_STATE_HOST_DIR is set.
-
-    state_dir = tmp_path / "leerie-state"
-    state_run_dir = state_dir / "runs" / "my-run"
-    state_run_dir.mkdir(parents=True)
-    (state_run_dir / "fly-machine.json").write_text(json.dumps({
-        "run_id": "my-run",
-        "fly_machine_id": "mach-state-001",
-    }))
 
     _stub_flyctl(tmp_path, remote_status="stopped", remote_dirty="")
     result = _run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
-            "LEERIE_STATE_HOST_DIR": str(state_dir),
-            "LEERIE_RUN_ID": "my-run",
+            "LEERIE_RUN_ID": "mach-state-001",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
             "LEERIE_MACHINE_START_TIMEOUT": "5",
         },
     )
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
-    # The state-dir's fly_machine_id reached flyctl — proves the state
-    # dir was consulted and the repo dir was not (the repo has no sidecar
-    # to fall back to).
     assert "machine start mach-state-001" in invocations
-
-
-def test_re_seed_falls_back_to_repo_when_state_host_dir_unset(tmp_path: Path):
-    """When LEERIE_STATE_HOST_DIR is unset, re_seed falls back to
-    $USER_REPO/.leerie/runs/<id>/ — the historical behavior.
-
-    Backward-compat cover for the same change as
-    test_re_seed_honors_state_host_dir: the fallback path must keep
-    working for installs that don't override the state dir.
-    """
-    repo = tmp_path / "user-repo"
-    _make_git_repo(repo)
-    repo_run_dir = repo / ".leerie" / "runs" / "my-run"
-    repo_run_dir.mkdir(parents=True)
-    (repo_run_dir / "fly-machine.json").write_text(json.dumps({
-        "run_id": "my-run",
-        "fly_machine_id": "mach-repo-001",
-    }))
-
-    _stub_flyctl(tmp_path, remote_status="stopped", remote_dirty="")
-    # NOTE: LEERIE_STATE_HOST_DIR deliberately NOT set in env.
-    result = _run_bash(
-        f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
-        env={
-            "USER_REPO": str(repo),
-            "LEERIE_RUN_ID": "my-run",
-            "PATH": f"{tmp_path}:/usr/bin:/bin",
-            "LEERIE_MACHINE_START_TIMEOUT": "5",
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    invocations = (tmp_path / "flyctl.log").read_text()
-    assert "machine start mach-repo-001" in invocations
 
 
 # --- re_seed: happy path on a clean machine -------------------------------
@@ -312,20 +224,12 @@ def test_re_seed_starts_stopped_machine_and_calls_dirty(tmp_path: Path):
     # Add an uncommitted edit so seed_repo_dirty has something to send.
     (repo / "edit.txt").write_text("new file\n")
 
-    run_dir = repo / ".leerie" / "runs" / "my-run"
-    run_dir.mkdir(parents=True)
-    (run_dir / "run.json").write_text(json.dumps({
-        "run_id": "my-run",
-        "fly_machine_id": "mach-001",
-        "paused_at": "2026-05-29T16:00:00+00:00",
-    }))
-
     _stub_flyctl(tmp_path, remote_status="stopped", remote_dirty="")
     result = _run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
-            "LEERIE_RUN_ID": "my-run",
+            "LEERIE_RUN_ID": "mach-001",
             "PATH": f"{tmp_path}:/usr/bin:/bin",
             "LEERIE_MACHINE_START_TIMEOUT": "5",
         },

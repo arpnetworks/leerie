@@ -153,44 +153,42 @@ def test_collector_exception_does_not_kill_sampler(leerie, tmp_path,
 
 
 def test_sampler_follows_run_dir_rename(leerie, tmp_path):
-    """Regression: the orchestrator atomically renames the run dir from
-    `_bootstrap-<6hex>` to the final `<run-id>` at the end of phase 1
-    (`State.rename_to` mutates `st.run_dir`). The sampler must re-resolve
-    `st.run_dir` on every tick — capturing the path once outside the loop
-    silently strands every sample after the rename, because the bootstrap
-    directory no longer exists and `open("a")` raises FileNotFoundError
-    (which the sampler swallows).
+    """Regression: the sampler must re-resolve `st.run_dir` on every tick.
+    Capturing the path once outside the loop silently strands every sample
+    after a run-dir rename (e.g. external move), because the old directory
+    no longer exists and `open("a")` raises FileNotFoundError (which the
+    sampler swallows).
 
     The original sampler ship (`2df0eb6`) had this bug; it surfaced as a
     46-minute run with only 3 memory.ndjson lines, all written before the
     rename. Pin the contract so a future refactor doesn't recapture the
     path."""
-    bootstrap = tmp_path / "runs" / "_bootstrap-aaaaaa"
-    bootstrap.mkdir(parents=True)
+    original = tmp_path / "runs" / "aaaaaa1234567890"
+    original.mkdir(parents=True)
     final = tmp_path / "runs" / "feat-final-abc123"
     st = SimpleNamespace(
-        run_dir=bootstrap,
+        run_dir=original,
         data={"current_phase": "phase 1: classify", "worker_count": 1},
     )
 
     async def run() -> tuple[int, list[dict]]:
         task = asyncio.create_task(
             leerie._memory_sampler(st, interval_sec=0.03))
-        # Pre-rename ticks: at least one sample lands in the bootstrap
+        # Pre-rename ticks: at least one sample lands in the original
         # dir while the captured path (if any) still resolves.
         await asyncio.sleep(0.08)
-        pre_count = len((bootstrap / "memory.ndjson").read_text()
+        pre_count = len((original / "memory.ndjson").read_text()
                         .splitlines())
-        # Now simulate the rename + State.rename_to mutation. After
-        # this, a bug-equivalent sampler that captured the path once
-        # outside the loop keeps writing to the *old* path string —
-        # which the rename carried the file out from under, so the
-        # writes hit a nonexistent parent dir and `open("a")` raises
-        # FileNotFoundError (swallowed). Distinguishing "post-rename
-        # writes landed" from "the file was simply carried along by
-        # the rename" requires comparing line counts before vs after.
+        # Now simulate a run-dir rename. After this, a bug-equivalent
+        # sampler that captured the path once outside the loop keeps
+        # writing to the *old* path string — which the rename carried
+        # the file out from under, so the writes hit a nonexistent
+        # parent dir and `open("a")` raises FileNotFoundError
+        # (swallowed). Distinguishing "post-rename writes landed" from
+        # "the file was simply carried along by the rename" requires
+        # comparing line counts before vs after.
         import os
-        os.rename(bootstrap, final)
+        os.rename(original, final)
         st.run_dir = final
         # Let several more ticks fire after the rename. A correct
         # sampler re-resolves st.run_dir each tick and continues

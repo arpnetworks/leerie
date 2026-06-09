@@ -76,7 +76,7 @@ def test_finish_no_work_run_preserves_existing_run_json_fields(leerie, tmp_path)
     `task`)."""
     st = _bootstrap_run_dir(tmp_path, leerie)
     # Pre-write a run.json the way `orchestrate` does after the
-    # bootstrap-dir rename (leerie.py:11075).
+    # run.json initialization after phase_classify.
     leerie._write_run_json(
         st.run_dir,
         run_id=st.run_id,

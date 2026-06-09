@@ -49,43 +49,10 @@ re_seed() {
     remote_log "re_seed: USER_REPO is not set"
     return 1
   fi
-  # Resolve fly_machine_id from the run dir. Mirror the launcher's
-  # _resolve_fly_machine_id_from_run_dir (leerie:66-94): fly-machine.json
-  # is the source of truth during the bootstrap window (the launcher
-  # writes it the moment provision_machine succeeds, before run.json
-  # exists); run.json is the post-classify source. Either is acceptable.
-  # Without the fly-machine.json fallback, --resume of a paused
-  # bootstrap-stage run reaches re_seed but aborts here because run.json
-  # isn't minted until after classify.
-  #
-  # Honor LEERIE_STATE_HOST_DIR first (matches fetch-branch.sh:263–267).
-  # The launcher writes fly-machine.json under $LEERIE_STATE_HOST_DIR/runs/
-  # (leerie:2402–2406), not under $USER_REPO/.leerie/. The repo-local
-  # path is the fallback for setups without a state-host-dir override.
-  local host_leerie_runs
-  if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
-    host_leerie_runs="$LEERIE_STATE_HOST_DIR/runs"
-  else
-    host_leerie_runs="$USER_REPO/.leerie/runs"
-  fi
-  local run_dir="$host_leerie_runs/$LEERIE_RUN_ID"
-  local mid=""
-  local candidate
-  for candidate in "$run_dir/fly-machine.json" "$run_dir/run.json"; do
-    if [ -f "$candidate" ]; then
-      mid="$(python3 -c "
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    print(d.get('fly_machine_id') or '')
-except Exception:
-    pass
-" "$candidate" 2>/dev/null || true)"
-      [ -n "$mid" ] && break
-    fi
-  done
+  # run_id IS the machine ID (DESIGN §6).
+  local mid="$LEERIE_RUN_ID"
   if [ -z "$mid" ]; then
-    remote_log "re_seed: no fly_machine_id at $run_dir/fly-machine.json or $run_dir/run.json"
+    remote_log "re_seed: LEERIE_RUN_ID is not set"
     return 1
   fi
 

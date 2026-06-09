@@ -260,15 +260,12 @@ def test_refuses_when_pid_file_missing(tmp_path):
     assert "finished_at" not in patched, patched
 
 
-def test_refuses_on_multiple_non_bootstrap_dirs(tmp_path):
-    """More than one non-bootstrap dir on the machine → REFUSE-MULTI."""
+def test_refuses_on_multiple_run_dirs(tmp_path):
+    """More than one run dir on the machine → REFUSE-MULTI."""
     mruns = tmp_path / "runs"
     mruns.mkdir()
     _make_run(mruns, "feat-one-aaa111", pid=999_999_999)
     _make_run(mruns, "feat-two-bbb222", pid=999_999_999)
-    # A bootstrap dir is filtered out by the payload, so adding one
-    # doesn't push us above the count.
-    (mruns / "_bootstrap-deadbe").mkdir()
     stub = _make_fake_flyctl(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
@@ -282,11 +279,10 @@ def test_refuses_on_multiple_non_bootstrap_dirs(tmp_path):
     assert "MULTI" in result.stderr or "can't pick" in result.stderr.lower()
 
 
-def test_refuses_on_zero_non_bootstrap_dirs(tmp_path):
-    """No non-bootstrap dir on the machine → REFUSE-NONE."""
+def test_refuses_on_zero_run_dirs(tmp_path):
+    """No run dir on the machine → REFUSE-NONE."""
     mruns = tmp_path / "runs"
     mruns.mkdir()
-    (mruns / "_bootstrap-cafebabe").mkdir()
     stub = _make_fake_flyctl(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
@@ -297,7 +293,7 @@ def test_refuses_on_zero_non_bootstrap_dirs(tmp_path):
         env=env,
     )
     assert result.returncode != 0, result.stderr
-    assert "NONE" in result.stderr or "no non-bootstrap" in result.stderr.lower()
+    assert "NONE" in result.stderr or "no run dir" in result.stderr.lower()
 
 
 def test_refuses_when_proc_scan_finds_live_orchestrator(tmp_path):

@@ -72,22 +72,19 @@ if [ ! -d "$RUNS_DIR" ]; then
   exit 0
 fi
 
-# Discover the single non-bootstrap run dir.
+# Discover the single run dir.
 candidates=()
 for d in "$RUNS_DIR"/*/; do
   [ -d "$d" ] || continue
-  case "$(basename "$d")" in
-    _bootstrap-*) continue ;;
-  esac
   candidates+=("$d")
 done
 
 if [ "${#candidates[@]}" -eq 0 ]; then
-  echo "COLLECT-ERROR:no non-bootstrap run dir"
+  echo "COLLECT-ERROR:no run dir"
   exit 0
 fi
 if [ "${#candidates[@]}" -gt 1 ]; then
-  echo "COLLECT-ERROR:multiple non-bootstrap run dirs (${#candidates[@]})"
+  echo "COLLECT-ERROR:multiple run dirs (${#candidates[@]})"
   exit 0
 fi
 

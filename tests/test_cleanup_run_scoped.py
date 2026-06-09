@@ -3,8 +3,6 @@
 cleanup.sh supports:
 - `--run-id <id> [--branches | --subtask-branches]` — single-run cleanup
 - `--all-runs [--branches | --subtask-branches]` — every per-run dir
-  (excluding _bootstrap-*)
-- `--bootstrap` — orphaned _bootstrap-* dirs
 - no flag — most-recently-failed run, with y/N prompt
 
 `--subtask-branches` is the post-finalize default (invoked by
@@ -43,11 +41,6 @@ def test_cleanup_declares_all_runs_mode():
     assert '--all-runs)' in src
 
 
-def test_cleanup_declares_bootstrap_mode():
-    src = _src()
-    assert '--bootstrap)' in src
-
-
 def test_cleanup_declares_branches_flag():
     src = _src()
     assert '--branches)' in src
@@ -81,16 +74,6 @@ def test_cleanup_branch_delete_scopes_to_run_id():
     # The for-each-ref patterns restrict to the run_id's namespace.
     assert 'refs/heads/leerie/runs/${run_id}' in src
     assert 'refs/heads/leerie/subtasks/${run_id}/' in src
-
-
-def test_cleanup_all_runs_excludes_bootstrap():
-    """--all-runs iterates per-run dirs but skips _bootstrap-* — those
-    have their own --bootstrap flag."""
-    src = _src()
-    # Locate the --all-runs body.
-    all_runs_body = src.split('ALL_RUNS" = "true"')[1].split('exit 0\nfi')[0]
-    assert "_bootstrap-*" in all_runs_body
-    assert "continue" in all_runs_body
 
 
 def test_cleanup_default_mode_uses_most_recently_failed_heuristic():
@@ -225,30 +208,6 @@ def test_cleanup_branches_and_subtask_branches_mutually_exclusive(tmp_path):
     )
     assert r.returncode == 2, f"expected exit 2; got {r.returncode}"
     assert "mutually exclusive" in r.stderr
-
-
-def test_cleanup_bootstrap_removes_orphans(tmp_path):
-    """End-to-end: `cleanup.sh --bootstrap` removes orphaned bootstrap
-    directories."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-
-    boot1 = repo / ".leerie" / "runs" / "_bootstrap-aaaaaa"
-    boot2 = repo / ".leerie" / "runs" / "_bootstrap-bbbbbb"
-    real = repo / ".leerie" / "runs" / "feat-real-cccccc"
-    boot1.mkdir(parents=True)
-    boot2.mkdir(parents=True)
-    real.mkdir(parents=True)
-
-    r = subprocess.run(
-        [str(CLEANUP_SH), "--bootstrap"],
-        cwd=repo, capture_output=True, text=True, check=False,
-    )
-    assert r.returncode == 0
-    assert not boot1.exists()
-    assert not boot2.exists()
-    assert real.exists(), "non-bootstrap run dir must NOT be removed by --bootstrap"
 
 
 # --- LEERIE_STATE_DIR precedence -----------------------------------------

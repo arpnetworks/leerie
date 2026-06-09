@@ -113,17 +113,6 @@ def test_list_runs_malformed_run_json_treated_as_missing(leerie, tmp_path, capsy
     assert "in-progress" in out
 
 
-def test_list_runs_skips_bootstrap_dirs(leerie, tmp_path, capsys):
-    _make_run(tmp_path, "_bootstrap-abcdef",
-              {"started_at": "2026-05-26T10:00:00+00:00", "task": "x"})
-    _make_run(tmp_path, "feat-real-bbbbbb",
-              {"started_at": "2026-05-26T11:00:00+00:00", "task": "y"})
-    leerie.list_runs(tmp_path)
-    out = capsys.readouterr().out
-    assert "_bootstrap-abcdef" not in out
-    assert "feat-real-bbbbbb" in out
-
-
 def test_list_runs_renders_branch_from_run_json(leerie, tmp_path, capsys):
     _make_run(tmp_path, "feat-a-aaaaaa",
               {"started_at": "2026-05-26T10:00:00+00:00", "task": "x"},
@@ -143,33 +132,7 @@ def test_list_runs_falls_back_to_compute_run_branch(leerie, tmp_path, capsys):
     assert "leerie/runs/feat-a-aaaaaa" in out
 
 
-# --- machine column + --status filter (DESIGN §6 unified --list) ----------
-
-def test_list_runs_machine_column_appears_for_remote_runs(leerie, tmp_path, capsys):
-    """When any run has fly_machine_id, the table includes a `machine`
-    column with that value."""
-    _make_run(tmp_path, "feat-r-aaaaaa",
-              {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"},
-              run_json={
-                  "paused_at": "2026-05-29T11:00:00+00:00",
-                  "fly_machine_id": "mach-abc123",
-              })
-    leerie.list_runs(tmp_path)
-    out = capsys.readouterr().out
-    assert "machine" in out
-    assert "mach-abc123" in out
-
-
-def test_list_runs_machine_column_hidden_when_no_remote_runs(leerie, tmp_path, capsys):
-    """Pure-local users see no machine column noise."""
-    _make_run(tmp_path, "feat-l-aaaaaa",
-              {"started_at": "2026-05-29T10:00:00+00:00", "task": "x"})
-    leerie.list_runs(tmp_path)
-    out = capsys.readouterr().out
-    # Header should NOT contain "machine"
-    header_line = out.split("\n", 1)[0]
-    assert "machine" not in header_line
-
+# --- --status filter (DESIGN §6 unified --list) ----------
 
 def test_list_runs_status_filter_in_progress(leerie, tmp_path, capsys):
     """--list --status in-progress filters to running runs."""
@@ -223,8 +186,8 @@ def _make_orphan(root: Path, run_id: str, fly: dict) -> None:
 
 def test_list_runs_shows_orphan_with_seed_failed_status(leerie, tmp_path, capsys):
     """A run dir with only fly-machine.json must appear in --list with
-    status `seed-failed` and a populated `machine` column. This is the
-    discoverability fix for the 2026-06-04 incident hangs."""
+    status `seed-failed`. This is the discoverability fix for the
+    2026-06-04 incident hangs."""
     _make_orphan(tmp_path, "feat-died-aaa111", {
         "fly_machine_id": "287061da360d78",
         "started_at": "2026-06-04T19:20:58+00:00",
@@ -233,8 +196,6 @@ def test_list_runs_shows_orphan_with_seed_failed_status(leerie, tmp_path, capsys
     out = capsys.readouterr().out
     assert "feat-died-aaa111" in out
     assert "seed-failed" in out
-    # Machine column appears (because the orphan has fly_machine_id).
-    assert "287061da360d78" in out
     # started_at from fly-machine.json renders.
     assert "2026-06-04T19:20:58" in out
 

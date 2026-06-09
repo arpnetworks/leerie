@@ -64,41 +64,12 @@ IMAGE_TAG="leerie:$LEERIE_VERSION"
 # one-time image-build cost; every subsequent invocation reuses the cached
 # image and starts in ~2s.
 
-# --- _resolve_fly_machine_id_from_run_dir -------------------------------
-# Read fly_machine_id from a run's host-side sidecar. Tries
-# fly-machine.json first, then run.json — the dual-order shared by
-# every host-side verb (`--stop`/`--kill`/`--finalize`/`--resume`) so
-# they all work during the in-flight bootstrap window (when the host
-# has fly-machine.json but no run.json yet — DESIGN §6 Detached
-# orchestrator (remote mode)).
-#
-# Echoes the machine id to stdout, empty string on miss. Used by
-# `_kill_bootstrap_minimal_run_json` and the verbs below.
-_resolve_fly_machine_id_from_run_dir() {
-  local run_dir="$1"
-  local candidate
-  for candidate in "$run_dir/fly-machine.json" "$run_dir/run.json"; do
-    if [ -f "$candidate" ]; then
-      python3 -c '
-import json, sys
-try:
-    d = json.load(open(sys.argv[1]))
-    mid = d.get("fly_machine_id")
-    print(mid if mid else "")
-except Exception:
-    pass
-' "$candidate"
-      return 0
-    fi
-  done
-  return 0
-}
+# _resolve_fly_machine_id_from_run_dir removed: run_id IS the machine ID.
 
-# Mirror of _resolve_fly_machine_id_from_run_dir for the per-machine Fly
-# volume created when FLY_VM_DISK_GB is set. provision.sh persists
-# volume_id into both fly-machine.json (bootstrap window) and run.json
-# (post-classify). --kill consults this so the volume is reaped
-# alongside the machine instead of orphaning.
+# Read volume_id from a run's host-side sidecar. provision.sh persists
+# volume_id into both fly-machine.json and run.json. --kill consults
+# this so the volume is reaped alongside the machine instead of
+# orphaning.
 _resolve_volume_id_from_run_dir() {
   local run_dir="$1"
   local candidate
@@ -507,22 +478,14 @@ PY
       echo "  Check 'leerie --list' for active runs." >&2
       exit 1
     fi
-    # Source provision.sh FIRST — it resets LEERIE_MACHINE_ID="" at
-    # load time (intended for provision_machine's create flow). Sourcing
-    # after setting LEERIE_MACHINE_ID would clobber our resolver result.
     FLY_APP="${LEERIE_FLY_APP:-leerie}"
     export FLY_APP
     export LEERIE_RUN_ID="$_stop_run_id"
     # shellcheck disable=SC1091
     . "$LEERIE_REPO/scripts/remote/provision.sh"
     require_flyctl || exit 1
-    # Try fly-machine.json first (in-flight bootstrap case), then
-    # run.json — via the shared dual-file resolver above.
-    LEERIE_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_stop_run_dir")"
-    if [ -z "$LEERIE_MACHINE_ID" ]; then
-      remote_log "--stop: $_stop_run_id has no fly_machine_id (was it a local run?)"
-      exit 1
-    fi
+    # run_id IS the machine ID (DESIGN §6).
+    LEERIE_MACHINE_ID="$_stop_run_id"
     export LEERIE_MACHINE_ID
     # Bootstrap a minimal run.json if only fly-machine.json exists, so
     # update_run_json has a file to merge paused_at into.
@@ -587,9 +550,8 @@ PY
         exit 1
       fi
       if [ -d "$_kill_run_dir" ] && [ -z "$_kill_machine_id" ]; then
-        # Try fly-machine.json first (in-flight bootstrap case), then
-        # run.json — via the shared dual-file resolver.
-        _kill_machine_id="$(_resolve_fly_machine_id_from_run_dir "$_kill_run_dir")"
+        # run_id IS the machine ID (DESIGN §6).
+        _kill_machine_id="$_kill_run_id"
       fi
     fi
     if [ -z "$_kill_machine_id" ]; then
@@ -633,14 +595,8 @@ PY
     fi
     remote_log "--kill: destroying machine $LEERIE_MACHINE_ID"
     destroy_machine
-    # Bootstrap run.json from fly-machine.json if needed (in-flight
-    # kill before classify) so killed_at + fly_machine_id are recorded
-    # host-side for forensics. Note: a bootstrap-id killed run does NOT
-    # appear in `leerie --list` because `discover_runs` requires
-    # state.json (which only the orchestrator writes); the run.json
-    # written here is for audit-trail purposes only. Non-bootstrap kills
-    # already have state.json from a prior fetch_branch or local run,
-    # so they do appear in --list with status=killed.
+    # Ensure run.json exists so killed_at + fly_machine_id are recorded
+    # host-side for forensics.
     if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
       _ensure_run_json "$_kill_run_dir" || true
       _kill_sidecar="$_kill_run_dir/run.json"
@@ -731,39 +687,9 @@ PY
     fi
     _fin_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_fin_run_id"
     if [ ! -d "$_fin_run_dir" ]; then
-      # Final-id fallback: when the user passes the final run-id but
-      # only the bootstrap dir exists locally (the orchestrator died
-      # before its host-side sync wrote the final dir), look for a
-      # sibling `_bootstrap-*` with `fly-machine.json` and proceed via
-      # that machine. `fetch_branch` will discover the real final id
-      # on the machine and the existing LEERIE_REMOTE_RUN_ID plumbing
-      # below (line ~447) migrates the host-side dir. Mirrors the
-      # bootstrap→final-id promotion `--resume` already does at lines
-      # 1684–1700.
-      _bootstrap_candidates=()
-      if [ -d "$LEERIE_STATE_HOST_DIR/runs" ]; then
-        # shellcheck disable=SC2231
-        for _d in "$LEERIE_STATE_HOST_DIR"/runs/_bootstrap-*; do
-          [ -d "$_d" ] || continue
-          [ -f "$_d/fly-machine.json" ] || continue
-          _bootstrap_candidates+=("$_d")
-        done
-      fi
-      if [ "${#_bootstrap_candidates[@]}" -eq 1 ]; then
-        _fin_run_dir="${_bootstrap_candidates[0]}"
-        remote_log "--finalize: $_fin_run_id not local; using bootstrap dir $(basename "$_fin_run_dir") (fetch_branch will discover the final id on the machine)"
-      elif [ "${#_bootstrap_candidates[@]}" -gt 1 ]; then
-        remote_log "--finalize: no local run dir at $LEERIE_STATE_HOST_DIR/runs/$_fin_run_id and multiple bootstrap dirs to choose from:"
-        for _d in "${_bootstrap_candidates[@]}"; do
-          remote_log "  $(basename "$_d")"
-        done
-        remote_log "  Re-run --finalize with one of the bootstrap ids above."
-        exit 1
-      else
-        remote_log "--finalize: no run dir at $_fin_run_dir"
-        remote_log "  Run \`leerie --list\` to see known runs on this host."
-        exit 1
-      fi
+      remote_log "--finalize: no run dir at $_fin_run_dir"
+      remote_log "  Run \`leerie --list\` to see known runs on this host."
+      exit 1
     fi
     # Short-circuit if already finalized (only possible once run.json
     # exists, i.e. after fetch_branch has run at least once).
@@ -845,20 +771,13 @@ except Exception:
       _fetched_run_id="$_fin_run_id"
       _fetched_run_dir="$_fin_run_dir"
     else
-      # Source provision.sh BEFORE setting LEERIE_MACHINE_ID — provision.sh
-      # resets LEERIE_MACHINE_ID="" at load time and would clobber our value.
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/provision.sh"
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/fetch-branch.sh"
       require_flyctl || exit 1
-      # Try fly-machine.json first (in-flight bootstrap case), then
-      # run.json — via the shared dual-file resolver.
-      LEERIE_MACHINE_ID="$(_resolve_fly_machine_id_from_run_dir "$_fin_run_dir")"
-      if [ -z "$LEERIE_MACHINE_ID" ]; then
-        remote_log "--finalize: $_fin_run_id has no fly_machine_id and is not already synced"
-        exit 1
-      fi
+      # run_id IS the machine ID (DESIGN §6).
+      LEERIE_MACHINE_ID="$_fin_run_id"
       export LEERIE_MACHINE_ID
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/force-finalize.sh"
@@ -907,9 +826,8 @@ except Exception:
           fi
         fi
       fi
-      # fetch_branch sets LEERIE_REMOTE_RUN_ID to the discovered final run-id
-      # (which may differ from $_fin_run_id if the user passed a bootstrap
-      # id). Use the discovered id to locate the run dir host-side.
+      # fetch_branch sets LEERIE_REMOTE_RUN_ID to the run-id discovered
+      # on the machine.
       _fetched_run_id="${LEERIE_REMOTE_RUN_ID:-$_fin_run_id}"
       _fetched_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_fetched_run_id"
       if [ ! -d "$_fetched_run_dir" ]; then
@@ -930,9 +848,8 @@ except Exception:
     # because the Fly machine cannot push (no GitHub SSH key on the
     # machine by design). That writes no_push=true to run.json on the
     # machine, which fetch_branch copies to the host. The user's actual
-    # intent is recorded host-side in the bootstrap dir's
-    # fly-machine.json (host_no_push field, set at launch time). On
-    # --finalize:
+    # intent is recorded host-side in the run dir's fly-machine.json
+    # (host_no_push field, set at launch time). On --finalize:
     #   - if --no-push is on the --finalize CLI, skip push (user
     #     explicitly opted out at finalize time).
     #   - else, if host_no_push=true was recorded at launch, skip push
@@ -941,12 +858,8 @@ except Exception:
     #     host pushes. The orchestrator's no_push was a mechanism flag,
     #     not a user-intent flag.
     if [ "$_FINALIZE_NO_PUSH" = "false" ]; then
-      # Look for the host-side no-push intent record. It may live in
-      # the bootstrap-id dir (if --finalize was called with a bootstrap
-      # id) or the final-id dir (post-rename).
       _host_intent=""
-      for _candidate in "$LEERIE_STATE_HOST_DIR/runs/$_fin_run_id" "$_fetched_run_dir"; do
-        if [ -f "$_candidate/fly-machine.json" ]; then
+      if [ -f "$_fin_run_dir/fly-machine.json" ]; then
           _host_intent="$(python3 -c '
 import json, sys
 try:
@@ -954,10 +867,8 @@ try:
     print("true" if data.get("host_no_push") else "false")
 except Exception:
     print("")
-' "$_candidate/fly-machine.json" 2>/dev/null || true)"
-          if [ -n "$_host_intent" ]; then break; fi
-        fi
-      done
+' "$_fin_run_dir/fly-machine.json" 2>/dev/null || true)"
+      fi
       if [ "$_host_intent" = "true" ]; then
         remote_log "finalize: host_no_push was set at launch — skipping push"
         _FINALIZE_NO_PUSH=true
@@ -2417,22 +2328,8 @@ if [ "$RUNTIME" = "fly" ]; then
     exit 1
   fi
 
-  # Generate a bootstrap run-id host-side if the user did not pass --run-id.
-  # The orchestrator runs detached on the Fly Machine and the launcher's
-  # tail needs to know which orchestrator.log path to follow *before* the
-  # orchestrator has produced any output. The bootstrap id matches today's
-  # orchestrator-side pre-classification pattern (`_bootstrap-<6hex>`); the
-  # orchestrator will rename the dir to a category-prefixed final id at the
-  # end of phase_classify (State.rename_to). The launcher's tail wrapper
-  # handles the rename by polling for the final id afterwards. See DESIGN
-  # §6 *Detached orchestrator (remote mode)*.
-  if [ -z "$LEERIE_RUN_ID" ]; then
-    LEERIE_RUN_ID="_bootstrap-$(python3 -c "import secrets; print(secrets.token_hex(3))")"
-    export LEERIE_RUN_ID
-    # Append --run-id to REWRITTEN_ARGS so the orchestrator inside the
-    # machine uses the same id (matches the --resume --run-id plumbing).
-    REWRITTEN_ARGS+=("--run-id" "$LEERIE_RUN_ID")
-  fi
+  # run_id = machine_id: set AFTER provision_machine succeeds (see below).
+  # For --resume, LEERIE_RUN_ID is already set from --run-id.
 
   # Communicate the host's launch-time push intent to the in-Fly
   # orchestrator (DESIGN §6 *Finalization*, intent vs mechanism). The
@@ -2553,12 +2450,10 @@ except Exception:
     # (DESIGN §6 Remote pause-on-failure.) Uses the dual-file resolver
     # at leerie:76 — fly-machine.json first, then run.json — to mirror
     # the existing --stop/--kill/--finalize/--resume behavior. For
-    # bootstrap-id runs paused before classify, run.json may not exist
-    # on the host; fly-machine.json is the source of truth.
+    # run_id IS the machine ID (DESIGN §6).
     _paused_mid=""
     if [ -n "$LEERIE_RUN_ID" ] && [ "$container_rc" -eq 0 ]; then
-      _paused_mid="$(_resolve_fly_machine_id_from_run_dir \
-                       "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID")"
+      _paused_mid="$LEERIE_RUN_ID"
     fi
 
     _provisioned=false
@@ -2579,15 +2474,10 @@ except Exception:
         container_rc=1
       fi
     elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
-      # --resume against a run-id with no machine pointer anywhere
-      # (no fly-machine.json, no run.json with fly_machine_id). Either
-      # the run-id is a typo or the run was already cleaned up. Fail
-      # loudly instead of silently provisioning a brand-new machine —
-      # the user typed "resume", not "start a new run".
-      remote_log "--resume: no Fly machine pointer found for run-id $LEERIE_RUN_ID"
-      echo "  Looked for: $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json" >&2
-      echo "             $LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json (fly_machine_id field)" >&2
-      echo "  Neither exists with a usable machine id." >&2
+      # --resume against a run-id whose machine is not found. The
+      # run_id IS the machine ID, so resume_machine would have found it
+      # if it existed. Fail loudly.
+      remote_log "--resume: machine $LEERIE_RUN_ID not found or not resumable"
       echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
       echo "  start a fresh run." >&2
       container_rc=1
@@ -2603,61 +2493,14 @@ except Exception:
       container_rc=1
     elif provision_machine; then
       _provisioned=true
-    fi
-
-    # E1: when resuming a bootstrap-id paused via `leerie --stop`, the
-    # orchestrator on the machine has already renamed its run dir to
-    # the final id via State.rename_to. Resuming with --run-id
-    # _bootstrap-XXX would die in resolve_run_id (which skips
-    # `_bootstrap-*` dirs). The orchestrator wrote the final id back to
-    # /work/.leerie/launcher-<bootstrap>.runid before renaming — read it
-    # over SSH, then rewrite LEERIE_RUN_ID and the --run-id element of
-    # REWRITTEN_ARGS before the orchestrator is exec'd. Migrate the
-    # host-side run dir (D2 created `_bootstrap-XXX/run.json`) to the
-    # final id so `leerie --list` and subsequent verbs find the run by
-    # its real name.
-    if [ "$_resumed" = "true" ] && \
-       [ -n "$LEERIE_RUN_ID" ] && \
-       [[ "$LEERIE_RUN_ID" == _bootstrap-* ]]; then
-      _bootstrap_pid="$LEERIE_RUN_ID"
-      _final_id="$(flyctl ssh console --app "$FLY_APP" \
-                     --machine "$LEERIE_MACHINE_ID" --pty=false \
-                     -C "cat /work/.leerie/launcher-${_bootstrap_pid}.runid" \
-                     2>/dev/null | head -1 | tr -d '[:space:]' || true)"
-      if [ -n "$_final_id" ] && [ "$_final_id" != "$_bootstrap_pid" ]; then
-        remote_log "remote: bootstrap id ${_bootstrap_pid} promoted to ${_final_id} on machine — rewriting LEERIE_RUN_ID"
-        # Migrate host-side run dir if needed.
-        _host_boot_dir="$LEERIE_STATE_HOST_DIR/runs/${_bootstrap_pid}"
-        _host_final_dir="$LEERIE_STATE_HOST_DIR/runs/${_final_id}"
-        if [ -d "$_host_boot_dir" ] && [ ! -d "$_host_final_dir" ]; then
-          mv "$_host_boot_dir" "$_host_final_dir" 2>/dev/null || true
-        fi
-        # If mv was skipped (promoted dir already existed from state sync),
-        # ensure fly-machine.json lands in the promoted dir so re_seed can
-        # resolve fly_machine_id without a second resume.
-        if [ -d "$_host_final_dir" ] && [ ! -f "$_host_final_dir/fly-machine.json" ] && \
-           [ -f "$_host_boot_dir/fly-machine.json" ]; then
-          cp "$_host_boot_dir/fly-machine.json" "$_host_final_dir/fly-machine.json" 2>/dev/null || true
-        fi
-        # Rewrite LEERIE_RUN_ID and any `--run-id <bootstrap>` element in
-        # REWRITTEN_ARGS (the user typed `--resume --run-id <bootstrap>`,
-        # the loop at line ~920 passed it through).
-        LEERIE_RUN_ID="$_final_id"
+      # run_id = machine_id: set LEERIE_RUN_ID now that we know the
+      # machine ID. Pass --run-id to the orchestrator via REWRITTEN_ARGS.
+      if [ -z "$LEERIE_RUN_ID" ]; then
+        LEERIE_RUN_ID="$LEERIE_MACHINE_ID"
         export LEERIE_RUN_ID
-        _rewritten_count="${#REWRITTEN_ARGS[@]}"
-        _i=0
-        while [ "$_i" -lt "$_rewritten_count" ]; do
-          if [ "${REWRITTEN_ARGS[$_i]}" = "--run-id" ] && \
-             [ "$((_i + 1))" -lt "$_rewritten_count" ] && \
-             [ "${REWRITTEN_ARGS[$((_i + 1))]}" = "$_bootstrap_pid" ]; then
-            REWRITTEN_ARGS[$((_i + 1))]="$_final_id"
-            break
-          fi
-          _i=$((_i + 1))
-        done
+        REWRITTEN_ARGS+=("--run-id" "$LEERIE_RUN_ID")
       fi
     fi
-
     # Promote the PID-keyed attach pointer to a run-keyed one as soon as
     # the machine is up, BEFORE seed_auth/seed_repo can fail. If anything
     # between here and the orchestrator-detach below errors out,
@@ -2674,12 +2517,7 @@ except Exception:
       if [ -f "$_pid_record" ] && [ ! -f "$_run_record" ]; then
         cp "$_pid_record" "$_run_record" 2>/dev/null || true
       fi
-      # Persist the task argument so a bootstrap-stage resume can recover
-      # it. The in-machine orchestrator's --resume requires state.json,
-      # which is never written for failures before classify. The launcher
-      # strips --resume on bootstrap-stage resumes (routing to the fresh-
-      # launch branch), but that branch needs a task argument. Without
-      # this file the user has to retype the task on every retry.
+      # Persist the task argument so a pre-classify resume can recover it.
       _task_record="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt"
       if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$_task_record" ]; then
         printf '%s' "$LEERIE_TASK_ARG" > "$_task_record" 2>/dev/null || true
@@ -2734,66 +2572,9 @@ except Exception:
         fi
       fi
       if [ "$_seed_ok" = "true" ]; then
-        # Start the orchestrator detached on the Fly Machine. setsid makes
-        # it a session leader so SIGHUP from the exec channel closing does
-        # not reach it; nohup is belt-and-braces. stdout/stderr go to a log
-        # file the machine owns; stdin is /dev/null. The launcher generated
-        # the bootstrap run-id host-side and passed it via --run-id in
-        # REWRITTEN_ARGS, so the path is known before the orchestrator
-        # produces any output. DESIGN §6 *Detached orchestrator (remote
-        # mode)*.
+        # Start the orchestrator detached on the Fly Machine. The
+        # run_id = machine_id, so the log path is known from the start.
         remote_log "remote: machine $LEERIE_MACHINE_ID seeded — starting orchestrator (detached)"
-
-        # Detached-launch wrapper. Uses a python3 heredoc instead of
-        # `sh -c "...setsid nohup..."` for three reasons:
-        #   (a) argv goes via sys.argv — no shell quoting needed for the
-        #       run-id or REWRITTEN_ARGS, so chars like ' or $ or \n
-        #       cannot break the wrapper or alter the orchestrator argv.
-        #   (b) start_new_session=True is equivalent to setsid and works
-        #       on every Python ≥ 3.2 — no dependency on the remote
-        #       shell understanding `setsid` (busybox sh does not).
-        #   (c) Launcher errors from python (not from sh quoting) surface
-        #       on stderr without the outer 2>&1 redirect, so a failed
-        #       launch is diagnosable.
-        # flyctl `machine exec` dropped both `--stdin` and the post-`--`
-        # argv form. Switch to `ssh console -C "<cmd>"` which (a) takes
-        # the remote command as a single string and (b) forwards host
-        # stdin. The Python launcher is built host-side with the argv
-        # JSON literal embedded into the source, then piped to
-        # `python3 -` on the machine — python reads its program from
-        # stdin, no remote-shell argv quoting in play.
-
-        # Strip --resume from REWRITTEN_ARGS when the run is still in the
-        # bootstrap window. `--resume` on the host means "wake the paused
-        # Fly machine"; the in-machine orchestrator interprets it as
-        # "resume orchestrator state from disk." For a `_bootstrap-*` id,
-        # no orchestrator state exists yet (by definition — classify
-        # hasn't run), so the orchestrator's --resume branch dies with
-        # "does not match any known run." The orchestrator's
-        # --run-id <bootstrap-*> branch already honors the id and creates
-        # fresh state; filtering --resume here routes there. Post-classify
-        # resumes keep --resume (LEERIE_RUN_ID was promoted to the final
-        # id by the rewrite block at lines 1843-1856 above, so this guard
-        # is False and REWRITTEN_ARGS flows through unchanged).
-        if [ "${IS_RESUME:-false}" = "true" ] && [[ "$LEERIE_RUN_ID" == _bootstrap-* ]]; then
-          _filtered=()
-          for _a in ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"}; do
-            [ "$_a" = "--resume" ] || _filtered+=("$_a")
-          done
-          REWRITTEN_ARGS=(${_filtered[@]+"${_filtered[@]}"})
-          # If the user didn't retype the task on this resume, recover it
-          # from the persisted task.txt written at first-launch. The
-          # orchestrator's fresh-launch branch (which we routed to by
-          # stripping --resume) requires a task argument.
-          _task_record="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt"
-          if [ -z "$LEERIE_TASK_ARG" ] && [ -f "$_task_record" ]; then
-            _restored_task="$(cat "$_task_record" 2>/dev/null || true)"
-            if [ -n "$_restored_task" ]; then
-              REWRITTEN_ARGS+=("$_restored_task")
-              remote_log "remote: recovered task from $_task_record"
-            fi
-          fi
-        fi
 
         _launch_argv_json="$(python3 -c '
 import json, sys
@@ -2817,7 +2598,7 @@ os.makedirs(run_dir, exist_ok=True)
 # Make /work/.leerie, /work/.leerie/runs, and the run dir itself writable
 # by leerie — os.makedirs created them as root (this wrapper runs as
 # root via ssh-console). The orchestrator runs as leerie and may need
-# to create sibling run dirs (bootstrap → final id rename, etc).
+# to write into /work/.leerie/runs/<run-id>/.
 leerie_pw = pwd.getpwnam("leerie")
 for d in ("/work/.leerie", "/work/.leerie/runs", run_dir):
     try:
@@ -2994,27 +2775,9 @@ PY
           remote_log "error: failed to start detached orchestrator on machine $LEERIE_MACHINE_ID (rc=$_launch_rc)"
           container_rc=1
         else
-          # The PID-keyed → run-keyed pointer promotion happened earlier
-          # (right after provision_machine succeeded), so the run dir
-          # already has fly-machine.json by the time we get here. The
-          # orchestrator will rename the run dir at classify time; the
-          # launcher's tail wrapper handles the rename via the handover
-          # file the orchestrator writes (see DESIGN §6).
-
-          # Tail the orchestrator log for the user's terminal. This is a
-          # separate exec session; its death (Ctrl-C, broken pipe, laptop
-          # closing) does NOT propagate to the orchestrator. After the
-          # orchestrator's State.rename_to promotes the bootstrap dir, it
-          # writes the final run-id to /work/.leerie/launcher-<bootstrap>.runid;
-          # the wrapper script reads that, re-tails the new path, and on
-          # orchestrator-pid exit prints a finalize hint and ends.
+          # Tail the orchestrator log for the user's terminal. The
+          # run_id is stable (no rename), so the log path is constant.
           remote_log "remote: tailing orchestrator log (Ctrl-C to detach — orchestrator keeps running)"
-
-          # The remote tail wrapper is shared with `leerie --resume`'s
-          # rc=75 pivot via render_tail_wrapper in scripts/remote/lib.sh
-          # (already sourced above). It handles the `_bootstrap-<6hex>` →
-          # final-id rename transparently and prints the finalize hint
-          # when the orchestrator pid disappears.
           _tail_script="$(render_tail_wrapper)"
 
           # Prepend an env-var assignment to the wrapper script so the
@@ -3113,9 +2876,16 @@ else
   # disabled) the bind-mount no-ops cleanly and the orchestrator's
   # _cgroup_probe returns False, falling back to the pre-fix
   # uncapped behavior with one warn log line.
+  # Write the container ID to a cidfile and bind-mount it into the
+  # container so container-entry.sh can inject --run-id <container-id>.
+  # nerdctl writes the cidfile before PID 1 starts.
+  _cidfile="$LEERIE_STATE_HOST_DIR/.cidfile-$$"
+  rm -f "$_cidfile"
   nerdctl run \
     --rm $TTY_FLAGS \
     --name "leerie-$(date +%s)-$$" \
+    --cidfile "$_cidfile" \
+    -v "$_cidfile:/run/leerie-cidfile:ro" \
     -e LEERIE_INSPECT_DIRS= \
     -e LEERIE_STATE_DIR=/leerie-state \
     --mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared \
@@ -3127,6 +2897,7 @@ else
     ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \
     -w /work \
     "$IMAGE_TAG" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} || container_rc=$?
+  rm -f "$_cidfile" 2>/dev/null
 fi
 
 # --- host-side finalize (push + PR) -------------------------------------

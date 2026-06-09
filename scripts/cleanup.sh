@@ -18,12 +18,7 @@
 #     the PR head and must outlive the orchestrator).
 #
 #   cleanup.sh --all-runs [--branches | --subtask-branches]
-#     Same as above, applied to every directory under <state-root>/runs/
-#     (excluding _bootstrap-* — use --bootstrap for those).
-#
-#   cleanup.sh --bootstrap
-#     Remove orphaned <state-root>/runs/_bootstrap-* directories (runs that
-#     died before classify completed and so have no stable run_id).
+#     Same as above, applied to every directory under <state-root>/runs/.
 #
 #   cleanup.sh  (no flag)
 #     Scans <state-root>/runs/*/state.json for the most recently failed run
@@ -115,7 +110,6 @@ most_recent_failed_run() {
     [ -d "$dir" ] || continue
     local base
     base="$(basename "$dir")"
-    case "$base" in _bootstrap-*) continue ;; esac
     local state="${dir}state.json"
     [ -f "$state" ] || continue
     # Parse finished_at and started_at from state.json by grep.
@@ -138,7 +132,6 @@ most_recent_failed_run() {
 
 RUN_ID=""
 ALL_RUNS=false
-BOOTSTRAP=false
 BRANCHES=false
 SUBTASK_BRANCHES=false
 
@@ -152,10 +145,6 @@ while [ $# -gt 0 ]; do
       ALL_RUNS=true
       shift
       ;;
-    --bootstrap)
-      BOOTSTRAP=true
-      shift
-      ;;
     --branches)
       BRANCHES=true
       shift
@@ -166,7 +155,7 @@ while [ $# -gt 0 ]; do
       ;;
     *)
       echo "cleanup.sh: unrecognized arg: $1" >&2
-      echo "usage: cleanup.sh [--run-id <id> | --all-runs | --bootstrap] [--branches | --subtask-branches]" >&2
+      echo "usage: cleanup.sh [--run-id <id> | --all-runs] [--branches | --subtask-branches]" >&2
       exit 2
       ;;
   esac
@@ -184,27 +173,8 @@ BR_FLAG=0
 
 # --- mode dispatch -------------------------------------------------------
 
-if [ "$BOOTSTRAP" = "true" ]; then
-  # ----- orphaned bootstrap directories -----------------------------------
-  if [ ! -d "${LEERIE_ROOT}/runs" ]; then
-    echo "cleanup: no ${LEERIE_ROOT}/runs/ to scan"
-    exit 0
-  fi
-  removed=0
-  for dir in "${LEERIE_ROOT}"/runs/_bootstrap-*/; do
-    [ -d "$dir" ] || continue
-    rm -rf "$dir"
-    echo "cleanup: removed orphaned $(basename "$dir")"
-    removed=$((removed + 1))
-  done
-  if [ "$removed" -eq 0 ]; then
-    echo "cleanup: no orphaned bootstrap directories"
-  fi
-  exit 0
-fi
-
 if [ "$ALL_RUNS" = "true" ]; then
-  # ----- every per-run directory (excluding _bootstrap-*) -----------------
+  # ----- every per-run directory ------------------------------------------
   if [ ! -d "${LEERIE_ROOT}/runs" ]; then
     echo "cleanup: no ${LEERIE_ROOT}/runs/ to clean"
     exit 0
@@ -212,9 +182,7 @@ if [ "$ALL_RUNS" = "true" ]; then
   cleaned=0
   for dir in "${LEERIE_ROOT}"/runs/*/; do
     [ -d "$dir" ] || continue
-    base="$(basename "$dir")"
-    case "$base" in _bootstrap-*) continue ;; esac
-    clean_one_run "$base" "$BR_FLAG"
+    clean_one_run "$(basename "$dir")" "$BR_FLAG"
     cleaned=$((cleaned + 1))
   done
   if [ "$cleaned" -eq 0 ]; then
@@ -237,7 +205,7 @@ fi
 target="$(most_recent_failed_run)"
 if [ -z "$target" ]; then
   echo "cleanup: no in-progress / failed runs found. " \
-       "Use --run-id <id>, --all-runs, or --bootstrap."
+       "Use --run-id <id> or --all-runs."
   exit 0
 fi
 printf "cleanup: most-recently-failed run is %s — remove? [y/N] " "$target"

@@ -309,34 +309,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   regardless of pause length. See DESIGN.md §6 *Remote disk policy*.
 
 - **`leerie --resume --runtime fly` no longer silently provisions a
-  duplicate Fly machine for bootstrap-id runs.** The launcher's
-  resume dispatch looked the run-id up only in
-  `.leerie/runs/<id>/run.json`, but for runs paused before
-  phase_classify completed, the host-side machine pointer lives in
-  `fly-machine.json` — `run.json` doesn't exist on the host yet (it
-  only materializes after the orchestrator on the machine has minted
-  a final run-id and synced state back). The miss made `_paused_mid`
-  empty; the dispatch fell through to `provision_machine` and started
-  a brand-new machine, overwriting `fly-machine.json` with the
-  duplicate's id and orphaning the original on Fly. Telemetry
-  reproducer: two distinct `fly_machine_id`s
-  (`2861322f49e708`, `2879390f17dd48`) written for the same
-  `_bootstrap-195f58` three hours apart, by two different launcher
-  PIDs. The user got an "attach: machine doesn't exist" error later
-  because the host pointer named the duplicate, which had also been
-  destroyed by the time they reattached.
-
-  The fix routes `--resume` through
-  `_resolve_fly_machine_id_from_run_dir` (the dual-file lookup
-  already used by `--stop`/`--kill`/`--finalize`/`--attach`).
-  Explicit `--resume` is now strict-fail: a missing machine pointer
-  or a failed `resume_machine` aborts with a diagnostic pointing at
-  `leerie --list` instead of falling through to provision. Fresh
-  runs (no `--resume`) keep their existing behavior — first call
-  still provisions. Behavior change for the misuse case:
-  `leerie --resume --run-id <typo-or-cleaned-up> --runtime fly` no
-  longer silently starts a new run; it tells the user the pointer
-  is missing.
+  duplicate Fly machine.** The run_id is now the Fly machine ID
+  (DESIGN §6), so the resume dispatch uses it directly — no sidecar
+  lookup needed, no ambiguity possible. Explicit `--resume` is
+  strict-fail: a missing or unresumable machine aborts with a
+  diagnostic pointing at `leerie --list` instead of falling through
+  to provision. Fresh runs (no `--resume`) keep their existing
+  behavior — first call still provisions.
 
 ### Removed
 
@@ -941,24 +920,13 @@ in-machine environment correct for the orchestrator + workers, and
 
 ### Fixed
 
-- **Memory sampler stranded after the bootstrap-dir → final-run-id
-  rename.** The sampler shipped earlier in this release captured
-  `out = st.run_dir / "memory.ndjson"` once outside its tick loop.
-  At end of phase 1 the orchestrator atomically renames
-  `_bootstrap-<6hex>` to the final `<run-id>` (via `State.rename_to`,
-  which mutates `st.run_dir`), but the sampler's captured Path still
-  pointed at the now-nonexistent bootstrap directory. Every
-  subsequent `open("a")` raised `FileNotFoundError`, which the
-  intentionally-broad outer `except Exception: pass` swallowed —
-  silently no-op'ing the sampler for the rest of the run. Surfaced
-  as `memory.ndjson` files frozen at ~3 lines (the pre-rename
-  ticks). Fix moves the `out = st.run_dir / "memory.ndjson"` re-
-  resolution inside the loop in both the normal tick and the
-  cancel-path final-sample. Added a regression test
-  (`test_sampler_follows_run_dir_rename`) that compares pre-rename
-  vs post-rename sample counts — the previous tests used a
-  SimpleNamespace stub with a fixed `run_dir` and never exercised
-  the rename hazard, which is exactly how the bug slipped through.
+- **Memory sampler re-resolves `st.run_dir` on every tick.** The
+  sampler previously captured `out = st.run_dir / "memory.ndjson"`
+  once outside its tick loop, which could silently no-op if
+  `st.run_dir` ever changed. Fix moves the path resolution inside
+  the loop. The run_id is now the container/machine ID (stable from
+  creation, no rename), so the original bug cannot recur — but the
+  defensive re-resolution is kept as defense-in-depth.
 
 ### Added
 
