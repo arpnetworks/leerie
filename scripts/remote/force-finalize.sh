@@ -234,6 +234,24 @@ except Exception:
     # is defensive for non-Linux test environments.
     pass
 
+def _is_zombie(pid: int) -> bool:
+    """Check if pid is a zombie (state Z) via /proc."""
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+        return ") Z " in stat
+    except Exception:
+        return False
+
+def _pid_is_dead(target_pid: int) -> bool:
+    try:
+        os.kill(target_pid, 0)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    # Zombie: killed but not yet reaped by parent — effectively dead.
+    return _is_zombie(target_pid)
+
 def _stop_pid(target_pid: int, label: str) -> bool:
     """SIGTERM target_pid, wait up to 30 s, escalate to SIGKILL.
     Returns True when the process is confirmed dead."""
@@ -245,12 +263,8 @@ def _stop_pid(target_pid: int, label: str) -> bool:
         return False
     for _ in range(30):
         time.sleep(1)
-        try:
-            os.kill(target_pid, 0)
-        except ProcessLookupError:
+        if _pid_is_dead(target_pid):
             return True
-        except PermissionError:
-            pass
     # Escalate to SIGKILL.
     try:
         os.kill(target_pid, signal.SIGKILL)
@@ -260,12 +274,8 @@ def _stop_pid(target_pid: int, label: str) -> bool:
         return False
     for _ in range(5):
         time.sleep(1)
-        try:
-            os.kill(target_pid, 0)
-        except ProcessLookupError:
+        if _pid_is_dead(target_pid):
             return True
-        except PermissionError:
-            pass
     return False
 
 if scan_hit_pid is not None:

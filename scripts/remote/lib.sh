@@ -209,7 +209,7 @@ done
 PID_FILE="/work/.leerie/runs/${ID}/orchestrator.pid"
 ORCH_PID="$(head -1 "$PID_FILE" 2>/dev/null)"
 
-( tail -F "$LOG" 2>/dev/null ) &
+tail -F "$LOG" 2>/dev/null &
 TAIL_PID=$!
 
 # Cross-check the orchestrator's liveness with two ORed signals:
