@@ -240,6 +240,11 @@ _orch_is_alive() {
   [ -d /proc ] || return 1
   for _cmd in /proc/[0-9]*/cmdline; do
     [ -r "$_cmd" ] || continue
+    # Skip our own process — the wrapper script text (passed via
+    # bash -c) appears in /proc/self/cmdline and would self-match.
+    _cpid="${_cmd#/proc/}"
+    _cpid="${_cpid%%/*}"
+    [ "$_cpid" = "$$" ] && continue
     _argv=" $(tr '\0' ' ' < "$_cmd" 2>/dev/null) " || continue
     case "$_argv" in
       *orchestrator/leerie.py*)
