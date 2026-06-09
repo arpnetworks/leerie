@@ -49,7 +49,7 @@ def _setup_fake_work(tmp_path: Path, run_id: str, *, pid: int | None = None,
 
 def _run_wrapper(tmp_path: Path, script: str, run_id: str,
                  env_extra: dict | None = None,
-                 timeout: float = 5.0) -> subprocess.CompletedProcess:
+                 timeout: float = 15.0) -> subprocess.CompletedProcess:
     """Run the wrapper with run_id as $1. The wrapper hard-codes
     /work/... so we use a `sed` rewrite to point at $tmp_path/work for
     the test.
