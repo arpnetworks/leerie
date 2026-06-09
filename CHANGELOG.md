@@ -5,6 +5,16 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.21]
+
+### Fixed
+
+- **Documentation alignment: `plan_overlap_judge` added to all worker
+  enumerations.** Every doc, code comment, argparse help string, and
+  test that listed judgment or inspect-bucket workers now includes
+  `plan_overlap_judge`. Also fixes stale "seven worker types" → "eight"
+  counts and a "Twelve" → "Eleven" miscount in the model-override table.
+
 ## [0.4.20]
 
 ### Changed
