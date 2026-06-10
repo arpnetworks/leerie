@@ -2419,6 +2419,84 @@ run lifecycle ("nuke the artifacts").
 
 ---
 
+## 5½. Mechanical-feedback loops (CRITIC pattern)
+
+Every worker except the PR writer runs inside `_run_checked_loop` — a
+generic async function that calls the worker, runs deterministic
+structural checks on the output, and re-invokes with formatted
+feedback if issues are found. The pattern is grounded in the CRITIC
+framework (ICLR 2024): self-correction works only with external
+tool-verified feedback, not intrinsic self-review.
+
+### Core functions
+
+| Function | Purpose |
+|----------|---------|
+| `_run_checked_loop(invoke, check, name, max_rounds, make_feedback_prompt)` | Generic loop: call → check → feedback → retry. Returns `(result, warnings)`. |
+| `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `settle_subtask`'s implementer confidence check. |
+| `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
+| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by all 8 worker schemas. |
+
+### Per-worker mechanical checks
+
+Each returns `list[str]` — empty when clean. Pure Python, no LLM.
+
+| Worker | Check function | Issue codes | Max rounds cap |
+|--------|---------------|-------------|----------------|
+| Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `MANY_CATEGORIES` | `judgment_check_rounds` (2) |
+| Planner | `check_planner_output(result, repo_root, domain)` | `PHANTOM_PATH`, `DANGLING_DEP`, `EMPTY_CRITERIA`, `OVERSIZED`, `INTRA_DOMAIN_OVERLAP`, `PROTECTED_PATH`, `INTRA_DOMAIN_CYCLE` | `planner_check_rounds` (3) |
+| Reconciler | `check_reconciler_output(output, plans)` | `RENAME_TO_NOWHERE`, `BAD_PREFIX`, `SELF_DEP` | `judgment_check_rounds` (2) |
+| Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH` | `judgment_check_rounds` (2) |
+| Provision | `check_provision_output(result, repo_root)` | `WRONG_PM`, `MISSING_WORKDIR`, `EMPTY_RECIPE` | `judgment_check_rounds` (2) |
+| Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED`, `UNMET_CRITERION` | `implementer_confidence_retries` (2) |
+| Integrator | (no-op sync check; async checks run post-loop) | — | `judgment_check_rounds` (2) |
+| Conformer | (unchanged: `_conformance_clean` on observable signals) | — | `conformance_rounds` (2) |
+
+The reconciler's size-gate and cycle-gate retry paths also run
+`check_reconciler_output` after each retry's `_apply_reconciler_output`,
+logging warnings for any structural issues.
+
+### Task-referenced file extraction
+
+When the task string references files (detected by
+`glob_task_references`), the orchestrator extracts structural elements
+and injects them as an external coverage checklist into the planner's
+prompt — breaking the correlated-error ceiling (arxiv 2603.25773).
+
+| Function | Purpose |
+|----------|---------|
+| `_expand_braces(pattern)` | Pre-expands `{a,b}` brace groups that Python's `glob.glob` does not handle. Recursive for nested braces. |
+| `glob_task_references(task, repo_root)` | Scans the task string for file-path tokens, expands braces, globs each pattern. Returns deduplicated `list[Path]`. |
+| `extract_task_file_structure(task, repo_root)` | Extracts headings from `.md`/`.txt` (regex: `#{1,6}`), list-item IDs from `.yaml`/`.yml` (regex: `^- id:`), and top-level mapping keys. Stdlib-only (no PyYAML). Returns `list[str]` or `None`. |
+| `check_task_file_coverage(extracted, subtasks)` | Checks which extracted items are not referenced by any subtask. Returns `LOW_COVERAGE` issue when >50% uncovered. |
+| `_format_task_file_structure(items)` | Formats extracted items as a prompt section for the planner. |
+
+No-op when the task doesn't reference files.
+
+### Multi-sample planning
+
+When `planner_samples > 1`, `phase_plan` runs N independent
+`plan_one(category, sample_idx)` calls per domain in parallel
+(bounded by `max_parallel`). Each gets a unique `sid`
+(`planner-{category}-s{idx}`) so log files don't collide.
+
+`_select_best_planner_sample(samples, repo_root, domain)` mechanically
+selects the winner: fewest `check_planner_output` issues, tiebreak on
+subtask count (more = better coverage), tiebreak on first sample
+(determinism). No LLM merge judge — avoids self-bias.
+
+### Cap resolvers
+
+Same resolution pattern as existing resolvers (CLI → env → TOML →
+default): `resolve_judgment_check_rounds`,
+`resolve_planner_check_rounds`,
+`resolve_implementer_confidence_retries`, `resolve_planner_samples`.
+Env vars: `LEERIE_JUDGMENT_CHECK_ROUNDS`,
+`LEERIE_PLANNER_CHECK_ROUNDS`,
+`LEERIE_IMPLEMENTER_CONFIDENCE_RETRIES`, `LEERIE_PLANNER_SAMPLES`.
+
+---
+
 ## 6. Caps and their values
 
 Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
