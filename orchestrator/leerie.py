@@ -119,7 +119,7 @@ DEFAULT_CAPS = {
     # Separate from conformance_rounds (which loops on observable
     # build/lint/test signals) and from confidence_rounds (which is
     # the worker-internal evidence-gate iteration budget).
-    "judgment_check_rounds": 2,     # classifier, reconciler, provision,
+    "judgment_check_rounds": 3,     # classifier, reconciler, provision,
                                     # overlap judge, integrator
     "planner_check_rounds": 3,      # planner (richer checks justify more)
     "implementer_confidence_retries": 2,  # separate from subtask_continuations

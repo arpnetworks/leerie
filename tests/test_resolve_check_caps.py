@@ -23,7 +23,7 @@ def repo_root(tmp_path, monkeypatch):
 # --- judgment_check_rounds ---------------------------------------------- #
 
 def test_judgment_check_rounds_default(leerie, repo_root):
-    assert leerie.resolve_judgment_check_rounds(repo_root) == 2
+    assert leerie.resolve_judgment_check_rounds(repo_root) == 3
 
 
 def test_judgment_check_rounds_env(leerie, repo_root, monkeypatch):
