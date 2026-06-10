@@ -111,7 +111,7 @@ DEFAULT_CAPS = {
     # the conformer when its output is malformed or residuals remain.
     # Exhausting this cap is a *warning*, not a failure — the phase is
     # advisory and never produces a `failed` / `blocked` subtask status.
-    "conformance_rounds": 2,
+    "conformance_rounds": 3,
     # CRITIC-pattern mechanical-feedback re-invocation caps. Each worker
     # type gets code-enforced structural checks (file existence, graph
     # cycles, lockfile consistency, etc.) and the orchestrator re-invokes
@@ -123,7 +123,7 @@ DEFAULT_CAPS = {
                                     # overlap judge, integrator
     "planner_check_rounds": 3,      # planner (richer checks justify more)
     "implementer_confidence_retries": 2,  # separate from subtask_continuations
-    "planner_samples": 1,           # multi-sample; 1 = off
+    "planner_samples": 3,           # multi-sample; set to 1 to disable
     "worker_timeout_sec": 5400,     # 90 minutes per worker process
     # If a worker emits no stdout events for this many seconds, log a
     # warning naming the worker, its PID, the elapsed silence, and any
@@ -2689,7 +2689,7 @@ def resolve_implementer_confidence_retries(
 
 def resolve_planner_samples(repo_root: Path,
                              cli_value: int | None = None) -> int:
-    """Resolve the planner-samples cap (multi-sample; 1 = off)."""
+    """Resolve the planner-samples cap (multi-sample; 1 disables)."""
     return _resolve_positive_int_pref(
         repo_root, cli_value,
         env_var=PLANNER_SAMPLES_ENV,
@@ -3568,6 +3568,27 @@ _VALID_EXTENTS = frozenset({"in_plan", "external"})
 # feedback on re-invocation.  See _run_checked_loop.
 
 
+def _confidence_issues(
+    conf: dict, axes: list[str], threshold: float = 9.0,
+) -> list[str]:
+    """Return one LOW_CONFIDENCE issue per axis below *threshold*.
+
+    Returns empty when *conf* has no numeric axes at all — the schema
+    enforces their presence in real runs; an empty dict here means the
+    caller passed ``result.get("confidence") or {}`` on a dict that
+    lacked the field entirely (e.g. a test stub)."""
+    if not any(isinstance(conf.get(ax), (int, float)) for ax in axes):
+        return []
+    out: list[str] = []
+    for ax in axes:
+        val = conf.get(ax)
+        if not isinstance(val, (int, float)) or val < threshold:
+            out.append(
+                f"LOW_CONFIDENCE: axis {ax!r} is {val} (threshold "
+                f"{threshold})")
+    return out
+
+
 def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
     """Thin mechanical checks on the classifier's category selection."""
     issues: list[str] = []
@@ -3594,6 +3615,8 @@ def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
         issues.append(
             f"MANY_CATEGORIES: {len(cats)} categories — typical "
             "tasks span 1–3")
+    issues.extend(_confidence_issues(
+        result.get("confidence") or {}, ["classification"]))
     return issues
 
 
@@ -3686,6 +3709,9 @@ def check_planner_output(
             "INTRA_DOMAIN_CYCLE: dependency cycle detected within "
             f"this domain ({domain})")
 
+    issues.extend(_confidence_issues(
+        result.get("confidence") or {},
+        ["task_understanding", "decomposition_quality"]))
     return issues
 
 
@@ -3718,6 +3744,8 @@ def check_reconciler_output(
             issues.append(
                 f"SELF_DEP: added subtask {sid!r} depends on itself")
 
+    issues.extend(_confidence_issues(
+        output.get("confidence") or {}, ["reconciliation"]))
     return issues
 
 
@@ -3780,6 +3808,8 @@ def check_overlap_judge_output(
                     f"would remove provides tags {orphaned} that "
                     "other subtasks require")
 
+    issues.extend(_confidence_issues(
+        output.get("confidence") or {}, ["judgment"]))
     return issues
 
 
@@ -3820,7 +3850,15 @@ def check_provision_output(
         issues.append(
             "EMPTY_RECIPE: recipe is empty but repo has lockfile(s)")
 
+    issues.extend(_confidence_issues(
+        result.get("confidence") or {}, ["recipe_correctness"]))
     return issues
+
+
+def check_integrator_output(result: dict) -> list[str]:
+    """Confidence gate for the integrator."""
+    return _confidence_issues(
+        result.get("confidence") or {}, ["resolution"])
 
 
 def check_implementer_output(
@@ -3927,10 +3965,12 @@ def extract_task_file_structure(
         ext = f.suffix.lower()
         name = f.name
         if ext in (".md", ".txt"):
-            for m in re.finditer(r'^#{1,6}\s+(.+)', text, re.MULTILINE):
+            for m in re.finditer(r'^#{3,6}\s+(.+)', text, re.MULTILINE):
                 items.append(f"{name}: {m.group(1).strip()}")
             for m in re.finditer(r'^\d+\.\s+(.+)', text, re.MULTILINE):
-                items.append(f"{name}: {m.group(1).strip()[:80]}")
+                raw = m.group(1).strip()
+                if not re.match(r'^\[.+\]\(#', raw):
+                    items.append(f"{name}: {raw[:80]}")
         elif ext in (".yaml", ".yml"):
             # Stdlib-only: extract list-item IDs and top-level mapping
             # keys via regex.  Full YAML parsing would require PyYAML
@@ -3943,14 +3983,23 @@ def extract_task_file_structure(
     return items if items else None
 
 
+_MAX_COVERAGE_ITEMS = 50
+
+
 def check_task_file_coverage(
     extracted: list[str], subtasks: list[dict],
 ) -> list[str]:
     """Check which extracted items are NOT referenced by any subtask.
 
-    Returns a LOW_COVERAGE issue when >50% of items are uncovered.
-    Pure substring matching — no semantic understanding needed."""
+    Returns a LOW_COVERAGE issue when >50% of items are uncovered AND the
+    item count is ≤ ``_MAX_COVERAGE_ITEMS``.  Above the cap the signal is
+    too dilute for meaningful gating — a planner with 5–15 subtasks cannot
+    realistically cover half of 200+ spec items.  The prompt injection
+    (``_format_task_file_structure``) is unconditional regardless of this
+    cap."""
     if not extracted:
+        return []
+    if len(extracted) > _MAX_COVERAGE_ITEMS:
         return []
     plan_text = " ".join(
         (s.get("intent", "") + " " +
@@ -12269,7 +12318,8 @@ async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
                         efforts: dict[str, str | None],
                         rules_files: list[Path],
                         blt_commands: dict[str, str],
-                        diff_base: str) -> dict | None:
+                        diff_base: str,
+                        extra_feedback: str | None = None) -> dict | None:
     """Spawn one conformer for one subtask in its existing worktree.
     Returns the worker's structured output, or None on WorkerError (which
     is recorded as a warning by the caller — DESIGN §9: the phase is
@@ -12299,6 +12349,8 @@ async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
         audience="conformer")
     if recipe_section is not None:
         up.append(recipe_section)
+    if extra_feedback is not None:
+        up.append(extra_feedback)
 
     # bump_workers is inside the try block on purpose: it raises
     # WorkerError when max_total_workers is exhausted, and the conformance
@@ -12655,12 +12707,14 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     blt = _infer_build_lint_test(repo_root)
     run_branch = compute_run_branch(st.run_id)
     last_res: dict | None = None
+    blt_feedback: str | None = None
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(worktree)
         last_res = await run_conformer(
             sid, leerie_dir, worktree, caps, st, models, efforts,
-            rules_files=rules_files, blt_commands=blt, diff_base=run_branch)
+            rules_files=rules_files, blt_commands=blt,
+            diff_base=run_branch, extra_feedback=blt_feedback)
 
         if last_res is None:
             warnings.append(f"conformer round {c_round}: worker crashed; "
@@ -12719,6 +12773,15 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
             leerie_dir / "logs" / f"{sid}-conformer.log",
             f"conformer round {c_round}", warnings)
 
+        bg_retry_warnings = [
+            w for w in warnings
+            if w.startswith(f"conformer round {c_round}:")
+            and "auto-backgrounded" in w]
+        blt_feedback = (
+            _format_check_feedback(bg_retry_warnings, c_round,
+                                   caps["conformance_rounds"])
+            if bg_retry_warnings else None)
+
         if _conformance_clean(last_res):
             break
 
@@ -12770,6 +12833,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
 
     warnings: list[str] = []
     last_res: dict | None = None
+    blt_feedback: str | None = None
 
     sys_prompt = load_prompt("conformer")
     rules_paths_str = ", ".join(
@@ -12808,6 +12872,8 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             audience="conformer")
         if recipe_section is not None:
             up.append(recipe_section)
+        if blt_feedback is not None:
+            up.append(blt_feedback)
 
         try:
             st.bump_workers(caps)
@@ -12886,6 +12952,15 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         _emit_bash_axis_warnings(
             leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
             f"final conformer round {c_round}", warnings)
+
+        bg_retry_warnings = [
+            w for w in warnings
+            if w.startswith(f"final conformer round {c_round}:")
+            and "auto-backgrounded" in w]
+        blt_feedback = (
+            _format_check_feedback(bg_retry_warnings, c_round,
+                                   caps["conformance_rounds"])
+            if bg_retry_warnings else None)
 
         if _conformance_clean(res):
             break
@@ -13255,12 +13330,9 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
 
         # The integrator's async mechanical checks (conflict markers,
         # merge committed) run in the resolved-status path below.
-        # The loop's value is re-invocation on crash; the schema enum
-        # already constrains status to resolved/design-conflict/failed
-        # so a sync check here would be redundant.
         ires, int_warnings = await _run_checked_loop(
             invoke=_invoke_integrator,
-            check=lambda r: [],
+            check=lambda r: check_integrator_output(r),
             name=f"integrator-{sid}",
             max_rounds=caps["judgment_check_rounds"],
             make_feedback_prompt=_on_integrator_fb,

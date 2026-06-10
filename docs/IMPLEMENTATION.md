@@ -2222,11 +2222,11 @@ Implements DESIGN §9 *Post-work conformance*.
 | Step | Function | Behavior |
 |------|----------|----------|
 | Discover rules files | `discover_rules_files(repo_root)` | Returns existing paths from a fixed, capped allowlist (`CLAUDE.md`, `AGENTS.md`, `.agent.md`, `.cursorrules`, `.windsurfrules`, `docs/CLAUDE.md`, `docs/AGENTS.md`, `docs/CONVENTIONS.md`, `docs/STYLE.md`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`), deterministic order, never raises. Empty list when nothing matches. |
-| Run conformer | `run_conformer()` | One `claude -p` invocation with `ACT_TOOLS`, `--dangerously-skip-permissions`, `SCHEMAS["conformer"]`. Catches `WorkerError` and returns `None` (surfaced as a warning). |
+| Run conformer | `run_conformer()` | One `claude -p` invocation with `ACT_TOOLS`, `--dangerously-skip-permissions`, `SCHEMAS["conformer"]`. Accepts optional `extra_feedback: str \| None` — when non-None, appended to the user prompt (used for Pattern B backgrounding-retry feedback from prior round). Catches `WorkerError` and returns `None` (surfaced as a warning). |
 | Validate output | `validate_conformance_result()` | Cross-field invariants — `rule_violations_residual` non-empty requires `rules_files_read` non-empty; each `rule_violations_fixed` item must cite a non-empty `rule` string; each `docs_updates` / `tests_updates` item must cite a `path` that exists. On failure → warning, loop breaks. |
 | Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions used on the implementer, re-applied to any new commits the conformer added. A scope-protected-path violation triggers `rollback_conformer_commits()` (reset to `before_sha`) and is recorded as a warning, **not** as `failed` / `blocked`. |
-| Loop bound | `caps["conformance_rounds"]` (default 2) | Re-runs the conformer if its output is malformed or residuals remain. Exhausting the cap with residuals still present is a warning, not a failure. |
-| BLT-axis observability | `_emit_bash_axis_warnings()` | After each round, parses the per-worker JSONL log at `<state-root>/runs/<id>/logs/<sid>-conformer.log` (or `final-conformer-r<N>.log` for the final pass) and surfaces two advisory warnings: (1) **multi-invocation** — `conformer round N: ran <AXIS>_CMD K times in one round (see <log>) — `run each axis exactly once per round` per conformer.md §4; surfaced as advisory.` when the worker invoked a single axis (test/build/lint) more than once in one round; (2) **retry-after-backgrounded** — `conformer round N: <AXIS>_CMD auto-backgrounded (bash_id=<id>) and was followed by another <AXIS>_CMD invocation — that is the retry-instead-of-recover pattern. Set `timeout: 600000` on the original invocation to prevent the background trap (conformer.md §4); if it still backgrounds, recover by reading the temp output file the Bash tool reports (`Read file_path=<path>`).` when a Bash-tool-auto-backgrounded command was followed by a fresh BLT command instead of a temp-file `Read`. Helpers `_count_bash_axis_invocations()` and `_count_orphaned_bg_axis()` are pure log-parsing — advisory by design, never raise. The `_count_orphaned_bg_axis` detection logic also accepts `BashOutput shell_id=<id>` polls as a valid recovery path even though `ACT_TOOLS` does not currently grant that tool to the conformer — the detection is forward-compatible with future tool-surface changes. |
+| Loop bound | `caps["conformance_rounds"]` (default 3) | Re-runs the conformer if its output is malformed or residuals remain. Exhausting the cap with residuals still present is a warning, not a failure. |
+| BLT-axis observability + feedback | `_emit_bash_axis_warnings()` | After each round, parses the per-worker JSONL log at `<state-root>/runs/<id>/logs/<sid>-conformer.log` (or `final-conformer-r<N>.log` for the final pass) and surfaces two types: (1) **multi-invocation** (advisory only) — `conformer round N: ran <AXIS>_CMD K times in one round` — legitimate progressive testing (targeted → full suite → grep) is the common cause; surfaced for observability. (2) **retry-after-backgrounded** (feedback-injected) — `conformer round N: <AXIS>_CMD auto-backgrounded (bash_id=<id>) and was followed by another <AXIS>_CMD invocation` — the "retry-instead-of-recover" pattern. These Pattern B warnings are collected after each round and, if non-empty, formatted via `_format_check_feedback()` and passed as `extra_feedback` to the next round's `run_conformer()` call so the conformer can correct the behavior. Helpers `_count_bash_axis_invocations()` and `_count_orphaned_bg_axis()` are pure log-parsing — never raise. The `_count_orphaned_bg_axis` detection logic also accepts `BashOutput shell_id=<id>` polls as a valid recovery path — forward-compatible with future tool-surface changes. |
 | Attach result | — | `res["conformance"]` (worker output blob) and `res["conformance_warnings"]` (list of strings) are added to the implementer's result. The subtask still returns `complete`. |
 
 The phase is advisory: **no path through the conformance phase produces a
@@ -2443,14 +2443,21 @@ Each returns `list[str]` — empty when clean. Pure Python, no LLM.
 
 | Worker | Check function | Issue codes | Max rounds cap |
 |--------|---------------|-------------|----------------|
-| Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `MANY_CATEGORIES` | `judgment_check_rounds` (2) |
-| Planner | `check_planner_output(result, repo_root, domain)` | `PHANTOM_PATH`, `DANGLING_DEP`, `EMPTY_CRITERIA`, `OVERSIZED`, `INTRA_DOMAIN_OVERLAP`, `PROTECTED_PATH`, `INTRA_DOMAIN_CYCLE` | `planner_check_rounds` (3) |
-| Reconciler | `check_reconciler_output(output, plans)` | `RENAME_TO_NOWHERE`, `BAD_PREFIX`, `SELF_DEP` | `judgment_check_rounds` (2) |
-| Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH` | `judgment_check_rounds` (2) |
-| Provision | `check_provision_output(result, repo_root)` | `WRONG_PM`, `MISSING_WORKDIR`, `EMPTY_RECIPE` | `judgment_check_rounds` (2) |
+| Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `MANY_CATEGORIES`, `LOW_CONFIDENCE` | `judgment_check_rounds` (2) |
+| Planner | `check_planner_output(result, repo_root, domain)` | `PHANTOM_PATH`, `DANGLING_DEP`, `EMPTY_CRITERIA`, `OVERSIZED`, `INTRA_DOMAIN_OVERLAP`, `PROTECTED_PATH`, `INTRA_DOMAIN_CYCLE`, `LOW_CONFIDENCE` | `planner_check_rounds` (3) |
+| Reconciler | `check_reconciler_output(output, plans)` | `RENAME_TO_NOWHERE`, `BAD_PREFIX`, `SELF_DEP`, `LOW_CONFIDENCE` | `judgment_check_rounds` (2) |
+| Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH`, `LOW_CONFIDENCE` | `judgment_check_rounds` (2) |
+| Provision | `check_provision_output(result, repo_root)` | `WRONG_PM`, `MISSING_WORKDIR`, `EMPTY_RECIPE`, `LOW_CONFIDENCE` | `judgment_check_rounds` (2) |
 | Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED`, `UNMET_CRITERION` | `implementer_confidence_retries` (2) |
-| Integrator | (no-op sync check; async checks run post-loop) | — | `judgment_check_rounds` (2) |
-| Conformer | (unchanged: `_conformance_clean` on observable signals) | — | `conformance_rounds` (2) |
+| Integrator | `check_integrator_output(result)` | `LOW_CONFIDENCE` | `judgment_check_rounds` (2) |
+| Conformer | (unchanged: `_conformance_clean` on observable signals) | — | `conformance_rounds` (3) |
+
+`LOW_CONFIDENCE` is emitted by `_confidence_issues(conf, axes, threshold=9.0)`,
+a helper that returns one issue string per axis below threshold. Each check
+function calls it with its worker's schema-defined axes: classifier
+`["classification"]`, planner `["task_understanding", "decomposition_quality"]`,
+reconciler `["reconciliation"]`, overlap judge `["judgment"]`, provision
+`["recipe_correctness"]`, integrator `["resolution"]`.
 
 The reconciler's size-gate and cycle-gate retry paths also run
 `check_reconciler_output` after each retry's `_apply_reconciler_output`,
@@ -2461,15 +2468,18 @@ logging warnings for any structural issues.
 When the task string references files (detected by
 `glob_task_references`), the orchestrator extracts structural elements
 and injects them as an external coverage checklist into the planner's
-prompt — breaking the correlated-error ceiling (arxiv 2603.25773).
+prompt. This is a novel technique inspired by but distinct from the
+executable-specification architecture of arxiv 2603.25773 (see
+DESIGN.md §8 for the distinction).
 
 | Function | Purpose |
 |----------|---------|
 | `_expand_braces(pattern)` | Pre-expands `{a,b}` brace groups that Python's `glob.glob` does not handle. Recursive for nested braces. |
 | `glob_task_references(task, repo_root)` | Scans the task string for file-path tokens, expands braces, globs each pattern. Returns deduplicated `list[Path]`. |
-| `extract_task_file_structure(task, repo_root)` | Extracts headings from `.md`/`.txt` (regex: `#{1,6}`), list-item IDs from `.yaml`/`.yml` (regex: `^- id:`), and top-level mapping keys. Stdlib-only (no PyYAML). Returns `list[str]` or `None`. |
-| `check_task_file_coverage(extracted, subtasks)` | Checks which extracted items are not referenced by any subtask. Returns `LOW_COVERAGE` issue when >50% uncovered. |
+| `extract_task_file_structure(task, repo_root)` | Extracts H3+ headings from `.md`/`.txt` (regex: `#{3,6}`; H1/H2 skipped as structural), numbered items (excluding TOC anchor links `[...](#...)`), list-item IDs from `.yaml`/`.yml` (regex: `^- id:`), and top-level mapping keys. Stdlib-only (no PyYAML). Returns `list[str]` or `None`. |
+| `check_task_file_coverage(extracted, subtasks)` | Checks which extracted items are not referenced by any subtask. Returns `LOW_COVERAGE` issue when >50% uncovered AND item count ≤ `_MAX_COVERAGE_ITEMS` (50). Above the cap, returns empty (too dilute for meaningful gating). |
 | `_format_task_file_structure(items)` | Formats extracted items as a prompt section for the planner. |
+| `_MAX_COVERAGE_ITEMS` | 50. A planner with 5–15 subtasks can realistically cover ~50 items; above this the 50% threshold becomes unrealistic. |
 
 No-op when the task doesn't reference files.
 
@@ -2506,7 +2516,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 |------|-----|--------|
 | subtask continuations (re-spawns of an implementer for the same subtask — both context-exhaustion handoffs *and* mid-execution clarifications consume from the same budget) | 3 (`subtask_continuations`) | return `blocked`; fatal at wave boundary |
 | corrective retries of a *retryable* failure per subtask (`failed_retries`) | 1 | return `failed` |
-| orchestrator-level conformer rounds per subtask (`conformance_rounds`) | 2 | exit the conformance loop; any residuals become `conformance_warnings` on the subtask result — never `failed` / `blocked` (DESIGN §9 *Post-work conformance*) |
+| orchestrator-level conformer rounds per subtask (`conformance_rounds`) | 3 | exit the conformance loop; any residuals become `conformance_warnings` on the subtask result — never `failed` / `blocked` (DESIGN §9 *Post-work conformance*). Backgrounding-retry (Pattern B) warnings from round N are injected as structured CRITIC-pattern feedback into round N+1. |
 | total worker invocations per run | 200 (`--max-workers`, also `LEERIE_MAX_WORKERS` env or `max_workers` in `leerie.toml`) | the cheap, runtime backstop in `State.bump_workers()`: raises `WorkerError`, abort, state saved for `--resume`. The complementary early check is `check_budget_feasibility()` at the plan/execute boundary (after `schedule()`, before `write_plan()`) — it estimates remaining `claude -p` calls from the planner output and `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value before any implementer spawns, so a run that is mathematically unwinnable fails at the cheapest moment rather than mid-wave. See DESIGN §13 *Budget feasibility — fail fast at the cheapest moment* and §"Budget feasibility preflight" above. |
 | per-subtask call-estimate (for the feasibility preflight) | 2.5 (`subtask_call_estimate`) | not a runtime gate; consumed by `check_budget_feasibility()` as the per-subtask multiplier in its remaining-call estimate. Default calibrated from successful runs at 2.0–2.31; the safety margin (next row) absorbs the lint-fighting inflator that pushes the ratio above 2.5 on environments-heavy repos. |
 | budget-preflight safety margin | 1.15 (`budget_safety_margin`) | not a runtime gate; consumed by `check_budget_feasibility()` as the multiplier on `total_estimate` before comparison to `max_total_workers`. With the default `subtask_call_estimate=2.5`, the guaranteed cap headroom is ~1.44×. |
@@ -2520,7 +2530,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | mechanical-feedback rounds for judgment workers (`judgment_check_rounds`) | 2 | classifier, reconciler, provision, overlap judge, integrator. The orchestrator runs deterministic checks (file existence, graph cycles, lockfile consistency) on each worker's output and re-invokes with structured feedback if issues are found. On exhaustion, proceed with best result + warnings. CRITIC pattern (ICLR 2024). |
 | mechanical-feedback rounds for planner (`planner_check_rounds`) | 3 | Same CRITIC pattern, but higher default because the planner has richer checks (phantom paths, dangling deps, intra-domain cycles, protected paths, task-file coverage). |
 | implementer confidence retries (`implementer_confidence_retries`) | 2 | Separate from `subtask_continuations`. Orchestrator checks confidence scores + scope drift + unmet criteria on complete results and re-invokes as a continuation if issues found. |
-| planner samples (`planner_samples`) | 1 (off) | Independent parallel invocations per domain. Mechanical selection: fewest issues, tiebreak on subtask count. Set to 2–3 for tasks where recall matters. Also `LEERIE_PLANNER_SAMPLES` env or `planner_samples` in `leerie.toml`. CLI: `--planner-samples`. |
+| planner samples (`planner_samples`) | 3 | Independent parallel invocations per domain. Mechanical selection: fewest issues, tiebreak on subtask count. Set to 1 to disable. Also `LEERIE_PLANNER_SAMPLES` env or `planner_samples` in `leerie.toml`. CLI: `--planner-samples`. |
 
 `--max-turns` by worker: classifier 60, planner 100, reconciler 30,
 plan_overlap_judge 30, provision 30, integrator 60, implementer 120,

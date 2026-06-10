@@ -89,15 +89,16 @@ class TestExtractTaskFileStructure:
         assert leerie.extract_task_file_structure(
             "fix the bug", tmp_path) is None
 
-    def test_markdown_headings(self, leerie, tmp_path):
+    def test_markdown_headings_h3_plus(self, leerie, tmp_path):
         (tmp_path / "spec.md").write_text(
-            "# Overview\n## Details\n### Deep\nSome text\n")
+            "# Overview\n## Details\n### Deep\n#### Deeper\nSome text\n")
         items = leerie.extract_task_file_structure(
             "check spec.md", tmp_path)
         assert items is not None
-        assert any("Overview" in i for i in items)
-        assert any("Details" in i for i in items)
+        assert not any("Overview" in i for i in items)
+        assert not any("Details" in i for i in items)
         assert any("Deep" in i for i in items)
+        assert any("Deeper" in i for i in items)
 
     def test_numbered_items(self, leerie, tmp_path):
         (tmp_path / "plan.md").write_text(
@@ -107,6 +108,17 @@ class TestExtractTaskFileStructure:
         assert items is not None
         assert any("First step" in i for i in items)
         assert any("Second step" in i for i in items)
+
+    def test_toc_links_excluded(self, leerie, tmp_path):
+        (tmp_path / "spec.md").write_text(
+            "1. [Overview](#overview)\n2. Real item\n"
+            "3. [Details](#details)\n")
+        items = leerie.extract_task_file_structure(
+            "review spec.md", tmp_path)
+        assert items is not None
+        assert not any("Overview" in i for i in items)
+        assert not any("Details" in i for i in items)
+        assert any("Real item" in i for i in items)
 
     def test_yaml_list_ids(self, leerie, tmp_path):
         (tmp_path / "jobs.yaml").write_text(
@@ -168,6 +180,19 @@ class TestCheckTaskFileCoverage:
         subtasks = [{"title": "covers X", "intent": "X",
                      "investigation_notes": ""}]
         # 2/3 uncovered = 66% > 50%
+        issues = leerie.check_task_file_coverage(extracted, subtasks)
+        assert any("LOW_COVERAGE" in i for i in issues)
+
+    def test_skipped_when_too_many_items(self, leerie):
+        extracted = [f"spec.md: item-{i}" for i in range(51)]
+        subtasks = [{"title": "fix one", "intent": "item-0",
+                     "investigation_notes": ""}]
+        assert leerie.check_task_file_coverage(extracted, subtasks) == []
+
+    def test_gates_when_under_cap(self, leerie):
+        extracted = [f"spec.md: item-{i}" for i in range(50)]
+        subtasks = [{"title": "fix one", "intent": "item-0",
+                     "investigation_notes": ""}]
         issues = leerie.check_task_file_coverage(extracted, subtasks)
         assert any("LOW_COVERAGE" in i for i in issues)
 

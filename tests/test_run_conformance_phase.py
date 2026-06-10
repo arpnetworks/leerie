@@ -18,6 +18,21 @@ import json
 import subprocess
 from pathlib import Path
 
+
+def _write_log(path, events):
+    path.write_text("\n".join(json.dumps(e) for e in events) + "\n")
+
+
+def _bash_event(tid, cmd):
+    return {"message": {"content": [
+        {"type": "tool_use", "id": tid, "name": "Bash",
+         "input": {"command": cmd}}]}}
+
+
+def _result_event(tid, text):
+    return {"message": {"content": [
+        {"type": "tool_result", "tool_use_id": tid, "content": text}]}}
+
 import pytest
 
 
@@ -117,12 +132,14 @@ def _stub_run_conformer(leerie_mod, results_queue, *, commits=None):
     `commits` is provided, the matching index's stub also writes a file
     and commits it to the worktree before returning."""
     commits = commits or {}
-    state = {"i": 0}
+    state = {"i": 0, "feedbacks": []}
 
     async def _stub(sid, leerie_dir, worktree, caps, st, models, efforts,
-                    *, rules_files, blt_commands, diff_base):
+                    *, rules_files, blt_commands, diff_base,
+                    extra_feedback=None):
         i = state["i"]
         state["i"] += 1
+        state["feedbacks"].append(extra_feedback)
         action = commits.get(i)
         if action is not None:
             action(Path(worktree))
@@ -515,3 +532,69 @@ def test_protected_path_rollback_warns_about_discarded_uncommitted(env):
     # AND a new warning should call out the discarded uncommitted file.
     assert any("discarding" in w and "src.py" in w for w in warnings), \
         f"expected a 'discarding' warning mentioning src.py; got {warnings!r}"
+
+
+# --- Pattern B feedback injection ----------------------------------------- #
+
+def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
+    """When _emit_bash_axis_warnings detects an auto-backgrounded retry
+    (Pattern B) in round 0, the orchestrator should inject structured
+    feedback into round 1's extra_feedback parameter."""
+    c = env["leerie"]
+    # Two rounds: round 0 has residuals (not clean), round 1 is clean.
+    dirty = _clean_result(
+        build={"ran": True, "passed": False, "command": "npm run build",
+               "summary": "fail"})
+    state = _stub_run_conformer(c, [dirty, _clean_result()])
+
+    # Write a log that triggers the Pattern B warning: a Bash command
+    # auto-backgrounded, then immediately retried with a fresh Bash.
+    log_dir = env["run_dir"] / "logs"
+    _write_log(log_dir / f"{env['sid']}-conformer.log", [
+        _bash_event("a1", "npm run build"),
+        _result_event("a1",
+                      "Command running in background with ID: bg42. "
+                      "Output is being written to: /tmp/bg42.output"),
+        _bash_event("a2", "npm run build"),
+        _result_event("a2", "build passed"),
+    ])
+
+    res, warnings = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert state["i"] == 2, "expected 2 conformer rounds"
+    assert state["feedbacks"][0] is None, \
+        "round 0 should have no prior feedback"
+    assert state["feedbacks"][1] is not None, \
+        "round 1 should receive Pattern B feedback"
+    assert "auto-backgrounded" in state["feedbacks"][1]
+
+
+def test_pattern_a_multi_invocation_does_not_inject_feedback(env):
+    """When the conformer runs the same axis multiple times (Pattern A:
+    legitimate progressive testing), no feedback should be injected."""
+    c = env["leerie"]
+    dirty = _clean_result(
+        build={"ran": True, "passed": False, "command": "npm run build",
+               "summary": "fail"})
+    state = _stub_run_conformer(c, [dirty, _clean_result()])
+
+    # Write a log that triggers Pattern A only (multiple invocations,
+    # no auto-backgrounding).
+    log_dir = env["run_dir"] / "logs"
+    _write_log(log_dir / f"{env['sid']}-conformer.log", [
+        _bash_event("a1", "npm test -- --testPathPattern=foo"),
+        _result_event("a1", "1 test passed"),
+        _bash_event("a2", "npm test"),
+        _result_event("a2", "42 tests passed"),
+    ])
+
+    res, warnings = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert state["i"] == 2, "expected 2 conformer rounds"
+    assert state["feedbacks"][0] is None
+    assert state["feedbacks"][1] is None, \
+        "Pattern A (progressive testing) should NOT inject feedback"

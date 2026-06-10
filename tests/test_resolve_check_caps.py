@@ -78,7 +78,7 @@ def test_implementer_confidence_retries_cli_wins(
 # --- planner_samples --------------------------------------------------- #
 
 def test_planner_samples_default(leerie, repo_root):
-    assert leerie.resolve_planner_samples(repo_root) == 1
+    assert leerie.resolve_planner_samples(repo_root) == 3
 
 
 def test_planner_samples_env(leerie, repo_root, monkeypatch):

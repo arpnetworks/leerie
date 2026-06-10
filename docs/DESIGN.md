@@ -1813,11 +1813,13 @@ Leerie applies this finding: every worker (except the PR writer) runs
 inside a code-enforced loop (`_run_checked_loop`) where the
 orchestrator computes **deterministic structural checks** on the
 worker's output — file-existence, dependency-graph cycles, lockfile
-consistency, protected-path violations — and re-invokes the worker
-with the check results as external feedback if issues are found. The
-feedback is mechanically derived (no LLM), so it breaks the
-correlated-error pattern identified by "The Specification as Quality
-Gate" (arxiv 2603.25773, 2026).
+consistency, protected-path violations, **confidence-axis gates** — and
+re-invokes the worker with the check results as external feedback if
+issues are found. The feedback is mechanically derived (no LLM).
+Confidence gating (threshold 9.0 on every worker's schema-defined axes)
+is code-enforced for all workers, not just the implementer — a worker
+that self-reports low confidence triggers re-invocation just like a
+worker that hallucinates a file path.
 
 The conformer loop (`_run_conformance_phase`) is the original instance
 of this pattern — it loops on observable build/lint/test signals. The
@@ -1826,22 +1828,36 @@ generic `_run_checked_loop` extends it to all workers.
 ### Task-referenced file extraction
 
 When the task string references files (detectable by globbing), the
-orchestrator mechanically extracts structural elements (markdown
-headings, YAML keys, numbered items) and injects them into the
-planner's prompt as an external coverage checklist. This is the
-"specification as quality gate" architecture: an external reference the
-planner did not generate, grounded in files the user explicitly pointed
-to, that breaks the correlated-error ceiling. The extraction is
-task-agnostic — it triggers on any task referencing files, not just
-spec files. No-op when the task doesn't reference files.
+orchestrator mechanically extracts structural elements (H3+ markdown
+headings, YAML keys, numbered items — excluding H1/H2 section
+structure and table-of-contents anchor links) and injects them into the
+planner's prompt as an external coverage checklist. The extraction is
+a novel technique — an external reference the planner did not generate,
+grounded in files the user explicitly pointed to. It is inspired by but
+distinct from the executable-specification architecture of "The
+Specification as Quality Gate" (arxiv 2603.25773, 2026): that paper
+recommends BDD scenarios and contract tests (pass/fail deterministic
+checks), while our extraction uses document-structure parsing with
+substring matching — a weaker but pragmatically useful mechanism for
+coverage-oriented tasks.
+
+The coverage gating check (`check_task_file_coverage`) triggers
+re-invocation only when the extracted item count is ≤ 50
+(`_MAX_COVERAGE_ITEMS`). Above that threshold the signal is too dilute
+for meaningful gating — a planner with 5–15 subtasks cannot
+realistically cover half of 200+ spec items — so the check logs
+informationally but does not re-invoke. The prompt injection is
+unconditional: the planner always sees the full checklist regardless of
+item count. No-op when the task doesn't reference files.
 
 ### Multi-sample planning
 
 Multiple independent planner invocations per domain, each a fresh
 `claude -p` session (Cross-Context Review, arxiv 2603.12123, 2026:
 context separation is the mechanism). Mechanical selection by issue
-count and subtask count avoids self-bias. Controlled by the
-`planner_samples` cap (default 1 = off).
+count and subtask count avoids self-bias (a novel extension beyond the
+paper, which tested single fresh-session review only). Controlled by
+the `planner_samples` cap (default 3).
 
 ---
 
@@ -1942,7 +1958,7 @@ Two further disciplines apply, and they sit at the §12 axis:
   criteria lock was retired — §8.)
 
 The phase is bounded by a separate cap from the evidence loop: the conformer
-gets a small number of orchestrator-level rounds (default 2) in which to
+gets a small number of orchestrator-level rounds (default 3) in which to
 detect and fix drift. Exhausting the cap with residuals still present does
 *not* fail the subtask — the residuals become warnings, the subtask still
 returns `complete`, and the work moves on to integration. This is consistent
@@ -1953,14 +1969,17 @@ worker's structured output is well-formed) is enforced in code.
 
 Within a round, the conformer is expected to invoke each build/lint/test axis
 **exactly once** (with a targeted-falsifier exception when verifying a single
-file's behavior). The orchestrator surfaces an advisory warning when this
-expectation is violated — either the same axis was invoked multiple times in
-one round, or a Bash-tool-auto-backgrounded BLT command was followed by a
-fresh BLT invocation rather than a temp-file `Read` recovery. Both warnings
-are observability, not enforcement: the round still completes and the
-subtask still returns `complete`. The expectation pairs with explicit prompt
-guidance to pass `timeout: 600000` on long-running test/build commands so
-the auto-background trap is avoided in the first place. This is the same
+file's behavior). The orchestrator distinguishes two patterns: (a) running
+the same axis multiple times with different scopes (targeted test → full
+suite → verification grep) is legitimate progressive testing and is surfaced
+as an advisory only; (b) a Bash-tool-auto-backgrounded BLT command followed
+by a fresh BLT invocation rather than a temp-file `Read` recovery is the
+"retry-instead-of-recover" pattern — this is wasteful and the orchestrator
+injects it as structured CRITIC-pattern feedback into the next conformer
+round so the conformer can correct the behavior. General "ran N times"
+advisories remain observability-only. The expectation pairs with explicit
+prompt guidance to pass `timeout: 600000` on long-running test/build commands
+so the auto-background trap is avoided in the first place. This is the same
 §12 boundary as the rest of the phase: the discipline is checked
 mechanically (by parsing the per-worker JSONL log), the response is
 advisory.
@@ -2200,12 +2219,14 @@ recurs everywhere in the design:
 
 - The orchestrator does not trust a worker's confidence score at face
   value; it runs deterministic structural checks (file existence, graph
-  cycles, lockfile consistency, task-file coverage) on the output and
-  re-invokes the worker with the check results as external feedback when
-  issues are found (§8 *Mechanical-feedback loops*). The confidence
-  score remains structurally required (a worker that skips it fails
-  schema validation) but the orchestrator gates on the mechanical checks,
-  not the number.
+  cycles, lockfile consistency, task-file coverage) on the output **and**
+  gates on the confidence axes themselves (threshold 9.0 on every
+  schema-defined axis). Both are code-enforced: a worker that
+  hallucinates a file path and a worker that self-reports low confidence
+  both trigger re-invocation with structured feedback. The confidence
+  gate completes the "code enforces" principle — a number the model
+  produces is still externally verified by the orchestrator rather than
+  trusted at face value.
 
 The complementary half of the principle is just as important: **what cannot be
 checked mechanically is left to the worker, and not second-guessed by code.**

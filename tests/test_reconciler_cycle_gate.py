@@ -1707,8 +1707,13 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
     # Attempt 1: the model invents config-011 providing
     # `infra-stacks-authored` but forgets to rename deps-008's
     # `cdk-stacks-authored`. This matches the captured 075210 failure.
+    _recon_conf = {"reconciliation": 9.5, "basis": "test",
+                    "falsifiers_tested": [],
+                    "contradictions_reconciled": [],
+                    "gap_to_close": {}}
     attempt_1_output = {
         "renames": [], "added_provides": [],
+        "confidence": _recon_conf,
         "added_subtasks": [{
             "id": "config-011",
             "title": "Author CDK foundation + compute stacks",
@@ -1730,6 +1735,7 @@ def test_unresolved_retry_loop_integration_with_stubbed_reconciler(
                      "from": "cdk-stacks-authored",
                      "to": "infra-stacks-authored"}],
         "added_provides": [],
+        "confidence": _recon_conf,
         "added_subtasks": [{
             "id": "config-011",
             "title": "Author CDK foundation + compute stacks",
@@ -1963,6 +1969,10 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
     # feat-001's tag renamed → "app-runtime-deps" (provided by config-005).
     # config-005's tag renamed → "backend-http-server" (provided by feat-001).
     # Closes a 2-node SCC.
+    _recon_conf2 = {"reconciliation": 9.5, "basis": "test",
+                     "falsifiers_tested": [],
+                     "contradictions_reconciled": [],
+                     "gap_to_close": {}}
     attempt_1_output = {
         "renames": [
             {"sid": "feat-001",
@@ -1975,6 +1985,7 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
         "added_provides": [], "added_subtasks": [],
         "dropped_requires": [], "dependency_edges": [],
         "merged_subtasks": [], "unresolvable": [],
+        "confidence": _recon_conf2,
     }
     # Attempt 2: model emits the rename + drop leerie's recommendation
     # suggests. Leerie's recommendation targets the ORIGINAL pre-rename
@@ -2007,6 +2018,7 @@ def test_cycle_retry_loop_integration_with_stubbed_reconciler(
                        "not a code artifact feat-001 produces"},
         ],
         "dependency_edges": [], "merged_subtasks": [], "unresolvable": [],
+        "confidence": _recon_conf2,
     }
 
     calls: list[dict] = []

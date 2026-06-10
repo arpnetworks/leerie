@@ -10,12 +10,19 @@ from pathlib import Path
 import pytest
 
 
+def _conf(**axes: float) -> dict:
+    """Build a valid confidence dict that clears the 9.0 gate."""
+    return {**axes, "basis": "test", "falsifiers_tested": [],
+            "contradictions_reconciled": [], "gap_to_close": {}}
+
+
 # --- check_classifier_output -------------------------------------------- #
 
 class TestCheckClassifierOutput:
     def test_clean_output(self, leerie, tmp_path):
         (tmp_path / "infra").mkdir()
-        result = {"categories": ["infrastructure"], "questions": []}
+        result = {"categories": ["infrastructure"], "questions": [],
+                  "confidence": _conf(classification=9.5)}
         assert leerie.check_classifier_output(result, tmp_path) == []
 
     def test_infra_no_dir(self, leerie, tmp_path):
@@ -30,7 +37,8 @@ class TestCheckClassifierOutput:
 
     def test_docs_with_dir(self, leerie, tmp_path):
         (tmp_path / "docs").mkdir()
-        result = {"categories": ["documentation"], "questions": []}
+        result = {"categories": ["documentation"], "questions": [],
+                  "confidence": _conf(classification=9.0)}
         assert leerie.check_classifier_output(result, tmp_path) == []
 
     def test_empty_why_underivable(self, leerie, tmp_path):
@@ -56,9 +64,13 @@ class TestCheckClassifierOutput:
 # --- check_planner_output ---------------------------------------------- #
 
 class TestCheckPlannerOutput:
-    def _plan(self, subtasks):
-        return {"subtasks": subtasks, "status": "ready",
-                "domain": "testing"}
+    def _plan(self, subtasks, conf=True):
+        d = {"subtasks": subtasks, "status": "ready",
+             "domain": "testing"}
+        if conf:
+            d["confidence"] = _conf(task_understanding=9.5,
+                                    decomposition_quality=9.5)
+        return d
 
     def test_clean_plan(self, leerie, tmp_path):
         (tmp_path / "src").mkdir()
@@ -185,7 +197,8 @@ class TestCheckReconcilerOutput:
         return [{"subtasks": [{"id": "feat-001", "provides": tags}]}]
 
     def test_clean(self, leerie):
-        output = {"renames": [], "added_subtasks": []}
+        output = {"renames": [], "added_subtasks": [],
+                  "confidence": _conf(reconciliation=9.0)}
         plans = self._plans_with_provides(["tag-a"])
         assert leerie.check_reconciler_output(output, plans) == []
 
@@ -196,9 +209,10 @@ class TestCheckReconcilerOutput:
         issues = leerie.check_reconciler_output(output, plans)
         assert any("RENAME_TO_NOWHERE" in i for i in issues)
 
-    def test_rename_to_existing(self, leerie):
+    def test_rename_to_existing_clean(self, leerie):
         output = {"renames": [{"sid": "x", "from": "a", "to": "tag-a"}],
-                  "added_subtasks": []}
+                  "added_subtasks": [],
+                  "confidence": _conf(reconciliation=9.0)}
         plans = self._plans_with_provides(["tag-a"])
         assert leerie.check_reconciler_output(output, plans) == []
 
@@ -223,7 +237,8 @@ class TestCheckProvisionOutput:
         (tmp_path / "pnpm-lock.yaml").touch()
         result = {"recipe": [{"kind": "install",
                                "command": ["pnpm", "install"],
-                               "working_dir": "."}]}
+                               "working_dir": "."}],
+                  "confidence": _conf(recipe_correctness=9.0)}
         assert leerie.check_provision_output(result, tmp_path) == []
 
     def test_wrong_pm(self, leerie, tmp_path):
@@ -248,7 +263,8 @@ class TestCheckProvisionOutput:
         assert any("EMPTY_RECIPE" in i for i in issues)
 
     def test_empty_recipe_no_lockfile(self, leerie, tmp_path):
-        result = {"recipe": []}
+        result = {"recipe": [],
+                  "confidence": _conf(recipe_correctness=9.5)}
         assert leerie.check_provision_output(result, tmp_path) == []
 
 
@@ -264,7 +280,8 @@ class TestCheckOverlapJudgeOutput:
         ]}]
 
     def test_clean(self, leerie, tmp_path):
-        output = {"collisions": []}
+        output = {"collisions": [],
+                  "confidence": _conf(judgment=9.0)}
         assert leerie.check_overlap_judge_output(
             output, self._plans(), tmp_path) == []
 
@@ -324,3 +341,84 @@ class TestCheckImplementerOutput:
         result = {"status": "complete"}
         assert leerie.check_implementer_output(
             result, {}, {"src/foo.ts"}) == []
+
+
+# --- _confidence_issues ------------------------------------------------- #
+
+class TestConfidenceIssues:
+    def test_all_clear(self, leerie):
+        conf = {"root_cause": 9.5, "solution": 9.0}
+        assert leerie._confidence_issues(conf, ["root_cause", "solution"]) == []
+
+    def test_one_below(self, leerie):
+        conf = {"root_cause": 8.9, "solution": 9.0}
+        issues = leerie._confidence_issues(conf, ["root_cause", "solution"])
+        assert len(issues) == 1
+        assert "root_cause" in issues[0]
+        assert "LOW_CONFIDENCE" in issues[0]
+
+    def test_all_axes_missing(self, leerie):
+        assert leerie._confidence_issues({}, ["classification"]) == []
+
+    def test_one_axis_present_one_missing(self, leerie):
+        conf = {"root_cause": 9.5}
+        issues = leerie._confidence_issues(
+            conf, ["root_cause", "solution"])
+        assert len(issues) == 1
+        assert "solution" in issues[0]
+
+    def test_exactly_threshold(self, leerie):
+        conf = {"classification": 9.0}
+        assert leerie._confidence_issues(conf, ["classification"]) == []
+
+    def test_custom_threshold(self, leerie):
+        conf = {"x": 7.0}
+        assert leerie._confidence_issues(conf, ["x"], threshold=7.0) == []
+        issues = leerie._confidence_issues(conf, ["x"], threshold=7.1)
+        assert len(issues) == 1
+
+
+# --- LOW_CONFIDENCE in check functions ---------------------------------- #
+
+class TestLowConfidenceGating:
+    def test_classifier_low_confidence(self, leerie, tmp_path):
+        result = {"categories": ["testing"], "questions": [],
+                  "confidence": _conf(classification=8.0)}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("LOW_CONFIDENCE" in i for i in issues)
+
+    def test_planner_low_confidence(self, leerie, tmp_path):
+        plan = {"subtasks": [], "status": "ready", "domain": "testing",
+                "confidence": _conf(task_understanding=8.0,
+                                    decomposition_quality=9.5)}
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("LOW_CONFIDENCE" in i and "task_understanding" in i
+                    for i in issues)
+
+    def test_reconciler_low_confidence(self, leerie):
+        output = {"renames": [], "added_subtasks": [],
+                  "confidence": _conf(reconciliation=5.0)}
+        issues = leerie.check_reconciler_output(output, [{"subtasks": []}])
+        assert any("LOW_CONFIDENCE" in i for i in issues)
+
+    def test_overlap_judge_low_confidence(self, leerie, tmp_path):
+        output = {"collisions": [],
+                  "confidence": _conf(judgment=8.9)}
+        issues = leerie.check_overlap_judge_output(
+            output, [{"subtasks": []}], tmp_path)
+        assert any("LOW_CONFIDENCE" in i for i in issues)
+
+    def test_provision_low_confidence(self, leerie, tmp_path):
+        result = {"recipe": [],
+                  "confidence": _conf(recipe_correctness=0.0)}
+        issues = leerie.check_provision_output(result, tmp_path)
+        assert any("LOW_CONFIDENCE" in i for i in issues)
+
+    def test_integrator_low_confidence(self, leerie):
+        result = {"confidence": _conf(resolution=7.5)}
+        issues = leerie.check_integrator_output(result)
+        assert any("LOW_CONFIDENCE" in i for i in issues)
+
+    def test_integrator_clean(self, leerie):
+        result = {"confidence": _conf(resolution=9.0)}
+        assert leerie.check_integrator_output(result) == []
