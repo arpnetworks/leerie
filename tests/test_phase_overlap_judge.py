@@ -23,6 +23,11 @@ import pytest
 # Schema tests
 # --------------------------------------------------------------------- #
 
+def _stub_confidence() -> dict:
+    return {"judgment": 9.0, "basis": "", "falsifiers_tested": [],
+            "contradictions_reconciled": [], "gap_to_close": {}}
+
+
 def _valid_collision_merge() -> dict:
     return {
         "a_sid": "feat-001",
@@ -68,7 +73,7 @@ def test_schema_empty_collisions_valid(leerie):
     """The no-collision case is the common one — the judge must be able
     to return {collisions: []}."""
     import jsonschema
-    jsonschema.validate({"collisions": []},
+    jsonschema.validate({"collisions": [], "confidence": _stub_confidence()},
                         leerie.SCHEMAS["plan_overlap_judge"])
 
 
@@ -79,7 +84,7 @@ def test_schema_full_payload_valid(leerie):
             _valid_collision_merge(),
             _valid_collision_drop_a(),
             _valid_collision_unresolvable(),
-        ]},
+        ], "confidence": _stub_confidence()},
         leerie.SCHEMAS["plan_overlap_judge"])
 
 
@@ -88,7 +93,8 @@ def test_schema_rejects_unknown_resolution(leerie):
     bad = _valid_collision_drop_a()
     bad["resolution"] = "merge_or_split"
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({"collisions": [bad]},
+        jsonschema.validate({"collisions": [bad],
+                            "confidence": _stub_confidence()},
                             leerie.SCHEMAS["plan_overlap_judge"])
 
 
@@ -96,7 +102,8 @@ def test_schema_rejects_extra_top_level_keys(leerie):
     import jsonschema
     with pytest.raises(jsonschema.ValidationError):
         jsonschema.validate(
-            {"collisions": [], "extra": "nope"},
+            {"collisions": [], "confidence": _stub_confidence(),
+             "extra": "nope"},
             leerie.SCHEMAS["plan_overlap_judge"])
 
 
@@ -105,7 +112,8 @@ def test_schema_requires_core_fields(leerie):
     incomplete = {"a_sid": "feat-001", "b_sid": "refactor-001",
                   "resolution": "merge"}
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({"collisions": [incomplete]},
+        jsonschema.validate({"collisions": [incomplete],
+                            "confidence": _stub_confidence()},
                             leerie.SCHEMAS["plan_overlap_judge"])
 
 

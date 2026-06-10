@@ -1,0 +1,326 @@
+"""Tests for the mechanical-check functions used by the CRITIC-pattern
+feedback loop (DESIGN §8 + §12).  Each check function is pure Python
+(no LLM, no I/O except the repo_root path) and returns a list[str] of
+issue descriptions — empty when clean.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+
+# --- check_classifier_output -------------------------------------------- #
+
+class TestCheckClassifierOutput:
+    def test_clean_output(self, leerie, tmp_path):
+        (tmp_path / "infra").mkdir()
+        result = {"categories": ["infrastructure"], "questions": []}
+        assert leerie.check_classifier_output(result, tmp_path) == []
+
+    def test_infra_no_dir(self, leerie, tmp_path):
+        result = {"categories": ["infrastructure"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("CATEGORY_NO_DIR" in i for i in issues)
+
+    def test_docs_no_dir(self, leerie, tmp_path):
+        result = {"categories": ["documentation"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("CATEGORY_NO_DIR" in i for i in issues)
+
+    def test_docs_with_dir(self, leerie, tmp_path):
+        (tmp_path / "docs").mkdir()
+        result = {"categories": ["documentation"], "questions": []}
+        assert leerie.check_classifier_output(result, tmp_path) == []
+
+    def test_empty_why_underivable(self, leerie, tmp_path):
+        result = {"categories": ["testing"],
+                  "questions": [{"id": "q1", "question": "?",
+                                 "why_underivable": ""}]}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("EMPTY_WHY" in i for i in issues)
+
+    def test_many_categories(self, leerie, tmp_path):
+        result = {"categories": ["a", "b", "c", "d", "e"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("MANY_CATEGORIES" in i for i in issues)
+
+    def test_four_categories_ok(self, leerie, tmp_path):
+        result = {"categories": ["a", "b", "c", "d"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("MANY_CATEGORIES" in i for i in issues)
+
+
+# --- check_planner_output ---------------------------------------------- #
+
+class TestCheckPlannerOutput:
+    def _plan(self, subtasks):
+        return {"subtasks": subtasks, "status": "ready",
+                "domain": "testing"}
+
+    def test_clean_plan(self, leerie, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "foo.ts").touch()
+        plan = self._plan([{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "files_likely_touched": ["src/foo.ts"],
+            "depends_on": [], "size": "small",
+        }])
+        assert leerie.check_planner_output(plan, tmp_path, "testing") == []
+
+    def test_phantom_path(self, leerie, tmp_path):
+        plan = self._plan([{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "files_likely_touched": ["nonexistent/deep/file.ts"],
+            "depends_on": [], "size": "small",
+        }])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("PHANTOM_PATH" in i for i in issues)
+
+    def test_parent_exists_ok(self, leerie, tmp_path):
+        (tmp_path / "src").mkdir()
+        plan = self._plan([{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "files_likely_touched": ["src/new-file.ts"],
+            "depends_on": [], "size": "small",
+        }])
+        assert leerie.check_planner_output(plan, tmp_path, "testing") == []
+
+    def test_dangling_dep(self, leerie, tmp_path):
+        plan = self._plan([{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "depends_on": ["test-999"], "size": "small",
+        }])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("DANGLING_DEP" in i for i in issues)
+
+    def test_cross_domain_dep_not_flagged(self, leerie, tmp_path):
+        plan = self._plan([{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "depends_on": ["feat-001"], "size": "small",
+        }])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert not any("DANGLING_DEP" in i for i in issues)
+
+    def test_empty_criteria(self, leerie, tmp_path):
+        plan = self._plan([{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "",
+            "depends_on": [], "size": "small",
+        }])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("EMPTY_CRITERIA" in i for i in issues)
+
+    def test_oversized(self, leerie, tmp_path):
+        plan = self._plan([{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "depends_on": [], "size": "large",
+        }])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("OVERSIZED" in i for i in issues)
+
+    def test_intra_domain_overlap(self, leerie, tmp_path):
+        (tmp_path / "src").mkdir()
+        (tmp_path / "src" / "foo.ts").touch()
+        plan = self._plan([
+            {"id": "test-001", "title": "a",
+             "success_criteria_seed": "x",
+             "files_likely_touched": ["src/foo.ts"],
+             "depends_on": [], "size": "small"},
+            {"id": "test-002", "title": "b",
+             "success_criteria_seed": "y",
+             "files_likely_touched": ["src/foo.ts"],
+             "depends_on": [], "size": "small"},
+        ])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("INTRA_DOMAIN_OVERLAP" in i for i in issues)
+
+    def test_protected_path(self, leerie, tmp_path):
+        plan = self._plan([{
+            "id": "test-001", "title": "t",
+            "success_criteria_seed": "check",
+            "files_likely_touched": [".leerie/state.json"],
+            "depends_on": [], "size": "small",
+        }])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("PROTECTED_PATH" in i for i in issues)
+
+    def test_intra_domain_cycle(self, leerie, tmp_path):
+        plan = self._plan([
+            {"id": "test-001", "title": "a",
+             "success_criteria_seed": "x",
+             "depends_on": ["test-002"], "size": "small"},
+            {"id": "test-002", "title": "b",
+             "success_criteria_seed": "y",
+             "depends_on": ["test-001"], "size": "small"},
+        ])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert any("INTRA_DOMAIN_CYCLE" in i for i in issues)
+
+    def test_no_cycle_when_linear(self, leerie, tmp_path):
+        plan = self._plan([
+            {"id": "test-001", "title": "a",
+             "success_criteria_seed": "x",
+             "depends_on": [], "size": "small"},
+            {"id": "test-002", "title": "b",
+             "success_criteria_seed": "y",
+             "depends_on": ["test-001"], "size": "small"},
+        ])
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert not any("INTRA_DOMAIN_CYCLE" in i for i in issues)
+
+
+# --- check_reconciler_output -------------------------------------------- #
+
+class TestCheckReconcilerOutput:
+    def _plans_with_provides(self, tags):
+        return [{"subtasks": [{"id": "feat-001", "provides": tags}]}]
+
+    def test_clean(self, leerie):
+        output = {"renames": [], "added_subtasks": []}
+        plans = self._plans_with_provides(["tag-a"])
+        assert leerie.check_reconciler_output(output, plans) == []
+
+    def test_rename_to_nowhere(self, leerie):
+        output = {"renames": [{"sid": "x", "from": "a", "to": "ghost"}],
+                  "added_subtasks": []}
+        plans = self._plans_with_provides(["tag-a"])
+        issues = leerie.check_reconciler_output(output, plans)
+        assert any("RENAME_TO_NOWHERE" in i for i in issues)
+
+    def test_rename_to_existing(self, leerie):
+        output = {"renames": [{"sid": "x", "from": "a", "to": "tag-a"}],
+                  "added_subtasks": []}
+        plans = self._plans_with_provides(["tag-a"])
+        assert leerie.check_reconciler_output(output, plans) == []
+
+    def test_bad_prefix(self, leerie):
+        output = {"renames": [],
+                  "added_subtasks": [{"id": "zz-001", "depends_on": []}]}
+        issues = leerie.check_reconciler_output(output, [{"subtasks": []}])
+        assert any("BAD_PREFIX" in i for i in issues)
+
+    def test_self_dep(self, leerie):
+        output = {"renames": [],
+                  "added_subtasks": [{"id": "feat-001",
+                                      "depends_on": ["feat-001"]}]}
+        issues = leerie.check_reconciler_output(output, [{"subtasks": []}])
+        assert any("SELF_DEP" in i for i in issues)
+
+
+# --- check_provision_output --------------------------------------------- #
+
+class TestCheckProvisionOutput:
+    def test_clean(self, leerie, tmp_path):
+        (tmp_path / "pnpm-lock.yaml").touch()
+        result = {"recipe": [{"kind": "install",
+                               "command": ["pnpm", "install"],
+                               "working_dir": "."}]}
+        assert leerie.check_provision_output(result, tmp_path) == []
+
+    def test_wrong_pm(self, leerie, tmp_path):
+        (tmp_path / "pnpm-lock.yaml").touch()
+        result = {"recipe": [{"kind": "install",
+                               "command": ["npm", "install"],
+                               "working_dir": "."}]}
+        issues = leerie.check_provision_output(result, tmp_path)
+        assert any("WRONG_PM" in i for i in issues)
+
+    def test_missing_workdir(self, leerie, tmp_path):
+        result = {"recipe": [{"kind": "install",
+                               "command": ["pip", "install"],
+                               "working_dir": "nonexistent"}]}
+        issues = leerie.check_provision_output(result, tmp_path)
+        assert any("MISSING_WORKDIR" in i for i in issues)
+
+    def test_empty_recipe_with_lockfile(self, leerie, tmp_path):
+        (tmp_path / "package-lock.json").touch()
+        result = {"recipe": []}
+        issues = leerie.check_provision_output(result, tmp_path)
+        assert any("EMPTY_RECIPE" in i for i in issues)
+
+    def test_empty_recipe_no_lockfile(self, leerie, tmp_path):
+        result = {"recipe": []}
+        assert leerie.check_provision_output(result, tmp_path) == []
+
+
+# --- check_overlap_judge_output ----------------------------------------- #
+
+class TestCheckOverlapJudgeOutput:
+    def _plans(self):
+        return [{"subtasks": [
+            {"id": "feat-001", "provides": ["tag-a"],
+             "files_likely_touched": ["src/a.ts"]},
+            {"id": "refactor-001", "provides": [],
+             "files_likely_touched": ["src/b.ts"]},
+        ]}]
+
+    def test_clean(self, leerie, tmp_path):
+        output = {"collisions": []}
+        assert leerie.check_overlap_judge_output(
+            output, self._plans(), tmp_path) == []
+
+    def test_no_file_overlap(self, leerie, tmp_path):
+        output = {"collisions": [{
+            "a_sid": "feat-001", "b_sid": "refactor-001",
+            "artifact": "some thing", "resolution": "merge",
+            "reason": "overlap"}]}
+        issues = leerie.check_overlap_judge_output(
+            output, self._plans(), tmp_path)
+        assert any("NO_FILE_OVERLAP" in i for i in issues)
+
+    def test_drop_breaks_graph(self, leerie, tmp_path):
+        plans = [{"subtasks": [
+            {"id": "feat-001", "provides": ["needed-tag"],
+             "files_likely_touched": ["src/a.ts"],
+             "requires": []},
+            {"id": "feat-002", "provides": [],
+             "files_likely_touched": ["src/a.ts"],
+             "requires": [{"tag": "needed-tag", "extent": "in_plan"}]},
+        ]}]
+        output = {"collisions": [{
+            "a_sid": "feat-001", "b_sid": "feat-002",
+            "artifact": "src/a.ts", "resolution": "drop_a",
+            "reason": "superseded"}]}
+        issues = leerie.check_overlap_judge_output(
+            output, plans, tmp_path)
+        assert any("DROP_BREAKS_GRAPH" in i for i in issues)
+
+
+# --- check_implementer_output ------------------------------------------ #
+
+class TestCheckImplementerOutput:
+    def test_clean(self, leerie):
+        result = {"status": "complete", "criteria_results": [
+            {"criterion": "test passes", "met": True}]}
+        subtask = {"files_likely_touched": ["src/foo.ts"]}
+        assert leerie.check_implementer_output(
+            result, subtask, {"src/foo.ts"}) == []
+
+    def test_no_planned_files_touched(self, leerie):
+        result = {"status": "complete"}
+        subtask = {"files_likely_touched": ["src/foo.ts"]}
+        issues = leerie.check_implementer_output(
+            result, subtask, {"src/bar.ts"})
+        assert any("NO_PLANNED_FILES_TOUCHED" in i for i in issues)
+
+    def test_unmet_criterion(self, leerie):
+        result = {"status": "complete", "criteria_results": [
+            {"criterion": "test passes", "met": False}]}
+        subtask = {}
+        issues = leerie.check_implementer_output(
+            result, subtask, set())
+        assert any("UNMET_CRITERION" in i for i in issues)
+
+    def test_no_criteria_is_ok(self, leerie):
+        result = {"status": "complete"}
+        assert leerie.check_implementer_output(
+            result, {}, {"src/foo.ts"}) == []

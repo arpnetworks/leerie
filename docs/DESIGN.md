@@ -1801,6 +1801,48 @@ orchestrator's structural enforcement is limited to "did the worker
 fill in the self-gate fields at all," not "is the model's score
 correct."
 
+### Mechanical-feedback loops (the CRITIC pattern)
+
+Research shows that LLMs cannot self-correct reasoning without external
+feedback (Huang et al., ICLR 2024) and that self-bias amplifies when
+reviewing their own output (ACL 2024). But self-correction WITH
+external tool-verified feedback works — the CRITIC framework (ICLR
+2024) showed 7.7 F1 gains grounded in search-API signals.
+
+Leerie applies this finding: every worker (except the PR writer) runs
+inside a code-enforced loop (`_run_checked_loop`) where the
+orchestrator computes **deterministic structural checks** on the
+worker's output — file-existence, dependency-graph cycles, lockfile
+consistency, protected-path violations — and re-invokes the worker
+with the check results as external feedback if issues are found. The
+feedback is mechanically derived (no LLM), so it breaks the
+correlated-error pattern identified by "The Specification as Quality
+Gate" (arxiv 2603.25773, 2026).
+
+The conformer loop (`_run_conformance_phase`) is the original instance
+of this pattern — it loops on observable build/lint/test signals. The
+generic `_run_checked_loop` extends it to all workers.
+
+### Task-referenced file extraction
+
+When the task string references files (detectable by globbing), the
+orchestrator mechanically extracts structural elements (markdown
+headings, YAML keys, numbered items) and injects them into the
+planner's prompt as an external coverage checklist. This is the
+"specification as quality gate" architecture: an external reference the
+planner did not generate, grounded in files the user explicitly pointed
+to, that breaks the correlated-error ceiling. The extraction is
+task-agnostic — it triggers on any task referencing files, not just
+spec files. No-op when the task doesn't reference files.
+
+### Multi-sample planning
+
+Multiple independent planner invocations per domain, each a fresh
+`claude -p` session (Cross-Context Review, arxiv 2603.12123, 2026:
+context separation is the mechanism). Mechanical selection by issue
+count and subtask count avoids self-bias. Controlled by the
+`planner_samples` cap (default 1 = off).
+
 ---
 
 ## 9. Success criteria (informational; historical lock)
@@ -2156,6 +2198,15 @@ recurs everywhere in the design:
   detection in Python and handing the model structured feedback plays to
   model strengths.
 
+- The orchestrator does not trust a worker's confidence score at face
+  value; it runs deterministic structural checks (file existence, graph
+  cycles, lockfile consistency, task-file coverage) on the output and
+  re-invokes the worker with the check results as external feedback when
+  issues are found (§8 *Mechanical-feedback loops*). The confidence
+  score remains structurally required (a worker that skips it fails
+  schema validation) but the orchestrator gates on the mechanical checks,
+  not the number.
+
 The complementary half of the principle is just as important: **what cannot be
 checked mechanically is left to the worker, and not second-guessed by code.**
 Understanding intent, writing code, decomposing a domain, resolving the
@@ -2211,6 +2262,18 @@ unfinished work observable, and the subtask never escalates to `failed` or
 `blocked`. This is the §12 principle applied to a phase that is itself
 advisory: the count is real, the action it triggers is to record, not to
 block.
+
+The mechanical-feedback caps (`judgment_check_rounds`,
+`planner_check_rounds`, `implementer_confidence_retries`) are also
+code-enforced. The orchestrator runs deterministic structural checks on
+each worker's output and re-invokes with the results as external
+feedback (§8 *Mechanical-feedback loops*). Escalation on exhaustion is
+worker-specific: planners proceed with the best result + warnings,
+the classifier dies, the integrator aborts the merge.
+
+The multi-sample cap (`planner_samples`) controls independent parallel
+invocations. Selection among samples is mechanical (fewest issues,
+most subtasks) — no LLM judgment involved.
 
 ### Worker-internal caps
 

@@ -35,7 +35,7 @@ import sys
 import time
 import uuid
 from collections import deque
-from collections.abc import Callable, Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -112,6 +112,18 @@ DEFAULT_CAPS = {
     # Exhausting this cap is a *warning*, not a failure — the phase is
     # advisory and never produces a `failed` / `blocked` subtask status.
     "conformance_rounds": 2,
+    # CRITIC-pattern mechanical-feedback re-invocation caps. Each worker
+    # type gets code-enforced structural checks (file existence, graph
+    # cycles, lockfile consistency, etc.) and the orchestrator re-invokes
+    # with the check results as external feedback if issues are found.
+    # Separate from conformance_rounds (which loops on observable
+    # build/lint/test signals) and from confidence_rounds (which is
+    # the worker-internal evidence-gate iteration budget).
+    "judgment_check_rounds": 2,     # classifier, reconciler, provision,
+                                    # overlap judge, integrator
+    "planner_check_rounds": 3,      # planner (richer checks justify more)
+    "implementer_confidence_retries": 2,  # separate from subtask_continuations
+    "planner_samples": 1,           # multi-sample; 1 = off
     "worker_timeout_sec": 5400,     # 90 minutes per worker process
     # If a worker emits no stdout events for this many seconds, log a
     # warning naming the worker, its PID, the elapsed silence, and any
@@ -388,6 +400,12 @@ RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
 CONFIDENCE_ROUNDS_ENV = "LEERIE_CONFIDENCE_ROUNDS"
 CONFIDENCE_ROUNDS_FILE = SOURCE_OF_TRUTH_FILE
 
+# CRITIC-pattern cap env vars. Same resolution shape as confidence_rounds.
+JUDGMENT_CHECK_ROUNDS_ENV = "LEERIE_JUDGMENT_CHECK_ROUNDS"
+PLANNER_CHECK_ROUNDS_ENV = "LEERIE_PLANNER_CHECK_ROUNDS"
+IMPLEMENTER_CONFIDENCE_RETRIES_ENV = "LEERIE_IMPLEMENTER_CONFIDENCE_RETRIES"
+PLANNER_SAMPLES_ENV = "LEERIE_PLANNER_SAMPLES"
+
 # max-workers preference. Same resolution shape as confidence_rounds.
 # CLI --max-workers wins; then LEERIE_MAX_WORKERS env; then max_workers
 # in leerie.toml; then DEFAULT_CAPS fallback.
@@ -647,10 +665,36 @@ _REQUIRES_ITEM = {
     },
 }
 
+
+def _confidence_schema(axes: list[str]) -> dict:
+    """Build the §8 confidence sub-schema for the given score axes.
+
+    Every worker that self-gates on confidence uses the same structural
+    discipline (DESIGN §8 / §12): numeric score axes, basis, falsifiers,
+    contradictions, gap-to-close.  This helper DRYs the seven occurrences
+    across SCHEMAS."""
+    return {
+        "type": "object",
+        "required": [*axes, "basis", "falsifiers_tested",
+                     "contradictions_reconciled", "gap_to_close"],
+        "properties": {
+            **{ax: {"type": "number"} for ax in axes},
+            "basis": {"type": "string"},
+            "falsifiers_tested": {
+                "type": "array", "items": {"type": "string"}},
+            "contradictions_reconciled": {
+                "type": "array", "items": {"type": "string"}},
+            "gap_to_close": {
+                "type": "object",
+                "properties": {ax: {"type": "string"} for ax in axes},
+            },
+        },
+    }
+
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
-        "required": ["categories"],
+        "required": ["categories", "confidence"],
         "properties": {
             "categories": {"type": "array", "items": {"type": "string"}},
             "questions": {
@@ -666,6 +710,7 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "source_of_truth_question": {"type": "boolean"},
+            "confidence": _confidence_schema(["classification"]),
         },
     },
     "planner": {
@@ -683,33 +728,9 @@ SCHEMAS: dict[str, dict] = {
                 "type": "string",
                 "enum": ["ready", "blocked"],
             },
-            # Worker-internal self-gate (DESIGN §8 + §12): required at the
-            # schema level so a planner that skipped self-gating fails its
-            # own JSON validation before the orchestrator sees the payload.
-            # The structure is code-enforced; the quality of the artifacts
-            # the fields name is model-judged.
-            "confidence": {
-                "type": "object",
-                "required": ["task_understanding", "decomposition_quality",
-                             "basis", "falsifiers_tested",
-                             "contradictions_reconciled", "gap_to_close"],
-                "properties": {
-                    "task_understanding": {"type": "number"},
-                    "decomposition_quality": {"type": "number"},
-                    "basis": {"type": "string"},
-                    "falsifiers_tested": {
-                        "type": "array", "items": {"type": "string"}},
-                    "contradictions_reconciled": {
-                        "type": "array", "items": {"type": "string"}},
-                    "gap_to_close": {
-                        "type": "object",
-                        "properties": {
-                            "task_understanding": {"type": "string"},
-                            "decomposition_quality": {"type": "string"},
-                        },
-                    },
-                },
-            },
+            # §8 + §12 structural enforcement via _confidence_schema.
+            "confidence": _confidence_schema(
+                ["task_understanding", "decomposition_quality"]),
             "subtasks": {
                 "type": "array",
                 "items": {
@@ -765,7 +786,7 @@ SCHEMAS: dict[str, dict] = {
         "required": ["renames", "added_provides", "added_subtasks",
                      "conditional_drops",
                      "dropped_requires", "dependency_edges",
-                     "merged_subtasks", "unresolvable"],
+                     "merged_subtasks", "unresolvable", "confidence"],
         "properties": {
             "renames": {
                 # Rewrite a `requires` tag on one subtask to match an
@@ -940,6 +961,7 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
+            "confidence": _confidence_schema(["reconciliation"]),
         },
     },
     "implementer": {
@@ -964,36 +986,8 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
-            # Worker-internal: the implementer prompt uses this as a self-gate
-            # ("proceed only when both scores ≥ 9.0"). The orchestrator does
-            # not consume it. Kept in the schema — and with required fields
-            # for the falsification, drift-reconciliation, and gap-surfacing
-            # disciplines — so a worker that skipped self-gating fails its
-            # own JSON schema before the orchestrator reads the payload (the
-            # structural enforcement called out in DESIGN §8 / §12).
-            "confidence": {
-                "type": "object",
-                "required": ["root_cause", "solution", "basis",
-                             "falsifiers_tested",
-                             "contradictions_reconciled",
-                             "gap_to_close"],
-                "properties": {
-                    "root_cause": {"type": "number"},
-                    "solution": {"type": "number"},
-                    "basis": {"type": "string"},
-                    "falsifiers_tested": {
-                        "type": "array", "items": {"type": "string"}},
-                    "contradictions_reconciled": {
-                        "type": "array", "items": {"type": "string"}},
-                    "gap_to_close": {
-                        "type": "object",
-                        "properties": {
-                            "root_cause": {"type": "string"},
-                            "solution": {"type": "string"},
-                        },
-                    },
-                },
-            },
+            # §8 + §12 structural enforcement via _confidence_schema.
+            "confidence": _confidence_schema(["root_cause", "solution"]),
             "checkpoint_path": {"type": ["string", "null"]},
             "blocker": {"type": ["string", "null"]},
             "summary": {"type": "string"},
@@ -1049,7 +1043,7 @@ SCHEMAS: dict[str, dict] = {
     },
     "integrator": {
         "type": "object",
-        "required": ["incoming_subtask", "status"],
+        "required": ["incoming_subtask", "status", "confidence"],
         "properties": {
             "incoming_subtask": {"type": "string"},
             "status": {
@@ -1058,6 +1052,7 @@ SCHEMAS: dict[str, dict] = {
             },
             "resolution_summary": {"type": "string"},
             "diagnosis": {"type": ["string", "null"]},
+            "confidence": _confidence_schema(["resolution"]),
         },
     },
     "judge": {
@@ -1151,34 +1146,12 @@ SCHEMAS: dict[str, dict] = {
             "lint": _CONFORMER_BLT_PROP,
             "tests": _CONFORMER_BLT_PROP,
             "summary": {"type": "string"},
-            # Worker-internal: the conformer prompt asks the worker to run
-            # the §8 disciplines (falsifier testing, drift reconciliation,
-            # gap surfacing) and record the result here. The orchestrator
-            # does not consume the score — it loops on observable signals
-            # (residuals, failed build/lint/test) up to `conformance_rounds`.
-            # Required at the schema level so a worker that skipped the
-            # disciplines fails its own JSON schema before the orchestrator
-            # reads the payload (the structural enforcement called out in
-            # DESIGN §8 / §12).
-            "confidence": {
-                "type": "object",
-                "required": ["conformance", "basis", "falsifiers_tested",
-                             "contradictions_reconciled", "gap_to_close"],
-                "properties": {
-                    "conformance": {"type": "number"},
-                    "basis": {"type": "string"},
-                    "falsifiers_tested": {
-                        "type": "array", "items": {"type": "string"}},
-                    "contradictions_reconciled": {
-                        "type": "array", "items": {"type": "string"}},
-                    "gap_to_close": {
-                        "type": "object",
-                        "properties": {
-                            "conformance": {"type": "string"},
-                        },
-                    },
-                },
-            },
+            # §8 + §12 structural enforcement via _confidence_schema.
+            # The orchestrator loops on observable signals (residuals,
+            # build/lint/test), not the score — but requiring the
+            # discipline fields ensures a worker that skipped self-gating
+            # fails its own JSON schema.
+            "confidence": _confidence_schema(["conformance"]),
         },
     },
     "patch_generator": {
@@ -1220,7 +1193,7 @@ SCHEMAS: dict[str, dict] = {
         # The recipe is structurally bounded here, then mechanically
         # validated by validate_provision_recipe() (§12 carve-out).
         "type": "object",
-        "required": ["recipe"],
+        "required": ["recipe", "confidence"],
         "properties": {
             "recipe": {
                 "type": "array",
@@ -1254,6 +1227,7 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
+            "confidence": _confidence_schema(["recipe_correctness"]),
         },
     },
     "plan_overlap_judge": {
@@ -1284,8 +1258,9 @@ SCHEMAS: dict[str, dict] = {
         #     reason; user revises the task or manually picks a side.
         "type": "object",
         "additionalProperties": False,
-        "required": ["collisions"],
+        "required": ["collisions", "confidence"],
         "properties": {
+            "confidence": _confidence_schema(["judgment"]),
             "collisions": {
                 "type": "array",
                 "items": {
@@ -2675,6 +2650,54 @@ def resolve_max_parallel(repo_root: Path,
         default=DEFAULT_CAPS["max_parallel"])
 
 
+def resolve_judgment_check_rounds(repo_root: Path,
+                                   cli_value: int | None = None) -> int:
+    """Resolve the judgment-check-rounds cap (CRITIC-pattern re-invocations
+    for classifier, reconciler, provision, overlap judge, integrator)."""
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=JUDGMENT_CHECK_ROUNDS_ENV,
+        file_key="judgment_check_rounds",
+        file_name=SOURCE_OF_TRUTH_FILE,
+        default=DEFAULT_CAPS["judgment_check_rounds"])
+
+
+def resolve_planner_check_rounds(repo_root: Path,
+                                  cli_value: int | None = None) -> int:
+    """Resolve the planner-check-rounds cap (CRITIC-pattern re-invocations
+    for planner — higher default because checks are richer)."""
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=PLANNER_CHECK_ROUNDS_ENV,
+        file_key="planner_check_rounds",
+        file_name=SOURCE_OF_TRUTH_FILE,
+        default=DEFAULT_CAPS["planner_check_rounds"])
+
+
+def resolve_implementer_confidence_retries(
+        repo_root: Path, cli_value: int | None = None) -> int:
+    """Resolve the implementer-confidence-retries cap (separate from
+    subtask_continuations so confidence retries don't consume the
+    handoff/clarification budget)."""
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=IMPLEMENTER_CONFIDENCE_RETRIES_ENV,
+        file_key="implementer_confidence_retries",
+        file_name=SOURCE_OF_TRUTH_FILE,
+        default=DEFAULT_CAPS["implementer_confidence_retries"])
+
+
+def resolve_planner_samples(repo_root: Path,
+                             cli_value: int | None = None) -> int:
+    """Resolve the planner-samples cap (multi-sample; 1 = off)."""
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=PLANNER_SAMPLES_ENV,
+        file_key="planner_samples",
+        file_name=SOURCE_OF_TRUTH_FILE,
+        default=DEFAULT_CAPS["planner_samples"])
+
+
 _MEMORY_SUFFIX_MULTIPLIER = {
     "": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4,
 }
@@ -3537,6 +3560,429 @@ _ID_PREFIXES = frozenset(f"{v}-" for v in CATEGORY_ABBREV.values())
 
 
 _VALID_EXTENTS = frozenset({"in_plan", "external"})
+
+
+# ---- Mechanical-check functions (CRITIC-pattern feedback) -------------- #
+# Each returns a list[str] of issue descriptions.  Empty = clean.
+# Pure Python, no LLM — the orchestrator injects these as external
+# feedback on re-invocation.  See _run_checked_loop.
+
+
+def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
+    """Thin mechanical checks on the classifier's category selection."""
+    issues: list[str] = []
+    cats = result.get("categories", [])
+
+    _DIR_SIGNALS: dict[str, list[str]] = {
+        "infrastructure": ["infra", "cdk", "terraform", "pulumi"],
+        "documentation": ["docs", "doc"],
+    }
+    for cat, dirs in _DIR_SIGNALS.items():
+        if cat in cats and not any(
+                (repo_root / d).exists() for d in dirs):
+            issues.append(
+                f"CATEGORY_NO_DIR: classified as {cat!r} but no "
+                f"{'/'.join(dirs)} directory found at repo root")
+
+    for q in result.get("questions", []):
+        if not (q.get("why_underivable") or "").strip():
+            issues.append(
+                f"EMPTY_WHY: question {q.get('id', '?')!r} has "
+                "empty why_underivable")
+
+    if len(cats) > 4:
+        issues.append(
+            f"MANY_CATEGORIES: {len(cats)} categories — typical "
+            "tasks span 1–3")
+    return issues
+
+
+def check_planner_output(
+    result: dict, repo_root: Path, domain: str,
+) -> list[str]:
+    """Rich mechanical checks on a single planner domain's output."""
+    issues: list[str] = []
+    subtasks = result.get("subtasks", [])
+    prefix = CATEGORY_ABBREV.get(domain, "") + "-"
+
+    for s in subtasks:
+        sid = s.get("id", "?")
+        for f in s.get("files_likely_touched", []):
+            full = repo_root / f
+            if not full.exists() and not full.parent.exists():
+                issues.append(
+                    f"PHANTOM_PATH: {sid} lists {f!r} in "
+                    "files_likely_touched but neither it nor its "
+                    "parent directory exists")
+
+    all_ids = {s["id"] for s in subtasks}
+    for s in subtasks:
+        sid = s.get("id", "?")
+        for dep in s.get("depends_on", []) or []:
+            if dep.startswith(prefix) and dep not in all_ids:
+                issues.append(
+                    f"DANGLING_DEP: {sid} depends_on {dep!r} which "
+                    "does not exist in this plan")
+
+    for s in subtasks:
+        if not (s.get("success_criteria_seed") or "").strip():
+            issues.append(
+                f"EMPTY_CRITERIA: {s.get('id', '?')} has empty "
+                "success_criteria_seed")
+
+    for s in subtasks:
+        if (s.get("size") or "").lower() == "large":
+            issues.append(
+                f"OVERSIZED: {s.get('id', '?')} has size='large' "
+                "— split it")
+
+    file_owners: dict[str, list[str]] = {}
+    for s in subtasks:
+        for f in s.get("files_likely_touched", []):
+            file_owners.setdefault(f, []).append(s.get("id", "?"))
+    for f, owners in file_owners.items():
+        if len(owners) > 1:
+            issues.append(
+                f"INTRA_DOMAIN_OVERLAP: {f!r} touched by "
+                f"{owners} — consider merging or splitting")
+
+    for s in subtasks:
+        bad = [f for f in (s.get("files_likely_touched") or [])
+               if isinstance(f, str) and is_protected_path(f)]
+        if bad:
+            issues.append(
+                f"PROTECTED_PATH: {s.get('id', '?')} lists "
+                f"protected path(s) {bad}")
+
+    # Intra-domain cycle via simple DFS.
+    deps: dict[str, list[str]] = {}
+    for s in subtasks:
+        sid = s.get("id", "?")
+        deps[sid] = [
+            d for d in (s.get("depends_on") or [])
+            if d.startswith(prefix) and d in all_ids]
+    WHITE, GRAY, BLACK = 0, 1, 2
+    color: dict[str, int] = {sid: WHITE for sid in all_ids}
+    cycle_found = False
+    for start in all_ids:
+        if color[start] != WHITE:
+            continue
+        stack = [start]
+        while stack and not cycle_found:
+            node = stack[-1]
+            if color[node] == WHITE:
+                color[node] = GRAY
+                for dep in deps.get(node, []):
+                    if color.get(dep) == GRAY:
+                        cycle_found = True
+                        break
+                    if color.get(dep) == WHITE:
+                        stack.append(dep)
+            else:
+                color[node] = BLACK
+                stack.pop()
+    if cycle_found:
+        issues.append(
+            "INTRA_DOMAIN_CYCLE: dependency cycle detected within "
+            f"this domain ({domain})")
+
+    return issues
+
+
+def check_reconciler_output(
+    output: dict, plans: list[dict],
+) -> list[str]:
+    """Mechanical checks on the reconciler's output beyond the existing
+    acyclicity / size / unresolved gates."""
+    issues: list[str] = []
+
+    all_provides: set[str] = set()
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            all_provides.update(s.get("provides", []) or [])
+
+    for r in output.get("renames", []) or []:
+        if r.get("to") and r["to"] not in all_provides:
+            issues.append(
+                f"RENAME_TO_NOWHERE: rename on {r.get('sid', '?')} "
+                f"from {r.get('from', '?')!r} to {r['to']!r} but "
+                "no subtask provides that tag")
+
+    for s in output.get("added_subtasks", []) or []:
+        sid = s.get("id", "")
+        if sid and not any(sid.startswith(p) for p in _ID_PREFIXES):
+            issues.append(
+                f"BAD_PREFIX: added subtask {sid!r} does not start "
+                "with a valid prefix")
+        if sid and sid in (s.get("depends_on") or []):
+            issues.append(
+                f"SELF_DEP: added subtask {sid!r} depends on itself")
+
+    return issues
+
+
+def check_overlap_judge_output(
+    output: dict, plans: list[dict], repo_root: Path,
+) -> list[str]:
+    """Mechanical checks on the overlap judge's collision list."""
+    issues: list[str] = []
+    collisions = output.get("collisions", []) or []
+
+    by_id: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            by_id[s["id"]] = s
+
+    _CODE_EXTS = frozenset(
+        ".ts .tsx .py .go .rs .java .rb .js .jsx .css .scss".split())
+    for c in collisions:
+        artifact = c.get("artifact", "")
+        if "/" in artifact or any(
+                artifact.endswith(ext) for ext in _CODE_EXTS):
+            if not (repo_root / artifact).exists():
+                issues.append(
+                    f"PHANTOM_ARTIFACT: collision "
+                    f"{c.get('a_sid', '?')} <-> {c.get('b_sid', '?')} "
+                    f"names artifact {artifact!r} which does not "
+                    "exist in the repo")
+
+    for c in collisions:
+        a = by_id.get(c.get("a_sid", ""), {})
+        b = by_id.get(c.get("b_sid", ""), {})
+        a_files = set(a.get("files_likely_touched", []) or [])
+        b_files = set(b.get("files_likely_touched", []) or [])
+        if a_files and b_files and not (a_files & b_files):
+            issues.append(
+                f"NO_FILE_OVERLAP: collision "
+                f"{c.get('a_sid', '?')} <-> {c.get('b_sid', '?')} "
+                "but they share no files_likely_touched")
+
+    all_requires_tags: set[str] = set()
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            for r in s.get("requires", []) or []:
+                tag = r.get("tag", "") if isinstance(r, dict) else ""
+                if tag:
+                    all_requires_tags.add(tag)
+    for c in collisions:
+        dropped_sid = None
+        if c.get("resolution") == "drop_a":
+            dropped_sid = c.get("a_sid")
+        elif c.get("resolution") == "drop_b":
+            dropped_sid = c.get("b_sid")
+        if dropped_sid and dropped_sid in by_id:
+            dropped_provides = set(
+                by_id[dropped_sid].get("provides", []) or [])
+            orphaned = dropped_provides & all_requires_tags
+            if orphaned:
+                issues.append(
+                    f"DROP_BREAKS_GRAPH: dropping {dropped_sid!r} "
+                    f"would remove provides tags {orphaned} that "
+                    "other subtasks require")
+
+    return issues
+
+
+def check_provision_output(
+    result: dict, repo_root: Path,
+) -> list[str]:
+    """Mechanical checks on the provision LLM fallback's recipe."""
+    issues: list[str] = []
+    recipe = result.get("recipe", []) or []
+
+    _LOCKFILE_TO_PM: dict[str, str] = {
+        "pnpm-lock.yaml": "pnpm", "yarn.lock": "yarn",
+        "package-lock.json": "npm", "bun.lockb": "bun",
+        "bun.lock": "bun", "uv.lock": "uv",
+        "poetry.lock": "poetry", "Pipfile.lock": "pipenv",
+    }
+    detected_pms: set[str] = set()
+    for lf, pm in _LOCKFILE_TO_PM.items():
+        if (repo_root / lf).exists():
+            detected_pms.add(pm)
+
+    for i, entry in enumerate(recipe):
+        wd = entry.get("working_dir", ".")
+        if wd != "." and not (repo_root / wd).is_dir():
+            issues.append(
+                f"MISSING_WORKDIR: recipe[{i}] working_dir="
+                f"{wd!r} does not exist")
+        cmd = entry.get("command", [])
+        if cmd and cmd[0] in ("npm", "yarn", "pnpm", "bun"):
+            if detected_pms and cmd[0] not in detected_pms:
+                issues.append(
+                    f"WRONG_PM: recipe uses {cmd[0]!r} but repo "
+                    f"has lockfile(s) for {detected_pms}")
+
+    has_lockfiles = any(
+        (repo_root / lf).exists() for lf in _LOCKFILE_TO_PM)
+    if not recipe and has_lockfiles:
+        issues.append(
+            "EMPTY_RECIPE: recipe is empty but repo has lockfile(s)")
+
+    return issues
+
+
+def check_implementer_output(
+    result: dict, subtask: dict, actual_files: set[str],
+) -> list[str]:
+    """Mechanical checks on an implementer's complete result."""
+    issues: list[str] = []
+    planned = set(subtask.get("files_likely_touched", []) or [])
+
+    if planned and actual_files:
+        if not (actual_files & planned):
+            issues.append(
+                f"NO_PLANNED_FILES_TOUCHED: none of the planned "
+                f"files were modified — planned: "
+                f"{sorted(planned)[:5]}")
+
+    if result.get("status") == "complete":
+        for cr in result.get("criteria_results", []) or []:
+            if cr.get("met") is False:
+                issues.append(
+                    f"UNMET_CRITERION: claims complete but "
+                    f"criterion {cr.get('criterion', '?')!r} "
+                    "is not met")
+
+    return issues
+
+
+# ---- Task-referenced file extraction (CRITIC correlated-error breaker) - #
+# When the task string references files (glob patterns or explicit paths),
+# the orchestrator mechanically extracts structural elements (headings,
+# YAML keys, numbered items) and injects them as an external coverage
+# reference into the planner's prompt.  This breaks the correlated-error
+# ceiling identified by "The Specification as Quality Gate" (Mar 2026,
+# arxiv 2603.25773).
+
+_GLOB_CHARS = frozenset("*?[{")
+_BRACE_RE = re.compile(r'\{([^}]+)\}')
+
+
+def _expand_braces(pattern: str) -> list[str]:
+    """Expand shell-style ``{a,b}`` brace groups into multiple patterns.
+
+    Python's ``glob.glob`` does not support brace expansion, but task
+    strings commonly use it (e.g. ``spec-*.{md,yaml}``).  Recursive
+    so nested braces work."""
+    m = _BRACE_RE.search(pattern)
+    if not m:
+        return [pattern]
+    prefix, suffix = pattern[:m.start()], pattern[m.end():]
+    expanded: list[str] = []
+    for alt in m.group(1).split(","):
+        expanded.extend(_expand_braces(prefix + alt.strip() + suffix))
+    return expanded
+
+
+def glob_task_references(task: str, repo_root: Path) -> list[Path]:
+    """Find file references in the task string via glob expansion.
+
+    Scans for tokens that look like file paths or glob patterns (contain
+    a dot + extension, or glob characters).  Brace groups like
+    ``{md,yaml}`` are pre-expanded before globbing since Python's
+    ``glob`` module does not handle them.  Returns deduplicated matched
+    paths sorted alphabetically.  Returns empty list when nothing
+    matches — the feature is a no-op for tasks that don't reference
+    files."""
+    import glob as _glob
+    candidates: list[str] = []
+    for token in task.split():
+        token = token.strip("\"'(),;:")
+        if not token:
+            continue
+        has_ext = "." in token and not token.startswith(".")
+        has_glob = any(c in token for c in _GLOB_CHARS)
+        if has_ext or has_glob:
+            candidates.append(token)
+    matched: list[Path] = []
+    seen: set[str] = set()
+    for cand in candidates:
+        for expanded in _expand_braces(cand):
+            for m in sorted(_glob.glob(str(repo_root / expanded))):
+                p = Path(m)
+                if p.is_file() and str(p) not in seen:
+                    seen.add(str(p))
+                    matched.append(p)
+    return matched
+
+
+def extract_task_file_structure(
+    task: str, repo_root: Path,
+) -> list[str] | None:
+    """Extract structural elements from files referenced in the task.
+
+    Returns a list of ``"filename: heading/key"`` strings, or ``None``
+    if no files matched or no structure could be extracted."""
+    matched = glob_task_references(task, repo_root)
+    if not matched:
+        return None
+    items: list[str] = []
+    for f in matched:
+        try:
+            text = f.read_text(errors="replace")
+        except OSError:
+            continue
+        ext = f.suffix.lower()
+        name = f.name
+        if ext in (".md", ".txt"):
+            for m in re.finditer(r'^#{1,6}\s+(.+)', text, re.MULTILINE):
+                items.append(f"{name}: {m.group(1).strip()}")
+            for m in re.finditer(r'^\d+\.\s+(.+)', text, re.MULTILINE):
+                items.append(f"{name}: {m.group(1).strip()[:80]}")
+        elif ext in (".yaml", ".yml"):
+            # Stdlib-only: extract list-item IDs and top-level mapping
+            # keys via regex.  Full YAML parsing would require PyYAML
+            # which is not a runtime dep (stdlib-preferred per CLAUDE.md).
+            for m in re.finditer(r'^- id:\s*(.+)', text, re.MULTILINE):
+                items.append(f"{name}: {m.group(1).strip()}")
+            for m in re.finditer(
+                    r'^([a-zA-Z_][\w-]*):', text, re.MULTILINE):
+                items.append(f"{name}: {m.group(1)}")
+    return items if items else None
+
+
+def check_task_file_coverage(
+    extracted: list[str], subtasks: list[dict],
+) -> list[str]:
+    """Check which extracted items are NOT referenced by any subtask.
+
+    Returns a LOW_COVERAGE issue when >50% of items are uncovered.
+    Pure substring matching — no semantic understanding needed."""
+    if not extracted:
+        return []
+    plan_text = " ".join(
+        (s.get("intent", "") + " " +
+         s.get("investigation_notes", "") + " " +
+         s.get("title", ""))
+        for s in subtasks
+    ).lower()
+    uncovered = []
+    for item in extracted:
+        key = item.split(": ", 1)[1] if ": " in item else item
+        if key.lower() not in plan_text:
+            uncovered.append(item)
+    if uncovered and len(uncovered) > len(extracted) * 0.5:
+        return [
+            f"LOW_COVERAGE: {len(uncovered)}/{len(extracted)} items "
+            f"from task-referenced files not mentioned in plan. "
+            f"Sample: {uncovered[:5]}"]
+    return []
+
+
+def _format_task_file_structure(items: list[str]) -> str:
+    """Format extracted structure as an external coverage reference
+    for the planner prompt."""
+    lines = "\n".join(f"- {item}" for item in items[:100])
+    return (
+        "TASK-REFERENCED FILE STRUCTURE (mechanically extracted by the "
+        "orchestrator — not generated by an LLM):\n\n"
+        f"{lines}\n\n"
+        "Use this as a coverage checklist. Verify your plan addresses "
+        "each item or explicitly notes why it's out of scope for your "
+        "domain."
+    )
 
 
 def validate_plan(subtasks: dict) -> None:
@@ -7427,15 +7873,40 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     st.data["current_phase"] = "phase 1: classify"
     st.save()
     sys_prompt = load_prompt("classifier")
-    st.bump_workers(caps)
-    result = await claude_p(
-        user_prompt=f"TASK:\n{task}\n\nClassify it and apply the clarification filter.",
-        system_prompt=sys_prompt, schema_key="classifier", cwd=os.getcwd(),
-        allowed_tools=INSPECT_TOOLS, max_turns=60, autonomous=False,
-        caps=caps, st=st, model=models["classifier"],
-        effort=efforts["classifier"], sid="classifier",
-        add_dirs=st.data.get("inspect_dirs") or None,
+    repo_root = Path(os.getcwd())
+    user_prompt_parts: list[str] = [
+        f"TASK:\n{task}\n\nClassify it and apply the clarification filter."]
+
+    async def _invoke() -> dict:
+        st.bump_workers(caps)
+        return await claude_p(
+            user_prompt="\n\n".join(user_prompt_parts),
+            system_prompt=sys_prompt, schema_key="classifier",
+            cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=60, autonomous=False,
+            caps=caps, st=st, model=models["classifier"],
+            effort=efforts["classifier"], sid="classifier",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    async def _on_feedback(fb: str) -> dict:
+        if len(user_prompt_parts) > 1:
+            user_prompt_parts[-1] = fb
+        else:
+            user_prompt_parts.append(fb)
+        return {}
+
+    result, gate_warnings = await _run_checked_loop(
+        invoke=_invoke,
+        check=lambda r: check_classifier_output(r, repo_root),
+        name="classifier",
+        max_rounds=caps["judgment_check_rounds"],
+        make_feedback_prompt=_on_feedback,
     )
+    if result is None:
+        die("classifier crashed and produced no result")
+    for w in gate_warnings:
+        log(f"  classifier: {w}")
     cats = [c for c in result.get("categories", []) if c in CATEGORIES]
     if not cats:
         die("classifier returned no recognized categories")
@@ -7732,26 +8203,48 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
         prov["source"] = "table"
         log(f"  table emitted {len(recipe)} install command(s)")
     else:
-        # 5b. LLM fallback.
+        # 5b. LLM fallback with CRITIC-pattern mechanical feedback loop.
         log("  table abstained — invoking provision worker")
         fixtures = gather_provision_fixtures(repo_root)
         sys_prompt = load_prompt("provision")
-        user_prompt = _format_provision_user_prompt(fixtures, st.data["task"])
-        st.bump_workers(caps)
-        result = await claude_p(
-            user_prompt=user_prompt,
-            system_prompt=sys_prompt,
-            schema_key="provision",
-            cwd=str(repo_root),
-            allowed_tools=INSPECT_TOOLS,
-            max_turns=30,
-            autonomous=False,
-            caps=caps, st=st,
-            model=models.get("provision", MODEL_DEFAULT),
-            effort=efforts.get("provision"),
-            sid="provision",
-            add_dirs=st.data.get("inspect_dirs") or None,
+        prov_up_parts: list[str] = [
+            _format_provision_user_prompt(fixtures, st.data["task"])]
+
+        async def _invoke_provision() -> dict:
+            st.bump_workers(caps)
+            return await claude_p(
+                user_prompt="\n\n".join(prov_up_parts),
+                system_prompt=sys_prompt,
+                schema_key="provision",
+                cwd=str(repo_root),
+                allowed_tools=INSPECT_TOOLS,
+                max_turns=30,
+                autonomous=False,
+                caps=caps, st=st,
+                model=models.get("provision", MODEL_DEFAULT),
+                effort=efforts.get("provision"),
+                sid="provision",
+                add_dirs=st.data.get("inspect_dirs") or None,
+            )
+
+        async def _on_prov_fb(fb: str) -> dict:
+            if len(prov_up_parts) > 1:
+                prov_up_parts[-1] = fb
+            else:
+                prov_up_parts.append(fb)
+            return {}
+
+        result, prov_warnings = await _run_checked_loop(
+            invoke=_invoke_provision,
+            check=lambda r: check_provision_output(r, repo_root),
+            name="provision",
+            max_rounds=caps["judgment_check_rounds"],
+            make_feedback_prompt=_on_prov_fb,
         )
+        if result is None:
+            die("provision worker crashed and produced no result")
+        for w in prov_warnings:
+            log(f"  provision: {w}")
         recipe = result.get("recipe") or []
         prov["source"] = "llm"
 
@@ -7770,6 +8263,31 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
 
     log(f"  recipe detected ({len(recipe)} command(s), "
         f"source={prov['source']}) — workers will run installs in their worktrees")
+
+
+def _select_best_planner_sample(
+    samples: list[dict], repo_root: Path, domain: str,
+) -> dict:
+    """Mechanically select the best planner sample for a domain.
+
+    Selection criteria (no LLM — avoids self-bias per ACL 2024):
+      1. Fewest mechanical-check issues
+      2. Tiebreak: most subtasks (more investigation = better coverage)
+      3. Tiebreak: first sample (determinism device)
+    """
+    scored: list[tuple[int, int, int, dict]] = []
+    for i, sample in enumerate(samples):
+        issues = check_planner_output(sample, repo_root, domain)
+        n_subtasks = len(sample.get("subtasks", []))
+        # Lower issue count is better; higher subtask count is better.
+        scored.append((len(issues), -n_subtasks, i, sample))
+    scored.sort()
+    winner = scored[0]
+    if len(samples) > 1:
+        log(f"  {domain}: multi-sample selected sample {winner[2]} "
+            f"({winner[0]} issues, {-winner[1]} subtasks) from "
+            f"{len(samples)} samples")
+    return winner[3]
 
 
 async def phase_plan(task: str, st: State, caps: dict,
@@ -7795,25 +8313,100 @@ async def phase_plan(task: str, st: State, caps: dict,
 
     sem = asyncio.Semaphore(caps["max_parallel"])
 
-    async def plan_one(category: str) -> dict:
-        async with sem:
-            st.bump_workers(caps)
-            prefix = f"{CATEGORY_ABBREV[category]}-"
-            up = (f"DOMAIN: {category}\nID_PREFIX: {prefix}\n\n"
-                  f"CONTEXT:\n{ctx}\n\n"
-                  f"Decompose the {category} aspect of this task into a JSON plan "
-                  "per your instructions. Every subtask id MUST start with "
-                  f"`{prefix}` (e.g., `{prefix}001`).")
-            return await claude_p(user_prompt=up, system_prompt=sys_prompt,
-                                  schema_key="planner", cwd=os.getcwd(),
-                                  allowed_tools=INSPECT_TOOLS, max_turns=100,
-                                  autonomous=False, caps=caps, st=st,
-                                  model=models["planner"],
-                                  effort=efforts["planner"],
-                                  sid=f"planner-{category}",
-                                  add_dirs=st.data.get("inspect_dirs") or None)
+    repo_root = Path(os.getcwd())
 
-    plans = await gather_or_cancel(*(plan_one(c) for c in cats))
+    # Task-referenced file extraction (CRITIC correlated-error breaker).
+    # Injects a mechanically-extracted coverage checklist into the planner
+    # prompt when the task string references files.  No-op otherwise.
+    task_file_items = extract_task_file_structure(task, repo_root)
+    task_file_section = (_format_task_file_structure(task_file_items)
+                         if task_file_items else None)
+    if task_file_section:
+        log(f"  extracted {len(task_file_items)} structural items "
+            "from task-referenced files")
+
+    async def plan_one(category: str, sample_idx: int = 0) -> dict:
+        async with sem:
+            prefix = f"{CATEGORY_ABBREV[category]}-"
+            sid = (f"planner-{category}-s{sample_idx}" if n_samples > 1
+                   else f"planner-{category}")
+            up_parts: list[str] = [
+                f"DOMAIN: {category}\nID_PREFIX: {prefix}\n\n"
+                f"CONTEXT:\n{ctx}\n\n"
+                f"Decompose the {category} aspect of this task into a JSON plan "
+                "per your instructions. Every subtask id MUST start with "
+                f"`{prefix}` (e.g., `{prefix}001`)."]
+            if task_file_section:
+                up_parts.append(task_file_section)
+
+            async def _invoke() -> dict:
+                st.bump_workers(caps)
+                return await claude_p(
+                    user_prompt="\n\n".join(up_parts),
+                    system_prompt=sys_prompt,
+                    schema_key="planner", cwd=str(repo_root),
+                    allowed_tools=INSPECT_TOOLS, max_turns=100,
+                    autonomous=False, caps=caps, st=st,
+                    model=models["planner"],
+                    effort=efforts["planner"],
+                    sid=sid,
+                    add_dirs=st.data.get("inspect_dirs") or None)
+
+            async def _on_feedback(fb: str) -> dict:
+                if len(up_parts) > 1:
+                    up_parts[-1] = fb
+                else:
+                    up_parts.append(fb)
+                return {}
+
+            def _check_planner(r: dict) -> list[str]:
+                issues = check_planner_output(r, repo_root, category)
+                if task_file_items:
+                    issues.extend(check_task_file_coverage(
+                        task_file_items, r.get("subtasks", [])))
+                return issues
+
+            result, gate_warnings = await _run_checked_loop(
+                invoke=_invoke,
+                check=_check_planner,
+                name=f"planner-{category}",
+                max_rounds=caps["planner_check_rounds"],
+                make_feedback_prompt=_on_feedback,
+            )
+            if result is None:
+                die(f"planner for {category} crashed and produced no result")
+            for w in gate_warnings:
+                log(f"  planner-{category}: {w}")
+            return result
+
+    n_samples = caps.get("planner_samples", 1)
+
+    if n_samples <= 1:
+        # Fast path: identical to single-sample behavior.
+        plans = await gather_or_cancel(*(plan_one(c) for c in cats))
+    else:
+        # Multi-sample: run N independent invocations per category,
+        # then mechanically select the cleanest sample per category.
+        log(f"  ({n_samples} samples per domain — multi-sample mode)")
+        all_coros = []
+        coro_keys: list[tuple[str, int]] = []
+        for c in cats:
+            for s_idx in range(n_samples):
+                all_coros.append(plan_one(c, s_idx))
+                coro_keys.append((c, s_idx))
+        all_results = await gather_or_cancel(*all_coros)
+
+        by_category: dict[str, list[dict]] = {}
+        for (c, _s_idx), result in zip(coro_keys, all_results):
+            by_category.setdefault(c, []).append(result)
+
+        plans = []
+        for c in cats:
+            samples = by_category[c]
+            best = _select_best_planner_sample(
+                samples, repo_root, c)
+            plans.append(best)
+
     for category, plan in zip(cats, plans):
         n = len(plan.get("subtasks", []))
         status = plan.get("status", "ready")
@@ -8569,8 +9162,31 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         }
         st.save()
 
-    # === Attempt 1: spawn, apply, check size, check acyclic ===
-    output = await _spawn_reconciler(user_prompt)
+    # === Attempt 1: spawn (with CRITIC-pattern check loop), apply,
+    # check size, check acyclic ===
+    recon_up_parts: list[str] = [user_prompt]
+
+    async def _invoke_recon() -> dict:
+        return await _spawn_reconciler("\n\n".join(recon_up_parts))
+
+    async def _on_recon_fb(fb: str) -> dict:
+        if len(recon_up_parts) > 1:
+            recon_up_parts[-1] = fb
+        else:
+            recon_up_parts.append(fb)
+        return {}
+
+    output, recon_warnings = await _run_checked_loop(
+        invoke=_invoke_recon,
+        check=lambda r: check_reconciler_output(r, plans),
+        name="reconciler",
+        max_rounds=caps["judgment_check_rounds"],
+        make_feedback_prompt=_on_recon_fb,
+    )
+    if output is None:
+        die("reconciler crashed and produced no result")
+    for w in recon_warnings:
+        log(f"  reconciler: {w}")
     _check_unresolvable(output)
     _apply_reconciler_output(plans, output)
     _record_conditional_drops(output)
@@ -8598,6 +9214,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             "retry prompt")
         output2 = await _spawn_reconciler(size_retry_prompt)
         _check_unresolvable(output2)
+        for w in check_reconciler_output(output2, plans):
+            log(f"  reconciler size-retry: {w}")
         _apply_reconciler_output(
             plans, output2, attempt_1_renames=output.get("renames"))
         _record_conditional_drops(output2)
@@ -8685,6 +9303,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 "constraint. Refine the task or re-run."
             )
 
+        for w in check_reconciler_output(output2, plans):
+            log(f"  reconciler cycle-retry: {w}")
         _apply_reconciler_output(
             plans, output2, attempt_1_renames=output.get("renames"))
         _record_conditional_drops(output2)
@@ -8832,6 +9452,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 "task or re-run."
             )
 
+        for w in check_reconciler_output(output3, plans):
+            log(f"  reconciler unresolved-retry: {w}")
         _apply_reconciler_output(
             plans, output3, attempt_1_renames=output.get("renames"))
         _record_conditional_drops(output3)
@@ -10721,17 +11343,41 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
         "collisions exist, return {\"collisions\": []}."
     )
 
-    st.bump_workers(caps)
-    output = await claude_p(
-        user_prompt=user_prompt, system_prompt=sys_prompt,
-        schema_key="plan_overlap_judge", cwd=os.getcwd(),
-        allowed_tools=INSPECT_TOOLS, max_turns=30,
-        autonomous=False, caps=caps, st=st,
-        model=models["plan_overlap_judge"],
-        effort=efforts["plan_overlap_judge"],
-        sid="plan_overlap_judge",
-        add_dirs=st.data.get("inspect_dirs") or None,
+    repo_root = Path(os.getcwd())
+    oj_up_parts: list[str] = [user_prompt]
+
+    async def _invoke_oj() -> dict:
+        st.bump_workers(caps)
+        return await claude_p(
+            user_prompt="\n\n".join(oj_up_parts),
+            system_prompt=sys_prompt,
+            schema_key="plan_overlap_judge", cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=30,
+            autonomous=False, caps=caps, st=st,
+            model=models["plan_overlap_judge"],
+            effort=efforts["plan_overlap_judge"],
+            sid="plan_overlap_judge",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    async def _on_oj_fb(fb: str) -> dict:
+        if len(oj_up_parts) > 1:
+            oj_up_parts[-1] = fb
+        else:
+            oj_up_parts.append(fb)
+        return {}
+
+    output, oj_warnings = await _run_checked_loop(
+        invoke=_invoke_oj,
+        check=lambda r: check_overlap_judge_output(r, plans, repo_root),
+        name="plan_overlap_judge",
+        max_rounds=caps["judgment_check_rounds"],
+        make_feedback_prompt=_on_oj_fb,
     )
+    if output is None:
+        die("plan overlap judge crashed and produced no result")
+    for w in oj_warnings:
+        log(f"  overlap-judge: {w}")
 
     # Persist the raw judge output for audit, even before applying —
     # if a later die() fires (unresolvable, or _validate_overlap_judge_output),
@@ -11697,6 +12343,99 @@ def _summarize_residuals(conf_res: dict) -> list[str]:
     return out
 
 
+def _confidence_axes_clear(
+    conf: dict, axes: list[str], threshold: float = 9.0,
+) -> bool:
+    """True when every named axis in *conf* is a number >= *threshold*.
+
+    Used by ``_run_checked_loop`` and the implementer's in-settle_subtask
+    confidence check.  Pure — no I/O, no state mutation."""
+    for ax in axes:
+        val = conf.get(ax)
+        if not isinstance(val, (int, float)) or val < threshold:
+            return False
+    return True
+
+
+def _format_check_feedback(
+    issues: list[str], rnd: int, max_rounds: int,
+) -> str:
+    """Format a structured feedback block for a re-invocation.
+
+    The block is deterministic text the orchestrator computed without an
+    LLM — file-existence checks, graph-cycle detection, lockfile
+    matching, etc.  Injected into the worker's user prompt on
+    re-invocation so the CRITIC pattern applies (external tool-verified
+    signal, not prior-pass output)."""
+    header = (
+        f"ORCHESTRATOR MECHANICAL CHECK (round {rnd + 1} of {max_rounds}):\n"
+        f"{len(issues)} issue(s) found by deterministic checks on your "
+        "output:\n"
+    )
+    body = "\n".join(f"- {issue}" for issue in issues)
+    footer = (
+        "\n\nAddress these issues. The orchestrator provides only these "
+        "mechanically-derived signals — not your previous output."
+    )
+    return header + body + footer
+
+
+async def _run_checked_loop(
+    *,
+    invoke: Callable[..., Awaitable[dict]],
+    check: Callable[[dict], list[str]],
+    name: str,
+    max_rounds: int,
+    make_feedback_prompt: Callable[[str], Awaitable[dict]] | None = None,
+) -> tuple[dict | None, list[str]]:
+    """Generic mechanical-feedback retry loop (CRITIC pattern).
+
+    Calls *invoke* up to *max_rounds* times.  After each call, runs
+    *check* (a pure-Python function) on the result.  If the check
+    returns an empty list the loop breaks (output is clean).  Otherwise
+    the issue list is formatted as external feedback via
+    ``_format_check_feedback`` and the next round's *invoke* is expected
+    to receive it (the caller is responsible for closing over a mutable
+    prompt variable that ``make_feedback_prompt`` updates, or ignoring
+    feedback for workers that don't need prompt mutation).
+
+    Returns ``(last_result, all_warnings)``.  The caller decides
+    escalation (die, block, warn).
+
+    *make_feedback_prompt* is optional.  When provided, it receives the
+    formatted feedback string and should update whatever closed-over
+    state the next ``invoke()`` call will read (typically a user-prompt
+    variable).  When ``None``, feedback is logged but not injected (the
+    loop still retries — useful when the re-invocation alone, as a fresh
+    ``claude -p`` session, is the value)."""
+    warnings: list[str] = []
+    last_res: dict | None = None
+
+    for rnd in range(max_rounds):
+        try:
+            last_res = await invoke()
+        except Exception as exc:
+            warnings.append(f"{name} round {rnd}: worker crashed: {exc}")
+            break
+
+        if last_res is None:
+            warnings.append(f"{name} round {rnd}: worker returned None")
+            break
+
+        issues = check(last_res)
+        if not issues:
+            break
+
+        for issue in issues:
+            warnings.append(f"{name} round {rnd}: {issue}")
+
+        if rnd < max_rounds - 1 and make_feedback_prompt is not None:
+            feedback = _format_check_feedback(issues, rnd, max_rounds)
+            await make_feedback_prompt(feedback)
+
+    return last_res, warnings
+
+
 def _conformance_clean(conf_res: dict) -> bool:
     """True when the conformer reports no residuals and every axis is
     either passed or not applicable. Used to short-circuit the
@@ -12177,6 +12916,7 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
     result."""
     continuations = 0
     retries = 0
+    confidence_retries = 0
     note = ""
     continuation = False
     worktree = str(leerie_dir / "worktrees" / sid)
@@ -12233,6 +12973,44 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             continue
 
         status = res.get("status")
+
+        # CRITIC-pattern confidence + mechanical check on complete results.
+        # Separate budget from subtask_continuations so confidence retries
+        # don't consume the handoff/clarification budget.
+        if status == "complete" and \
+                confidence_retries < caps.get("implementer_confidence_retries", 2):
+            conf = (res.get("confidence") or {}) \
+                if isinstance(res.get("confidence"), dict) else {}
+            if not _confidence_axes_clear(conf, ["root_cause", "solution"]):
+                below = {ax: conf.get(ax) for ax in ["root_cause", "solution"]
+                         if not isinstance(conf.get(ax), (int, float))
+                         or conf[ax] < 9.0}
+                log(f"  {sid}: confidence gate not cleared: {below}")
+                confidence_retries += 1
+                continuation = True
+                note = (
+                    f"Previous attempt returned complete but confidence "
+                    f"gate did not clear: {below}. Re-examine and either "
+                    f"raise your confidence with evidence or report blocked.")
+                continue
+            # Mechanical checks on the implementer's output.
+            run_branch = compute_run_branch(st.run_id)
+            diff_proc = await run_proc(
+                ["git", "diff", "--name-only", run_branch],
+                cwd=worktree)
+            actual_files = set(diff_proc.stdout.strip().splitlines()
+                               ) if diff_proc.returncode == 0 else set()
+            impl_issues = check_implementer_output(res, subtask, actual_files)
+            if impl_issues and confidence_retries < caps.get(
+                    "implementer_confidence_retries", 2):
+                log(f"  {sid}: mechanical check issues: {impl_issues}")
+                confidence_retries += 1
+                continuation = True
+                note = _format_check_feedback(
+                    impl_issues, confidence_retries - 1,
+                    caps.get("implementer_confidence_retries", 2))
+                continue
+
         st.data.setdefault("subtask_status", {})[sid] = status
         st.save()
 
@@ -12446,19 +13224,49 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
         # exit 1 (conflict): staging worktree is mid-merge — hand to an integrator
         log(f"  conflict integrating {sid}; spawning integrator")
         sys_prompt = load_prompt("integrator")
-        up = (f"Resolve the in-progress merge conflict in this worktree.\n"
-              f"LEERIE_DIR is {leerie_dir}.\n"
-              f"Incoming subtask: {sid}\n"
-              f"Already-integrated subtasks it may conflict with: "
-              f"{', '.join(integrated_so_far) or 'none'}")
-        st.bump_workers(caps)
-        ires = await claude_p(user_prompt=up, system_prompt=sys_prompt,
-                              schema_key="integrator", cwd=str(staging),
-                              allowed_tools=ACT_TOOLS, max_turns=60,
-                              autonomous=True, caps=caps, st=st,
-                              model=models["integrator"],
-                              effort=efforts["integrator"],
-                              sid=f"integrator-{sid}")
+        up_parts: list[str] = [
+            f"Resolve the in-progress merge conflict in this worktree.\n"
+            f"LEERIE_DIR is {leerie_dir}.\n"
+            f"Incoming subtask: {sid}\n"
+            f"Already-integrated subtasks it may conflict with: "
+            f"{', '.join(integrated_so_far) or 'none'}"]
+
+        async def _invoke_integrator() -> dict:
+            st.bump_workers(caps)
+            return await claude_p(
+                user_prompt="\n\n".join(up_parts),
+                system_prompt=sys_prompt,
+                schema_key="integrator", cwd=str(staging),
+                allowed_tools=ACT_TOOLS, max_turns=60,
+                autonomous=True, caps=caps, st=st,
+                model=models["integrator"],
+                effort=efforts["integrator"],
+                sid=f"integrator-{sid}")
+
+        async def _on_integrator_fb(fb: str) -> dict:
+            if len(up_parts) > 1:
+                up_parts[-1] = fb
+            else:
+                up_parts.append(fb)
+            return {}
+
+        # The integrator's async mechanical checks (conflict markers,
+        # merge committed) run in the resolved-status path below.
+        # The loop's value is re-invocation on crash; the schema enum
+        # already constrains status to resolved/design-conflict/failed
+        # so a sync check here would be redundant.
+        ires, int_warnings = await _run_checked_loop(
+            invoke=_invoke_integrator,
+            check=lambda r: [],
+            name=f"integrator-{sid}",
+            max_rounds=caps["judgment_check_rounds"],
+            make_feedback_prompt=_on_integrator_fb,
+        )
+        if ires is None:
+            await run_proc(["git", "merge", "--abort"], cwd=str(staging))
+            die(f"integrator for {sid} crashed; merge aborted")
+        for w in int_warnings:
+            log(f"  integrator-{sid}: {w}")
         if ires.get("status") == "resolved":
             # the integrator must have actually committed the merge — a
             # 'resolved' claim with the worktree still mid-merge is a lie,
@@ -13386,6 +14194,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          f"(default {DEFAULT_CAPS['confidence_rounds']}); "
                          f"also {CONFIDENCE_ROUNDS_ENV} and "
                          f"confidence_rounds in leerie.toml")
+    ap.add_argument("--planner-samples", type=_positive_int, metavar="N",
+                    help=f"independent planner invocations per domain; "
+                         f"the cleanest sample is selected mechanically "
+                         f"(default {DEFAULT_CAPS['planner_samples']}; "
+                         f"set to 2–3 for recall). Also "
+                         f"{PLANNER_SAMPLES_ENV} and "
+                         "planner_samples in leerie.toml")
     ap.add_argument("--worker-memory-max", metavar="SIZE",
                     help="per-worker cgroup memory cap (e.g. '4G', "
                          "'512M', '1024'). Bounds RAM available to each "
@@ -13585,6 +14400,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # a bad --confidence-rounds via _positive_int.
     caps["confidence_rounds"] = resolve_confidence_rounds(
         Path(os.getcwd()), args.confidence_rounds)
+    cwd = Path(os.getcwd())
+    caps["judgment_check_rounds"] = resolve_judgment_check_rounds(
+        cwd, getattr(args, "judgment_check_rounds", None))
+    caps["planner_check_rounds"] = resolve_planner_check_rounds(
+        cwd, getattr(args, "planner_check_rounds", None))
+    caps["implementer_confidence_retries"] = \
+        resolve_implementer_confidence_retries(
+            cwd, getattr(args, "implementer_confidence_retries", None))
+    caps["planner_samples"] = resolve_planner_samples(
+        cwd, getattr(args, "planner_samples", None))
     # Resolve per-worker cgroup memory cap. Auto-derives from
     # /proc/meminfo when unset; resolver die()s on a bad size string.
     # Reads `caps["max_parallel"]` already resolved above so the auto-

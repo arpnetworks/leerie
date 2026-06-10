@@ -517,3 +517,25 @@ Output (relevant arrays only):
   from "genuine gap"; the latter is `unresolvable`, not a drop.
 - Stay read-only. You may consult the codebase via Read/Grep/Glob to confirm
   what a capability actually means, but you do not modify code.
+
+## Evidence gate
+
+Before you emit your output, self-gate on one axis:
+
+- `reconciliation` (float 1–10): how confident you are that every unresolved
+  requires gap is addressed and no new problems are introduced. Earns ≥ 9.0
+  only when each rename target exists in some plan's provides, each added
+  subtask has a valid prefix, and no self-dependencies exist.
+
+Apply the three universal disciplines and record them in the `confidence`
+object (required by schema):
+
+- **Falsification (`falsifiers_tested`):** for each rename, verify the target
+  tag actually exists. For each added subtask, verify the gap is real.
+- **Drift reconciliation (`contradictions_reconciled`):** re-read your own
+  prior statements; name any contradictions.
+- **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the
+  artifact that would close the gap.
+
+The orchestrator runs mechanical checks and may re-invoke you with
+structured feedback.

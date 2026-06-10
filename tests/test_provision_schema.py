@@ -28,7 +28,7 @@ def test_provision_requires_recipe(leerie):
     rejecting an empty list (the validator would, but only if it gets
     a list to look at)."""
     schema = leerie.SCHEMAS["provision"]
-    assert set(schema["required"]) == {"recipe"}
+    assert set(schema["required"]) == {"recipe", "confidence"}
 
 
 def test_provision_recipe_is_array_of_objects(leerie):

@@ -1,5 +1,5 @@
-"""Structural tests for the confidence/status fields added to the planner,
-implementer, and conformer schemas (DESIGN §8).
+"""Structural tests for the confidence/status fields on all worker schemas
+(DESIGN §8).
 
 The point of pinning these structural contracts is mechanical enforcement
 of DESIGN §12 / §8: a worker that skipped self-gating fails its own JSON
@@ -10,6 +10,8 @@ change removes one of these fields without an accompanying DESIGN update,
 this test catches it.
 """
 from __future__ import annotations
+
+import pytest
 
 
 def test_planner_schema_top_level_required(leerie):
@@ -104,3 +106,60 @@ def test_gap_to_close_keys_match_score_axes(leerie):
     assert set(impl_gap["properties"].keys()) == {"root_cause", "solution"}
     conformer_gap = leerie.SCHEMAS["conformer"]["properties"]["confidence"]["properties"]["gap_to_close"]
     assert set(conformer_gap["properties"].keys()) == {"conformance"}
+
+
+# --- New schemas: classifier, reconciler, provision, overlap judge, integrator ---
+
+_DISCIPLINE_FIELDS = {"basis", "falsifiers_tested",
+                      "contradictions_reconciled", "gap_to_close"}
+
+
+def _assert_confidence_schema(leerie, schema_key: str, axes: list[str]):
+    """Shared structural assertions for any confidence schema."""
+    schema = leerie.SCHEMAS[schema_key]
+    assert "confidence" in set(schema["required"]), (
+        f"{schema_key} must require confidence at the top level")
+    conf = schema["properties"]["confidence"]
+    assert conf["type"] == "object"
+    required = set(conf["required"])
+    assert _DISCIPLINE_FIELDS.issubset(required), (
+        f"{schema_key} confidence missing discipline fields: "
+        f"{_DISCIPLINE_FIELDS - required}")
+    for ax in axes:
+        assert ax in required, f"{schema_key} confidence missing axis {ax!r}"
+        assert conf["properties"][ax]["type"] == "number", (
+            f"{schema_key} confidence.{ax} must be a number")
+    gap = conf["properties"]["gap_to_close"]
+    assert set(gap["properties"].keys()) == set(axes), (
+        f"{schema_key} gap_to_close keys must mirror axes")
+
+
+@pytest.mark.parametrize("schema_key, axes", [
+    ("classifier", ["classification"]),
+    ("reconciler", ["reconciliation"]),
+    ("provision", ["recipe_correctness"]),
+    ("plan_overlap_judge", ["judgment"]),
+    ("integrator", ["resolution"]),
+])
+def test_new_schema_confidence_structure(leerie, schema_key, axes):
+    """Every worker schema has a required confidence object with the §8
+    discipline fields and worker-specific numeric score axes."""
+    _assert_confidence_schema(leerie, schema_key, axes)
+
+
+def test_confidence_schema_helper_produces_correct_structure(leerie):
+    """The _confidence_schema helper builds the same shape regardless
+    of the number of axes."""
+    single = leerie._confidence_schema(["x"])
+    assert set(single["required"]) == {"x", "basis", "falsifiers_tested",
+                                        "contradictions_reconciled",
+                                        "gap_to_close"}
+    assert single["properties"]["x"]["type"] == "number"
+    assert set(single["properties"]["gap_to_close"]["properties"].keys()) == {"x"}
+
+    multi = leerie._confidence_schema(["a", "b", "c"])
+    assert {"a", "b", "c"}.issubset(set(multi["required"]))
+    for ax in ("a", "b", "c"):
+        assert multi["properties"][ax]["type"] == "number"
+    assert set(multi["properties"]["gap_to_close"]["properties"].keys()) == {
+        "a", "b", "c"}

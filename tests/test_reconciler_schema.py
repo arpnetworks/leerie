@@ -69,6 +69,13 @@ def _full_valid_output() -> dict:
              "reason": "No planner produced anything related and no "
                        "plausible connector subtask can be inferred."},
         ],
+        "confidence": {
+            "reconciliation": 9.2,
+            "basis": "all unresolved tags addressed",
+            "falsifiers_tested": ["checked rename targets exist"],
+            "contradictions_reconciled": [],
+            "gap_to_close": {},
+        },
     }
 
 
@@ -95,7 +102,7 @@ def test_reconciler_requires_all_eight_arrays(leerie):
     assert required == {"renames", "added_provides", "added_subtasks",
                         "conditional_drops",
                         "dropped_requires", "dependency_edges",
-                        "merged_subtasks", "unresolvable"}
+                        "merged_subtasks", "unresolvable", "confidence"}
 
 
 def test_reconciler_conditional_drops_shape(leerie):
@@ -209,14 +216,14 @@ def test_reconciler_arrays_can_all_be_empty(leerie):
     empty = {"renames": [], "added_provides": [], "added_subtasks": [],
              "conditional_drops": [],
              "dropped_requires": [], "dependency_edges": [],
-             "merged_subtasks": [], "unresolvable": []}
-    # Reach into the schema to confirm `required` covers exactly the
-    # eight arrays — any of which being absent is a violation.
+             "merged_subtasks": [], "unresolvable": [],
+             "confidence": {"reconciliation": 9.0, "basis": "",
+                            "falsifiers_tested": [],
+                            "contradictions_reconciled": [],
+                            "gap_to_close": {}}}
     required = set(leerie.SCHEMAS["reconciler"]["required"])
     assert set(empty.keys()) == required, (
-        "fixture and schema must agree on the full set of required arrays")
-    for field in empty:
-        assert field in required
+        "fixture and schema must agree on the full set of required fields")
 
 
 def test_reconciler_full_payload_keys_align_with_schema(leerie):

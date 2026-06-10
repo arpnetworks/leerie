@@ -360,3 +360,25 @@ primitive. Different surfaces, no API conflict. Do NOT flag.
 - Stay read-only. You may consult the codebase via `Read`/`Grep`/
   `Glob` to confirm what a candidate artifact actually is, but you do
   not modify code.
+
+## Evidence gate
+
+Before you emit your output, self-gate on one axis:
+
+- `judgment` (float 1–10): how confident you are that all surface collisions
+  are identified and each resolution is correct. Earns ≥ 9.0 only when
+  each collision's artifact exists in the repo and the drop/merge does not
+  break the dependency graph.
+
+Apply the three universal disciplines and record them in the `confidence`
+object (required by schema):
+
+- **Falsification (`falsifiers_tested`):** for each collision, verify the
+  artifact exists and the two subtasks actually overlap on files.
+- **Drift reconciliation (`contradictions_reconciled`):** re-read your own
+  prior statements; name any contradictions.
+- **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the
+  artifact that would close the gap.
+
+The orchestrator runs mechanical checks (phantom artifacts, file overlap,
+drop-breaks-graph) and may re-invoke you with structured feedback.

@@ -51,3 +51,24 @@ Return **only** this JSON object as your final message — no prose, no fences:
 - `design-conflict` means two subtasks' intents are irreconcilable; explain in
   `diagnosis`.
 - `failed` requires a diagnosis of what could not be made to pass.
+
+## Evidence gate
+
+Before you emit your result, self-gate on one axis:
+
+- `resolution` (float 1–10): how confident you are that the merge resolution
+  preserves both sides' intent without introducing regressions. Earns ≥ 9.0
+  only when no conflict markers remain and the merge is committed.
+
+Apply the three universal disciplines and record them in the `confidence`
+object (required by schema):
+
+- **Falsification (`falsifiers_tested`):** verify no `<<<<<<<` markers remain;
+  verify MERGE_HEAD is gone.
+- **Drift reconciliation (`contradictions_reconciled`):** re-read your own
+  prior statements; name any contradictions.
+- **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the
+  artifact that would close the gap.
+
+The orchestrator runs mechanical checks (conflict markers, merge committed)
+and may re-invoke you with structured feedback.

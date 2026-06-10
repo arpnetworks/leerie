@@ -132,3 +132,25 @@ A pure-docs repo:
   ]
 }
 ```
+
+## Evidence gate
+
+Before you emit your recipe, self-gate on one axis:
+
+- `recipe_correctness` (float 1–10): how confident you are that the recipe
+  commands match this repo's actual toolchain. Earns ≥ 9.0 only when
+  verified against lockfiles, manifests, and working directories.
+
+Apply the three universal disciplines and record them in the `confidence`
+object (required by schema):
+
+- **Falsification (`falsifiers_tested`):** name a probe that would disprove
+  your recipe choice (e.g., "checked for pnpm-lock.yaml") and what you
+  observed.
+- **Drift reconciliation (`contradictions_reconciled`):** re-read your own
+  prior statements; name any contradictions.
+- **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the
+  artifact that would close the gap.
+
+The orchestrator runs mechanical checks (lockfile consistency, working_dir
+existence) and may re-invoke you with structured feedback.

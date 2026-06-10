@@ -73,3 +73,27 @@ Return **only** this JSON object as your final message — no prose, no fences:
 `questions` is empty when the task is fully specified. Every question must be
 genuine intent ambiguity that survived the filter — not something you could
 have looked up.
+
+## Evidence gate
+
+Before you emit your classification, self-gate on one axis:
+
+- `classification` (float 1–10): how confident you are that the selected
+  categories are correct and the question list is complete and filtered.
+  Earns ≥ 9.0 only when you have verified each category against the actual
+  codebase (e.g., `infrastructure` selected → an `infra/` or `cdk/`
+  directory exists).
+
+Apply the three universal disciplines and record them in the `confidence`
+object (required by schema):
+
+- **Falsification (`falsifiers_tested`):** for each category, name a probe
+  that would disprove it and what you observed.
+- **Drift reconciliation (`contradictions_reconciled`):** re-read your own
+  prior statements; name any contradictions with evidence for the kept
+  version.
+- **Gap surfacing (`gap_to_close`):** if the score is below 9.0, name the
+  specific artifact that would close the gap.
+
+The orchestrator runs mechanical checks on your output and may re-invoke
+you with structured feedback if issues are found.

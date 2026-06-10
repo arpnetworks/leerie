@@ -1218,7 +1218,7 @@ export IS_RESUME
 LEERIE_TASK_ARG=""
 _prev=""
 _value_flags=" --run-id --answers --pr-template --max-workers \
---max-parallel --confidence-rounds --worker-memory-max \
+--max-parallel --confidence-rounds --planner-samples --worker-memory-max \
 --source-of-truth --runtime --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --telemetry-dir --judge-dir \

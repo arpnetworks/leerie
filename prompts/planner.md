@@ -180,6 +180,13 @@ The orchestrator gives you, in your prompt:
    analysis in `confidence.gap_to_close`. The orchestrator will surface
    the blocker; do not invent subtasks to look unblocked.
 
+   **Mechanical checks.** The orchestrator runs deterministic structural
+   checks on your output (phantom file paths, dangling dependencies,
+   intra-domain cycles, protected-path violations, task-file coverage)
+   and may re-invoke you with the results as structured feedback. Address
+   the listed issues — the feedback is mechanically derived, not a prior
+   pass's output.
+
 ## Output
 
 Return **only** this JSON object as your final message — no prose, no fences:

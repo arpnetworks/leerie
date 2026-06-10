@@ -184,6 +184,13 @@ must (a) attempt the falsifier on any claim still below 9.0, (b) reconcile
 any new contradictions with prior iterations, and (c) update `gap_to_close`
 based on what you learned. If you hit the cap without clearing the gates,
 stop and return status `blocked` with the precise missing evidence.
+
+**Mechanical checks.** The orchestrator runs deterministic structural
+checks on your output (confidence scores, scope drift vs.
+files_likely_touched, unmet criteria_results) and may re-invoke you
+with the results as structured feedback. Address the listed issues —
+the feedback is mechanically derived, not a prior pass's output.
+
 If the missing piece is something only the user can provide and
 `CAN_ASK_USER` is `true`, prefer the `needs-clarification` exit in
 §6b — the question survives across a worker boundary, the user
