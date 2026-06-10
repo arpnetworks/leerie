@@ -8330,19 +8330,24 @@ async def phase_plan(task: str, st: State, caps: dict,
             prefix = f"{CATEGORY_ABBREV[category]}-"
             sid = (f"planner-{category}-s{sample_idx}" if n_samples > 1
                    else f"planner-{category}")
-            up_parts: list[str] = [
+            base_prompt = (
                 f"DOMAIN: {category}\nID_PREFIX: {prefix}\n\n"
                 f"CONTEXT:\n{ctx}\n\n"
                 f"Decompose the {category} aspect of this task into a JSON plan "
                 "per your instructions. Every subtask id MUST start with "
-                f"`{prefix}` (e.g., `{prefix}001`)."]
+                f"`{prefix}` (e.g., `{prefix}001`).")
+            # Mutable list: [base, task_file_section?, feedback?].
+            # task_file_section persists across rounds (external
+            # reference); feedback replaces on each round.
+            up_parts: list[str] = [base_prompt]
             if task_file_section:
                 up_parts.append(task_file_section)
+            feedback_slot: list[str] = []
 
             async def _invoke() -> dict:
                 st.bump_workers(caps)
                 return await claude_p(
-                    user_prompt="\n\n".join(up_parts),
+                    user_prompt="\n\n".join(up_parts + feedback_slot),
                     system_prompt=sys_prompt,
                     schema_key="planner", cwd=str(repo_root),
                     allowed_tools=INSPECT_TOOLS, max_turns=100,
@@ -8353,10 +8358,8 @@ async def phase_plan(task: str, st: State, caps: dict,
                     add_dirs=st.data.get("inspect_dirs") or None)
 
             async def _on_feedback(fb: str) -> dict:
-                if len(up_parts) > 1:
-                    up_parts[-1] = fb
-                else:
-                    up_parts.append(fb)
+                feedback_slot.clear()
+                feedback_slot.append(fb)
                 return {}
 
             def _check_planner(r: dict) -> list[str]:
