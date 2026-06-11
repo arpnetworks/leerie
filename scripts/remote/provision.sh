@@ -453,9 +453,8 @@ decide_teardown() {
       remote_log "PAUSED: machine $mid (rc=$rc, reason=$reason)"
       if [ -n "${LEERIE_RUN_ID:-}" ]; then
         echo "  run-id:  $LEERIE_RUN_ID" >&2
-        echo "  resume:  leerie --resume --run-id $LEERIE_RUN_ID --runtime fly" >&2
       fi
-      echo "  attach:  leerie --resume ${LEERIE_RUN_ID:-<run-id>}" >&2
+      echo "  resume:  leerie --resume ${LEERIE_RUN_ID:-<run-id>} --runtime fly" >&2
       echo "  kill:    leerie --kill ${LEERIE_RUN_ID:-<run-id>}" >&2
       if [ -n "${LEERIE_PAUSE_NOTIFY_CMD:-}" ]; then
         eval "$LEERIE_PAUSE_NOTIFY_CMD" || true

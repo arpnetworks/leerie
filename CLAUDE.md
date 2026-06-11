@@ -298,9 +298,9 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 
 # Pre-classify failures (seed_auth aborted before phase_classify) now
 # appear in `--list` with status `seed-failed` and are resumable via
-# `--resume --run-id <id>`. Previously these runs were invisible:
+# `--resume <id>`. Previously these runs were invisible:
 ./leerie --list --status seed-failed
-./leerie --resume --run-id <seed-failed-id> --runtime fly
+./leerie --resume <seed-failed-id> --runtime fly
 
 # Chain verbs: submit, inspect, and cancel multi-run chains via the
 # leerie-chain HTTP API. LEERIE_CHAIN_URL sets the endpoint

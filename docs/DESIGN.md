@@ -564,7 +564,7 @@ depends on.
 
 When more than one run is in flight in the same repository, `--resume`
 needs to know *which* run to resume. The orchestrator auto-picks when
-exactly one run exists, and requires an explicit `--run-id` otherwise; the
+exactly one run exists, and requires an explicit run-id otherwise; the
 discovery scans `<state-root>/runs/*/state.json`. Resume never guesses across
 multiple runs.
 
@@ -994,7 +994,7 @@ rate-limit / session-limit is hit mid-worker. In each case the
 orchestrator runs a cleanup pass before exiting, and the cleanup
 *scope* is uniformly conservative — **state and branches are always
 preserved**; only worktrees are torn down. The run is always
-resumable via `--resume --run-id <id>` after any abnormal exit.
+resumable via `--resume <id>` after any abnormal exit.
 
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
@@ -1424,7 +1424,7 @@ remote run lifecycle, each doing exactly one thing:
 |---|---|
 | `leerie "task" --runtime fly` | Provision machine, detach orchestrator, tail log |
 | `leerie --stop <run-id>` | Clean pause (`flyctl machine stop`); resumable |
-| `leerie --resume --run-id <id> --runtime fly` | Smart resume — wakes a paused machine, attaches to a live orchestrator, or relaunches against an alive-but-orphaned machine, automatically |
+| `leerie --resume <id> --runtime fly` | Smart resume — wakes a paused machine, attaches to a live orchestrator, or relaunches against an alive-but-orphaned machine, automatically |
 | `leerie --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
 
 Plus `leerie --list` (unified across local and remote, with `--status
@@ -1510,7 +1510,7 @@ saves uncommitted edits, pulls in a new submodule. The remote machine
 needs a user-triggered way to pick that up without destroying its
 volume. leerie realises this as two surfaces sharing one mechanism:
 an explicit `leerie --re-seed <run-id>` subcommand and an implicit
-auto-re-seed step inside `leerie --resume --run-id <id> --runtime fly`.
+auto-re-seed step inside `leerie --resume <id> --runtime fly`.
 Both wake the machine if stopped, run a safety check, and call the
 same `seed_repo_dirty` helper used by the fresh-provision path.
 

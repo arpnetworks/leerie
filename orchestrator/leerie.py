@@ -1660,7 +1660,7 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     recover it.
 
     If `full_purge` is False (SIGTERM/SIGHUP/exception): state.json and
-    the run branch are left intact so `--resume --run-id <id>` can
+    the run branch are left intact so `--resume <id>` can
     continue the run. This is the conservative default for "external
     process killed me, user probably wants to recover.\""""
     if st is None or st.run_id is None:
@@ -2164,7 +2164,7 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None) -> str:
                 return cli_run_id
         available = ", ".join(r["run_id"] for r in runs) or "(none)"
         die(
-            f"--run-id {cli_run_id!r} does not match any known run. "
+            f"run-id {cli_run_id!r} does not match any known run. "
             f"Available: {available}. Use `leerie --list` to enumerate."
         )
     if not runs:
@@ -2177,7 +2177,7 @@ def resolve_run_id(leerie_root: Path, cli_run_id: str | None) -> str:
     available = "\n  ".join(_format_run_for_disambiguation(r, leerie_root)
                             for r in runs)
     die(
-        "multiple runs present; pass --run-id <id> to disambiguate:\n  "
+        "multiple runs present; pass the run-id to disambiguate:\n  "
         f"{available}\nUse `leerie --list` to see full details."
     )
 
@@ -14803,8 +14803,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 # SIGINT exit code (130) the way the top-level arm
                 # does — `main()` returns through the normal flow.
                 log("interrupted by user (SIGINT) during rate-limit "
-                    f"sleep — state preserved (resume with --resume "
-                    f"--run-id {st.run_id})")
+                    f"sleep — state preserved (resume with "
+                    f"leerie --resume {st.run_id})")
                 interrupted_during_sleep = True
                 exit_code = 130
             if not interrupted_during_sleep:
@@ -14819,14 +14819,14 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 # gives us a fresh worker budget and a fresh asyncio loop
                 # without recursing through the launcher.
                 log(f"  auto-resuming: exec orchestrator "
-                    f"--resume --run-id {st.run_id}")
+                    f"--resume {st.run_id}")
                 os.execv(sys.executable,
                          [sys.executable, __file__,
                           "--resume", "--run-id", st.run_id])
                 # Unreachable: execv replaces the process.
         else:
             log(f"  could not parse reset time; "
-                f"resume manually: leerie --resume --run-id {st.run_id}")
+                f"resume manually: leerie --resume {st.run_id}")
             exit_code = 75  # EX_TEMPFAIL
     except KeyboardInterrupt:
         # Ctrl-C → worktree cleanup only; state and branches preserved
@@ -14839,7 +14839,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         full_purge = False
         st.save()
         log("interrupted by user (SIGINT) — worktree cleanup; "
-            f"state preserved (resume with --resume --run-id {st.run_id})")
+            f"state preserved (resume with leerie --resume {st.run_id})")
         exit_code = 130
     except InterruptedBySignal as e:
         # SIGTERM / SIGHUP → external orchestration (CI cancel, systemd
@@ -14849,7 +14849,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         full_purge = False
         st.save()
         log(f"interrupted by signal ({e}) — worktree cleanup; "
-            f"state preserved (resume with --resume --run-id {st.run_id})")
+            f"state preserved (resume with leerie --resume {st.run_id})")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.
         signum = getattr(signal, str(e), None)
         exit_code = (128 + int(signum)) if signum else 1

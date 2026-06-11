@@ -512,7 +512,7 @@ PY
       paused_at "$(iso_now)" \
       pause_reason "user-requested" \
       fly_machine_id "$LEERIE_MACHINE_ID" || true
-    remote_log "--stop: paused. Resume via: leerie --resume --run-id $LEERIE_RUN_ID --runtime fly"
+    remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID --runtime fly"
     exit 0
     ;;
   --kill)
@@ -2415,7 +2415,7 @@ except Exception:
           fi
           ;;
         *)
-          remote_log "--resume: multiple active launches — pass --run-id to disambiguate:"
+          remote_log "--resume: multiple active launches — pass the run-id to disambiguate:"
           for _f in "${_active_records[@]}"; do
             python3 -c "
 import json, sys

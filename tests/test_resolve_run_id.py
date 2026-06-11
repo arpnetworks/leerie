@@ -114,7 +114,7 @@ def _make_orphan(leerie_root: Path, run_id: str, fly: dict) -> None:
 
 def test_resolve_explicit_orphan_id_accepted(leerie, tmp_path):
     """Orphan dirs (fly-machine.json without state.json) must resolve
-    so the user can `--resume --run-id <orphan-id>` after seed_auth
+    so the user can `--resume <orphan-id>` after seed_auth
     aborted before phase_classify. This is the live regression test for
     the stackpulse/finalmemoriam hangs."""
     _make_orphan(tmp_path, "feat-seed-died-abc123", {

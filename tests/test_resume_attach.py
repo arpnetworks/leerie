@@ -110,7 +110,7 @@ except Exception:
       fi
       ;;
     *)
-      remote_log "--resume: multiple active launches — pass --run-id to disambiguate:"
+      remote_log "--resume: multiple active launches — pass the run-id to disambiguate:"
       for _f in "${_active_records[@]}"; do
         python3 -c "
 import json, sys

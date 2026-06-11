@@ -352,7 +352,7 @@ def test_decide_teardown_rc2_pauses(tmp_path: Path):
 def test_decide_teardown_prints_resume_command(tmp_path: Path):
     """The pause notification includes the resume command verbatim."""
     result, _ = _decide_teardown_with_rc(tmp_path, "1", run_id="my-run-abc")
-    assert "leerie --resume --run-id my-run-abc --runtime fly" in result.stderr
+    assert "leerie --resume my-run-abc --runtime fly" in result.stderr
 
 
 def test_decide_teardown_pause_reason_overridable(tmp_path: Path):
@@ -470,16 +470,10 @@ def test_resume_machine_refuses_destroyed_machine(tmp_path: Path):
 # --- coupling: launcher pause-print includes the resume command ----------
 
 def test_launcher_resume_command_format_matches_decide_teardown():
-    """Coupling: the resume command printed by decide_teardown must match
-    the shape consumed by the launcher's --resume + --run-id parsing.
-
-    decide_teardown prints: leerie --resume --run-id <id> --runtime fly
-    The launcher parses --run-id from $@ (see LEERIE_RUN_ID extraction).
-    Both halves must use the same flag shape.
+    """Coupling: the resume command printed by decide_teardown must use
+    positional run-id, matching the launcher's positional-arg parsing.
     """
-    launcher = (REPO_ROOT / "leerie").read_text()
     provision = PROVISION_SH.read_text()
-    assert "leerie --resume --run-id $LEERIE_RUN_ID --runtime fly" in provision, (
+    assert "leerie --resume ${LEERIE_RUN_ID:-<run-id>} --runtime fly" in provision, (
         "decide_teardown's resume hint string drifted"
     )
-    assert '--run-id' in launcher, "launcher no longer extracts --run-id"

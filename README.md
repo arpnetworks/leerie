@@ -171,9 +171,9 @@ leerie "Fix the login timeout bug and add a regression test"
 leerie path/to/task.md
 
 # Resume an interrupted or budget-capped run. Auto-picks if exactly one
-# in-flight run exists; otherwise requires --run-id (see `--list`).
+# in-flight run exists; otherwise pass the run-id (see `--list`).
 leerie --resume
-leerie --resume --run-id fix-login-timeout-bug-b81e90
+leerie --resume fix-login-timeout-bug-b81e90
 
 # List in-flight and completed runs in this repository:
 leerie --list
@@ -278,7 +278,7 @@ Complete reference for every CLI flag, environment variable, and
 | Flag | Default | Description |
 |------|---------|-------------|
 | `task` (positional) | — | The task description (literal string, or path to a `.txt`/`.md` file). Required unless `--resume`, `--list`, or `--phase` is given. |
-| `--resume` | off | Resume an interrupted run. Auto-picks if exactly one run exists; requires `--run-id` if multiple. |
+| `--resume` | off | Resume an interrupted run. Auto-picks if exactly one run exists; pass the run-id if multiple. |
 | `--run-id ID` | — | Select a specific run by id (e.g., for `--resume` or `--phase` when multiple runs are in flight). |
 | `--list` | off | Enumerate in-flight and completed runs in this repository (run id, started, status, branch). |
 | `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `LEERIE_NO_PUSH` / `leerie.toml`. |
@@ -604,7 +604,7 @@ for an audit cleanup across every past run).
 - **Run interrupted (Ctrl-C, SIGTERM, SIGHUP, CI cancel, terminal close, reboot)** —
   worktrees are torn down but state.json + branches are preserved.
   Resume with `./leerie --resume` (auto-picks if exactly one in-flight
-  run) or `./leerie --resume --run-id <id>`. Run `leerie --list` to see
+  run) or `./leerie --resume <id>`. Run `leerie --list` to see
   what's in flight. The explicit "throw this away" command is
   `scripts/cleanup.sh --run-id <id> --branches` — Ctrl-C alone is
   always safely resumable.
@@ -617,7 +617,7 @@ for an audit cleanup across every past run).
   unfamiliar timezone, or a future format change), leerie exits with
   code 75 and prints the manual resume command — re-run that command
   yourself once the rate-limit clears. Auto-resume passes only
-  `--resume --run-id <id>`; CLI-only overrides (`--model`,
+  `--resume <id>`; CLI-only overrides (`--model`,
   `--max-workers`, etc.) on the original launch are *not* preserved
   across an auto-resume. Set those via env (`LEERIE_*`) or `leerie.toml`
   if you want them to survive — both channels are re-resolved on
@@ -652,7 +652,7 @@ Yes. Each invocation derives a unique `run_id` and namespaces all of its
 state under `$LEERIE_STATE_HOST_DIR/runs/<run-id>/` and its branches under
 `leerie/runs/<run-id>` (run branch) and `leerie/subtasks/<run-id>/<sid>`
 (subtask branches) — so parallel runs in the same clone never collide.
-Use `--list` to see what's in flight and `--resume --run-id <id>` to
+Use `--list` to see what's in flight and `--resume <id>` to
 resume a specific one.
 
 **Does Leerie work outside a git repository?**
