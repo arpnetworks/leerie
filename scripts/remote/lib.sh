@@ -270,6 +270,19 @@ fi
 kill "$TAIL_PID" 2>/dev/null || true
 wait "$TAIL_PID" 2>/dev/null || true
 
+# Read the orchestrator's exit code from the sidecar file so
+# decide_teardown can route failed runs to the pause branch
+# (DESIGN §6 teardown disposition table). Absent file (OOM,
+# SIGKILL, crash before the handler) → default 0 (backward compat).
+ORCH_EXIT=0
+EXIT_FILE="/work/.leerie/runs/${ID}/orchestrator.exit_code"
+if [ -f "$EXIT_FILE" ]; then
+  _read_rc="$(head -1 "$EXIT_FILE" 2>/dev/null)" || true
+  case "$_read_rc" in
+    [0-9]|[0-9][0-9]|[0-9][0-9][0-9]) ORCH_EXIT="$_read_rc" ;;
+  esac
+fi
+
 echo "" >&2
 echo "$(date +%FT%T%z | sed 's/\(..\)$/:\1/') [leerie] remote: orchestrator exited — syncing run branch + state to host..." >&2
 
@@ -281,6 +294,7 @@ echo "$(date +%FT%T%z | sed 's/\(..\)$/:\1/') [leerie] remote: orchestrator exit
 if [ -n "$AUTO_FINALIZE_TOKEN" ]; then
   echo "${AUTO_FINALIZE_TOKEN}${ID}" >&2
 fi
+exit "$ORCH_EXIT"
 TAIL_SH
 }
 

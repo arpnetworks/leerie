@@ -531,6 +531,19 @@ next wave starts. Conflicts surface one wave at a time, close to the work
 that caused them — not all at once at the end, where they are far harder to
 untangle.
 
+**Partial-wave integration.** When some subtasks in a wave fail while
+others succeed, the orchestrator integrates the *successful* subtasks
+into the run branch before exiting with the failure diagnostic.
+`integrate_wave` already filters for `status == "complete"` and skips
+failed/blocked subtasks, so partial integration is a matter of
+invocation order: `integrate_wave` runs before `die()`. The wave
+counter (`completed_waves`) is **not** incremented for a
+partially-integrated wave, so `--resume` re-enters the wave.
+Already-integrated subtask branches produce a no-op `git merge
+--no-ff` ("Already up to date.", exit 0) — `integrate.sh` uses `git
+merge --no-ff`, which is idempotent on branches that are already
+ancestors of the run branch.
+
 ### The run branch is the resume contract
 
 The run branch is also the durable record of everything completed so far:
@@ -775,9 +788,10 @@ push + PR sit between them on the host:
    (`0 | 10 | 75`) it calls `scripts/remote/fetch-branch.sh`, which:
    - discovers the completed run-id by scanning `.leerie/runs/*/run.json` on
      the Machine for a `finished_at`-bearing, unpushed entry;
-   - creates a `git bundle` of `leerie/runs/<run-id>` on the Machine and
-     pipes it to the host, where `git fetch` materialises the branch in the
-     host's local repo;
+   - creates a `git bundle` of `leerie/runs/<run-id>` **and all
+     `leerie/subtasks/<run-id>/*` branches present on the Machine** and
+     pipes it to the host, where `git fetch` materialises the branches in
+     the host's local repo;
    - tars `.leerie/runs/<run-id>/` on the Machine and extracts it under
      `$LEERIE_STATE_HOST_DIR/runs/` on the host.
 3. With the run dir now on the host, the trap sources
@@ -793,15 +807,18 @@ push + PR sit between them on the host:
 **Controlled exits write `finished_at` eagerly.** `die()` raises
 `SystemExit`; `main()`'s `except SystemExit` handler writes
 `finished_at` to both `state.json` and `run.json` (best-effort,
-guarded by `st is not None`) before re-raising. This is necessary
-because the Fly tail wrapper always exits 0 — it polls the
-orchestrator pid and has no channel for the orchestrator's exit code —
-so `decide_teardown` takes the clean-exit branch and `fetch_branch`
-needs `finished_at` to discover the run. Without this write, every
-post-setup `die()` (e.g. "unresolved subtasks") triggers the
-sync-failure banner. The value is idempotent on `--resume`:
-`phase_finalize` overwrites it with the real completion time if the
-run succeeds on retry.
+guarded by `st is not None`) before re-raising. It also writes the
+exit code to `orchestrator.exit_code` in the run directory so the
+tail wrapper can propagate it to `decide_teardown`. Without the exit
+code file, the tail wrapper falls back to exit 0 (the pre-exit-code
+behavior) and `decide_teardown` takes the clean-exit branch.
+
+The `finished_at` write remains necessary even with exit code
+propagation: `fetch_branch` needs `finished_at` to discover the run.
+Without this write, every post-setup `die()` (e.g. "unresolved
+subtasks") triggers the sync-failure banner. The value is idempotent
+on `--resume`: `phase_finalize` overwrites it with the real completion
+time if the run succeeds on retry.
 
 **Recovery when the orchestrator dies before `finished_at`.** An
 uncontrolled exit — SIGKILL, OOM, power loss, or any crash that
@@ -828,6 +845,15 @@ has `claude` CLI, the integrator prompt, and seeded auth. Branches
 the integrator cannot resolve (design-conflict or failed) are skipped
 and reported. The collection step runs after the `finished_at` patch
 and before `fetch_branch` streams the result to the host.
+
+**Defense in depth: bundle scope vs. subtree collection.**
+`fetch-branch.sh` bundles subtask branches alongside the run branch so
+that even if integration never ran (crash, OOM, power loss between
+subtask completion and integration), the raw work is recoverable on
+the host. `collect_subtrees_remote` remains the on-machine
+integration mechanism (merging subtask branches into the run branch
+before fetch). The two are complementary: collection integrates; the
+expanded bundle scope preserves.
 
 **`--force`: stop the orchestrator, then collect.** `leerie --finalize
 <run-id> --force` extends the recovery path to runs where the
@@ -1248,11 +1274,20 @@ finishes, not when the orchestrator finishes. The reclassified table:
 
 | Exit | Meaning | Disposition |
 |---|---|---|
-| `0` | tail saw orchestrator exit cleanly via `orchestrator.pid` | destroy after stream-back |
+| `0` | tail saw orchestrator exit cleanly (or could not read exit code) | destroy after stream-back |
 | `EXIT_NEEDS_ANSWERS=10` | clarification (plugin re-runs) | destroy (nothing to inspect) |
 | `75` (EX_TEMPFAIL) | rate-limit, parse-fail | destroy (state in run branch; cheaper to re-provision) |
 | `130` / `143` | host-side SIGINT / SIGTERM | **detach: leave machine alone, print reattach hints** |
-| any other non-zero | worker/orchestrator failure | **pause: stop machine, write sidecar, notify** |
+| any other non-zero | worker/orchestrator failure (`die()`, etc.) | **pause: stop machine, write sidecar, notify** |
+
+The tail wrapper reads the orchestrator's exit code from
+`orchestrator.exit_code` (written by the `except SystemExit` handler
+in `main()`) and uses it as its own exit code. When the file is absent
+(OOM, SIGKILL, or a crash before the handler ran), the wrapper falls
+back to exit 0 — the same behavior as the pre-exit-code era — so
+uncontrolled exits still route through the clean-exit branch where
+`fetch_branch` bundles whatever is on the run branch (and any subtask
+branches) before destroying.
 
 The Ctrl-C row is the load-bearing change. Earlier versions of leerie
 treated rc=130 as "user cancelled, destroy the machine" — but with the

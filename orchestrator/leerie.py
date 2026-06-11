@@ -13412,14 +13412,12 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
 
         blocked = [s for s, r in results.items()
                    if r.get("status") in ("blocked", "failed")]
-        if blocked:
-            st.data["blocked"] = {s: results[s].get("blocker")
-                                  or results[s].get("summary") for s in blocked}
-            st.save()
-            die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
-                f"See {st.path}; resolve and re-run with --resume.")
 
-        await integrate_wave(wave, results, leerie_dir, caps, st, models, efforts)
+        # Integrate successful subtasks BEFORE dying on failures
+        # (DESIGN §3 *Partial-wave integration*). integrate_wave already
+        # filters for status=="complete", so passing the full wave is safe.
+        integrated = await integrate_wave(
+            wave, results, leerie_dir, caps, st, models, efforts)
 
         # Deterministic post-integration safety net: an unresolved
         # conflict marker means integration broke the tree. Per-subtask
@@ -13431,6 +13429,16 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             die(f"wave {wi + 1}: {marker_err}\n"
                 f"Resolve manually in {staging_path}, commit, "
                 "then re-run with --resume.")
+
+        if blocked:
+            if integrated:
+                log(f"  integrated {len(integrated)} successful subtask(s) "
+                    f"before reporting {len(blocked)} failure(s)")
+            st.data["blocked"] = {s: results[s].get("blocker")
+                                  or results[s].get("summary") for s in blocked}
+            st.save()
+            die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
+                f"See {st.path}; resolve and re-run with --resume.")
 
         st.data["completed_waves"] = wi + 1
         st.save()
@@ -14845,7 +14853,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.
         signum = getattr(signal, str(e), None)
         exit_code = (128 + int(signum)) if signum else 1
-    except SystemExit:
+    except SystemExit as e:
         # `die()` raises SystemExit. It's the *clean* exit mechanism for
         # known failure modes (preflight gh missing, classifier produced
         # no categories, integrator design-conflict, ...). Don't treat it
@@ -14855,17 +14863,21 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # preflight die() before setup-run.sh ran).
         abnormal = True
         full_purge = False
-        # On Fly the tail wrapper exits 0 regardless of the orchestrator's
-        # exit code, so decide_teardown takes the clean-exit branch and
-        # fetch_branch's discovery script requires finished_at in run.json.
-        # Without this write, every post-setup die() leaves the run
-        # undiscoverable and the sync fails with "no completed unpushed
-        # run found on machine."
+        # fetch_branch's discovery script requires finished_at in
+        # run.json. Without this write, every post-setup die() leaves
+        # the run undiscoverable and the sync fails with "no completed
+        # unpushed run found on machine."
+        # The exit code file lets the tail wrapper propagate the
+        # orchestrator's exit code to decide_teardown so failed runs
+        # reach the pause branch (DESIGN §6 teardown disposition table).
         if st is not None and st.run_dir is not None:
             try:
                 st.data["finished_at"] = now()
                 st.save()
                 _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
+                _ec = e.code if e.code is not None else 1
+                (st.run_dir / "orchestrator.exit_code").write_text(
+                    str(_ec) + "\n")
             except Exception:
                 pass
         raise
@@ -14887,6 +14899,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 # Cleanup failure is non-fatal; the user can re-run
                 # `scripts/cleanup.sh --run-id <id>` manually.
                 log(f"cleanup failed (non-fatal): {cleanup_err}")
+    # Write exit code for the tail wrapper (DESIGN §6 teardown
+    # disposition table). The SystemExit handler writes it eagerly
+    # (before re-raise); this covers the non-raise paths
+    # (KeyboardInterrupt, InterruptedBySignal, normal exit).
+    if st is not None and st.run_dir is not None:
+        try:
+            (st.run_dir / "orchestrator.exit_code").write_text(
+                str(exit_code) + "\n")
+        except Exception:
+            pass
     if exit_message is not None:
         die(exit_message, code=exit_code)
     if exit_code != 0:

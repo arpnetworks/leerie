@@ -201,31 +201,77 @@ print(best[3])
   if _fetch_machine_exec git -C /work rev-parse --verify "refs/heads/$run_branch" >/dev/null 2>&1; then
     _branch_present="true"
   fi
-  if [ "$_branch_present" = "false" ]; then
+
+  # Discover per-subtask branches on the machine (defense-in-depth:
+  # DESIGN §6 *Defense in depth — bundle scope vs. subtree collection*).
+  # Even if integration never ran, bundling subtask branches preserves
+  # the raw work on the host.
+  local _subtask_refs=""
+  local _subtask_prefix="leerie/subtasks/${run_id}/"
+  _subtask_refs="$(_fetch_machine_exec \
+    git -C /work for-each-ref --format='%(refname:short)' \
+    "refs/heads/${_subtask_prefix}" 2>/dev/null || true)"
+
+  if [ "$_branch_present" = "false" ] && [ -z "$_subtask_refs" ]; then
     remote_log "remote: run branch $run_branch not present on machine; skipping bundle"
   else
-    # Create a bundle on the machine containing the run branch and all
-    # its ancestry, then pipe it to the host and fetch from it.  The host
-    # already has all history from origin (seeded via clone), so the
-    # bundle resolves cleanly against the local repo objects.
-    #
-    # Bundle path is a tmpfile on the machine; we stream via stdout and
-    # consume on the host side via `git fetch` reading from a temp
-    # bundle file.
+    # Build the list of refs to bundle: run branch (if present) + any
+    # subtask branches. git bundle create fails entirely if any ref is
+    # missing (rc=128), so we only include refs confirmed present.
+    local _bundle_refs=""
+    if [ "$_branch_present" = "true" ]; then
+      _bundle_refs="$run_branch"
+    fi
+    local _ref
+    for _ref in $_subtask_refs; do
+      [ -n "$_ref" ] || continue
+      _bundle_refs="$_bundle_refs $_ref"
+    done
+    # Trim leading space
+    _bundle_refs="${_bundle_refs# }"
+
     local host_bundle
     host_bundle="$(mktemp "${TMPDIR:-/tmp}/leerie-bundle-XXXXXX.bundle")"
     # shellcheck disable=SC2064
     trap "rm -f '$host_bundle'" RETURN
 
-    remote_log "remote: streaming git bundle for $run_branch ..."
+    local _subtask_count=0
+    for _ref in $_subtask_refs; do
+      [ -n "$_ref" ] || continue
+      _subtask_count=$((_subtask_count + 1))
+    done
+    if [ "$_branch_present" = "true" ] && [ "$_subtask_count" -gt 0 ]; then
+      remote_log "remote: streaming git bundle for $run_branch (+ $_subtask_count subtask branch(es)) ..."
+    elif [ "$_branch_present" = "true" ]; then
+      remote_log "remote: streaming git bundle for $run_branch ..."
+    else
+      remote_log "remote: streaming git bundle for $_subtask_count subtask branch(es) (run branch absent) ..."
+    fi
+
     # git bundle create writes the bundle to stdout when given "-" as
     # the file. flyctl machine exec streams that stdout back to the host.
+    # shellcheck disable=SC2086
     if ! _fetch_machine_exec \
-         git -C /work bundle create - "$run_branch" \
+         git -C /work bundle create - $_bundle_refs \
          > "$host_bundle" 2>/dev/null; then
-      remote_log "fetch_branch: failed to create git bundle on machine $machine_id"
-      rm -f "$host_bundle"
-      return 1
+      # Fallback: if bundling all refs failed (race with concurrent
+      # cleanup deleting a subtask branch between discovery and bundle),
+      # retry with just the run branch.
+      if [ "$_branch_present" = "true" ] && [ "$_subtask_count" -gt 0 ]; then
+        remote_log "fetch_branch: full bundle failed; retrying with run branch only"
+        if ! _fetch_machine_exec \
+             git -C /work bundle create - "$run_branch" \
+             > "$host_bundle" 2>/dev/null; then
+          remote_log "fetch_branch: failed to create git bundle on machine $machine_id"
+          rm -f "$host_bundle"
+          return 1
+        fi
+        _subtask_refs=""
+      else
+        remote_log "fetch_branch: failed to create git bundle on machine $machine_id"
+        rm -f "$host_bundle"
+        return 1
+      fi
     fi
 
     if [ ! -s "$host_bundle" ]; then
@@ -241,16 +287,29 @@ print(best[3])
       return 1
     fi
 
-    # Fetch the run branch into the host repo from the bundle.
-    # `git fetch <bundle> <refspec>` creates the local branch.
+    # Build refspecs: +<ref>:<ref> for each bundled branch.
+    local _fetch_refspecs=""
+    if [ "$_branch_present" = "true" ]; then
+      _fetch_refspecs="+$run_branch:$run_branch"
+    fi
+    for _ref in $_subtask_refs; do
+      [ -n "$_ref" ] || continue
+      _fetch_refspecs="$_fetch_refspecs +$_ref:$_ref"
+    done
+
+    # shellcheck disable=SC2086
     if ! git -C "$USER_REPO" fetch "$host_bundle" \
-           "+$run_branch:$run_branch" 2>/dev/null; then
+           $_fetch_refspecs 2>/dev/null; then
       remote_log "fetch_branch: git fetch from bundle failed"
       rm -f "$host_bundle"
       return 1
     fi
     rm -f "$host_bundle"
-    remote_log "remote: run branch $run_branch fetched to host"
+    if [ "$_branch_present" = "true" ]; then
+      remote_log "remote: run branch $run_branch fetched to host"
+    else
+      remote_log "remote: subtask branches fetched to host"
+    fi
   fi
 
   # --- Step 3: stream the .leerie run state directory back -------------------
