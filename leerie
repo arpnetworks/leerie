@@ -2605,7 +2605,7 @@ try:
     except BlockingIOError:
         sys.stderr.write("orchestrator already running for run " + run_id + "\\n")
         sys.stderr.write("Tail the existing run instead of spawning a duplicate:\\n")
-        sys.stderr.write("  leerie --resume " + run_id + "\\n")
+        sys.stderr.write("  leerie --resume " + run_id + " --runtime fly\\n")
         sys.exit(75)
 finally:
     os.close(_probe_fd)

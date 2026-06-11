@@ -420,7 +420,7 @@ PYEOF
       local spid="${rest#*:}"
       remote_log "force-finalize: STOP-FAILED — could not kill orchestrator pid $spid for run $rid on machine $machine."
       remote_log "  The process did not die after SIGTERM + SIGKILL. Inspect manually with"
-      remote_log "  \`leerie --resume <run-id> --shell\`, then \`--kill\` when done."
+      remote_log "  \`leerie --resume <run-id> --shell --runtime fly\`, then \`--kill --runtime fly\` when done."
       return 1
       ;;
     REFUSE-ALIVE-SCAN:*)
@@ -429,8 +429,8 @@ PYEOF
       local comm="${rest#*:}"
       remote_log "force-finalize: REFUSED — /proc scan found live orchestrator pid $pid ($comm) for this run on machine $machine."
       remote_log "  The pid file may point at a stillborn process (see DESIGN §6 *Single owner per run dir*); the scan is authoritative."
-      remote_log "  Use \`leerie --kill <run-id>\` if you really want to abandon the run, or"
-      remote_log "  \`leerie --resume <run-id>\` to tail/inspect what it's doing first."
+      remote_log "  Use \`leerie --kill <run-id> --runtime fly\` if you really want to abandon the run, or"
+      remote_log "  \`leerie --resume <run-id> --runtime fly\` to tail/inspect what it's doing first."
       return 1
       ;;
     REFUSE-ALIVE:*)
@@ -438,21 +438,21 @@ PYEOF
       local pid="${rest%%:*}"
       local comm="${rest#*:}"
       remote_log "force-finalize: REFUSED — orchestrator pid $pid ($comm) is still alive on machine $machine."
-      remote_log "  Use \`leerie --kill <run-id>\` if you really want to abandon the run, or"
-      remote_log "  \`leerie --resume <run-id>\` to tail/inspect what it's doing first."
+      remote_log "  Use \`leerie --kill <run-id> --runtime fly\` if you really want to abandon the run, or"
+      remote_log "  \`leerie --resume <run-id> --runtime fly\` to tail/inspect what it's doing first."
       return 1
       ;;
     REFUSE-NOPID:*)
       local rid="${sentinel#REFUSE-NOPID:}"
       remote_log "force-finalize: REFUSED — run $rid has no orchestrator.pid on machine $machine."
       remote_log "  This usually means the orchestrator failed very early (before phase_classify)."
-      remote_log "  Attach manually with \`leerie --resume <run-id> --shell\` to inspect, then \`--kill\` when done."
+      remote_log "  Attach manually with \`leerie --resume <run-id> --shell --runtime fly\` to inspect, then \`--kill --runtime fly\` when done."
       return 1
       ;;
     REFUSE-MULTI:*)
       local count="${sentinel#REFUSE-MULTI:}"
       remote_log "force-finalize: REFUSED — $count run dirs on machine $machine; can't pick one."
-      remote_log "  Attach manually with \`leerie --resume <run-id> --shell\` to disambiguate."
+      remote_log "  Attach manually with \`leerie --resume <run-id> --shell --runtime fly\` to disambiguate."
       return 1
       ;;
     REFUSE-NONE)

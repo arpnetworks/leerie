@@ -1297,9 +1297,10 @@ on Ctrl-C would be exactly the behavior the detach was introduced to
 prevent. The launcher therefore prints a small banner listing the
 reattach, pause, and destroy commands and exits without touching the
 machine. The user can then come back hours or days later and either
-`leerie --resume <run-id>` to watch progress (the default tails the
-orchestrator log; `--shell` opens a bash shell instead), `leerie
---stop` to pause cleanly, or `leerie --kill` to explicitly destroy.
+`leerie --resume <run-id> --runtime fly` to watch progress (the
+default tails the orchestrator log; `--shell` opens a bash shell
+instead), `leerie --stop --runtime fly` to pause cleanly, or
+`leerie --kill --runtime fly` to explicitly destroy.
 
 The decision lives in the launcher (`scripts/remote/provision.sh`'s
 EXIT trap), not the orchestrator. Per §6 *Worker subtree termination*
@@ -1367,8 +1368,9 @@ Six sidecar fields on `run.json` capture remote lifecycle state:
 - `sync_failed_at` — ISO timestamp written when the clean-exit branch
   of `decide_teardown` ran `fetch_branch` and it failed. The machine
   is left RUNNING (not stopped — see below); the user recovers by
-  running `leerie --finalize <id>` (retry sync + push) or
-  `leerie --kill <id>` (destroy after manually salvaging work).
+  running `leerie --finalize <id> --runtime fly` (retry sync + push)
+  or `leerie --kill <id> --runtime fly` (destroy after manually
+  salvaging work).
 - `sync_fail_reason` — short tag accompanying `sync_failed_at`
   (`sync-failed-on-clean-exit`).
 
@@ -1404,12 +1406,12 @@ confirmed sync success does it destroy. On any sync failure
 LEFT RUNNING — not stopped — and a multi-line WARNING points the
 user at three recovery commands:
 
-  1. `leerie --finalize <run-id>`  (retry sync + push)
-  2. `leerie --resume <run-id>`    (manual inspection — attaches to the
-                                  live orchestrator's log, or drops into
-                                  a shell with `--shell`)
-  3. `leerie --kill <run-id>`      (destroy AFTER user confirms
-                                  work is safely on host)
+  1. `leerie --finalize <run-id> --runtime fly`  (retry sync + push)
+  2. `leerie --resume <run-id> --runtime fly`    (manual inspection —
+                                  attaches to the live orchestrator's
+                                  log, or drops into a shell with `--shell`)
+  3. `leerie --kill <run-id> --runtime fly`      (destroy AFTER user
+                                  confirms work is safely on host)
 
 The user owns the machine in this state. leerie does NOT auto-
 destroy after a successful manual finalize either — the user must
@@ -1423,9 +1425,9 @@ remote run lifecycle, each doing exactly one thing:
 | Verb | Effect |
 |---|---|
 | `leerie "task" --runtime fly` | Provision machine, detach orchestrator, tail log |
-| `leerie --stop <run-id>` | Clean pause (`flyctl machine stop`); resumable |
+| `leerie --stop <run-id> --runtime fly` | Clean pause (`flyctl machine stop`); resumable |
 | `leerie --resume <id> --runtime fly` | Smart resume — wakes a paused machine, attaches to a live orchestrator, or relaunches against an alive-but-orphaned machine, automatically |
-| `leerie --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
+| `leerie --kill <run-id> --runtime fly` | Destroy machine, mark run terminated (irreversible) |
 
 Plus `leerie --list` (unified across local and remote, with `--status
 <state>` and `--runtime <local|fly>` filtering as orthogonal axes).
