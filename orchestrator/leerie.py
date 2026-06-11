@@ -14180,7 +14180,7 @@ launcher verbs (handled before the container starts):
   --shell               drop into bash on resume instead of tailing the log
   --auto-finalize       auto-finalize on clean orchestrator exit during resume
   --no-re-seed          skip auto-reseed on resume
-  --fly-disk-gb N       provision a Fly volume of N GB
+  --fly-disk-gb N       Fly volume size in GB (default 8 on --runtime fly)
   --state-dir PATH      override per-repo state directory
   --no-runtime-install  skip container runtime auto-install
   --no-auto-publish     skip image publish probe

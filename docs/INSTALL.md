@@ -276,16 +276,16 @@ and delegates the entire worker lifecycle to the Fly.io API. The
 local container runtime (Colima on macOS, containerd on Linux) is
 only needed for the default `local` runtime.
 
-**Disk sizing.** By default Fly Machines run on the platform's default
-ephemeral rootfs (capped at 2,000 IOPS / 8 MiB/s). If a run errors out
-with `ENOSPC: no space left on device` (typically during parallel
-waves when many `claude -p` workers accumulate session-env state and
-per-subtask worktrees at once) or if you need to pause a run and
-resume it days later, set `FLY_VM_DISK_GB` (or pass `--fly-disk-gb N`,
-or put `fly_disk_gb = N` in `leerie.toml`). That provisions a per-
-machine Fly volume sized at N GB and mounts it at `/work` — the path
-that holds the seeded repo, `.leerie/runs/<id>/` state, and the per-
-subtask worktrees that dominate disk growth:
+**Disk sizing.** Every `--runtime fly` run gets a per-machine Fly
+volume (default 8 GB) mounted at `/work` — the path that holds the
+seeded repo, `.leerie/runs/<id>/` state, and the per-subtask worktrees
+that dominate disk growth. The volume survives `machine stop` so the
+pause-on-failure contract holds across arbitrarily long pauses. If a
+run errors out with `ENOSPC: no space left on device` (typically
+during parallel waves when many `claude -p` workers accumulate
+session-env state and per-subtask worktrees at once), increase the
+volume size via `FLY_VM_DISK_GB` (or `--fly-disk-gb N`, or
+`fly_disk_gb = N` in `leerie.toml`):
 
 ```bash
 FLY_VM_DISK_GB=30 leerie 'task' --runtime fly
@@ -296,9 +296,7 @@ leerie 'task' --runtime fly --fly-disk-gb 50
 The volume is created at machine-provision time and destroyed when the
 machine is destroyed (clean exit or `leerie --kill`), so steady-state
 storage cost is zero. While a paused run is on its volume, Fly charges
-per-GB-month — minimal at typical sizes but non-zero. If you regularly
-run very long-running tasks or want the §6 *Remote pause-on-failure*
-contract to hold across long pauses, set this value.
+per-GB-month — minimal at typical sizes but non-zero.
 
 **Recovery if an orchestrator dies mid-run.** If a run errors out and
 the post-run sync fails (e.g. the machine ran out of disk before the

@@ -1320,12 +1320,14 @@ on the machine's filesystem by the time a pause fires.
 
 ### Remote disk policy
 
-**Disk durability is conditional on `FLY_VM_DISK_GB`.** When the env
-var is set, `provision.sh` creates a per-machine Fly volume mounted at
-`/work` and the pause-on-failure contract above is unconditional — the
-volume survives `machine stop` and reattaches on `machine start`,
-indefinitely. The mount target is `/work` because that's where the
-durable workload lives: the seeded repo, the run-state tree under
+**Every Fly-path run gets a per-machine volume by default.**
+`FLY_VM_DISK_GB` defaults to `8` when `RUNTIME=fly` and the user has
+not set it explicitly (CLI / env / toml). `provision.sh` creates the
+volume before the machine, mounts it at `/work`, and the
+pause-on-failure contract is unconditional — the volume survives
+`machine stop` and reattaches on `machine start`, indefinitely. The
+mount target is `/work` because that's where the durable workload
+lives: the seeded repo, the run-state tree under
 `.leerie/runs/<run-id>/`, and the per-subtask worktrees that dominate
 the run's disk footprint. The caches under `/home/leerie/.cache/...`
 and the auth bundle at `/home/leerie/.claude` are bounded in size and
@@ -1338,20 +1340,11 @@ pnpm-store or cargo registry can still hit the rootfs cap on
 unusually large monorepos. The historical ENOSPC mode was per-
 subtask worktree accumulation, not cache growth, so prioritizing
 worktrees on the volume is the right default; runs that
-empirically exhaust caches should size `FLY_VM_DISK_GB` higher and
-treat the spillover as a rootfs problem to solve separately. When
-`FLY_VM_DISK_GB` is **unset** (the default), the machine runs on its
-ephemeral rootfs disk with no volume. A short `machine stop` window
-preserves the rootfs and `start` resumes normally; but a sufficiently
-long stop, or any Fly-side reclamation, discards the rootfs and the
-run dir with it. Users running anything they intend to pause-and-
-resume across a long window should set `FLY_VM_DISK_GB`. The same env
-var doubles as the recovery for runs that hit ENOSPC mid-execution —
-historically ENOSPC was reached by per-worker worktree accumulation
-exhausting the rootfs's ~8 GiB size cap, which the volume relieves
-directly. The rootfs's separate throughput cap (2,000 IOPS / 8 MiB/s)
-compounds the failure by slowing the spillover; the volume accelerates
-it as a side-effect since per-machine tiers run 4k–32k IOPS.
+empirically exhaust caches should set `FLY_VM_DISK_GB` higher and
+treat the spillover as a rootfs problem to solve separately. The
+rootfs's throughput cap (2,000 IOPS / 8 MiB/s) compounds disk
+pressure by slowing spillover; the volume accelerates it as a
+side-effect since per-machine tiers run 4k–32k IOPS.
 
 Six sidecar fields on `run.json` capture remote lifecycle state:
 

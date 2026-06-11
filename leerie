@@ -1311,12 +1311,12 @@ for arg in "$@"; do
   fi
 done
 
-# --- FLY_VM_DISK_GB (opt-in per-machine Fly volume size in GB) ------------
+# --- FLY_VM_DISK_GB (per-machine Fly volume size in GB) -------------------
 # Resolution ladder (highest → lowest):
 #   1. --fly-disk-gb N / --fly-disk-gb=N on the CLI
 #   2. $FLY_VM_DISK_GB already set in the env
 #   3. fly_disk_gb = N in leerie.toml
-#   4. unset (provision.sh skips the volume; machine uses Fly default disk)
+#   4. default: 8 GB when RUNTIME=fly, unset when RUNTIME=local
 #
 # When set, provision.sh creates a per-machine Fly volume sized at N GB,
 # mounts it at /home/leerie, persists the volume_id into run.json, and
@@ -1360,10 +1360,15 @@ if [ -n "${FLY_VM_DISK_GB:-}" ]; then
       exit 1
       ;;
     0)
-      remote_log "FLY_VM_DISK_GB=0 is invalid; unset the var to use Fly's default disk"
+      remote_log "FLY_VM_DISK_GB=0 is invalid; minimum is 1 (GB)"
       exit 1
       ;;
   esac
+  export FLY_VM_DISK_GB
+fi
+# Default to 8 GB when running on Fly and no explicit value was given.
+if [ "$RUNTIME" = "fly" ] && [ -z "${FLY_VM_DISK_GB:-}" ]; then
+  FLY_VM_DISK_GB=8
   export FLY_VM_DISK_GB
 fi
 
