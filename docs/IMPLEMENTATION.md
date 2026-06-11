@@ -2492,7 +2492,9 @@ When `planner_samples > 1`, `phase_plan` runs N independent
 `_select_best_planner_sample(samples, repo_root, domain)` mechanically
 selects the winner: fewest `check_planner_output` issues, tiebreak on
 subtask count (more = better coverage), tiebreak on first sample
-(determinism). No LLM merge judge — avoids self-bias.
+(determinism). No LLM merge judge — avoids self-bias. A crashed sample
+(worker returned `None`) is dropped from the candidate set before
+selection. If all samples for a domain crash, the run aborts.
 
 ### Cap resolvers
 

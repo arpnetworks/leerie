@@ -8374,7 +8374,7 @@ async def phase_plan(task: str, st: State, caps: dict,
         log(f"  extracted {len(task_file_items)} structural items "
             "from task-referenced files")
 
-    async def plan_one(category: str, sample_idx: int = 0) -> dict:
+    async def plan_one(category: str, sample_idx: int = 0) -> dict | None:
         async with sem:
             prefix = f"{CATEGORY_ABBREV[category]}-"
             sid = (f"planner-{category}-s{sample_idx}" if n_samples > 1
@@ -8426,7 +8426,12 @@ async def phase_plan(task: str, st: State, caps: dict,
                 make_feedback_prompt=_on_feedback,
             )
             if result is None:
-                die(f"planner for {category} crashed and produced no result")
+                if n_samples > 1:
+                    log(f"  planner-{category}: crashed and produced "
+                        "no result")
+                    return None
+                die(f"planner for {category} crashed and produced "
+                    "no result")
             for w in gate_warnings:
                 log(f"  planner-{category}: {w}")
             return result
@@ -8450,11 +8455,15 @@ async def phase_plan(task: str, st: State, caps: dict,
 
         by_category: dict[str, list[dict]] = {}
         for (c, _s_idx), result in zip(coro_keys, all_results):
-            by_category.setdefault(c, []).append(result)
+            if result is not None:
+                by_category.setdefault(c, []).append(result)
 
         plans = []
         for c in cats:
-            samples = by_category[c]
+            samples = by_category.get(c, [])
+            if not samples:
+                die(f"all {n_samples} planner samples for {c} crashed "
+                    "— no plan produced")
             best = _select_best_planner_sample(
                 samples, repo_root, c)
             plans.append(best)

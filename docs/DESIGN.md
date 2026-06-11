@@ -1728,7 +1728,9 @@ artifact to hand off — there is nothing for a successor to continue from — s
 their hard failure aborts the run with state saved for `--resume`. The
 **conformer** has commits but its phase is advisory, so a hard failure surfaces
 as a warning, not an abort. The rule is general: salvage if there is something
-to salvage; abort cleanly otherwise.
+to salvage; abort cleanly otherwise. When `planner_samples > 1`, a crashed
+sample is dropped and the surviving samples for that domain proceed to
+selection; the abort fires only when all samples for a domain fail.
 
 ---
 
