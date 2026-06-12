@@ -13433,6 +13433,13 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"{len(wave)} subtask{'s' if len(wave) != 1 else ''}")
 
+        # Clear stale terminal status so _get_progress counts retried
+        # subtasks as "running" (absent = running per _get_progress).
+        ss = st.data.get("subtask_status", {})
+        cleared = [sid for sid in remaining if ss.pop(sid, None) is not None]
+        if cleared:
+            st.save()
+
         pairs = await gather_or_cancel(*(settle_one(sid) for sid in remaining))
         results: dict[str, dict] = dict(pairs)
 

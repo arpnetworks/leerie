@@ -79,6 +79,22 @@ def test_failed_skips_conformer_check(leerie):
     assert leerie._get_progress(st) == (0, 0, 1, 1, 1)
 
 
+def test_cleared_failed_status_counts_as_running(leerie):
+    """On --resume, phase_execute pops stale failed/blocked entries from
+    subtask_status before dispatching retries. The absent key should
+    make _get_progress count the subtask as running, not done."""
+    st = SimpleNamespace(data={
+        "waves": [["a", "b", "c"]],
+        "subtask_status": {"a": "complete", "b": "complete"},
+        "conformance": {
+            "a": {"result": None, "warnings": []},
+            "b": {"result": None, "warnings": []},
+        },
+    })
+    # c was "failed" but popped before retry — absent = running
+    assert leerie._get_progress(st) == (1, 0, 2, 1, 1)
+
+
 def test_wave_index_advances_with_completed_waves(leerie):
     """`completed_waves` is incremented after each wave settles. The
     in-flight wave is `completed_waves + 1`, and counts are restricted
