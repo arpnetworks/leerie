@@ -550,7 +550,10 @@ The run branch is also the durable record of everything completed so far:
 every integrated wave is a commit on it. This is what `--resume` is built on.
 Run state records *which wave* to resume from; the run branch holds *the
 work* every prior wave produced. The two together are the entire resume
-contract.
+contract. Within a wave, `phase_execute` skips subtasks whose
+`subtask_status` is already `complete` — only failed or blocked
+subtasks are re-run. When every subtask in a wave is already complete,
+the wave is skipped entirely and `completed_waves` is advanced.
 
 This places one hard requirement on the design: **a run branch, once
 created, is never reset.** Setup creates it only if it does not already

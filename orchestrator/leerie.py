@@ -13413,10 +13413,27 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     start = st.data.get("completed_waves", 0)
     for wi in range(start, len(waves)):
         wave = waves[wi]
-        log(f"phase 5: wave {wi + 1} of {len(waves)} — "
-            f"{len(wave)} subtask{'s' if len(wave) != 1 else ''}")
+        # On --resume, skip subtasks already completed in a prior
+        # invocation.  Failed/blocked subtasks are retried — that is
+        # the point of --resume.
+        prior = st.data.get("subtask_status", {})
+        remaining = [sid for sid in wave if prior.get(sid) != "complete"]
+        if not remaining:
+            log(f"phase 5: wave {wi + 1} of {len(waves)} — "
+                f"all {len(wave)} subtask(s) already complete, skipping")
+            st.data["completed_waves"] = wi + 1
+            st.save()
+            continue
+        skipped = len(wave) - len(remaining)
+        if skipped:
+            log(f"phase 5: wave {wi + 1} of {len(waves)} — "
+                f"{len(remaining)} subtask(s) to run "
+                f"({skipped} already complete)")
+        else:
+            log(f"phase 5: wave {wi + 1} of {len(waves)} — "
+                f"{len(wave)} subtask{'s' if len(wave) != 1 else ''}")
 
-        pairs = await gather_or_cancel(*(settle_one(sid) for sid in wave))
+        pairs = await gather_or_cancel(*(settle_one(sid) for sid in remaining))
         results: dict[str, dict] = dict(pairs)
 
         blocked = [s for s, r in results.items()
