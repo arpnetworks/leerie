@@ -467,6 +467,109 @@ def test_resume_machine_refuses_destroyed_machine(tmp_path: Path):
     assert "destroyed" in result.stderr or "no longer recoverable" in result.stderr
 
 
+def test_resume_machine_updates_image_on_version_drift(tmp_path: Path):
+    """When image_tag in run.json differs from FLY_IMAGE_TAG, resume_machine
+    calls flyctl machine update --image before starting."""
+    log = tmp_path / "flyctl.log"
+    fake = tmp_path / "flyctl"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> "{log}"\n'
+        "case \"$1 $2\" in\n"
+        "  'auth status') exit 0 ;;\n"
+        "  'machine update') exit 0 ;;\n"
+        "  'machine start') exit 0 ;;\n"
+        "  'machine status') printf 'Machine ID: mach-001\\nState: started\\n'; exit 0 ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    user_repo = tmp_path / "user-repo"
+    run_dir = user_repo / ".leerie" / "runs" / "test-002"
+    run_dir.mkdir(parents=True)
+    sidecar = run_dir / "run.json"
+    sidecar.write_text(json.dumps({
+        "run_id": "test-002",
+        "paused_at": "2026-06-01T10:00:00+00:00",
+        "fly_machine_id": "mach-upgrade",
+        "pause_reason": "worker-error",
+        "image_tag": "registry.fly.io/leerie:0.6.6",
+    }))
+    result = _run_bash(
+        f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-upgrade",
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "USER_REPO": str(user_repo),
+            "LEERIE_RUN_ID": "test-002",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:0.6.7",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    invocations = log.read_text()
+    assert "machine update mach-upgrade --image registry.fly.io/leerie:0.6.7" in invocations
+    assert "machine start mach-upgrade" in invocations
+    data = json.loads(sidecar.read_text())
+    assert data["image_tag"] == "registry.fly.io/leerie:0.6.7"
+    assert data["paused_at"] is None
+
+
+def test_resume_machine_skips_image_update_when_same_version(tmp_path: Path):
+    """When image_tag matches FLY_IMAGE_TAG, no machine update is issued."""
+    _make_flyctl_stub(tmp_path, behavior="happy")
+    user_repo = tmp_path / "user-repo"
+    run_dir = user_repo / ".leerie" / "runs" / "test-003"
+    run_dir.mkdir(parents=True)
+    sidecar = run_dir / "run.json"
+    sidecar.write_text(json.dumps({
+        "run_id": "test-003",
+        "paused_at": "2026-06-01T10:00:00+00:00",
+        "fly_machine_id": "mach-same",
+        "pause_reason": "worker-error",
+        "image_tag": "registry.fly.io/leerie:0.6.7",
+    }))
+    result = _run_bash(
+        f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-same",
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "USER_REPO": str(user_repo),
+            "LEERIE_RUN_ID": "test-003",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:0.6.7",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    invocations = (tmp_path / "flyctl.log").read_text()
+    assert "machine update" not in invocations
+    assert "machine start mach-same" in invocations
+
+
+def test_resume_machine_skips_image_update_when_no_stored_tag(tmp_path: Path):
+    """Backfill: runs provisioned before image_tag existed have no stored
+    tag — resume_machine skips the update (no false positive)."""
+    _make_flyctl_stub(tmp_path, behavior="happy")
+    user_repo = tmp_path / "user-repo"
+    run_dir = user_repo / ".leerie" / "runs" / "test-004"
+    run_dir.mkdir(parents=True)
+    sidecar = run_dir / "run.json"
+    sidecar.write_text(json.dumps({
+        "run_id": "test-004",
+        "paused_at": "2026-06-01T10:00:00+00:00",
+        "fly_machine_id": "mach-legacy",
+        "pause_reason": "worker-error",
+    }))
+    result = _run_bash(
+        f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-legacy",
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "USER_REPO": str(user_repo),
+            "LEERIE_RUN_ID": "test-004",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:0.6.7",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    invocations = (tmp_path / "flyctl.log").read_text()
+    assert "machine update" not in invocations
+
+
 # --- coupling: launcher pause-print includes the resume command ----------
 
 def test_launcher_resume_command_format_matches_decide_teardown():

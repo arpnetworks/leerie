@@ -15,9 +15,11 @@
 #
 # Environment variables (set by the launcher):
 #
-#   LEERIE_FLY_APP — Fly.io app name (default: "leerie")
-#   USER_REPO    — host-side path to the user's repo (for sidecar I/O)
-#   LEERIE_RUN_ID  — the run id being resumed
+#   LEERIE_FLY_APP        — Fly.io app name (default: "leerie")
+#   FLY_IMAGE_TAG         — current image tag (registry.fly.io/<app>:<ver>)
+#   USER_REPO             — host-side path to the user's repo (for sidecar I/O)
+#   LEERIE_STATE_HOST_DIR — host-side state directory (preferred over USER_REPO)
+#   LEERIE_RUN_ID         — the run id being resumed
 #
 # Exports:
 #   LEERIE_MACHINE_ID — the resumed machine's ID
@@ -40,6 +42,43 @@ resume_machine() {
   fi
   local fly_app="${LEERIE_FLY_APP:-leerie}"
   remote_log "remote: resuming machine $mid (app=$fly_app)..."
+
+  # Resolve sidecar path once — used by the image-update block below
+  # and by the pause-sentinel clearing at the end.
+  local sidecar=""
+  if [ -n "${LEERIE_RUN_ID:-}" ]; then
+    if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+      sidecar="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json"
+    elif [ -n "${USER_REPO:-}" ]; then
+      sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
+    fi
+  fi
+
+  # Update machine image if the leerie version changed since provision.
+  # The machine is stopped; --skip-start changes the image config without
+  # booting. The subsequent flyctl machine start (below) boots with the
+  # new image. Volumes at /work survive the update — only the ephemeral
+  # rootfs is replaced (seed_auth re-provisions that on every resume).
+  local current_tag="${FLY_IMAGE_TAG:-}"
+  if [ -n "$current_tag" ] && [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
+    local stored_tag=""
+    stored_tag="$(python3 -c "
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get('image_tag', ''))
+except Exception:
+    pass
+" "$sidecar" 2>/dev/null || true)"
+    if [ -n "$stored_tag" ] && [ "$stored_tag" != "$current_tag" ]; then
+      remote_log "remote: updating machine $mid image: $stored_tag → $current_tag"
+      if ! flyctl machine update "$mid" --image "$current_tag" \
+           --app "$fly_app" --skip-start -y 2>&1; then
+        remote_log "warning: image update failed; resuming with existing image"
+      else
+        update_run_json "$sidecar" image_tag "$current_tag" || true
+      fi
+    fi
+  fi
 
   if ! flyctl machine start "$mid" --app "$fly_app" >/dev/null 2>&1; then
     # The machine might already be running (idempotency on retry).
@@ -88,13 +127,10 @@ resume_machine() {
 
   # Clear the pause sentinels so the run no longer renders as
   # paused in `leerie --list --status paused` once the resume succeeds.
-  if [ -n "${USER_REPO:-}" ] && [ -n "${LEERIE_RUN_ID:-}" ]; then
-    local sidecar="$USER_REPO/.leerie/runs/$LEERIE_RUN_ID/run.json"
-    if [ -f "$sidecar" ]; then
-      update_run_json "$sidecar" \
-        paused_at "" \
-        pause_reason "" || true
-    fi
+  if [ -n "$sidecar" ] && [ -f "$sidecar" ]; then
+    update_run_json "$sidecar" \
+      paused_at "" \
+      pause_reason "" || true
   fi
 
   remote_log "remote: machine $mid resumed"

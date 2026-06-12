@@ -649,9 +649,12 @@ provision_machine() {
       if [ -n "$LEERIE_VOLUME_ID" ]; then
         update_run_json "$sidecar" \
           fly_machine_id "$machine_id" \
-          volume_id "$LEERIE_VOLUME_ID" || true
+          volume_id "$LEERIE_VOLUME_ID" \
+          image_tag "${FLY_IMAGE_TAG:-}" || true
       else
-        update_run_json "$sidecar" fly_machine_id "$machine_id" || true
+        update_run_json "$sidecar" \
+          fly_machine_id "$machine_id" \
+          image_tag "${FLY_IMAGE_TAG:-}" || true
       fi
     fi
   fi
