@@ -508,6 +508,10 @@ def test_resume_machine_updates_image_on_version_drift(tmp_path: Path):
     invocations = log.read_text()
     assert "machine update mach-upgrade --image registry.fly.io/leerie:0.6.7" in invocations
     assert "machine start mach-upgrade" in invocations
+    lines = invocations.splitlines()
+    update_idx = next(i for i, l in enumerate(lines) if "machine update" in l)
+    start_idx = next(i for i, l in enumerate(lines) if "machine start" in l)
+    assert update_idx < start_idx, "machine update must precede machine start"
     data = json.loads(sidecar.read_text())
     assert data["image_tag"] == "registry.fly.io/leerie:0.6.7"
     assert data["paused_at"] is None
@@ -568,6 +572,97 @@ def test_resume_machine_skips_image_update_when_no_stored_tag(tmp_path: Path):
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
     assert "machine update" not in invocations
+
+
+def test_resume_machine_continues_on_image_update_failure(tmp_path: Path):
+    """Fail-open: if flyctl machine update fails, resume_machine logs a
+    warning and proceeds with the old image — the resume is not blocked."""
+    log = tmp_path / "flyctl.log"
+    fake = tmp_path / "flyctl"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> "{log}"\n'
+        "case \"$1 $2\" in\n"
+        "  'auth status') exit 0 ;;\n"
+        "  'machine update') exit 1 ;;\n"
+        "  'machine start') exit 0 ;;\n"
+        "  'machine status') printf 'Machine ID: mach-001\\nState: started\\n'; exit 0 ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    user_repo = tmp_path / "user-repo"
+    run_dir = user_repo / ".leerie" / "runs" / "test-005"
+    run_dir.mkdir(parents=True)
+    sidecar = run_dir / "run.json"
+    sidecar.write_text(json.dumps({
+        "run_id": "test-005",
+        "paused_at": "2026-06-01T10:00:00+00:00",
+        "fly_machine_id": "mach-failopen",
+        "pause_reason": "worker-error",
+        "image_tag": "registry.fly.io/leerie:0.6.6",
+    }))
+    result = _run_bash(
+        f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-failopen",
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "USER_REPO": str(user_repo),
+            "LEERIE_RUN_ID": "test-005",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:0.6.7",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "image update failed" in result.stderr
+    invocations = log.read_text()
+    assert "machine start mach-failopen" in invocations
+    data = json.loads(sidecar.read_text())
+    assert data["image_tag"] == "registry.fly.io/leerie:0.6.6", \
+        "sidecar should retain old tag when update fails"
+
+
+def test_resume_machine_image_update_via_state_host_dir(tmp_path: Path):
+    """Image-update sidecar resolution prefers LEERIE_STATE_HOST_DIR over
+    USER_REPO, matching provision.sh's pattern."""
+    log = tmp_path / "flyctl.log"
+    fake = tmp_path / "flyctl"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> "{log}"\n'
+        "case \"$1 $2\" in\n"
+        "  'auth status') exit 0 ;;\n"
+        "  'machine update') exit 0 ;;\n"
+        "  'machine start') exit 0 ;;\n"
+        "  'machine status') printf 'Machine ID: mach-001\\nState: started\\n'; exit 0 ;;\n"
+        "esac\n"
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    state_dir = tmp_path / "state-dir"
+    run_dir = state_dir / "runs" / "test-006"
+    run_dir.mkdir(parents=True)
+    sidecar = run_dir / "run.json"
+    sidecar.write_text(json.dumps({
+        "run_id": "test-006",
+        "paused_at": "2026-06-01T10:00:00+00:00",
+        "fly_machine_id": "mach-statedir",
+        "pause_reason": "worker-error",
+        "image_tag": "registry.fly.io/leerie:0.6.6",
+    }))
+    result = _run_bash(
+        f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-statedir",
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "LEERIE_RUN_ID": "test-006",
+            "FLY_IMAGE_TAG": "registry.fly.io/leerie:0.6.7",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    invocations = log.read_text()
+    assert "machine update mach-statedir --image registry.fly.io/leerie:0.6.7" in invocations
+    data = json.loads(sidecar.read_text())
+    assert data["image_tag"] == "registry.fly.io/leerie:0.6.7"
+    assert data["paused_at"] is None
 
 
 # --- coupling: launcher pause-print includes the resume command ----------
