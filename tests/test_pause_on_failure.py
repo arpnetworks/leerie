@@ -7,6 +7,7 @@ Covers:
   - provision.sh: decide_teardown classification (rc → stop vs destroy)
   - provision.sh: decide_teardown writes paused_at + pause_reason + fly_machine_id
   - resume-machine.sh: resume_machine starts a stopped machine and clears paused_at
+  - resume-machine.sh: resume_machine image-update on version drift (fail-open, state-host-dir)
 
 All tests stub flyctl so no real Fly.io calls are made.
 """
