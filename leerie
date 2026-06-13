@@ -1256,6 +1256,7 @@ export LEERIE_TASK_ARG
 # container starts. --runtime is NOT consumed — it flows through
 # REWRITTEN_ARGS to the orchestrator's own argparse.
 RUNTIME=local
+_RUNTIME_EXPLICIT=false
 # Precedence (lowest → highest): default → toml → env → CLI.
 # TOML is resolved first so env overrides it.
 if [ -f "$USER_REPO/leerie.toml" ]; then
@@ -1265,7 +1266,7 @@ if [ -f "$USER_REPO/leerie.toml" ]; then
                          print; exit
                        }' "$USER_REPO/leerie.toml" 2>/dev/null || true)"
   case "${toml_runtime:-}" in
-    local|fly) RUNTIME="${toml_runtime}" ;;
+    local|fly) RUNTIME="${toml_runtime}"; _RUNTIME_EXPLICIT=true ;;
     "")        : ;;
     *)
       remote_log "leerie.toml: runtime=${toml_runtime} is not one of local|fly"
@@ -1274,7 +1275,7 @@ if [ -f "$USER_REPO/leerie.toml" ]; then
   esac
 fi
 case "${LEERIE_RUNTIME:-}" in
-  local|fly) RUNTIME="${LEERIE_RUNTIME}" ;;
+  local|fly) RUNTIME="${LEERIE_RUNTIME}"; _RUNTIME_EXPLICIT=true ;;
   "")        : ;;
   *)
     remote_log "LEERIE_RUNTIME=${LEERIE_RUNTIME} is not one of local|fly"
@@ -1284,8 +1285,8 @@ esac
 # CLI (highest priority) — scanned before REWRITTEN_ARGS loop below.
 for arg in "$@"; do
   case "$arg" in
-    --runtime=local)    RUNTIME=local ;;
-    --runtime=fly)      RUNTIME=fly ;;
+    --runtime=local)    RUNTIME=local; _RUNTIME_EXPLICIT=true ;;
+    --runtime=fly)      RUNTIME=fly; _RUNTIME_EXPLICIT=true ;;
     --runtime=*)
       remote_log "--runtime=${arg#--runtime=} is not one of local|fly"
       exit 1
@@ -1297,7 +1298,7 @@ prev_was_runtime=false
 for arg in "$@"; do
   if $prev_was_runtime; then
     case "$arg" in
-      local|fly) RUNTIME="$arg" ;;
+      local|fly) RUNTIME="$arg"; _RUNTIME_EXPLICIT=true ;;
       *)
         remote_log "--runtime $arg is not one of local|fly"
         exit 1
@@ -1310,6 +1311,31 @@ for arg in "$@"; do
     prev_was_runtime=true
   fi
 done
+
+# --- auto-detect Fly runtime on --resume ---------------------------------
+# When --resume targets a run that originated on Fly (fly-machine.json
+# exists) but no explicit --runtime was given, auto-promote to fly.
+# Without this, the launcher starts a local container whose host-side
+# state.json is empty — validate_resume_state dies with "no usable task".
+if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
+   [ "$_RUNTIME_EXPLICIT" = "false" ] && [ -n "$LEERIE_RUN_ID" ]; then
+  _fly_sidecar="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json"
+  if [ -f "$_fly_sidecar" ]; then
+    remote_log "--resume: auto-detected Fly run (fly-machine.json present); promoting --runtime to fly"
+    RUNTIME=fly
+    REWRITTEN_ARGS+=("--runtime" "fly")
+  fi
+fi
+# When the user explicitly set --runtime local on a Fly-originated run,
+# warn but respect their choice.
+if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
+   [ "$_RUNTIME_EXPLICIT" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
+  _fly_sidecar="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json"
+  if [ -f "$_fly_sidecar" ]; then
+    remote_log "warning: resuming a Fly run with --runtime local — host-side state.json may be incomplete"
+    echo "  Consider: leerie --resume $LEERIE_RUN_ID --runtime fly" >&2
+  fi
+fi
 
 # --- FLY_VM_DISK_GB (per-machine Fly volume size in GB) -------------------
 # Resolution ladder (highest → lowest):

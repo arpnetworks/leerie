@@ -454,6 +454,47 @@ decide_teardown() {
           pause_reason "$reason" \
           fly_machine_id "$mid" || true
       fi
+      # Sync the run state directory from the machine BEFORE stopping it
+      # so the host has up-to-date state.json for subsequent --resume.
+      # Best-effort: failure is logged but does not block the pause —
+      # the machine-side state is preserved on the volume.
+      if [ -n "${LEERIE_RUN_ID:-}" ]; then
+        local _sync_target=""
+        if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+          _sync_target="$LEERIE_STATE_HOST_DIR/runs"
+        elif [ -n "${USER_REPO:-}" ]; then
+          _sync_target="$USER_REPO/.leerie/runs"
+        fi
+        if [ -n "$_sync_target" ]; then
+          mkdir -p "$_sync_target" 2>/dev/null || true
+          remote_log "remote: syncing state from machine before pause..."
+          # Timeout: 60 s (state dir is typically <10 MB; use the
+          # _seed_timeout_prefix mechanism but override the budget to
+          # avoid blocking decide_teardown for 600 s on a WireGuard
+          # stall). Falls back to unbounded on hosts without `timeout`.
+          local _pause_timeout=""
+          if command -v timeout >/dev/null 2>&1; then
+            _pause_timeout="timeout --kill-after=5 60"
+          fi
+          if $_pause_timeout flyctl ssh console --app "$FLY_APP" --machine "$mid" \
+               --pty=false -C "tar -cC /work/.leerie/runs $LEERIE_RUN_ID" \
+               2>/dev/null \
+             | tar -xC "$_sync_target" 2>/dev/null; then
+            remote_log "remote: state synced to $_sync_target/$LEERIE_RUN_ID"
+            # The tar extraction overwrites run.json with the machine-side
+            # copy (which lacks paused_at/pause_reason/fly_machine_id).
+            # Re-apply the pause metadata so --list and --resume see it.
+            if [ -n "$sidecar" ]; then
+              update_run_json "$sidecar" \
+                paused_at "$(iso_now)" \
+                pause_reason "$reason" \
+                fly_machine_id "$mid" || true
+            fi
+          else
+            remote_log "warning: state sync before pause failed (machine state preserved on volume)"
+          fi
+        fi
+      fi
       stop_machine
       echo "" >&2
       remote_log "PAUSED: machine $mid (rc=$rc, reason=$reason)"

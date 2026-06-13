@@ -810,11 +810,15 @@ push + PR sit between them on the host:
 **Controlled exits write `finished_at` eagerly.** `die()` raises
 `SystemExit`; `main()`'s `except SystemExit` handler writes
 `finished_at` to both `state.json` and `run.json` (best-effort,
-guarded by `st is not None`) before re-raising. It also writes the
-exit code to `orchestrator.exit_code` in the run directory so the
-tail wrapper can propagate it to `decide_teardown`. Without the exit
-code file, the tail wrapper falls back to exit 0 (the pre-exit-code
-behavior) and `decide_teardown` takes the clean-exit branch.
+guarded by `st is not None`; `state.json` is additionally guarded by
+`st.data.get("task")` to avoid poisoning the host-side file with a
+bare `{"finished_at": …}` stub when the handler fires before state
+was loaded — e.g. a failed `--resume` against an incomplete
+host-side state) before re-raising. It also writes the exit code to
+`orchestrator.exit_code` in the run directory so the tail wrapper can
+propagate it to `decide_teardown`. Without the exit code file, the
+tail wrapper falls back to exit 0 (the pre-exit-code behavior) and
+`decide_teardown` takes the clean-exit branch.
 
 The `finished_at` write remains necessary even with exit code
 propagation: `fetch_branch` needs `finished_at` to discover the run.
@@ -1321,6 +1325,15 @@ committed work) plus `<state-root>/runs/<run-id>/` (the orchestrator's
 own state) are the only durable record of a run, and both already live
 on the machine's filesystem by the time a pause fires.
 
+Before `stop_machine`, the pause branch syncs the machine-side
+`.leerie/runs/<run-id>/` directory to the host via the same tar-pipe
+primitive that `fetch_branch` uses. This is best-effort (bounded by
+a 60 s timeout; failure is logged but does not block the pause) and
+serves two purposes: it gives the host a copy of `state.json` so a
+subsequent `--resume` against an auto-detected Fly run can read the
+task and wave state locally, and it surfaces logs and checkpoint
+artifacts for offline inspection without restarting the machine.
+
 ### Remote disk policy
 
 **Every Fly-path run gets a per-machine volume by default.**
@@ -1441,6 +1454,16 @@ tmux's `kill-session` is distinct from `detach`. Ctrl-C as a
 destructive verb was an artifact of the lifetime coupling — once the
 coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
 this terminal-side activity") and destruction needs its own verb.
+
+**Runtime auto-detection on `--resume`.** When `--resume` targets a
+run whose state directory contains a `fly-machine.json` sidecar and
+no explicit `--runtime` was given (via CLI, env, or leerie.toml), the
+launcher auto-promotes `RUNTIME` to `fly`. Without this, the default
+`local` runtime starts a container that reads the host-side
+`state.json` — which may be empty or stale for Fly-originated runs
+(the real state lives on the machine's volume). If the user
+explicitly sets `--runtime local` on a Fly-originated run, the
+launcher warns but respects the choice.
 
 **Smart resume in remote mode.** `--resume` is the single verb for
 re-engaging with a remote run, regardless of the run's current state.

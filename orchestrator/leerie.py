@@ -14906,7 +14906,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         if st is not None and st.run_dir is not None:
             try:
                 st.data["finished_at"] = now()
-                st.save()
+                # Only persist state.json when it carries meaningful
+                # content.  A failed --resume leaves st.data as a bare
+                # stub (no "task"); writing that poisons the host-side
+                # file and blocks subsequent resumes with "no usable
+                # task" instead of the clearer "no state.json".
+                if st.data.get("task"):
+                    st.save()
                 _write_run_json(st.run_dir, finished_at=st.data["finished_at"])
                 _ec = e.code if e.code is not None else 1
                 (st.run_dir / "orchestrator.exit_code").write_text(
