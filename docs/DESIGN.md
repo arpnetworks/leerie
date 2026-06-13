@@ -1434,9 +1434,9 @@ remote run lifecycle, each doing exactly one thing:
 | Verb | Effect |
 |---|---|
 | `leerie "task" --runtime fly` | Provision machine, detach orchestrator, tail log |
-| `leerie --stop <run-id> --runtime fly` | Clean pause (`flyctl machine stop`); resumable |
-| `leerie --resume <id> --runtime fly` | Smart resume — wakes a paused machine, attaches to a live orchestrator, or relaunches against an alive-but-orphaned machine, automatically |
-| `leerie --kill <run-id> --runtime fly` | Destroy machine, mark run terminated (irreversible) |
+| `leerie --stop <run-id>` | Clean pause (`flyctl machine stop`); resumable |
+| `leerie --resume <id>` | Smart resume — wakes a paused machine, attaches to a live orchestrator, or relaunches against an alive-but-orphaned machine, automatically |
+| `leerie --kill <run-id>` | Destroy machine, mark run terminated (irreversible) |
 
 Plus `leerie --list` (unified across local and remote, with `--status
 <state>` and `--runtime <local|fly>` filtering as orthogonal axes).
@@ -1455,15 +1455,17 @@ destructive verb was an artifact of the lifetime coupling — once the
 coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
 this terminal-side activity") and destruction needs its own verb.
 
-**Runtime auto-detection on `--resume`.** When `--resume` targets a
-run whose state directory contains a `fly-machine.json` sidecar and
-no explicit `--runtime` was given (via CLI, env, or leerie.toml), the
-launcher auto-promotes `RUNTIME` to `fly`. Without this, the default
-`local` runtime starts a container that reads the host-side
-`state.json` — which may be empty or stale for Fly-originated runs
-(the real state lives on the machine's volume). If the user
-explicitly sets `--runtime local` on a Fly-originated run, the
-launcher warns but respects the choice.
+**Runtime auto-detection on run-id-bearing verbs.** When `--resume`,
+`--stop`, `--kill`, or `--finalize` targets a run whose state
+directory contains a `fly-machine.json` sidecar and no explicit
+`--runtime` was given, the launcher auto-promotes to `fly` via the
+shared `_auto_detect_fly_runtime` helper. Without this, the default
+`local` runtime either starts a container with an empty host-side
+`state.json` (`--resume`) or rejects the command with "no
+local-runtime equivalent" (`--stop`/`--kill`/`--finalize`). If the
+user explicitly sets `--runtime local` on a Fly-originated run,
+`--resume` warns but respects the choice; the fast-path verbs reject
+it as before.
 
 **Smart resume in remote mode.** `--resume` is the single verb for
 re-engaging with a remote run, regardless of the run's current state.

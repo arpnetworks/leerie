@@ -2973,14 +2973,15 @@ Resolution order (highest priority first):
 Invalid values in env or TOML are rejected immediately with an error
 message and exit 1 before any preflight runs.
 
-**Runtime auto-detection on `--resume`:** when `--resume` is active and no
-explicit `--runtime` was given at any precedence level, the launcher checks
-for `$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json`. If
-present, `RUNTIME` is promoted to `fly` and `--runtime fly` is appended to
-`REWRITTEN_ARGS`. The launcher tracks whether the runtime was explicitly set
-via an internal `_RUNTIME_EXPLICIT` flag; when the user explicitly passes
-`--runtime local` on a Fly-originated run, the launcher warns but respects
-the choice.
+**Runtime auto-detection on run-id-bearing verbs:** the shared
+`_auto_detect_fly_runtime(run_id, explicit_runtime)` helper checks for
+`$LEERIE_STATE_HOST_DIR/runs/$run_id/fly-machine.json`. If
+present and `explicit_runtime` is empty, it returns 0 and the caller
+promotes the local runtime variable to `fly`. Applied to `--resume` (which
+also appends `--runtime fly` to `REWRITTEN_ARGS` and tracks the
+`_RUNTIME_EXPLICIT` flag), `--stop`, `--kill`, and `--finalize`. When the
+user explicitly passes `--runtime local` on a Fly-originated run, `--resume`
+warns but respects the choice; the fast-path verbs reject it as before.
 
 When `RUNTIME=fly`, the launcher skips the per-OS nerdctl preflight, the
 image-build check, the auth/cache mount assembly, and the `nerdctl run`
@@ -3771,10 +3772,9 @@ Two new launcher flags, routed at the top of `leerie` alongside
   `stop_machine()`. Then calls `update_run_json` from `lib.sh` to set
   `paused_at = <iso_now>` and `pause_reason = "user-requested"` on
   the sidecar. The run is resumable via the existing
-  `leerie --resume <id> --runtime fly` path. Errors with an
-  actionable message if the sidecar is missing or `fly_machine_id`
-  is null (the latter means the run was launched locally, not via
-  `--runtime fly`).
+  `leerie --resume <id>` path (runtime auto-detected from
+  `fly-machine.json`). Errors with an actionable message if the
+  sidecar is missing or `fly_machine_id` is null.
 - **`leerie --kill <run-id> [--force]`** — destroy. Same sidecar
   resolution. Prompts the user to type the run-id to confirm (unless
   `--force` / `LEERIE_FORCE_KILL=1`), then calls `destroy_machine()`.

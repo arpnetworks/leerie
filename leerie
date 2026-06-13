@@ -136,6 +136,21 @@ with open(sidecar, "w") as f:
 ' "$fmj" "$sidecar"
 }
 
+# --- _auto_detect_fly_runtime --------------------------------------------
+# When a run-id-bearing verb is invoked without an explicit --runtime and
+# the run directory contains fly-machine.json, the run originated on Fly.
+# Returns 0 (auto-detected) or 1 (not detected / explicit runtime given).
+_auto_detect_fly_runtime() {
+  local run_id="$1" explicit_runtime="$2"
+  if [ -n "$explicit_runtime" ]; then return 1; fi
+  if [ -z "$run_id" ]; then return 1; fi
+  local sidecar="$LEERIE_STATE_HOST_DIR/runs/$run_id/fly-machine.json"
+  if [ -f "$sidecar" ]; then
+    return 0
+  fi
+  return 1
+}
+
 # --- host-side per-repo state directory ----------------------------------
 # Resolves LEERIE_STATE_HOST_DIR: the host path for this repo's leerie run
 # state (runs/, worktrees/, etc.). Lives under $HOME so Colima auto-shares
@@ -487,6 +502,10 @@ PY
       echo "  Usage: leerie --stop <run-id> [--runtime fly]" >&2
       exit 1
     fi
+    if _auto_detect_fly_runtime "$_stop_run_id" "$_stop_runtime"; then
+      remote_log "--stop: auto-detected Fly run; promoting --runtime to fly"
+      _stop_runtime="fly"
+    fi
     _stop_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_stop_run_id"
     if [ ! -d "$_stop_run_dir" ]; then
       remote_log "--stop: no run dir at $_stop_run_dir"
@@ -512,7 +531,7 @@ PY
       paused_at "$(iso_now)" \
       pause_reason "user-requested" \
       fly_machine_id "$LEERIE_MACHINE_ID" || true
-    remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID --runtime fly"
+    remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
     exit 0
     ;;
   --kill)
@@ -551,6 +570,10 @@ PY
     if [ "$_kill_runtime" = "local" ]; then
       remote_log "--kill --runtime local: no local-runtime equivalent yet (local runs are not persistently running)."
       exit 1
+    fi
+    if _auto_detect_fly_runtime "$_kill_run_id" "$_kill_runtime"; then
+      remote_log "--kill: auto-detected Fly run; promoting --runtime to fly"
+      _kill_runtime="fly"
     fi
     [ -n "${LEERIE_FORCE_KILL:-}" ] && _kill_force=1
     FLY_APP="${_kill_app:-${LEERIE_FLY_APP:-leerie}}"
@@ -694,6 +717,10 @@ PY
     if [ "$_fin_runtime" = "local" ]; then
       remote_log "--finalize --runtime local: no local-runtime equivalent yet (local runs finalize inline)."
       exit 1
+    fi
+    if _auto_detect_fly_runtime "$_fin_run_id" "$_fin_runtime"; then
+      remote_log "--finalize: auto-detected Fly run; promoting --runtime to fly"
+      _fin_runtime="fly"
     fi
     if [ -z "$_fin_run_id" ]; then
       remote_log "--finalize requires a <run-id>"
@@ -1313,14 +1340,13 @@ for arg in "$@"; do
 done
 
 # --- auto-detect Fly runtime on --resume ---------------------------------
-# When --resume targets a run that originated on Fly (fly-machine.json
-# exists) but no explicit --runtime was given, auto-promote to fly.
-# Without this, the launcher starts a local container whose host-side
-# state.json is empty — validate_resume_state dies with "no usable task".
+# Uses the shared _auto_detect_fly_runtime helper. The --resume path
+# differs from the fast-path verbs: it sets REWRITTEN_ARGS (forwarded to
+# the orchestrator) and uses _RUNTIME_EXPLICIT to distinguish default
+# from user-set.
 if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
-   [ "$_RUNTIME_EXPLICIT" = "false" ] && [ -n "$LEERIE_RUN_ID" ]; then
-  _fly_sidecar="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/fly-machine.json"
-  if [ -f "$_fly_sidecar" ]; then
+   [ "$_RUNTIME_EXPLICIT" = "false" ]; then
+  if _auto_detect_fly_runtime "$LEERIE_RUN_ID" ""; then
     remote_log "--resume: auto-detected Fly run (fly-machine.json present); promoting --runtime to fly"
     RUNTIME=fly
     REWRITTEN_ARGS+=("--runtime" "fly")
