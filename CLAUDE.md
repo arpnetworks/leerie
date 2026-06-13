@@ -300,7 +300,7 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 # appear in `--list` with status `seed-failed` and are resumable via
 # `--resume <id>`. Previously these runs were invisible:
 ./leerie --list --status seed-failed
-./leerie --resume <seed-failed-id> --runtime fly
+./leerie --resume <seed-failed-id>
 
 # Chain verbs: submit, inspect, and cancel multi-run chains via the
 # leerie-chain HTTP API. LEERIE_CHAIN_URL sets the endpoint
