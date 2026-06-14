@@ -5,6 +5,63 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0]
+
+### Changed
+
+- **`chain.git_ops.synth_merge_branches` passes a bot identity to
+  `git merge` defensively.** The function now invokes
+  `git -c user.email=leerie-chain@bot.invalid
+  -c user.name=leerie-chain merge --no-ff --no-edit
+  origin/<branch>` so the merge commit succeeds even when the
+  laptop's (or CI runner's) global git identity is unset. Without
+  this, the merge failed with "Committer identity unknown" and the
+  wave-loop's synth-merge step aborted with a misleading
+  `SynthMergeConflict` on the FIRST branch instead of the actually-
+  conflicting one. Closes a real production gap on laptops without
+  `git config --global user.email/name` and fixes the six PR-#10 CI
+  failures on Ubuntu runners (Python 3.10/3.11/3.12). DESIGN/spec
+  surface unchanged; the bot identity matches the existing
+  `write_audit_artifact` convention. Documented in IMPLEMENTATION.md
+  §1966.
+
+### Fixed
+
+- **`tests/test_chain_git_ops.py` fixtures pin HEAD to `main`.**
+  The `origin_repo` and `seeded_origin` fixtures now pass `-b main`
+  to `git init --bare` and `git init` so the bare repo's HEAD
+  symbolic ref points at `refs/heads/main` regardless of the
+  runner's `init.defaultBranch` config (CI Ubuntu defaults to
+  `master`). Without this, the fixture pushed
+  `HEAD:main` but the bare HEAD still pointed at the absent
+  `master`; downstream `git clone` then checked out an EMPTY
+  working tree, and the `test_write_audit_artifact_commits_chain_json`
+  verification `assert artifact.exists()` returned False even though
+  the file was correctly committed and pushed.
+
+- **`tests/test_chain_credential_transport.py` skips Darwin-only
+  tests on Linux.** Two `*_on_darwin` tests exercise the macOS
+  Keychain code path that the launcher's
+  `_extract_claude_credentials_json` helper gates on
+  `uname -s = Darwin`; on Linux the stub `security` binary is never
+  invoked, so the assertions never see the blob. The tests now skip
+  with `@pytest.mark.skipif(sys.platform != "darwin", ...)`. The
+  other three tests in the file already work cross-platform.
+
+- **CI workflow sets a default git identity.** `.github/workflows/test.yml`
+  gains a "Set git identity" step (`git config --global user.email
+  ci@leerie.invalid && git config --global user.name "Leerie CI"`)
+  before `pytest tests/` runs. Defense-in-depth catch-all so any
+  future test that forgets to set identity per-operation doesn't
+  silently fail on a runner that has no global config.
+
+- **Test consistency: `tests/test_cleanup_run_scoped.py` `git init`
+  calls.** Four `git init -q` sites (lines 105/197/227/262) now
+  include `-b main`, matching line 143's existing convention. These
+  sites were not at risk of the HEAD-symbolic-ref bug above (no
+  downstream clone-and-verify pattern), so this is consistency
+  hygiene rather than a bug fix.
+
 ## [0.4.21]
 
 ### Fixed
