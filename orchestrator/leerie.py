@@ -3615,6 +3615,24 @@ def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
         issues.append(
             f"MANY_CATEGORIES: {len(cats)} categories — typical "
             "tasks span 1–3")
+    _SAME_WORK_RISK_PAIRS = [
+        ("bug-fixing", "feature-implementation"),
+        ("bug-fixing", "refactoring"),
+        ("feature-implementation", "refactoring"),
+    ]
+    cats_set = set(cats)
+    for a, b in _SAME_WORK_RISK_PAIRS:
+        if a in cats_set and b in cats_set:
+            issues.append(
+                f"SAME_WORK_RISK: {a!r} and {b!r} both selected — "
+                "these categories often describe the same intent "
+                "under different labels (e.g. 'complete translations' "
+                "as both bug-fix and feature). Apply the same-work "
+                "test: would planners in each category modify the same "
+                "files for the same reason? If yes, keep only the "
+                "best-fitting category. If they produce genuinely "
+                "different deliverables, keep both."
+            )
     issues.extend(_confidence_issues(
         result.get("confidence") or {}, ["classification"]))
     return issues

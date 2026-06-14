@@ -60,6 +60,36 @@ class TestCheckClassifierOutput:
         issues = leerie.check_classifier_output(result, tmp_path)
         assert not any("MANY_CATEGORIES" in i for i in issues)
 
+    def test_same_work_risk_bug_and_feature(self, leerie, tmp_path):
+        result = {"categories": ["bug-fixing", "feature-implementation"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("SAME_WORK_RISK" in i for i in issues)
+
+    def test_same_work_risk_bug_and_refactoring(self, leerie, tmp_path):
+        result = {"categories": ["bug-fixing", "refactoring"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("SAME_WORK_RISK" in i for i in issues)
+
+    def test_same_work_risk_feature_and_refactoring(self, leerie, tmp_path):
+        result = {"categories": ["feature-implementation", "refactoring"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("SAME_WORK_RISK" in i for i in issues)
+
+    def test_no_same_work_risk_bug_and_testing(self, leerie, tmp_path):
+        result = {"categories": ["bug-fixing", "testing"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("SAME_WORK_RISK" in i for i in issues)
+
+    def test_no_same_work_risk_single_category(self, leerie, tmp_path):
+        result = {"categories": ["bug-fixing"],
+                  "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("SAME_WORK_RISK" in i for i in issues)
+
 
 # --- check_planner_output ---------------------------------------------- #
 

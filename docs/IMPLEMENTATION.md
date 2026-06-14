@@ -2447,7 +2447,7 @@ Each returns `list[str]` — empty when clean. Pure Python, no LLM.
 
 | Worker | Check function | Issue codes | Max rounds cap |
 |--------|---------------|-------------|----------------|
-| Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `MANY_CATEGORIES`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
+| Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `MANY_CATEGORIES`, `SAME_WORK_RISK`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
 | Planner | `check_planner_output(result, repo_root, domain)` | `PHANTOM_PATH`, `DANGLING_DEP`, `EMPTY_CRITERIA`, `OVERSIZED`, `INTRA_DOMAIN_OVERLAP`, `PROTECTED_PATH`, `INTRA_DOMAIN_CYCLE`, `LOW_CONFIDENCE` | `planner_check_rounds` (3) |
 | Reconciler | `check_reconciler_output(output, plans)` | `RENAME_TO_NOWHERE`, `BAD_PREFIX`, `SELF_DEP`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
 | Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |

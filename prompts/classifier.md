@@ -38,6 +38,22 @@ Assign the task to one or more of these nine categories:
 A task commonly spans several. Include every category that genuinely applies;
 do not pad.
 
+**Same-work test.** When considering two categories, ask: would a planner
+in each produce subtasks that modify the same files for the same reason?
+If yes, the two categories describe one intent under two labels — pick the
+single best-fitting one. Two planners producing the same deliverables
+create 2× the subtasks with no additional coverage.
+
+The test PASSES (keep both) when two categories produce genuinely
+different deliverables — different files, or different purposes on the
+same files. `bug-fixing` fixes a handler + `testing` adds a test file →
+keep both. `bug-fixing` fixes a timeout + `feature-implementation` adds
+new retry logic → keep both (different purposes). The test FAILS (drop
+one) when both categories would update the same files for the same
+reason: "complete Spanish translations" as both `bug-fixing` and
+`feature-implementation` → both update translation files with the same
+translations → pick `bug-fixing`.
+
 Split principle for `configuration-build` vs `infrastructure`:
 `configuration-build` owns *wiring* (the app reads cloud outputs via
 env vars, scripts, build args); `infrastructure` owns *producers* (the

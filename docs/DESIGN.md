@@ -163,6 +163,12 @@ Every task is classified into one or more of:
 
 A task commonly spans several categories. One planner is assigned per matched
 category; the categories are domains of expertise, not mutually exclusive bins.
+The corollary is a **same-work test**: when two categories would produce the
+same deliverables — same files modified for the same reason — the classifier
+picks the single best-fitting label. The orchestrator surfaces a
+`SAME_WORK_RISK` advisory for category pairs that commonly over-classify
+(e.g. `bug-fixing` + `feature-implementation`); the classifier addresses it
+on its structured-feedback retry.
 
 ---
 
