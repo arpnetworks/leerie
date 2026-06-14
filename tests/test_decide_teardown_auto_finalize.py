@@ -182,3 +182,61 @@ def test_clean_exit_missing_host_finalize_sh_falls_back(tmp_path):
     assert "auto-finalize: pushing + opening PR" not in combined
     assert "[stub] destroy_machine called" in combined
     assert "leerie --finalize rid-001" in combined
+
+
+# ---------------------------------------------------------------------------
+# Chain-aware detach banner
+# ---------------------------------------------------------------------------
+#
+# Per-job runs that are part of a chain still pause / detach individually
+# under the v5 Shape A model — there is no longer a special chain-mode
+# short-circuit in decide_teardown. What survives is the rc=130 detach
+# banner's chain-scoped command hints, which fire purely on
+# LEERIE_CHAIN_ID being present in env.
+
+
+def test_chain_id_detach_banner_includes_chain_scoped_commands(tmp_path):
+    """When LEERIE_CHAIN_ID is set, the rc=130 detach banner lists
+    chain-scoped recovery commands in addition to the run-scoped ones.
+    The per-job decide_teardown otherwise behaves identically to a
+    single-run detach (no destroy, no stop).
+    """
+    chain_id = "test-chain-uuid-001"
+    run_id = "rid-001"
+    user_repo = tmp_path / "user_repo"
+    run_dir = user_repo / ".leerie" / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(
+        '{"finished_at": "2026-06-14T00:00:00Z", "branch": "leerie/runs/test"}'
+    )
+    script = f"""
+source {PROVISION_SH}
+_try_fetch_branch_for_teardown() {{ return 0; }}
+destroy_machine() {{ echo "[stub] destroy_machine called"; LEERIE_MACHINE_ID=''; }}
+stop_machine() {{ echo "[stub] stop_machine called"; LEERIE_MACHINE_ID=''; }}
+update_run_json() {{ :; }}
+export LEERIE_MACHINE_ID=test-mid-chain-001
+export LEERIE_REMOTE_EXIT_RC=130
+export LEERIE_REMOTE_RUN_ID={run_id}
+export LEERIE_RUN_ID={run_id}
+export LEERIE_CHAIN_ID={chain_id}
+export USER_REPO={user_repo}
+decide_teardown
+"""
+    result = subprocess.run(
+        ["bash", "-c", script],
+        capture_output=True, text=True,
+        env={**os.environ, "PATH": os.environ.get("PATH", "")},
+    )
+    combined = result.stdout + result.stderr
+    assert result.returncode == 0, combined
+    # rc=130 specifically does NOT destroy or stop.
+    assert "[stub] destroy_machine called" not in combined
+    assert "[stub] stop_machine called" not in combined
+    # Run-scoped (existing) commands still shown.
+    assert f"leerie --resume {run_id}" in combined
+    # Chain-scoped commands surfaced.
+    assert f"leerie --status {chain_id}" in combined
+    assert f"leerie --attach {chain_id}" in combined
+    assert f"leerie --stop   {chain_id}" in combined
+    assert f"leerie --kill   {chain_id}" in combined

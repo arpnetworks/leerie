@@ -366,19 +366,23 @@ The full inventory of CLI flags and environment variables is in the
 
 ## Submitting and tracking a chain
 
-A *chain* is a sequence of Leerie runs coordinated by a separate
-`leerie-chain` service (DESIGN §19). Each run in the chain executes
-one task on the same target repository; `leerie-chain` launches them
-in order, waits for each to complete cleanly, and moves on to the
-next. This is the right shape for a series of tasks with a strict
-ordering — for example: refactor the data model, then write the
-migration, then update the API layer.
+A *chain* is a sequence of waves; each wave is a set of Leerie runs
+that execute in parallel against the same target repository. Wave
+N+1 only starts when every run in wave N reaches a terminal status.
+Use chains for tasks with a fixed ordering — for example: run two
+parallel scaffolds in wave 0, then run a follow-up integration job
+in wave 1 that depends on both.
 
-The chain verbs (`--chain-submit`, `--chain-status`, `--list-chains`,
-`--chain-kill`, `--chain-attach`) are launcher fast-paths — they talk
-to the `leerie-chain` HTTP API and never start a container. They read
-`LEERIE_CHAIN_URL` to find the API endpoint (default:
-`http://localhost:8080`).
+`leerie --chain` is a **laptop-side wave sequencer** (DESIGN §19).
+It loops over waves on the laptop: for each wave, it fans out N
+parallel `./leerie --runtime fly` invocations (one per prompt file),
+waits for all to finalize on the laptop (existing single-run path),
+runs synth-merge to build the next wave's base branch, pushes that
+staging branch to origin, and advances. The laptop is the
+sequencer; there is no Fly coordinator machine.
+
+GitHub credentials are touched only by the laptop, via the existing
+`host_finalize` mechanism per per-job run. Workers never see them.
 
 ### Step 1 — Write your prompt files
 
@@ -387,110 +391,102 @@ you would pass to `leerie "..."`:
 
 ```
 prompts/
-  01-refactor-data-model.md
-  02-write-migration.md
-  03-update-api-layer.md
+  01-scaffold-api.md
+  02-scaffold-worker.md
+  03-integration.md
 ```
 
-### Step 2 — Submit the chain
+### Step 2 — Required env vars
+
+No chain-specific env vars are required. Each per-job
+`./leerie --runtime fly` invocation has its own env requirements
+(same as today's single-run flow); set those once in your shell
+profile.
+
+### Step 3 — Submit the chain
 
 ```bash
-export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev  # point at your deployed app
-
-# Each --wave defines one sequential wave. Waves execute in order;
-# runs within a wave execute in parallel. In this example, the
-# data-model refactor lands first (wave 0), then the migration and
-# API update execute in wave 1 against the refactor.
-leerie --chain-submit \
-  --wave prompts/01-refactor-data-model.md \
-  --wave prompts/02-write-migration.md,prompts/03-update-api-layer.md \
-  --target ~/src/myrepo
-
+# Each --wave defines one wave (one or more comma-separated prompt
+# file paths). Waves execute sequentially on the laptop; runs within
+# a wave run in parallel as separate Fly machines. In this example,
+# two scaffolds run in parallel as wave 0, then the integration job
+# runs in wave 1 once both scaffolds are done. The chain operates
+# against $USER_REPO directly.
+leerie --chain \
+  --wave prompts/01-scaffold-api.md,prompts/02-scaffold-worker.md \
+  --wave prompts/03-integration.md
 ```
 
-Each `--wave` value is a comma-separated list of prompt-file paths
-(resolved on the host). Wave index is assigned by `--wave` flag
-order (0, 1, 2, …). `--target` is the local path of the repository
-to run against; it defaults to `$PWD` when omitted. `leerie-chain`
-receives a `POST /chains` request, inserts a chain record, and
-immediately launches wave 0 runs in parallel. Each subsequent wave
-launches after the previous wave completes cleanly. The command
-prints the new `chain-id`:
+The launcher mints a fresh `chain_id` (UUID), prints a submission
+banner, then enters the wave loop. The wave loop runs in the
+foreground of your terminal — keep it running until the chain
+completes, or Ctrl-C to stop (the trap propagates SIGTERM to every
+in-flight wave child).
 
-```
-{"chain_id": "chain-abc123", "status": "running", "current_run": 0}
-```
+`--chain-submit` is kept as a deprecated alias for `--chain`; both
+behave identically.
 
-Copy the `chain_id` — you'll use it for the other verbs.
+### Step 4 — Monitor progress
 
-### Step 3 — Monitor progress
+The single-run verbs (`--status`, `--attach`, `--stop`, `--kill`,
+`--resume`, `--finalize`) are ID-dispatched: pass a UUID and they
+operate on the chain (iterating `$LEERIE_STATE_HOST_DIR/runs/*/run.json`
+filtered by `chain_id`); pass a Fly machine id and they operate on
+the single run (unchanged behavior).
+
+From a different terminal:
 
 ```bash
-# One-shot status check (JSON response):
-leerie --chain-status chain-abc123
+# Per-run snapshot of every run in the chain:
+leerie --status <chain-id>
 
-# Stream the leerie-chain log (follows until interrupted):
-leerie --chain-attach chain-abc123
+# Poll until every chain run reaches a terminal state:
+leerie --attach <chain-id>
 ```
 
-`--chain-status` calls `GET /chains/<chain-id>` and prints the JSON
-response, which includes the chain status (`running`, `paused`,
-`completed`, `failed`), the index and run-id of the current run, and
-the completion state of earlier runs.
+### Step 5 — Worker branches and PRs
 
-`--chain-attach` streams `GET /chains/<chain-id>/log`. Press Ctrl-C to
-detach from the stream; the chain keeps running. Re-attach whenever
-you like.
+Each chain worker runs the leerie orchestrator on its own Fly
+machine and produces a run branch (`leerie/runs/<run-id>`). When the
+worker exits, the laptop's `decide_teardown` trap fires
+`fetch_branch` + `host_finalize` (push + PR + destroy machine) just
+like a single run today. By the time wave N completes, every wave-N
+PR is open.
 
-### Step 4 — Review each run branch
+Between waves, the laptop synth-merges all wave-N branches into a
+staging branch `leerie/stage/<chain-id>-wave-<N+1>` (via
+`chain.git_ops.synth_merge_branches`), pushes the staging branch to
+origin, and advances `current_base` to it. Wave N+1 workers see the
+staged base as their starting point.
 
-While the chain is running, each completed run produces a run branch
-(`leerie/runs/<run-id>`) and opens a PR just like a single run. Review
-and merge those PRs as they appear — the chain continues regardless,
-and you pull in each change when you're satisfied.
-
-### Step 5 — List all chains
+### Step 6 — List active chains
 
 ```bash
-leerie --list-chains
+leerie --list --chains
 ```
 
-Calls `GET /chains` and prints all chains the `leerie-chain` app knows
-about. Filter in your terminal (e.g. `| jq '.[] | select(.status ==
-"running")'`) to find a chain you submitted earlier.
+Or via the deprecated alias `leerie --list-chains`. Both iterate
+`$LEERIE_STATE_HOST_DIR/runs/*/run.json`, group runs by `chain_id`,
+and print one row per chain (chain_id, status, pushed/total runs,
+wave count, started_at).
 
-### Step 6 — Cancel a chain
-
-If you want to stop a chain in progress (for example, you spotted a
-mistake in run two before it starts):
+### Step 7 — Pause, resume, cancel, or finalize a chain
 
 ```bash
-leerie --chain-kill chain-abc123
+# Pause every running chain run:
+leerie --stop <chain-id>
+
+# Resume every paused chain run; then re-run `leerie --chain --wave ...`
+# to continue the wave loop from where it stopped. The wave loop's
+# idempotency check skips waves whose runs are already all pushed.
+leerie --resume <chain-id>
+
+# Finalize every chain run that isn't pushed yet (push + open PR):
+leerie --finalize <chain-id>
+
+# Destroy every chain run's machine (idempotent).
+leerie --kill <chain-id>
 ```
 
-Sends `DELETE /chains/<chain-id>`. Any run that is already in flight
-continues to its natural conclusion (running its own `--resume`
-recovery path if interrupted); the chain moves to `cancelled` status
-and no new runs are started.
-
-### Pointing at a different leerie-chain app
-
-`LEERIE_CHAIN_URL` selects the API endpoint for all five verbs:
-
-```bash
-# Deployed Fly app (production):
-export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
-
-# Local development instance:
-export LEERIE_CHAIN_URL=http://localhost:8080
-
-leerie --chain-submit \
-  --wave prompts/a.md \
-  --wave prompts/b.md \
-  --target ~/src/myrepo
-```
-
-For the `leerie-chain` setup steps (deploying the Fly app, setting
-`GH_DISPATCH_PAT`, `FLY_API_TOKEN`, and `CHAIN_WEBHOOK_SECRET`),
-see [`docs/IMPLEMENTATION.md`](IMPLEMENTATION.md) §7 "Chain launcher
-verbs" and the `chain/` subdirectory's own `README`.
+`--kill <chain-id>` iterates the chain's runs and invokes
+`leerie --kill <run-id>` per run; already-killed runs are skipped.

@@ -133,7 +133,10 @@ orchestrator and not used anywhere in this repo.
   *except* for documented non-error structured exits like
   `EXIT_NEEDS_ANSWERS=10`, where `die()`'s `leerie: error:` prefix would
   mislabel a non-error deferred-clarification signal. Both helpers live in
-  `leerie.py`.
+  `leerie.py`. The `chain/` subpackage is the second deliberate
+  exception: it provides its own `chain/_log.py::log()` and `die()`
+  because the package-isolation invariant forbids importing from
+  `orchestrator/leerie.py`.
 - **Type hints** on every function signature. Use PEP 604 union syntax
   (`str | None`, not `Optional[str]`) — Python 3.10+ is the minimum.
 - **Comments explain *why*, not *what*.** Well-named identifiers
@@ -152,9 +155,11 @@ scripts/*.sh                Git worktree mechanics (setup, integrate, finalize, 
 commands/leerie.md        Thin plugin skill — launches the orchestrator
 docs/DESIGN.md              Architecture and reasoning
 docs/IMPLEMENTATION.md      Current code surface
-chain/                      leerie-chain Fly app — persistent chain-orchestration service
-                            (see DESIGN.md §19). fly launch once from this subdirectory
-                            to provision the app; subsequent --chain-submit calls reuse it.
+chain/                      Laptop-side chain helpers (see DESIGN.md §19). A chain is
+                            N parallel `leerie --runtime fly` invocations per wave,
+                            sequenced by the launcher's `--chain` arm. `chain/git_ops.py`
+                            provides `synth_merge_branches` (used between waves).
+                            No Fly coordinator machine.
 tests/                      pytest suite
 ```
 
@@ -302,21 +307,39 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 ./leerie --list --status seed-failed
 ./leerie --resume <seed-failed-id>
 
-# Chain verbs: submit, inspect, and cancel multi-run chains via the
-# leerie-chain HTTP API. LEERIE_CHAIN_URL sets the endpoint
-# (default: http://localhost:8080). These verbs are launcher fast-paths
-# (like --kill) — they never start a container and do not forward to the
-# Python orchestrator. Each --wave flag defines one sequential wave
-# (N waves supported); waves execute in order:
-./leerie --chain-submit \
+# Chain verbs: submit + manage multi-run chains. A chain is N parallel
+# `./leerie --runtime fly` invocations per wave, with synth-merge between
+# waves to build the next wave's base branch. The laptop is the sequencer;
+# no Fly coordinator machine. Each --wave flag defines one sequential wave
+# (N waves supported); waves execute in order, jobs inside a wave run in
+# parallel. No chain-specific env vars required — the per-job
+# `--runtime fly` invocations have their own env requirements unchanged.
+./leerie --chain \
   --wave "prompts/fetch.md,prompts/lint.md" \
-  --wave "prompts/publish.md" \
-  --target /my/repo
-./leerie --chain-status <chain-id>
-./leerie --list-chains
-./leerie --chain-kill <chain-id>
-./leerie --chain-attach <chain-id>
-export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
+  --wave "prompts/publish.md"
+
+# Resume after a wave failure or synth-merge conflict: re-submit
+# with --chain-id pinned to the prior chain's UUID. The wave loop
+# skips already-pushed waves AND skips synth-merge for transitions
+# whose staging branch is already on origin (idempotency probe via
+# `git ls-remote --exit-code`). Run `./leerie --resume <chain-id>`
+# first to unpause any per-run paused machines.
+./leerie --resume <chain-id>
+./leerie --chain --chain-id <chain-id> \
+  --wave "prompts/fetch.md,prompts/lint.md" \
+  --wave "prompts/publish.md"
+
+# ID-dispatched verbs: UUID → chain scope (iterates run.json filtered by
+# chain_id); Fly machine id → existing single-run behavior. Deprecated
+# chain-prefixed aliases (--chain-submit, --chain-status, --chain-kill,
+# --chain-attach, --list-chains) shim to the new verbs.
+./leerie --status   <chain-id>        # render per-run states from run.json
+./leerie --attach   <chain-id>        # poll run.json files every 5s
+./leerie --stop     <chain-id>        # pause every running chain run
+./leerie --kill     <chain-id>        # destroy every chain run's machine
+./leerie --resume   <chain-id>        # resume every paused chain run
+./leerie --finalize <chain-id>        # push + open PR for every unpushed run
+./leerie --list --chains              # group runs by chain_id
 ```
 
 ## Testing
@@ -364,7 +387,8 @@ Before marking a change complete:
       `response_content` keys). Replace `<state-root>` with the resolved
       state directory (default: `$HOME/.leerie/<basename>/`).
 - [ ] `grep -q -- '--chain-submit)\|--chain-status)\|--list-chains)\|--chain-kill)\|--chain-attach)' leerie`
-      — if chain launcher verbs were touched, confirm all five verb case-arms
-      are still present in the launcher (see DESIGN.md §19 and
-      IMPLEMENTATION.md "Chain launcher verbs"; `pytest tests/test_chain_launcher_verbs.py`
-      for full coverage).
+      — if chain launcher verbs were touched, confirm all five deprecated-alias
+      case-arms are still present in the launcher (the aliases shim to the new
+      ID-dispatched verbs; see DESIGN.md §19 and IMPLEMENTATION.md "Chain
+      verbs"; `pytest tests/test_chain_launcher_id_dispatch.py` for the
+      ID-dispatch contract test).

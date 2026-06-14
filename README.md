@@ -232,33 +232,34 @@ leerie "task" --model-implementer opus --model-classifier haiku
 # for worker processes (default is 95%):
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
 
-# Chain orchestration: submit and track multi-run chains via the
-# leerie-chain HTTP API (LEERIE_CHAIN_URL sets the endpoint;
-# default: http://localhost:8080).
+# Chain orchestration: submit and track multi-run chains. A chain is
+# N parallel `leerie --runtime fly` invocations per wave, with
+# synth-merge between waves to build the next wave's base branch.
+# The laptop is the sequencer; no Fly coordinator machine. No chain-
+# specific env vars required — each per-job `--runtime fly`
+# invocation has its own env requirements unchanged.
 
-# Submit a new chain. Each --wave defines one sequential wave
-# (comma-separated prompt files). Waves execute in order; runs
-# within a wave execute in parallel. N waves are supported.
-# --target is the local repo path (defaults to $PWD).
-leerie --chain-submit \
+# Submit a new chain. Each --wave defines one wave (comma-separated
+# prompt files). Waves execute in order; runs within a wave execute
+# in parallel as separate Fly machines. N waves supported. The chain
+# operates against $USER_REPO directly.
+leerie --chain \
   --wave prompts/fetch.md,prompts/lint.md \
-  --wave prompts/publish.md \
-  --target ~/src/myrepo
+  --wave prompts/publish.md
 
-# Check status of a running or completed chain:
-leerie --chain-status <chain-id>
+# ID-dispatched verbs: UUID positional → chain scope (iterates
+# run.json filtered by chain_id); Fly machine id → existing
+# single-run scope.
+leerie --status   <chain-id>   # render per-run states from run.json
+leerie --attach   <chain-id>   # poll run.json files every 5s
+leerie --stop     <chain-id>   # pause every running chain run
+leerie --kill     <chain-id>   # destroy every chain run's machine
+leerie --resume   <chain-id>   # resume every paused chain run
+leerie --finalize <chain-id>   # push + open PR for every unpushed run
+leerie --list --chains         # group runs by chain_id
 
-# List all chains known to the leerie-chain app:
-leerie --list-chains
-
-# Stream the chain orchestrator's log (follows until interrupted):
-leerie --chain-attach <chain-id>
-
-# Cancel an in-progress chain:
-leerie --chain-kill <chain-id>
-
-# Point at a deployed leerie-chain app instead of localhost:
-export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
+# Deprecated --chain-* aliases (kept for backwards compat) shim to
+# the new verbs above.
 ```
 
 Inside Claude Code (after `/plugin install leerie@enricai-leerie`):
@@ -383,7 +384,7 @@ details and sub-flags.
 | `LEERIE_MODEL_PR_WRITER` | `model_pr_writer` | Model alias for the finalize-time PR writer. Overridden by `--pr-writer-model`. Unset → default `sonnet`. |
 | `LEERIE_WORKER_DEBUG` | — | Enable debug-level logging injection (`DEBUG=*`, `ANTHROPIC_LOG=debug`) into worker processes. Truthy → on. |
 | `LEERIE_FLY_APP` | — | Fly.io app name used by launcher verbs (`--stop`, `--kill`, `--finalize`, etc.). Unset → default `leerie`. Launcher-only. |
-| `LEERIE_CHAIN_URL` | — | Base URL for the leerie-chain HTTP API. Unset → default `http://localhost:8080`. Launcher-only. |
+| `LEERIE_REGION` | — | Fly region used by per-job `--runtime fly` machines (including those spawned by `leerie --chain`). Unset → default `iad`. Launcher-only. |
 | `LEERIE_SEED_TIMEOUT_S` | — | Timeout in seconds for `seed_auth` / `seed_repo` bulk transfers over `flyctl ssh console`. Unset → default `600` (10 min). Launcher-only. |
 | `LEERIE_PROGRESS_INTERVAL_S` | — | Heartbeat cadence in seconds for "still streaming" lines during bulk transfers. Set to `0` to suppress. Unset → default `10`. Launcher-only. |
 | `LEERIE_MACHINE_START_TIMEOUT` | — | Timeout in seconds for Fly machine start. Unset → default `120`. Launcher-only. |
