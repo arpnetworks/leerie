@@ -1131,3 +1131,61 @@ def test_apply_collisions_anchor_b_sid_lex_largest(leerie):
     assert survivors == ["z-anchor"], (
         f"anchor rule must override lex when anchor is b_sid and "
         f"lex-largest. Got survivors {survivors}.")
+
+
+# --------------------------------------------------------------------- #
+# Post-merge acyclicity — merges can introduce transitive cycles
+# --------------------------------------------------------------------- #
+
+def test_merge_introduces_transitive_cycle(leerie):
+    """A(feat-001)→B(bugfix-001), C(bugfix-002)→A. Merge B+C collapses
+    to lex-smaller B; B inherits C's dep on A → A→B and B→A — cycle."""
+    plans = [
+        {"domain": "feature-implementation", "subtasks": [
+            {"id": "feat-001", "title": "A", "intent": "a",
+             "provides": [], "requires": [], "depends_on": ["bugfix-001"],
+             "files_likely_touched": ["src/a.tsx"],
+             "success_criteria_seed": "a"},
+        ]},
+        {"domain": "bug-fixing", "subtasks": [
+            {"id": "bugfix-001", "title": "B", "intent": "b",
+             "provides": [], "requires": [], "depends_on": [],
+             "files_likely_touched": ["src/shared.tsx"],
+             "success_criteria_seed": "b"},
+            {"id": "bugfix-002", "title": "C", "intent": "c",
+             "provides": [], "requires": [], "depends_on": ["feat-001"],
+             "files_likely_touched": ["src/shared.tsx"],
+             "success_criteria_seed": "c"},
+        ]},
+    ]
+    # Pre-merge: feat-001 → bugfix-001, bugfix-002 → feat-001. Acyclic.
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    preds, _, _ = leerie._build_predecessor_graph(by_id)
+    succ = {sid: set() for sid in by_id}
+    for tgt, src_set in preds.items():
+        for src in src_set:
+            succ[src].add(tgt)
+    assert leerie._tarjan_sccs(set(by_id), succ) == []
+
+    # Merge collision between bugfix-001 and bugfix-002.  Lex-smaller
+    # bugfix-001 survives; it inherits bugfix-002's depends_on: [feat-001].
+    # feat-001 already depends_on bugfix-001 → cycle.
+    collisions = [{
+        "a_sid": "bugfix-001", "b_sid": "bugfix-002",
+        "artifact": "src/shared.tsx", "resolution": "merge",
+        "merge_feasibility": "both touch shared.tsx", "reason": "overlap",
+    }]
+    leerie._apply_overlap_collisions(plans, collisions)
+
+    # Post-merge: rebuild graph and confirm cycle exists.
+    by_id2 = {s["id"]: s for p in plans for s in p["subtasks"]}
+    preds2, _, _ = leerie._build_predecessor_graph(by_id2)
+    succ2 = {sid: set() for sid in by_id2}
+    for tgt, src_set in preds2.items():
+        for src in src_set:
+            succ2[src].add(tgt)
+    sccs = leerie._tarjan_sccs(set(by_id2), succ2)
+    assert len(sccs) == 1, f"expected 1 cycle, got {sccs}"
+    # Lex-smaller bugfix-001 survives; it inherits bugfix-002's dep on
+    # feat-001, creating bugfix-001 → feat-001 → bugfix-001.
+    assert set(sccs[0]) == {"feat-001", "bugfix-001"}

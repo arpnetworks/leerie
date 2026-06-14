@@ -419,6 +419,17 @@ absorbed into A. This is the same silent-data-loss class the
 per-pair merge-feasibility discipline exists to prevent, applied
 across the chain of absorptions rather than within a single pair.
 
+**Post-merge acyclicity.** The merge dependency-union (B inherits A's
+`depends_on` when A is absorbed) plus downstream reference rewriting
+(any subtask depending on A now depends on B) can introduce transitive
+cycles absent from the post-reconcile graph — the phase 2½ acyclicity
+gate passed before these merges ran. The orchestrator therefore runs
+Tarjan's SCC on the post-merge graph immediately after applying
+collisions. On cycle detection it `die()`s with the full cycle
+diagnostic; the actionable recovery is `--skip-overlap-judge` (let the
+integrator resolve file conflicts at integration time) or narrowing the
+task to reduce cross-planner overlap.
+
 ### Artifact passing between subtasks
 
 Some subtasks produce a structured deliverable that a downstream subtask

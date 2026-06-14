@@ -11489,6 +11489,35 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # Apply merges and drops in input order via the pure helper.
     applied = _apply_overlap_collisions(plans, collisions)
 
+    # Post-merge acyclicity gate. Merge dependency-union can introduce
+    # transitive cycles absent from the post-reconcile graph (phase 2½
+    # passed before these merges ran). Catch them here with a clear
+    # diagnostic instead of letting phase 3's Kahn fallback emit an
+    # opaque subtask dump.
+    post_merge_subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            post_merge_subtasks[s["id"]] = s
+    pm_preds, _pm_provs, pm_edge_sources = _build_predecessor_graph(
+        post_merge_subtasks)
+    pm_succ: dict[str, set[str]] = {sid: set() for sid in post_merge_subtasks}
+    for tgt, src_set in pm_preds.items():
+        for src in src_set:
+            pm_succ[src].add(tgt)
+    pm_sccs = _tarjan_sccs(set(post_merge_subtasks), pm_succ)
+    if pm_sccs:
+        diag = _format_cycle_diagnostic(
+            pm_sccs, pm_succ, pm_edge_sources, {}, post_merge_subtasks)
+        die(
+            f"phase 2¾: overlap-judge merges introduced "
+            f"{len(pm_sccs)} dependency cycle(s):\n{diag}\n"
+            "The pre-merge graph was acyclic (phase 2½ gate passed); "
+            "the merge dependency-union created a transitive cycle. "
+            "To unblock: re-run with --skip-overlap-judge and let the "
+            "integrator resolve file conflicts at integration time, or "
+            "narrow the task to reduce cross-planner overlap."
+        )
+
     st.data["plan_overlap_applied"] = applied
     st.save()
     n_merge = sum(1 for a in applied if a['action'] == 'merge')
@@ -11665,12 +11694,9 @@ def schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
 
     preds, _providers, _edge_sources = _build_predecessor_graph(subtasks)
 
-    # Kahn's algorithm -> waves. Cycles are normally caught upstream by
-    # phase 2½'s acyclicity gate (with edge attribution + retry); if one
-    # slips through to here, the same `_build_predecessor_graph` produced
-    # the edges, so the gate's earlier Tarjan would have caught it. The
-    # `remaining`-dump fallback below stays as a belt-and-suspenders
-    # diagnostic for that improbable case.
+    # Kahn's algorithm -> waves. Cycles are caught upstream by phase 2½'s
+    # acyclicity gate (reconciler output) and phase 2¾'s post-merge gate
+    # (overlap-judge merges). This fallback stays as defense-in-depth.
     waves: list[list[str]] = []
     done: set[str] = set()
     remaining = set(subtasks)
