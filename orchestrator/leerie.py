@@ -1787,6 +1787,7 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
             shutil.rmtree(worktree, ignore_errors=True)
         except OSError:
             pass
+    await run_proc(["git", "worktree", "prune"])
 
 
 def _parse_claude_version(version_output: str | None) -> tuple[int, int, int] | None:
@@ -13444,6 +13445,14 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     proc = await run_script("setup-run.sh", st.run_id)
     if proc.returncode != 0:
         die(f"run setup failed: {proc.stderr.strip()}")
+
+    # On Fly, machine stop SIGKILLs the orchestrator (PID 1 is sleep
+    # infinity; SIGTERM reaps it, kernel SIGKILLs children) — the
+    # finally-block cleanup never runs and .git/worktrees/ metadata
+    # from the prior invocation persists on the volume. Prune before
+    # any wave creates new worktrees so stale entries don't crash
+    # `git worktree list --porcelain` in new-worktree.sh.
+    await run_proc(["git", "worktree", "prune"])
 
     sem = asyncio.Semaphore(caps["max_parallel"])
 
