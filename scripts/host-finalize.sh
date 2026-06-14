@@ -177,6 +177,21 @@ EOF
 )"
   fi
 
+  # The working_branch recorded at run start may no longer exist on
+  # origin — e.g. a stacked run whose parent was squash-merged (and
+  # branch-deleted) while this run was in flight. Detect and fall back
+  # to the repo's default branch so `gh pr create` doesn't 404.
+  local original_working_branch="$working_branch"
+  if ! git -C "$USER_REPO" ls-remote --exit-code --heads origin "$working_branch" >/dev/null 2>&1; then
+    local default_branch
+    default_branch="$(git -C "$USER_REPO" remote show origin 2>/dev/null \
+                       | sed -n 's/.*HEAD branch: //p')"
+    if [ -n "$default_branch" ]; then
+      echo "[leerie] finalize: base branch $working_branch no longer exists on origin; falling back to $default_branch" >&2
+      working_branch="$default_branch"
+    fi
+  fi
+
   echo "[leerie] finalize: opening PR against $working_branch" >&2
   local pr_output
   if ! pr_output="$(echo "$pr_body" | gh pr create \
@@ -189,6 +204,10 @@ EOF
       "pr_url=" "pr_error=${pr_output:-gh pr create failed}"
     echo "⚠  \`gh pr create\` failed; branch was pushed successfully." >&2
     echo "  Pushed branch: $run_branch (on origin)" >&2
+    if [ "$working_branch" != "$original_working_branch" ]; then
+      echo "  (base branch $original_working_branch was already deleted from origin;" >&2
+      echo "   tried fallback to $working_branch, which also failed)" >&2
+    fi
     echo "  Open the PR manually:" >&2
     echo "    gh pr create --base $working_branch --head $run_branch" >&2
     echo "  Or via the GitHub web UI for the repo." >&2
