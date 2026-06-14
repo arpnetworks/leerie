@@ -102,7 +102,7 @@ def test_cleanup_run_id_removes_worktrees_but_preserves_state(tmp_path):
     # Set up a tiny git repo so `git worktree prune` doesn't error.
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "test@x"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
     (repo / "file").write_text("x")
@@ -194,7 +194,7 @@ def test_cleanup_branches_and_subtask_branches_mutually_exclusive(tmp_path):
     run branch."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "t@t"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
     (repo / "x").write_text("x")
@@ -224,7 +224,7 @@ def test_cleanup_finds_run_dir_under_state_dir(tmp_path):
     that env var is set — NOT from <cwd>/.leerie/runs/<id>/."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "test@x"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
     (repo / "file").write_text("x")
@@ -259,7 +259,7 @@ def test_cleanup_state_dir_unset_falls_back_to_repo(tmp_path):
     relative to CWD — the legacy/in-repo behavior."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.email", "test@x"], cwd=repo, check=True)
     subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
     (repo / "file").write_text("x")

@@ -1963,7 +1963,7 @@ touches happen on the laptop using its existing `gh auth` and
 
 | Function | Purpose |
 |----------|---------|
-| `synth_merge_branches(repo, base_branch, dep_branches, stage_name)` | Build a stage branch by merging each dep branch into a fresh checkout of `base_branch`; raises `SynthMergeConflict` on any conflict. Used by the wave loop between waves. |
+| `synth_merge_branches(repo, base_branch, dep_branches, stage_name)` | Build a stage branch by merging each dep branch into a fresh checkout of `base_branch`; raises `SynthMergeConflict` on any conflict. Used by the wave loop between waves. Passes `-c user.email=leerie-chain@bot.invalid -c user.name=leerie-chain` to `git merge` defensively so the merge commit succeeds even when the laptop's global git identity is unset (otherwise the merge would fail with "Committer identity unknown"). |
 | `clone_target(url, pat, dest)`, `fetch_branch`, `push_branch`, `open_pr`, `finalize_run`, `write_audit_artifact` | Kept for compatibility with existing tests and any future automated paths; the wave loop MVP uses only `synth_merge_branches`. |
 
 Maps to `DESIGN.md`: §19 *Chain orchestration*.
