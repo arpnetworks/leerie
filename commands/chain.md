@@ -1,5 +1,5 @@
 ---
-description: Submit and manage a multi-run leerie chain. Use when the user wants to run a sequence of leerie runs (Wave A producers, Wave B consumers) via the leerie-chain HTTP API.
+description: Submit and manage a multi-run leerie chain. Use when the user wants to run a sequence of leerie runs (N sequential waves) via the leerie-chain HTTP API.
 argument-hint: <submit|status|list|kill|attach> [<args>]
 ---
 
@@ -12,10 +12,9 @@ $ARGUMENTS
 ```
 
 A *chain* is a sequence of leerie runs orchestrated by the `leerie-chain`
-Fly app (DESIGN.md §19). Each chain is split into two waves: Wave A runs
-execute against the repo's current state in parallel; Wave B runs execute
-against the accumulated Wave A results (a `stage-<chain-id>` branch) once
-all Wave A runs have merged.
+Fly app (DESIGN.md §19). Each chain has N sequential waves (wave 0, 1, …).
+Runs within a wave execute in parallel; each wave runs against the
+accumulated results of all prior waves (a `stage-<chain-id>` branch).
 
 **Runtime prerequisite**: The `leerie-chain` Fly app must be deployed and
 reachable. `LEERIE_CHAIN_URL` controls the endpoint (default:
@@ -34,14 +33,14 @@ Parse the first word of `$ARGUMENTS` to decide the subcommand:
 
 ### `submit` — start a new chain
 
-Required: at least one prompt file (Wave A or Wave B). Optional: a target
-repo (defaults to the current repo). The launcher reads each prompt file
-and sends its contents as the run prompt.
+Required: at least one `--wave` flag. Optional: a target repo (defaults
+to the current repo). Each `--wave` defines one sequential wave; the
+launcher reads each prompt file and sends its contents as the run prompt.
 
 ```
 bash "${CLAUDE_PLUGIN_ROOT}/leerie" --chain-submit \
-  --wave-a-runs <path/to/a1.txt,path/to/a2.txt> \
-  --wave-b-runs <path/to/b1.txt> \
+  --wave <path/to/a1.txt,path/to/a2.txt> \
+  --wave <path/to/b1.txt> \
   --target <repo-path-or-url>
 ```
 
@@ -55,7 +54,7 @@ bash "${CLAUDE_PLUGIN_ROOT}/leerie" --chain-status <chain-id>
 ```
 
 Returns the full chain row plus each run's status, wave, and Fly machine
-id. Poll this to watch a chain progress from `wave_a` → `wave_b` → `done`.
+id. Poll this to watch a chain progress from `wave_0` → `wave_1` → … → `done`.
 
 ### `list` — list all chains
 

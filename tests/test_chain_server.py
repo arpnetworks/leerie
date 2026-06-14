@@ -6,14 +6,14 @@ git_ops.clone_target / create_stage_branch are stubbed so no live Fly API
 calls or git network access is required.
 
 Test coverage:
-  POST /chains   — creates a chain row, stubs launch_machine for Wave A
+  POST /chains   — creates a chain row, stubs launch_machine for wave 0
   GET  /chains/<id>  — returns the snapshot
   GET  /chains/<missing-id>  — returns 404
   POST /webhooks/fly
-      — Wave-A-final exit event triggers Wave B launch
+      — Wave-A-final exit event triggers wave 1 launch
       — Bad signature returns 400
       — Non-exit event is silently ignored (200 ok)
-      — Wave A failure pauses chain (no Wave B launch)
+      — wave 0 failure pauses chain (no wave 1 launch)
 """
 from __future__ import annotations
 
@@ -161,8 +161,8 @@ class TestPostChains:
                 {
                     "target": "https://github.com/org/repo",
                     "runs": [
-                        {"prompt": "Task A1", "wave": "a"},
-                        {"prompt": "Task A2", "wave": "a"},
+                        {"prompt": "Task A1", "wave": "0"},
+                        {"prompt": "Task A2", "wave": "0"},
                     ],
                 },
             )
@@ -171,7 +171,7 @@ class TestPostChains:
         assert "id" in body
         assert body["target"] == "https://github.com/org/repo"
 
-    def test_launches_wave_a_machines(
+    def test_launches_wave_0_machines(
         self, server_url: str, cs: ChainState
     ) -> None:
         launched: list[dict] = []
@@ -186,17 +186,17 @@ class TestPostChains:
                 {
                     "target": "https://github.com/org/repo",
                     "runs": [
-                        {"prompt": "Wave A Task", "wave": "a"},
-                        {"prompt": "Wave B Task", "wave": "b"},
+                        {"prompt": "wave 0 Task", "wave": "0"},
+                        {"prompt": "wave 1 Task", "wave": "1"},
                     ],
                 },
             )
 
         assert status == 201
-        # Only Wave A should have been launched.
+        # Only wave 0 should have been launched.
         assert len(launched) == 1
 
-    def test_does_not_launch_wave_b_machines_on_create(
+    def test_does_not_launch_wave_1_machines_on_create(
         self, server_url: str, cs: ChainState
     ) -> None:
         launched_waves: list[str] = []
@@ -213,17 +213,17 @@ class TestPostChains:
                 {
                     "target": "https://github.com/org/repo",
                     "runs": [
-                        {"prompt": "A1", "wave": "a"},
-                        {"prompt": "B1", "wave": "b"},
-                        {"prompt": "B2", "wave": "b"},
+                        {"prompt": "A1", "wave": "0"},
+                        {"prompt": "B1", "wave": "1"},
+                        {"prompt": "B2", "wave": "1"},
                     ],
                 },
             )
 
-        # Only Wave A (1 run) launched.
+        # Only wave 0 (1 run) launched.
         assert len(launched_waves) == 1
 
-    def test_wave_a_runs_marked_running(
+    def test_wave_0_runs_marked_running(
         self, server_url: str, cs: ChainState
     ) -> None:
         with patch("chain.server.fly_client.launch_machine", return_value="m-test"):
@@ -231,21 +231,21 @@ class TestPostChains:
                 f"{server_url}/chains",
                 {
                     "target": "https://github.com/org/repo",
-                    "runs": [{"prompt": "A task", "wave": "a"}],
+                    "runs": [{"prompt": "A task", "wave": "0"}],
                 },
             )
 
         chain_id = body["id"]
         snap = cs.load_chain(chain_id)
         assert snap is not None
-        wave_a_run = next(r for r in snap["runs"] if r["wave"] == "a")
-        assert wave_a_run["status"] == "running"
-        assert wave_a_run["machine_id"] == "m-test"
+        wave_0_run = next(r for r in snap["runs"] if r["wave"] == "0")
+        assert wave_0_run["status"] == "running"
+        assert wave_0_run["machine_id"] == "m-test"
 
     def test_missing_target_returns_400(self, server_url: str) -> None:
         status, body = _post(
             f"{server_url}/chains",
-            {"runs": [{"prompt": "p", "wave": "a"}]},
+            {"runs": [{"prompt": "p", "wave": "0"}]},
         )
         assert status == 400
         assert "target" in body.get("error", "").lower()
@@ -283,7 +283,7 @@ class TestPostChains:
         """A 400 response must not persist a chain row in the DB."""
         status, _ = _post(
             f"{server_url}/chains",
-            {"runs": [{"prompt": "p", "wave": "a"}]},  # missing target
+            {"runs": [{"prompt": "p", "wave": "0"}]},  # missing target
         )
         assert status == 400
         assert cs.list_chains() == []
@@ -318,7 +318,7 @@ class TestGetChain:
     ) -> None:
         chain_id = cs.create_chain(
             target="https://github.com/org/repo",
-            run_prompts=[("Task A", "a"), ("Task B", "b")],
+            run_prompts=[("Task A", "0"), ("Task B", "1")],
         )
         status, body = _get(f"{server_url}/chains/{chain_id}")
         assert status == 200
@@ -335,7 +335,7 @@ class TestGetChain:
     ) -> None:
         chain_id = cs.create_chain(
             target="https://github.com/org/repo",
-            run_prompts=[("Task A", "a")],
+            run_prompts=[("Task A", "0")],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
@@ -382,7 +382,7 @@ class TestWebhookFly:
     ) -> None:
         chain_id = cs.create_chain(
             target="https://github.com/org/repo",
-            run_prompts=[("Task A", "a")],
+            run_prompts=[("Task A", "0")],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
@@ -402,67 +402,67 @@ class TestWebhookFly:
         assert updated is not None
         assert updated["runs"][0]["status"] == "done"
 
-    def test_wave_a_complete_launches_wave_b(
+    def test_wave_0_complete_launches_wave_1(
         self, server_url: str, cs: ChainState
     ) -> None:
-        """When the last Wave A run exits 0, Wave B machines are launched."""
+        """When the last wave 0 run exits 0, wave 1 machines are launched."""
         chain_id = cs.create_chain(
             target="https://github.com/org/repo",
             run_prompts=[
-                ("Wave A task", "a"),
-                ("Wave B task 1", "b"),
-                ("Wave B task 2", "b"),
+                ("wave 0 task", "0"),
+                ("wave 1 task 1", "1"),
+                ("wave 1 task 2", "1"),
             ],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
-        run_a = next(r for r in snap["runs"] if r["wave"] == "a")
-        cs.transition_run(run_a["id"], "running", machine_id="m-wave-a")
+        run_0 = next(r for r in snap["runs"] if r["wave"] == "0")
+        cs.transition_run(run_0["id"], "running", machine_id="m-wave-0")
 
-        wave_b_launches: list[str] = []
+        wave_1_launches: list[str] = []
 
         def fake_launch(**kw: Any) -> str:
-            wave_b_launches.append("launched")
-            return f"m-b-{len(wave_b_launches)}"
+            wave_1_launches.append("launched")
+            return f"m-1-{len(wave_1_launches)}"
 
         with patch("chain.server.fly_client.launch_machine", side_effect=fake_launch):
             payload = {
                 "type": _FLY_EXIT_EVENT,
-                "machine_id": "m-wave-a",
+                "machine_id": "m-wave-0",
                 "exit_code": 0,
             }
             status, _ = _post_webhook(server_url, payload)
 
         assert status == 200
-        # Both Wave B runs must have been launched.
-        assert len(wave_b_launches) == 2
+        # Both wave 1 runs must have been launched.
+        assert len(wave_1_launches) == 2
 
         updated = cs.load_chain(chain_id)
         assert updated is not None
-        assert updated["wave_state"] == "wave_b"
-        wave_b_runs = [r for r in updated["runs"] if r["wave"] == "b"]
-        assert all(r["status"] == "running" for r in wave_b_runs)
+        assert updated["wave_state"] == "wave_1"
+        wave_1_runs = [r for r in updated["runs"] if r["wave"] == "1"]
+        assert all(r["status"] == "running" for r in wave_1_runs)
 
-    def test_wave_a_failure_pauses_chain(
+    def test_wave_0_failure_pauses_chain(
         self, server_url: str, cs: ChainState
     ) -> None:
-        """A non-zero Wave A exit pauses the chain — no Wave B launch."""
+        """A non-zero wave 0 exit pauses the chain — no wave 1 launch."""
         chain_id = cs.create_chain(
             target="https://github.com/org/repo",
             run_prompts=[
-                ("Wave A task", "a"),
-                ("Wave B task", "b"),
+                ("wave 0 task", "0"),
+                ("wave 1 task", "1"),
             ],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
-        run_a = next(r for r in snap["runs"] if r["wave"] == "a")
-        cs.transition_run(run_a["id"], "running", machine_id="m-fail")
+        run_0 = next(r for r in snap["runs"] if r["wave"] == "0")
+        cs.transition_run(run_0["id"], "running", machine_id="m-fail")
 
         launched: list[str] = []
         with patch(
             "chain.server.fly_client.launch_machine",
-            side_effect=lambda **kw: launched.append("b") or "m-b-1",
+            side_effect=lambda **kw: launched.append("1") or "m-1-1",
         ):
             payload = {
                 "type": _FLY_EXIT_EVENT,
@@ -477,8 +477,8 @@ class TestWebhookFly:
         updated = cs.load_chain(chain_id)
         assert updated is not None
         assert updated["status"] == "paused"
-        # wave_state remains wave_a — never advanced.
-        assert updated["wave_state"] == "wave_a"
+        # wave_state remains wave_0 — never advanced.
+        assert updated["wave_state"] == "wave_0"
 
     def test_non_exit_event_ignored(
         self, server_url: str, cs: ChainState
@@ -486,7 +486,7 @@ class TestWebhookFly:
         """Non-exit Fly events are accepted (200) but do not change state."""
         chain_id = cs.create_chain(
             target="https://github.com/org/repo",
-            run_prompts=[("Task A", "a")],
+            run_prompts=[("Task A", "0")],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
@@ -528,18 +528,18 @@ class TestWebhookFly:
             status = exc.code
         assert status == 400
 
-    def test_wave_a_done_no_wave_b_marks_chain_done(
+    def test_wave_0_done_no_wave_1_marks_chain_done(
         self, server_url: str, cs: ChainState
     ) -> None:
-        """When Wave A completes and there is no Wave B, the chain is marked done."""
+        """When wave 0 completes and there is no wave 1, the chain is marked done."""
         chain_id = cs.create_chain(
             target="https://github.com/org/repo",
-            run_prompts=[("Task A only", "a")],
+            run_prompts=[("Task A only", "0")],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
-        run_a = snap["runs"][0]
-        cs.transition_run(run_a["id"], "running", machine_id="m-solo")
+        run_0 = snap["runs"][0]
+        cs.transition_run(run_0["id"], "running", machine_id="m-solo")
 
         payload = {
             "type": _FLY_EXIT_EVENT,
@@ -568,11 +568,11 @@ class TestListChains:
     def test_lists_all_chains(self, server_url: str, cs: ChainState) -> None:
         c1 = cs.create_chain(
             target="https://github.com/org/r1",
-            run_prompts=[("A", "a")],
+            run_prompts=[("A", "0")],
         )
         c2 = cs.create_chain(
             target="https://github.com/org/r2",
-            run_prompts=[("B", "a")],
+            run_prompts=[("B", "0")],
         )
         status, body = _get(f"{server_url}/chains")
         assert status == 200
@@ -585,7 +585,7 @@ class TestListChains:
         """The list endpoint is a summary; per-chain runs live behind GET /chains/<id>."""
         cs.create_chain(
             target="https://github.com/org/r",
-            run_prompts=[("A", "a"), ("B", "b")],
+            run_prompts=[("A", "0"), ("B", "1")],
         )
         _, body = _get(f"{server_url}/chains")
         for c in body["chains"]:
@@ -602,7 +602,7 @@ class TestGetChainLog:
     ) -> None:
         chain_id = cs.create_chain(
             target="https://github.com/org/r",
-            run_prompts=[("Task A", "a"), ("Task B", "b")],
+            run_prompts=[("Task A", "0"), ("Task B", "1")],
         )
         status, body = _get(f"{server_url}/chains/{chain_id}/log")
         assert status == 200
@@ -617,7 +617,7 @@ class TestGetChainLog:
     ) -> None:
         chain_id = cs.create_chain(
             target="https://github.com/org/r",
-            run_prompts=[("Task", "a")],
+            run_prompts=[("Task", "0")],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
@@ -644,7 +644,7 @@ class TestDeleteChain:
     ) -> None:
         chain_id = cs.create_chain(
             target="https://github.com/org/r",
-            run_prompts=[("Task", "a")],
+            run_prompts=[("Task", "0")],
         )
         with patch("chain.server.fly_client.destroy_machine"):
             status, body = _delete(f"{server_url}/chains/{chain_id}")
@@ -657,13 +657,13 @@ class TestDeleteChain:
     ) -> None:
         chain_id = cs.create_chain(
             target="https://github.com/org/r",
-            run_prompts=[("A1", "a"), ("A2", "a"), ("B1", "b")],
+            run_prompts=[("A1", "0"), ("A2", "0"), ("B1", "1")],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
         running_machines = ["m-running-1", "m-running-2"]
         for run, mid in zip(
-            [r for r in snap["runs"] if r["wave"] == "a"],
+            [r for r in snap["runs"] if r["wave"] == "0"],
             running_machines,
         ):
             cs.transition_run(run["id"], "running", machine_id=mid)
@@ -684,7 +684,7 @@ class TestDeleteChain:
         """Queued and already-done runs do not trigger destroy_machine calls."""
         chain_id = cs.create_chain(
             target="https://github.com/org/r",
-            run_prompts=[("A", "a"), ("B", "a")],
+            run_prompts=[("A", "0"), ("B", "0")],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
@@ -706,7 +706,7 @@ class TestDeleteChain:
         """Cancelling transitions still-running runs to 'failed' in the DB."""
         chain_id = cs.create_chain(
             target="https://github.com/org/r",
-            run_prompts=[("A", "a")],
+            run_prompts=[("A", "0")],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
@@ -733,7 +733,7 @@ class TestDeleteChain:
 
         chain_id = cs.create_chain(
             target="https://github.com/org/r",
-            run_prompts=[("A", "a")],
+            run_prompts=[("A", "0")],
         )
         snap = cs.load_chain(chain_id)
         assert snap is not None
@@ -754,7 +754,7 @@ class TestDeleteChain:
     ) -> None:
         chain_id = cs.create_chain(
             target="https://github.com/org/r",
-            run_prompts=[("A", "a")],
+            run_prompts=[("A", "0")],
         )
         with patch("chain.server.fly_client.destroy_machine"):
             _delete(f"{server_url}/chains/{chain_id}")

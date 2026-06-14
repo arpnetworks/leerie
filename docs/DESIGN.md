@@ -2690,16 +2690,16 @@ this section is meant to surface.
 Chain orchestration (§19) is also not demonstrated. The launcher verbs
 (`--chain-submit`, `--chain-status`, `--list-chains`, `--chain-kill`,
 `--chain-attach`) are implemented and documented, but the `leerie-chain`
-Fly app — the persistent HTTP server, its SQLite state machine, Wave A/B
+Fly app — the persistent HTTP server, its SQLite state machine, N-wave
 sequencing, and machine-exit webhook handling — has not been exercised
 in a live run. The chain subsystem's behavior is reasoned, not observed.
 
-**Chain Wave A finalization is an explicit open item.** The webhook
+**Chain wave finalization is an explicit open item.** The webhook
 handler in `chain/server.py` transitions runs to `done`/`failed` and
 advances the chain's wave state, but it does *not* push the run branch
 to origin or open the PR. The helpers exist (`chain/git_ops.push_branch`,
-`chain/git_ops.open_pr`) but are unwired. A clean Wave A exit today
-therefore advances the chain to Wave B without producing a PR for the
+`chain/git_ops.open_pr`) but are unwired. A clean wave exit today
+therefore advances the chain to the next wave without producing a PR for the
 finished run. Wiring the push + PR into the webhook path is non-trivial
 because the per-run Fly machine has already exited (and is typically
 destroyed) by the time the webhook fires — the chain orchestrator must
@@ -2756,10 +2756,10 @@ design:
 - **Per-domain implementer specialization.** One generic implementer serves all
   nine domains today. Nine domain-specialized implementers would allow richer
   per-domain guidance, at the cost of more to maintain.
-- **Richer chain dependency DAG.** The chain subsystem (§19) uses a two-wave
-  (Wave A / Wave B) model — the minimum shape that is not flat. A general
-  task-dependency DAG would allow arbitrary inter-run ordering for workloads
-  that do not fit the single-level producer/consumer pattern.
+- **Chain dependency DAG.** The chain subsystem (§19) uses an N-wave
+  sequential model (wave 0, wave 1, …, wave N−1). A general task-dependency
+  DAG would allow arbitrary inter-run ordering for workloads that do not
+  fit a purely sequential pattern (e.g. diamond dependencies).
 
 ---
 
@@ -2796,7 +2796,7 @@ path, so the run branch is *not* on origin when the machine-exit webhook
 fires. The chain orchestrator must therefore push the branch and open
 the PR itself: `chain/git_ops.py` exposes `push_branch` and `open_pr`
 helpers for this purpose. **Open item**: those helpers exist but are not
-yet wired into `chain/server.py`'s webhook handler — Wave A
+yet wired into `chain/server.py`'s webhook handler — wave
 finalization is currently a no-op. See §16 *Verification status*
 for the open work.
 
@@ -2821,10 +2821,9 @@ Whatever the host working tree's HEAD points to at invocation time.
 tree as-is — no `git checkout` and no `git rev-parse HEAD` in the
 seeding path. The chain orchestrator establishes the stage branch in
 its own clone via `chain/git_ops.create_stage_branch`, then launches
-each Wave B machine with the stage branch already checked out in the
-clone the seeder reads from. The seeding mechanism does not change;
-the chain app manages branch state, not the seeder. (See also
-*Wave B seeding* below.)
+each subsequent-wave machine with the stage branch already checked out
+in the clone the seeder reads from. The seeding mechanism does not
+change; the chain app manages branch state, not the seeder.
 
 
 
@@ -2975,36 +2974,21 @@ start latency on webhook delivery. The machine is small — the app is a
 lightweight Python HTTP server with no worker processes of its own — and
 costs significantly less than the ephemeral per-run machines it launches.
 
-### Wave A and Wave B sequencing
+### N-wave sequential execution
 
-The chain model organizes runs into two waves:
+The chain model organizes runs into N sequential waves (wave 0, wave 1,
+…, wave N−1). Each `--wave` flag on `--chain-submit` defines one wave;
+runs within a wave may execute in parallel; waves execute in strict
+order. Wave K+1 does not begin until every run in wave K has completed
+successfully.
 
-- **Wave A** — runs that execute independently against the repository's
-  current state (typically `main`). All Wave A runs may run in parallel.
-  Each produces a PR; each PR is merged when its run completes and passes
-  review. Wave A is complete when all its runs have merged.
-- **Wave B** — runs that depend on one or more Wave A results being on
-  the base branch. `leerie-chain` creates a `stage-<chain-id>` branch,
-  merges each Wave A result into it as they land, and seeds each Wave B
-  machine from that staging branch. Wave B runs may also run in parallel
-  once Wave A is complete; their PRs target the staging branch and are
-  merged in order.
-
-**Why this two-wave structure and not a richer DAG.** A general
-task-dependency DAG would allow arbitrary inter-run ordering. The chain
-feature is introduced as a single-level producer/consumer model — Wave A
-produces artifacts or code that Wave B consumes — because that covers the
-motivating use case (fetch → summarize → publish) with the minimum
-machinery. A richer DAG can be built on this foundation later; Wave A/B
-is the simplest shape that is not flat.
-
-**Wave B seeding.** `leerie-chain` seeds each Wave B machine by seeding
-the `stage-<chain-id>` branch as the working tree HEAD. The existing
-`seed-repo.sh` seeds whatever the host's working tree contains — a
-`git checkout stage-<chain-id>` on the `leerie-chain` machine's clone
-before seeding delivers the accumulated Wave A results to the Wave B
-worker. No change to the seeding mechanism is required; the chain app
-manages the branch state, not the seeder.
+`leerie-chain` creates a `stage-<chain-id>` branch and merges each
+completed wave's results into it before seeding the next wave's
+machines. The existing `seed-repo.sh` seeds whatever the host's working
+tree contains — a `git checkout stage-<chain-id>` on the chain app's
+clone before seeding delivers the accumulated prior-wave results to the
+next wave's workers. No change to the seeding mechanism is required; the
+chain app manages the branch state, not the seeder.
 
 **Failure handling.** A run that exits nonzero (implementation failed,
 confidence gate not cleared, blocked) pauses the chain and records the
@@ -3023,8 +3007,9 @@ rationale behind the CLI-subprocess shape that makes this natural):
 
 ```
 leerie --chain-submit \
-       --wave-a-runs prompts/fetch.txt,prompts/lint.txt \
-       --wave-b-runs prompts/summarize.txt,prompts/publish.txt \
+       --wave prompts/fetch.txt,prompts/lint.txt \
+       --wave prompts/summarize.txt \
+       --wave prompts/publish.txt \
        --target ~/src/enric/summarizer
 
 leerie --chain-status <chain-id>
@@ -3049,8 +3034,8 @@ chain subsystem the same way it applies everywhere else:
   a machine-exit event transitions state mechanically; no model judges
   whether the transition is valid.
 - The **run sequencing** — which run in the chain launches next, whether
-  Wave A is fully complete before Wave B begins — is a Python query over
-  the SQLite `chain_runs` table. The prompt that describes Wave A/B to
+  wave K is fully complete before wave K+1 begins — is a Python query over
+  the SQLite `chain_runs` table. The prompt that describes wave sequencing to
   a user does not govern the sequencing; the code does.
 - The **webhook signature verification** — confirming that a received
   webhook was signed with the Fly signing secret — is a HMAC check in

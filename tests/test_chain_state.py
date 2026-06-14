@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from chain.state import ChainState, CHAIN_STATUSES, RUN_STATUSES, WAVE_STATES
+from chain.state import ChainState, CHAIN_STATUSES, RUN_STATUSES, _valid_wave_state
 
 
 # ---------------------------------------------------------------------------
@@ -20,15 +20,15 @@ def _make_db() -> ChainState:
 
 
 def _simple_chain(cs: ChainState) -> tuple[str, list[str]]:
-    """Create a chain with two runs (one Wave A, one Wave B).
+    """Create a chain with two runs (wave 0 and wave 1).
 
-    Returns (chain_id, [run_id_a, run_id_b]).
+    Returns (chain_id, [run_id_0, run_id_1]).
     """
     chain_id = cs.create_chain(
         target="https://github.com/test/repo",
         run_prompts=[
-            ("Fetch the data", "a"),
-            ("Summarise the data", "b"),
+            ("Fetch the data", "0"),
+            ("Summarise the data", "1"),
         ],
     )
     snapshot = cs.load_chain(chain_id)
@@ -71,7 +71,7 @@ def test_init_db_wal_mode(tmp_path) -> None:
 
 def test_create_chain_returns_id() -> None:
     cs = _make_db()
-    chain_id = cs.create_chain("repo-url", [("Task A", "a")])
+    chain_id = cs.create_chain("repo-url", [("Task A", "0")])
     assert isinstance(chain_id, str)
     assert len(chain_id) > 0
     cs.close()
@@ -84,7 +84,7 @@ def test_load_chain_returns_snapshot() -> None:
     assert snap is not None
     assert snap["id"] == chain_id
     assert snap["target"] == "https://github.com/test/repo"
-    assert snap["wave_state"] == "wave_a"
+    assert snap["wave_state"] == "wave_0"
     assert snap["status"] == "running"
     assert len(snap["runs"]) == 2
     cs.close()
@@ -95,13 +95,13 @@ def test_load_chain_run_fields() -> None:
     chain_id, run_ids = _simple_chain(cs)
     snap = cs.load_chain(chain_id)
     assert snap is not None
-    run_a = snap["runs"][0]
-    assert run_a["wave"] == "a"
-    assert run_a["status"] == "queued"
-    assert run_a["machine_id"] is None
-    assert run_a["chain_id"] == chain_id
-    run_b = snap["runs"][1]
-    assert run_b["wave"] == "b"
+    run_0 = snap["runs"][0]
+    assert run_0["wave"] == "0"
+    assert run_0["status"] == "queued"
+    assert run_0["machine_id"] is None
+    assert run_0["chain_id"] == chain_id
+    run_1 = snap["runs"][1]
+    assert run_1["wave"] == "1"
     cs.close()
 
 
@@ -114,7 +114,7 @@ def test_load_chain_missing_returns_none() -> None:
 
 def test_create_chain_n_runs() -> None:
     cs = _make_db()
-    prompts = [(f"Run {i}", "a") for i in range(5)]
+    prompts = [(f"Run {i}", "0") for i in range(5)]
     chain_id = cs.create_chain("target", prompts)
     snap = cs.load_chain(chain_id)
     assert snap is not None
@@ -124,8 +124,8 @@ def test_create_chain_n_runs() -> None:
 
 def test_create_chain_invalid_wave_raises() -> None:
     cs = _make_db()
-    with pytest.raises(ValueError, match="wave must be"):
-        cs.create_chain("target", [("Task", "c")])
+    with pytest.raises(ValueError, match="non-negative integer"):
+        cs.create_chain("target", [("Task", "x")])
     cs.close()
 
 
@@ -141,8 +141,8 @@ def test_list_chains_empty() -> None:
 
 def test_list_chains_returns_all() -> None:
     cs = _make_db()
-    cs.create_chain("repo1", [("T1", "a")])
-    cs.create_chain("repo2", [("T2", "a")])
+    cs.create_chain("repo1", [("T1", "0")])
+    cs.create_chain("repo2", [("T2", "0")])
     chains = cs.list_chains()
     assert len(chains) == 2
     targets = {c["target"] for c in chains}
@@ -278,20 +278,20 @@ def test_all_chain_statuses_accepted() -> None:
 # advance_wave
 # ---------------------------------------------------------------------------
 
-def test_advance_wave_a_to_b() -> None:
+def test_advance_wave_0_to_1() -> None:
     cs = _make_db()
     chain_id, _ = _simple_chain(cs)
-    cs.advance_wave(chain_id, "wave_b")
+    cs.advance_wave(chain_id, "wave_1")
     snap = cs.load_chain(chain_id)
     assert snap is not None
-    assert snap["wave_state"] == "wave_b"
+    assert snap["wave_state"] == "wave_1"
     cs.close()
 
 
-def test_advance_wave_b_to_done() -> None:
+def test_advance_wave_through_n_to_done() -> None:
     cs = _make_db()
     chain_id, _ = _simple_chain(cs)
-    cs.advance_wave(chain_id, "wave_b")
+    cs.advance_wave(chain_id, "wave_1")
     cs.advance_wave(chain_id, "done")
     snap = cs.load_chain(chain_id)
     assert snap is not None
@@ -303,21 +303,23 @@ def test_advance_wave_invalid_raises() -> None:
     cs = _make_db()
     chain_id, _ = _simple_chain(cs)
     with pytest.raises(ValueError, match="invalid wave state"):
-        cs.advance_wave(chain_id, "wave_c")
+        cs.advance_wave(chain_id, "wave_x")
     cs.close()
 
 
 def test_advance_wave_missing_chain_raises() -> None:
     cs = _make_db()
     with pytest.raises(KeyError):
-        cs.advance_wave("nonexistent-chain", "wave_b")
+        cs.advance_wave("nonexistent-chain", "wave_1")
     cs.close()
 
 
-def test_all_wave_states_accepted() -> None:
-    for ws in WAVE_STATES:
+def test_advance_wave_high_index_accepted() -> None:
+    """Wave indices above 1 are valid (N-wave chains)."""
+    for idx in (0, 1, 5, 99):
         cs = _make_db()
         chain_id, _ = _simple_chain(cs)
+        ws = f"wave_{idx}"
         cs.advance_wave(chain_id, ws)
         snap = cs.load_chain(chain_id)
         assert snap is not None
@@ -351,37 +353,32 @@ def test_set_machine_id_missing_raises() -> None:
 # ---------------------------------------------------------------------------
 
 def test_full_chain_flow() -> None:
-    """Create chain, run Wave A, advance to Wave B, run Wave B, mark done."""
+    """Create chain, run wave 0, advance to wave 1, run wave 1, mark done."""
     cs = _make_db()
     chain_id = cs.create_chain(
         target="https://github.com/org/repo",
         run_prompts=[
-            ("Fetch data", "a"),
-            ("Process results", "b"),
+            ("Fetch data", "0"),
+            ("Process results", "1"),
         ],
     )
 
     snap = cs.load_chain(chain_id)
     assert snap is not None
-    run_a_id = snap["runs"][0]["id"]
-    run_b_id = snap["runs"][1]["id"]
+    run_0_id = snap["runs"][0]["id"]
+    run_1_id = snap["runs"][1]["id"]
 
-    # Wave A: launch, complete
-    cs.transition_run(run_a_id, "running", machine_id="m-001")
-    cs.transition_run(run_a_id, "done")
+    cs.transition_run(run_0_id, "running", machine_id="m-001")
+    cs.transition_run(run_0_id, "done")
 
-    # Advance chain to wave_b
-    cs.advance_wave(chain_id, "wave_b")
+    cs.advance_wave(chain_id, "wave_1")
 
-    # Wave B: launch, complete
-    cs.transition_run(run_b_id, "running", machine_id="m-002")
-    cs.transition_run(run_b_id, "done")
+    cs.transition_run(run_1_id, "running", machine_id="m-002")
+    cs.transition_run(run_1_id, "done")
 
-    # Mark chain done
     cs.advance_wave(chain_id, "done")
     cs.transition_chain(chain_id, "done")
 
-    # Final snapshot
     final = cs.load_chain(chain_id)
     assert final is not None
     assert final["status"] == "done"
@@ -393,10 +390,37 @@ def test_full_chain_flow() -> None:
     cs.close()
 
 
-def test_chain_pause_on_failure() -> None:
-    """A failed Wave A run can pause the chain."""
+def test_full_chain_flow_3_waves() -> None:
+    """3-wave chain: wave_0 → wave_1 → wave_2 → done."""
     cs = _make_db()
-    chain_id = cs.create_chain("repo", [("Run 1", "a"), ("Run 2", "a")])
+    chain_id = cs.create_chain(
+        target="repo",
+        run_prompts=[("W0", "0"), ("W1", "1"), ("W2", "2")],
+    )
+    snap = cs.load_chain(chain_id)
+    assert snap is not None
+    rids = [r["id"] for r in snap["runs"]]
+
+    for i, rid in enumerate(rids):
+        cs.transition_run(rid, "running", machine_id=f"m-{i}")
+        cs.transition_run(rid, "done")
+        if i < len(rids) - 1:
+            cs.advance_wave(chain_id, f"wave_{i + 1}")
+
+    cs.advance_wave(chain_id, "done")
+    cs.transition_chain(chain_id, "done")
+
+    final = cs.load_chain(chain_id)
+    assert final is not None
+    assert final["wave_state"] == "done"
+    assert all(r["status"] == "done" for r in final["runs"])
+    cs.close()
+
+
+def test_chain_pause_on_failure() -> None:
+    """A failed wave 0 run can pause the chain."""
+    cs = _make_db()
+    chain_id = cs.create_chain("repo", [("Run 1", "0"), ("Run 2", "0")])
     snap = cs.load_chain(chain_id)
     assert snap is not None
     run_ids = [r["id"] for r in snap["runs"]]
@@ -409,7 +433,6 @@ def test_chain_pause_on_failure() -> None:
     assert snap is not None
     assert snap["status"] == "paused"
     assert snap["runs"][0]["status"] == "failed"
-    # Run 1 still queued — not launched
     assert snap["runs"][1]["status"] == "queued"
     cs.close()
 
@@ -423,8 +446,8 @@ def test_chain_pause_on_failure() -> None:
 def test_two_chains_disjoint_state() -> None:
     """Transitioning one chain's state must not affect the other chain."""
     cs = _make_db()
-    chain_a = cs.create_chain("repo-a", [("Task A1", "a"), ("Task A2", "b")])
-    chain_b = cs.create_chain("repo-b", [("Task B1", "a")])
+    chain_a = cs.create_chain("repo-a", [("Task A1", "0"), ("Task A2", "1")])
+    chain_b = cs.create_chain("repo-b", [("Task B1", "0")])
 
     snap_a = cs.load_chain(chain_a)
     snap_b = cs.load_chain(chain_b)
@@ -433,7 +456,7 @@ def test_two_chains_disjoint_state() -> None:
 
     # Advance chain A's state; chain B must remain unchanged.
     cs.transition_run(run_a_id, "running", machine_id="m-a")
-    cs.advance_wave(chain_a, "wave_b")
+    cs.advance_wave(chain_a, "wave_1")
     cs.transition_chain(chain_a, "paused")
 
     snap_a2 = cs.load_chain(chain_a)
@@ -442,12 +465,12 @@ def test_two_chains_disjoint_state() -> None:
 
     # Chain A reflects changes.
     assert snap_a2["status"] == "paused"
-    assert snap_a2["wave_state"] == "wave_b"
+    assert snap_a2["wave_state"] == "wave_1"
     assert snap_a2["runs"][0]["status"] == "running"
 
     # Chain B is entirely unaffected.
     assert snap_b2["status"] == "running"
-    assert snap_b2["wave_state"] == "wave_a"
+    assert snap_b2["wave_state"] == "wave_0"
     assert snap_b2["runs"][0]["status"] == "queued"
     assert snap_b2["runs"][0]["machine_id"] is None
 

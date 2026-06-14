@@ -8,12 +8,13 @@ webhook receiver):
         {
           "target": "<repo https url>",
           "runs": [
-            {"prompt": "<task text>", "wave": "a" | "b"},
+            {"prompt": "<task text>", "wave": "0"},
+            {"prompt": "<task text>", "wave": "1"},
             ...
           ]
         }
       Clones the target repo, creates the stage-<chain_id> branch, launches
-      all Wave A machines immediately via the Fly Machines API, and persists
+      all wave 0 machines immediately via the Fly Machines API, and persists
       the chain in SQLite. Returns 201 with the full chain snapshot.
 
   GET /chains
@@ -39,8 +40,8 @@ webhook receiver):
       Receive Fly machine-exit events. Verifies the HMAC-SHA256 signature
       in the ``fly-signature-256`` header; rejects with 400 on mismatch.
       Dispatches to ``handle_machine_exit`` from chain.webhooks; if all
-      Wave A runs are now done, advances the chain to ``wave_b`` and
-      launches the Wave B machines.
+      runs in the current wave are done, advances to the next wave and
+      launches its machines.
 
 The handler is intentionally stateless across requests — all mutable state
 lives in the ``ChainState`` SQLite DB. The server is single-threaded on a
@@ -224,7 +225,7 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
         # "chain is cancelled" guarantee holds even if a future code path
         # introduces a new exception type through transition_run /
         # destroy_machine — without the finally, a mid-loop raise would
-        # leave the chain stuck in wave_a/wave_b with some runs failed.
+        # leave the chain stuck in an active wave with some runs failed.
         destroy_errors: list[str] = []
         try:
             for run in snap["runs"]:
@@ -282,10 +283,10 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
                 return
             prompt = item.get("prompt", "")
             wave = item.get("wave", "")
-            if not prompt or wave not in ("a", "b"):
+            if not prompt or not isinstance(wave, str) or not wave.isdigit():
                 self._send_json(
                     400,
-                    {"error": "each run must have a non-empty 'prompt' and 'wave' ('a' or 'b')"},
+                    {"error": "each run must have a non-empty 'prompt' and 'wave' (non-negative integer string)"},
                 )
                 return
             run_prompts.append((str(prompt), str(wave)))
@@ -316,7 +317,7 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": f"git setup failed: {exc}"})
             return
 
-        # Launch all Wave A machines.
+        # Launch all wave 0 machines.
         snap = self._cs.load_chain(chain_id)
         if snap is None:
             self._send_json(500, {"error": "chain row disappeared after creation"})
@@ -326,7 +327,7 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
         fly_region = os.environ.get("LEERIE_REGION", "iad")
 
         for run in snap["runs"]:
-            if run["wave"] != "a":
+            if run["wave"] != "0":
                 continue
             try:
                 machine_id = fly_client.launch_machine(
@@ -381,15 +382,14 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": f"webhook handler error: {exc}"})
             return
 
-        # After a successful machine exit, check whether all Wave A runs are
-        # done and it's time to launch Wave B.
-        self._maybe_advance_to_wave_b(payload)
+        # After a successful machine exit, check whether all runs in the
+        # current wave are done and it's time to launch the next wave.
+        self._maybe_advance_wave(payload)
 
         self._send_json(200, {"ok": True})
 
-    def _maybe_advance_to_wave_b(self, payload: dict[str, Any]) -> None:
-        """If all Wave A runs are done, advance chain to wave_b and launch Wave B machines."""
-        # Find the run whose machine_id matches the payload's machine_id.
+    def _maybe_advance_wave(self, payload: dict[str, Any]) -> None:
+        """If all runs in the current wave are done, advance to the next wave."""
         machine_id: str | None = (
             payload.get("machine_id")
             or payload.get("id")
@@ -399,7 +399,6 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
         if not machine_id:
             return
 
-        # Find the chain that owns this machine_id.
         chain_id_or_none = self._cs.find_chain_id_by_machine_id(machine_id)
         if chain_id_or_none is None:
             return
@@ -409,41 +408,38 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
         if snap is None:
             return
 
-        # Only advance if we're still in wave_a.
-        if snap["wave_state"] != "wave_a":
+        ws = snap["wave_state"]
+        if not ws.startswith("wave_"):
+            return
+        current_idx = int(ws[5:])
+        current_wave = str(current_idx)
+
+        current_runs = [r for r in snap["runs"] if r["wave"] == current_wave]
+        if not all(r["status"] in ("done", "failed") for r in current_runs):
             return
 
-        wave_a_runs = [r for r in snap["runs"] if r["wave"] == "a"]
-        wave_b_runs = [r for r in snap["runs"] if r["wave"] == "b"]
-
-        # All Wave A runs must be in terminal state (done or failed).
-        all_done = all(r["status"] in ("done", "failed") for r in wave_a_runs)
-        if not all_done:
-            return
-
-        # If any Wave A run failed, pause the chain instead of launching Wave B.
-        any_failed = any(r["status"] == "failed" for r in wave_a_runs)
-        if any_failed:
+        if any(r["status"] == "failed" for r in current_runs):
             self._cs.transition_chain(chain_id, "paused")
             return
 
-        # All Wave A runs completed successfully.
-        if not wave_b_runs:
-            # No Wave B runs — chain is done.
+        next_idx = current_idx + 1
+        next_wave = str(next_idx)
+        next_runs = [r for r in snap["runs"] if r["wave"] == next_wave]
+
+        if not next_runs:
             self._cs.advance_wave(chain_id, "done")
             self._cs.transition_chain(chain_id, "done")
             return
 
-        # Advance to wave_b and launch all Wave B machines.
-        self._cs.advance_wave(chain_id, "wave_b")
+        self._cs.advance_wave(chain_id, f"wave_{next_idx}")
 
         fly_image = os.environ.get("LEERIE_IMAGE", "registry.fly.io/leerie:latest")
         fly_region = os.environ.get("LEERIE_REGION", "iad")
         target = snap["target"]
 
-        for run in wave_b_runs:
+        for run in next_runs:
             try:
-                machine_id_b = fly_client.launch_machine(
+                mid = fly_client.launch_machine(
                     image=fly_image,
                     env={
                         "LEERIE_CHAIN_ID": chain_id,
@@ -456,7 +452,7 @@ class ChainHTTPHandler(BaseHTTPRequestHandler):
             except fly_client.FlyClientError:
                 self._cs.transition_chain(chain_id, "failed")
                 return
-            self._cs.transition_run(run["id"], "running", machine_id=machine_id_b)
+            self._cs.transition_run(run["id"], "running", machine_id=mid)
 
     # ------------------------------------------------------------------
     # Helpers

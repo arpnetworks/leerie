@@ -14237,7 +14237,7 @@ launcher verbs (handled before the container starts):
   --local-build         force local image build (not Fly remote builder)
 
 chain verbs (launcher fast-paths — no container started):
-  --chain-submit        submit a multi-run chain (--wave-a-runs/--wave-b-runs)
+  --chain-submit        submit a multi-run chain (--wave <files> ...)
   --chain-status <id>   print a chain snapshot
   --list-chains         list all chains
   --chain-kill <id>     cancel a chain and destroy its machines

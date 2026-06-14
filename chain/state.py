@@ -20,7 +20,7 @@ Two tables:
   chains
     id           TEXT PRIMARY KEY   — opaque UUID-style identifier
     target       TEXT NOT NULL      — target repo URL or local path
-    wave_state   TEXT NOT NULL      — 'wave_a' | 'wave_b' | 'done'
+    wave_state   TEXT NOT NULL      — 'wave_0' | 'wave_1' | … | 'done'
     status       TEXT NOT NULL      — 'running' | 'paused' | 'done' | 'failed' | 'cancelled'
     created_at   TEXT NOT NULL      — ISO-8601 UTC timestamp
     updated_at   TEXT NOT NULL
@@ -29,7 +29,7 @@ Two tables:
     id           TEXT PRIMARY KEY   — opaque UUID-style identifier
     chain_id     TEXT NOT NULL      — FK → chains.id
     prompt       TEXT NOT NULL      — task prompt text for this run
-    wave         TEXT NOT NULL      — 'a' | 'b'
+    wave         TEXT NOT NULL      — '0' | '1' | '2' | …
     machine_id   TEXT               — Fly machine ID (set when launched)
     status       TEXT NOT NULL      — 'queued' | 'running' | 'done' | 'failed'
     created_at   TEXT NOT NULL
@@ -53,7 +53,7 @@ _DDL = """\
 CREATE TABLE IF NOT EXISTS chains (
     id         TEXT PRIMARY KEY,
     target     TEXT NOT NULL,
-    wave_state TEXT NOT NULL DEFAULT 'wave_a',
+    wave_state TEXT NOT NULL DEFAULT 'wave_0',
     status     TEXT NOT NULL DEFAULT 'running',
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -75,7 +75,11 @@ CREATE TABLE IF NOT EXISTS chain_runs (
 # Valid status values — checked at transition boundaries.
 CHAIN_STATUSES = frozenset({"running", "paused", "done", "failed", "cancelled"})
 RUN_STATUSES = frozenset({"queued", "running", "done", "failed"})
-WAVE_STATES = frozenset({"wave_a", "wave_b", "done"})
+def _valid_wave_state(s: str) -> bool:
+    """'done' or 'wave_N' for non-negative integer N."""
+    if s == "done":
+        return True
+    return s.startswith("wave_") and s[5:].isdigit()
 
 
 def _now() -> str:
@@ -93,8 +97,8 @@ class ChainState:
 
         cs = ChainState.init_db("/data/chain.db")
         chain_id = cs.create_chain(target="https://github.com/org/repo",
-                                   run_prompts=[("Fetch data", "a"),
-                                                ("Summarise", "b")])
+                                   run_prompts=[("Fetch data", "0"),
+                                                ("Summarise", "1")])
         cs.transition_run(run_id, "running")
         cs.transition_run(run_id, "done")
         snapshot = cs.load_chain(chain_id)
@@ -137,7 +141,8 @@ class ChainState:
         Args:
             target: Target repo URL or local path.
             run_prompts: Ordered list of ``(prompt_text, wave)`` tuples.
-                         ``wave`` must be ``'a'`` or ``'b'``.
+                         ``wave`` is a non-negative integer string
+                         (``'0'``, ``'1'``, …).
 
         Returns:
             The new chain's ``id``.
@@ -147,12 +152,12 @@ class ChainState:
         with self._conn:
             self._conn.execute(
                 "INSERT INTO chains (id, target, wave_state, status, created_at, updated_at)"
-                " VALUES (?, ?, 'wave_a', 'running', ?, ?)",
+                " VALUES (?, ?, 'wave_0', 'running', ?, ?)",
                 (chain_id, target, now, now),
             )
             for prompt, wave in run_prompts:
-                if wave not in ("a", "b"):
-                    raise ValueError(f"wave must be 'a' or 'b', got {wave!r}")
+                if not wave.isdigit():
+                    raise ValueError(f"wave must be a non-negative integer string, got {wave!r}")
                 self._conn.execute(
                     "INSERT INTO chain_runs"
                     " (id, chain_id, prompt, wave, machine_id, status, created_at, updated_at)"
@@ -169,7 +174,7 @@ class ChainState:
             {
               "id": "...",
               "target": "...",
-              "wave_state": "wave_a" | "wave_b" | "done",
+              "wave_state": "wave_0" | "wave_1" | … | "done",
               "status": "running" | "paused" | "done" | "failed" | "cancelled",
               "created_at": "...",
               "updated_at": "...",
@@ -178,7 +183,7 @@ class ChainState:
                   "id": "...",
                   "chain_id": "...",
                   "prompt": "...",
-                  "wave": "a" | "b",
+                  "wave": "0" | "1" | …,
                   "machine_id": "..." | None,
                   "status": "queued" | "running" | "done" | "failed",
                   "created_at": "...",
@@ -276,15 +281,17 @@ class ChainState:
             raise KeyError(f"chain {chain_id!r} not found")
 
     def advance_wave(self, chain_id: str, new_wave_state: str) -> None:
-        """Advance the chain's wave state (e.g. ``'wave_a'`` → ``'wave_b'``).
+        """Advance the chain's wave state (e.g. ``'wave_0'`` → ``'wave_1'``).
 
         Raises:
-            ValueError: If *new_wave_state* is not in ``WAVE_STATES``.
+            ValueError: If *new_wave_state* is not ``'done'`` or ``'wave_N'``
+                        for a non-negative integer N.
             KeyError: If *chain_id* is not found.
         """
-        if new_wave_state not in WAVE_STATES:
+        if not _valid_wave_state(new_wave_state):
             raise ValueError(
-                f"invalid wave state {new_wave_state!r}; must be one of {sorted(WAVE_STATES)}"
+                f"invalid wave state {new_wave_state!r}; "
+                "must be 'done' or 'wave_N' for non-negative integer N"
             )
         now = _now()
         with self._conn:

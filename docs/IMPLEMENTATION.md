@@ -858,14 +858,13 @@ export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
 # they never start a container and do not forward to the Python orchestrator.
 # LEERIE_CHAIN_URL sets the API base URL (default: http://localhost:8080).
 
-# Submit a new chain. --wave-a-runs and --wave-b-runs each take a comma-
-# separated list of prompt-file paths. Wave A runs execute in parallel
-# against the repo's current state; Wave B runs execute against the
-# accumulated Wave A results (a stage-<chain-id> branch).
+# Submit a new chain. Each --wave flag defines one sequential wave
+# (comma-separated prompt-file paths). Waves execute in order; runs
+# within a wave execute in parallel. N waves are supported.
 # --target is the repo path (defaults to $USER_REPO or $PWD).
 leerie --chain-submit \
-  --wave-a-runs prompts/fetch.txt,prompts/lint.txt \
-  --wave-b-runs prompts/publish.txt \
+  --wave prompts/fetch.txt,prompts/lint.txt \
+  --wave prompts/publish.txt \
   --target ~/src/myrepo
 
 # Check status of a chain. Prints the JSON response from GET /chains/<id>.
@@ -1782,7 +1781,7 @@ container.
 
 | Verb | Flags | API call |
 |------|-------|----------|
-| `leerie --chain-submit` | one or more of `--wave-a-runs <files>`, `--wave-b-runs <files>`; `--target <repo>` (optional, defaults to `$USER_REPO` or `$PWD`) | `POST /chains` — body is `{"runs": [{"prompt": ..., "wave": "a" \| "b"}, ...], "target": "..."}` built with `python3 -c '...'`. Each `--wave-*-runs` value is a comma-separated list of *prompt file paths*; the launcher reads each file and sends its contents as the prompt (DESIGN.md §19 *Wave A and Wave B sequencing*). |
+| `leerie --chain-submit` | one or more `--wave <files>` (repeatable); `--target <repo>` (optional, defaults to `$USER_REPO` or `$PWD`) | `POST /chains` — body is `{"runs": [{"prompt": ..., "wave": "0" \| "1" \| …}, ...], "target": "..."}` built with `python3 -c '...'`. Each `--wave` value is a comma-separated list of *prompt file paths*; the launcher reads each file and sends its contents as the prompt. Wave index is assigned by `--wave` flag order (0, 1, 2, …). N waves are supported (DESIGN.md §19 *N-wave sequential execution*). |
 | `leerie --chain-status <chain-id>` | positional `<chain-id>` | `GET /chains/<chain-id>` |
 | `leerie --list-chains` | none | `GET /chains` — returns `{"chains": [...]}` (summary rows; no run details) |
 | `leerie --chain-kill <chain-id>` | positional `<chain-id>` | `DELETE /chains/<chain-id>` — server destroys every still-running per-run Fly machine via `fly_client.destroy_machine`, transitions the chain to `'cancelled'`, returns `{"chain": <snapshot>}` (or `{"chain": ..., "warnings": [...]}` on partial Fly-side failure). Idempotent on already-terminal chains. |
@@ -1790,9 +1789,8 @@ container.
 
 All five verbs exit non-zero on missing required args or when a positional
 argument looks like a flag (starts with `--`). `--chain-submit` exits non-zero
-when none of `--wave-a-runs`/`--wave-b-runs` are passed, when a referenced
-prompt file does not exist or is empty, or when an unrecognised flag is
-passed.
+when no `--wave` flags are passed, when a referenced prompt file does not
+exist or is empty, or when an unrecognised flag is passed.
 
 The launcher/server route contract is enforced mechanically by
 `tests/test_chain_server.py::TestLauncherServerCoupling` — it greps every
@@ -4000,17 +3998,16 @@ preflight, alongside `--kill` / `--stop`), never forwarded to the Python
 orchestrator, and never start a container. `LEERIE_CHAIN_URL` sets the
 base URL (default: `http://localhost:8080`).
 
-- **`leerie --chain-submit [--wave-a-runs <files>] [--wave-b-runs <files>]
-  [--target <repo>]`** — POST `/chains`. Each
-  `--wave-*-runs` value is a comma-separated list of prompt-file
-  paths; the launcher reads each file and emits one
-  `{"prompt": <file contents>, "wave": "a" | "b"}` object per file in the
-  request body. `--target` is the repo path
-  (defaults to `$USER_REPO` or `$PWD`). The launcher converts the values to
-  a JSON body via `python3 -c '...'` and passes it to `curl -X POST`. Exits
-  non-zero when none of `--wave-a-runs` / `--wave-b-runs` are
-  passed, when a referenced prompt file does not exist or is empty, or
-  when an unknown flag is passed.
+- **`leerie --chain-submit --wave <files> [--wave <files> ...] [--target <repo>]`**
+  — POST `/chains`. Each `--wave` value is a comma-separated list of
+  prompt-file paths; the launcher reads each file and emits one
+  `{"prompt": <file contents>, "wave": "<index>"}` object per file, where
+  the index is assigned by `--wave` flag order (0, 1, 2, …). N waves are
+  supported. `--target` is the repo path (defaults to `$USER_REPO` or
+  `$PWD`). The launcher converts the values to a JSON body via
+  `python3 -c '...'` and passes it to `curl -X POST`. Exits non-zero when
+  no `--wave` flags are passed, when a referenced prompt file does not
+  exist or is empty, or when an unknown flag is passed.
 
 - **`leerie --chain-status <chain-id>`** — GET `/chains/<chain-id>` and
   print the JSON response. Exits non-zero when `<chain-id>` is missing or
@@ -4074,8 +4071,8 @@ export LEERIE_CHAIN_URL=https://leerie-chain.fly.dev
 echo "Add a blank line to README.md" > /tmp/a.txt
 echo "Add a comment to that line"    > /tmp/b.txt
 leerie --chain-submit \
-  --wave-a-runs /tmp/a.txt \
-  --wave-b-runs /tmp/b.txt \
+  --wave /tmp/a.txt \
+  --wave /tmp/b.txt \
   --target git@github.com:<user>/<throwaway>.git
 # capture CHAIN_ID from the response JSON
 leerie --chain-status "$CHAIN_ID"   # poll
@@ -4086,9 +4083,9 @@ leerie --chain-kill "$CHAIN_ID"     # idempotent on done chains
 
 **Pass criteria.**
 
-- Wave A machine launches, exits cleanly, Fly fires the webhook.
-- `wave_state` advances `wave_a` → `wave_b`.
-- Wave B machine launches against the `stage-<chain-id>` branch.
+- Wave 0 machine launches, exits cleanly, Fly fires the webhook.
+- `wave_state` advances `wave_0` → `wave_1`.
+- Wave 1 machine launches against the `stage-<chain-id>` branch.
 - Both runs land PRs against the target repo.
 
 After the test passes, DESIGN.md §16's chain-orchestration caveat
@@ -4125,13 +4122,13 @@ model for `leerie-chain`. Key public surface:
 | `ChainState.list_chains()` | Return all chain rows (no run sub-rows). |
 | `ChainState.transition_run(run_id, new_status, machine_id=None)` | Advance a run's status; optionally records the Fly machine ID. Raises `ValueError` on invalid status, `KeyError` if not found. |
 | `ChainState.transition_chain(chain_id, new_status)` | Set the chain's top-level status. Raises `ValueError`/`KeyError`. |
-| `ChainState.advance_wave(chain_id, new_wave_state)` | Advance the chain's wave state (`wave_a` → `wave_b` → `done`). Raises `ValueError`/`KeyError`. |
+| `ChainState.advance_wave(chain_id, new_wave_state)` | Advance the chain's wave state (`wave_0` → `wave_1` → … → `done`). Raises `ValueError`/`KeyError`. |
 | `ChainState.find_chain_id_by_machine_id(machine_id)` | Return the `chain_id` for the run with the given Fly machine ID, or `None` if not found. |
 | `ChainState.set_machine_id(run_id, machine_id)` | Record a Fly machine ID on a run row without changing status. Raises `KeyError` if not found. |
 | `ChainState.close()` | Close the underlying SQLite connection. |
 | `CHAIN_STATUSES` | `frozenset` of valid chain status values: `running`, `paused`, `done`, `failed`, `cancelled`. |
 | `RUN_STATUSES` | `frozenset` of valid run status values: `queued`, `running`, `done`, `failed`. |
-| `WAVE_STATES` | `frozenset` of valid wave state values: `wave_a`, `wave_b`, `done`. |
+| `_valid_wave_state(s)` | Returns `True` if *s* is `'done'` or `'wave_N'` for non-negative integer N. Replaces the former `WAVE_STATES` frozenset. |
 
 Single-writer semantics mirror the orchestrator's `State` class: `leerie-chain` is one process on one Fly machine; all HTTP handler coroutines serialise on a single asyncio event loop and never interleave inside a SQLite transaction. WAL mode is enabled for defence-in-depth (concurrent readers are possible; the writer-exclusive lock prevents concurrent writes regardless). Covered by `tests/test_chain_state.py`.
 
@@ -4188,9 +4185,9 @@ Endpoints:
 
 | Method | Path | Behaviour |
 |--------|------|-----------|
-| `POST` | `/chains` | Body: `{"target": str, "runs": [{"prompt": str, "wave": "a"\|"b"}, ...]}`. Creates a chain row in SQLite, clones the target repo via `git_ops.clone_target`, creates the stage branch via `git_ops.create_stage_branch`, launches all Wave A runs via `fly_client.launch_machine`, marks them `running`, and returns 201 with the full chain snapshot. Returns 400 on missing/invalid fields; 500 on git or Fly errors. |
+| `POST` | `/chains` | Body: `{"target": str, "runs": [{"prompt": str, "wave": "0"\|"1"\|…}, ...]}`. Creates a chain row in SQLite, clones the target repo via `git_ops.clone_target`, creates the stage branch via `git_ops.create_stage_branch`, launches all wave 0 runs via `fly_client.launch_machine`, marks them `running`, and returns 201 with the full chain snapshot. Returns 400 on missing/invalid fields; 500 on git or Fly errors. |
 | `GET` | `/chains/<id>` | Returns 200 with the full chain snapshot (`ChainState.load_chain`), or 404 if not found. |
-| `POST` | `/webhooks/fly` | Reads `fly-signature-256` header; rejects with 400 on bad/absent signature. Dispatches to `handle_machine_exit`; after a successful Wave A completion, calls `_maybe_advance_to_wave_b` which advances `wave_state` to `wave_b` and launches Wave B machines. If any Wave A run failed, pauses the chain. If Wave A completes with no Wave B runs, marks the chain `done`. Returns 200 `{"ok": true}` on success. |
+| `POST` | `/webhooks/fly` | Reads `fly-signature-256` header; rejects with 400 on bad/absent signature. Dispatches to `handle_machine_exit`; after a successful current-wave completion, calls `_maybe_advance_wave` which advances `wave_state` to the next wave and launches its machines. If any current-wave run failed, pauses the chain. If the current wave completes with no subsequent waves, marks the chain `done`. Returns 200 `{"ok": true}` on success. |
 
 Covered by `tests/test_chain_server.py` (server spun in-process on an
 ephemeral port; `fly_client.launch_machine` and `git_ops` stubbed via

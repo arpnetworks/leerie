@@ -306,11 +306,11 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 # leerie-chain HTTP API. LEERIE_CHAIN_URL sets the endpoint
 # (default: http://localhost:8080). These verbs are launcher fast-paths
 # (like --kill) — they never start a container and do not forward to the
-# Python orchestrator. --wave-a-runs / --wave-b-runs are the canonical
-# flags:
+# Python orchestrator. Each --wave flag defines one sequential wave
+# (N waves supported); waves execute in order:
 ./leerie --chain-submit \
-  --wave-a-runs "prompts/fetch.md,prompts/lint.md" \
-  --wave-b-runs "prompts/publish.md" \
+  --wave "prompts/fetch.md,prompts/lint.md" \
+  --wave "prompts/publish.md" \
   --target /my/repo
 ./leerie --chain-status <chain-id>
 ./leerie --list-chains

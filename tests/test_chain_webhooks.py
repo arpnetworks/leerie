@@ -50,7 +50,7 @@ def _make_exit_payload(
 def _db_with_running_run() -> tuple[ChainState, str, str]:
     """Return (ChainState, chain_id, run_id) with one running run."""
     cs = ChainState.init_db(":memory:")
-    chain_id = cs.create_chain("https://github.com/test/repo", [("Task A", "a")])
+    chain_id = cs.create_chain("https://github.com/test/repo", [("Task A", "0")])
     snap = cs.load_chain(chain_id)
     assert snap is not None
     run_id = snap["runs"][0]["id"]

@@ -2,7 +2,7 @@
 
 The chain app runs inside a container that holds the GH_DISPATCH_PAT.
 Functions here clone the target repo, manage the stage-<chain-id>
-branch used for Wave B sequencing, and push branches / open PRs via gh.
+branch used for N-wave sequencing, and push branches / open PRs via gh.
 
 This is the chain app's counterpart to the host-side scripts/host-finalize.sh.
 The actor is different (chain app, not user's shell) but the git/gh mechanic

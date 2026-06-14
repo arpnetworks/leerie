@@ -236,14 +236,13 @@ export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
 # leerie-chain HTTP API (LEERIE_CHAIN_URL sets the endpoint;
 # default: http://localhost:8080).
 
-# Submit a new chain. --wave-a-runs and --wave-b-runs each take a
-# comma-separated list of prompt files; Wave A runs execute against
-# the repo's current state, Wave B runs execute against the
-# accumulated Wave A results (a stage-<chain-id> branch).
+# Submit a new chain. Each --wave defines one sequential wave
+# (comma-separated prompt files). Waves execute in order; runs
+# within a wave execute in parallel. N waves are supported.
 # --target is the local repo path (defaults to $PWD).
 leerie --chain-submit \
-  --wave-a-runs prompts/fetch.md,prompts/lint.md \
-  --wave-b-runs prompts/publish.md \
+  --wave prompts/fetch.md,prompts/lint.md \
+  --wave prompts/publish.md \
   --target ~/src/myrepo
 
 # Check status of a running or completed chain:

@@ -397,25 +397,25 @@ prompts/
 ```bash
 export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev  # point at your deployed app
 
-# Canonical form: --wave-a-runs and --wave-b-runs split the chain into
-# Wave A (runs against current main, executed in parallel) and Wave B
-# (runs against the accumulated Wave A results — a stage-<chain-id>
-# branch). In this example, the data-model refactor lands first, then
-# the migration and API update execute in Wave B against the refactor.
+# Each --wave defines one sequential wave. Waves execute in order;
+# runs within a wave execute in parallel. In this example, the
+# data-model refactor lands first (wave 0), then the migration and
+# API update execute in wave 1 against the refactor.
 leerie --chain-submit \
-  --wave-a-runs prompts/01-refactor-data-model.md \
-  --wave-b-runs prompts/02-write-migration.md,prompts/03-update-api-layer.md \
+  --wave prompts/01-refactor-data-model.md \
+  --wave prompts/02-write-migration.md,prompts/03-update-api-layer.md \
   --target ~/src/myrepo
 
 ```
 
-Each `--wave-a-runs` / `--wave-b-runs` value is a
-comma-separated list of prompt-file paths (resolved on the host).
-`--target` is the local path of the repository to run against; it
-defaults to `$PWD` when omitted. `leerie-chain` receives a `POST
-/chains` request, inserts a chain record, and immediately launches
-the Wave A runs in parallel. Wave B launches after all Wave A runs
-complete cleanly. The command prints the new `chain-id`:
+Each `--wave` value is a comma-separated list of prompt-file paths
+(resolved on the host). Wave index is assigned by `--wave` flag
+order (0, 1, 2, …). `--target` is the local path of the repository
+to run against; it defaults to `$PWD` when omitted. `leerie-chain`
+receives a `POST /chains` request, inserts a chain record, and
+immediately launches wave 0 runs in parallel. Each subsequent wave
+launches after the previous wave completes cleanly. The command
+prints the new `chain-id`:
 
 ```
 {"chain_id": "chain-abc123", "status": "running", "current_run": 0}
@@ -485,8 +485,8 @@ export LEERIE_CHAIN_URL=https://my-chain-app.fly.dev
 export LEERIE_CHAIN_URL=http://localhost:8080
 
 leerie --chain-submit \
-  --wave-a-runs prompts/a.md \
-  --wave-b-runs prompts/b.md \
+  --wave prompts/a.md \
+  --wave prompts/b.md \
   --target ~/src/myrepo
 ```
 

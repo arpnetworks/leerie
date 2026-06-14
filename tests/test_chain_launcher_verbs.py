@@ -41,7 +41,7 @@ def _stub_curl(tmp_path: Path, response: str = '{"ok":true}', rc: int = 0) -> Pa
 
 def _write_prompts(tmp_path: Path, names: list[str]) -> str:
     """Create one prompt file per name under tmp_path and return them
-    as a comma-separated absolute-path string suitable for --wave-a-runs."""
+    as a comma-separated absolute-path string suitable for --wave."""
     paths: list[str] = []
     for n in names:
         p = tmp_path / n
@@ -90,7 +90,7 @@ def test_chain_submit_posts_to_chains_endpoint(tmp_path: Path):
     runs = _write_prompts(tmp_path, ["prompts/run-1.txt", "prompts/run-2.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--wave-a-runs", runs,
+        "--wave", runs,
         "--target", "/tmp/my-repo",
     ])
     assert result.returncode == 0, result.stderr
@@ -105,7 +105,7 @@ def test_chain_submit_includes_prompts_in_payload(tmp_path: Path):
     runs = _write_prompts(tmp_path, ["a.txt", "b.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--wave-a-runs", runs,
+        "--wave", runs,
         "--target", "/tmp/repo",
     ])
     assert result.returncode == 0, result.stderr
@@ -120,7 +120,7 @@ def test_chain_submit_includes_target_in_payload(tmp_path: Path):
     runs = _write_prompts(tmp_path, ["run.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--wave-a-runs", runs,
+        "--wave", runs,
         "--target", "/my/special/repo",
     ])
     assert result.returncode == 0, result.stderr
@@ -128,29 +128,29 @@ def test_chain_submit_includes_target_in_payload(tmp_path: Path):
     assert "/my/special/repo" in invoc
 
 
-def test_chain_submit_wave_a_and_b_split(tmp_path: Path):
-    """--wave-a-runs and --wave-b-runs designate runs per wave."""
-    a_paths = _write_prompts(tmp_path, ["wave_a/p1.txt", "wave_a/p2.txt"])
-    b_paths = _write_prompts(tmp_path, ["wave_b/p3.txt"])
+def test_chain_submit_multi_wave_split(tmp_path: Path):
+    """Multiple --wave flags assign sequential wave indices."""
+    w0_paths = _write_prompts(tmp_path, ["w0/p1.txt", "w0/p2.txt"])
+    w1_paths = _write_prompts(tmp_path, ["w1/p3.txt"])
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--wave-a-runs", a_paths,
-        "--wave-b-runs", b_paths,
+        "--wave", w0_paths,
+        "--wave", w1_paths,
         "--target", "/tmp/repo",
     ])
     assert result.returncode == 0, result.stderr
     invoc = _curl_invocations(tmp_path)
-    assert '"wave": "a"' in invoc
-    assert '"wave": "b"' in invoc
-    assert "prompt content for wave_a/p1.txt" in invoc
-    assert "prompt content for wave_b/p3.txt" in invoc
+    assert '"wave": "0"' in invoc
+    assert '"wave": "1"' in invoc
+    assert "prompt content for w0/p1.txt" in invoc
+    assert "prompt content for w1/p3.txt" in invoc
 
 
 def test_chain_submit_missing_prompt_file_errors(tmp_path: Path):
-    """A --wave-a-runs path that does not exist is a hard error, not a silent drop."""
+    """A --wave path that does not exist is a hard error, not a silent drop."""
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--wave-a-runs", str(tmp_path / "does-not-exist.txt"),
+        "--wave", str(tmp_path / "does-not-exist.txt"),
         "--target", "/tmp/repo",
     ])
     assert result.returncode != 0
@@ -163,7 +163,7 @@ def test_chain_submit_empty_prompt_file_errors(tmp_path: Path):
     empty.write_text("")
     result = _run_launcher(tmp_path, [
         "--chain-submit",
-        "--wave-a-runs", str(empty),
+        "--wave", str(empty),
         "--target", "/tmp/repo",
     ])
     assert result.returncode != 0
@@ -171,7 +171,7 @@ def test_chain_submit_empty_prompt_file_errors(tmp_path: Path):
 
 
 def test_chain_submit_requires_wave_runs(tmp_path: Path):
-    """--chain-submit without --wave-*-runs exits non-zero with an error."""
+    """--chain-submit without --wave exits non-zero with an error."""
     result = _run_launcher(tmp_path, ["--chain-submit", "--target", "/tmp/repo"])
     assert result.returncode != 0
     assert "wave" in result.stderr.lower()
@@ -181,7 +181,7 @@ def test_chain_submit_target_optional(tmp_path: Path):
     """--chain-submit without --target succeeds (target defaults to USER_REPO)."""
     runs = _write_prompts(tmp_path, ["run.txt"])
     result = _run_launcher(tmp_path, [
-        "--chain-submit", "--wave-a-runs", runs,
+        "--chain-submit", "--wave", runs,
     ])
     assert result.returncode == 0, result.stderr
     invoc = _curl_invocations(tmp_path)
@@ -193,7 +193,7 @@ def test_chain_submit_rejects_unknown_flags(tmp_path: Path):
     """--chain-submit rejects unknown flags."""
     runs = _write_prompts(tmp_path, ["a.txt"])
     result = _run_launcher(tmp_path, [
-        "--chain-submit", "--wave-a-runs", runs, "--bogus",
+        "--chain-submit", "--wave", runs, "--bogus",
     ])
     assert result.returncode != 0
 
