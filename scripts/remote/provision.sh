@@ -146,13 +146,11 @@ destroy_machine() {
     fi
     LEERIE_VOLUME_ID=""
   fi
-  # Drop the PID-keyed attach pointer (Phase 3) — the machine no longer
-  # exists, so attach should report "no active remote machine" next time.
-  if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
-    rm -f "$LEERIE_STATE_HOST_DIR/remote/$$.json"
-  elif [ -n "${USER_REPO:-}" ]; then
-    rm -f "$USER_REPO/.leerie/remote/$$.json"
-  fi
+  # Keep the PID-keyed attach pointer (remote/$$.json) after destroy.
+  # The chain tagging loop reads it post-wait to discover the machine ID
+  # and write chain_id + wave_idx into run.json. The resume auto-discovery
+  # path already filters stale pointers via kill -0, so a pointer for a
+  # dead PID is harmless.
   LEERIE_MACHINE_ID=""
 }
 

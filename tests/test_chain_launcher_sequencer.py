@@ -49,7 +49,12 @@ def _write_prompt(tmp_path: Path, name: str, content: str = "do the thing") -> P
     return p
 
 
-def _build_self_stub(tmp_path: Path, *, exit_codes: list[int] | None = None) -> tuple[Path, Path]:
+def _build_self_stub(
+    tmp_path: Path,
+    *,
+    exit_codes: list[int] | None = None,
+    skip_remote_pointer: bool = False,
+) -> tuple[Path, Path]:
     """Build a stub binary that:
 
     1. Records its argv on the log file.
@@ -59,6 +64,11 @@ def _build_self_stub(tmp_path: Path, *, exit_codes: list[int] | None = None) -> 
     3. Exits with the rc from `exit_codes[index]` (default 0).
 
     The stub uses its own PPID as a unique machine_id stand-in.
+
+    When *skip_remote_pointer* is True, the stub omits the
+    `remote/<pid>.json` write (simulating the old destroy_machine
+    behavior) but still writes `runs/<mid>/fly-machine.json` so
+    the fallback tagging path can discover the run via launcher_pid.
     """
     log = tmp_path / "stub.log"
     state_dir = tmp_path / ".leerie" / "testrepo"
@@ -66,6 +76,7 @@ def _build_self_stub(tmp_path: Path, *, exit_codes: list[int] | None = None) -> 
     stub = tmp_path / "self-stub"
     rc_table = exit_codes or [0]
     rc_table_repr = " ".join(str(c) for c in rc_table)
+    write_pointer = "false" if skip_remote_pointer else "true"
     stub.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
         # Stub for ./leerie --runtime fly --chain-id <id> invocations.
@@ -90,7 +101,13 @@ def _build_self_stub(tmp_path: Path, *, exit_codes: list[int] | None = None) -> 
           esac
         done
         # Write the launcher_pid pointer the wave loop looks for.
-        cat > "$_state/remote/$$.json" <<EOF
+        if [ "{write_pointer}" = "true" ]; then
+          cat > "$_state/remote/$$.json" <<EOF
+          {{"fly_machine_id":"$_mid","run_id":"$_mid","launcher_pid":$$}}
+        EOF
+        fi
+        # Write fly-machine.json (always present — provision.sh copies it).
+        cat > "$_state/runs/$_mid/fly-machine.json" <<EOF
         {{"fly_machine_id":"$_mid","run_id":"$_mid","launcher_pid":$$}}
         EOF
         # Write the run.json the wave loop will tag with chain_id + wave_idx.
@@ -184,6 +201,7 @@ def _run_chain(
     exit_codes: list[int] | None = None,
     synth_fail: bool = False,
     extra_args: list[str] | None = None,
+    skip_remote_pointer: bool = False,
 ) -> subprocess.CompletedProcess:
     """Run the launcher's --chain arm with stubs."""
     user_repo = tmp_path / "userrepo"
@@ -195,7 +213,9 @@ def _run_chain(
     state_dir = tmp_path / ".leerie" / "testrepo"
     state_dir.mkdir(parents=True, exist_ok=True)
 
-    self_stub, self_log = _build_self_stub(tmp_path, exit_codes=exit_codes)
+    self_stub, self_log = _build_self_stub(
+        tmp_path, exit_codes=exit_codes, skip_remote_pointer=skip_remote_pointer,
+    )
     fake_chain_dir, synth_log = _build_synth_merge_stub(tmp_path)
     git_bin_dir, git_log = _stub_git(tmp_path)
 
@@ -922,4 +942,43 @@ def test_chain_id_strips_surrounding_whitespace(tmp_path: Path) -> None:
     assert invocations_run2_new == 0, (
         f"whitespace-padded --chain-id failed idempotency match: "
         f"{invocations_run2_new} new fan-outs (should be 0)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fallback tagging via fly-machine.json
+# ---------------------------------------------------------------------------
+
+
+def test_chain_id_tagged_via_fly_machine_json_fallback(tmp_path: Path) -> None:
+    """When remote/<pid>.json is absent (e.g., old images whose
+    destroy_machine deleted the pointer before the parent could read
+    it), the tagging loop falls back to scanning
+    runs/*/fly-machine.json for a matching launcher_pid.
+
+    Test path:
+    1. Run a 1-wave chain with skip_remote_pointer=True (stub writes
+       fly-machine.json but NOT remote/<pid>.json).
+    2. Verify: chain_id + wave_idx are still written to run.json via
+       the fallback path.
+    """
+    p = _write_prompt(tmp_path, "a.md")
+    result = _run_chain(tmp_path, [[p]], skip_remote_pointer=True)
+    assert result.returncode == 0, result.stderr
+
+    state_dir = tmp_path / ".leerie" / "testrepo"
+    run_jsons = list((state_dir / "runs").glob("*/run.json"))
+    assert len(run_jsons) >= 1, "stub didn't write any run.json"
+
+    data = json.loads(run_jsons[0].read_text())
+    assert data.get("chain_id"), (
+        f"chain_id not tagged on {run_jsons[0]} (fallback path failed): {data}"
+    )
+    assert str(data.get("wave_idx")) == "0", f"wave_idx wrong: {data}"
+
+    # Confirm remote/<pid>.json does NOT exist (the stub skipped it).
+    remote_dir = state_dir / "remote"
+    pointer_files = list(remote_dir.glob("*.json")) if remote_dir.exists() else []
+    assert len(pointer_files) == 0, (
+        f"remote pointer should not exist in this test: {pointer_files}"
     )

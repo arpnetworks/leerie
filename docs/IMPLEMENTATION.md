@@ -1843,6 +1843,16 @@ completes for that run. The launcher's `update_run_json` bash
 helper (`scripts/remote/lib.sh:42`) merges the field atomically into
 the existing JSON.
 
+The tagging loop discovers each child's machine ID via two paths
+(tried in order):
+
+1. **Primary:** `remote/<child-pid>.json` — the PID-keyed pointer
+   written by `provision.sh` during provisioning.
+2. **Fallback:** scan `runs/*/fly-machine.json` for a matching
+   `launcher_pid` field. This path fires when the pointer file is
+   absent (e.g., older images whose `destroy_machine()` deleted
+   it before the parent could read it).
+
 All chain-scoped verbs operate by iterating
 `$LEERIE_STATE_HOST_DIR/runs/*/run.json`, parsing each with
 `json.load`, and filtering by the `chain_id` field. The standard

@@ -1644,14 +1644,34 @@ PY
         done
 
         # Tag every just-spawned run (whether finalized or paused-on-
-        # failure) with chain_id + wave_idx via the remote/<child-pid>.json
-        # → fly-machine.json → run.json chain. We tag BEFORE the failure
-        # check so paused runs are discoverable by `leerie --resume
-        # <chain-id>` / `--kill <chain-id>` / etc.
+        # failure) with chain_id + wave_idx. Primary path: read
+        # remote/<child-pid>.json to get fly_machine_id. Fallback: scan
+        # runs/*/fly-machine.json for matching launcher_pid (survives
+        # pointer deletion by destroy_machine in older images). We tag
+        # BEFORE the failure check so paused runs are discoverable by
+        # `leerie --resume <chain-id>` / `--kill <chain-id>` / etc.
         for _cp in "${_ch_wave_child_pids[@]}"; do
+          _ch_mid=""
           _ch_remote_pointer="$LEERIE_STATE_HOST_DIR/remote/$_cp.json"
-          [ -f "$_ch_remote_pointer" ] || continue
-          _ch_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_ch_remote_pointer" 2>/dev/null)"
+          if [ -f "$_ch_remote_pointer" ]; then
+            _ch_mid="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("fly_machine_id",""))' "$_ch_remote_pointer" 2>/dev/null)"
+          fi
+          # Fallback: scan fly-machine.json files for matching launcher_pid.
+          if [ -z "$_ch_mid" ]; then
+            _ch_mid="$(python3 -c '
+import json, sys
+from pathlib import Path
+state_dir, pid = Path(sys.argv[1]), int(sys.argv[2])
+for fmj in (state_dir / "runs").glob("*/fly-machine.json"):
+    try:
+        d = json.loads(fmj.read_text())
+    except (OSError, ValueError):
+        continue
+    if d.get("launcher_pid") == pid:
+        print(fmj.parent.name)
+        break
+' "$LEERIE_STATE_HOST_DIR" "$_cp" 2>/dev/null)"
+          fi
           [ -z "$_ch_mid" ] && continue
           _ch_run_json="$LEERIE_STATE_HOST_DIR/runs/$_ch_mid/run.json"
           [ -f "$_ch_run_json" ] || continue

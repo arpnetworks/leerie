@@ -1562,13 +1562,16 @@ concern"). The same mechanism serves four roles:
 
 State contract: `scripts/remote/provision.sh` writes a PID-keyed
 record at `$LEERIE_STATE_HOST_DIR/remote/$$.json` immediately after
-provisioning, removes it in `destroy_machine`, and lets the launcher
-rename it to `$LEERIE_STATE_HOST_DIR/runs/<run-id>/fly-machine.json` after
-the run-id becomes known (via fetch-branch.sh). `leerie --resume`
-resolves the machine via either path. Multiple concurrent remote
-runs in the same repo are disambiguated by passing a run-id; with no
-`--run-id` and a single active launcher record, `--resume` resolves
-the run-id from that record.
+provisioning and copies it to
+`$LEERIE_STATE_HOST_DIR/runs/<run-id>/fly-machine.json` once the
+run-id is known. The pointer is retained after `destroy_machine` so
+the chain wave loop's tagging step can read it post-wait; the
+`--resume` auto-discovery path filters stale pointers via `kill -0`
+(dead-PID records are harmless). `leerie --resume` resolves the
+machine via either path. Multiple concurrent remote runs in the same
+repo are disambiguated by passing a run-id; with no `--run-id` and a
+single active launcher record, `--resume` resolves the run-id from
+that record.
 
 Local mode keeps its inline `--resume` behavior by design. Local
 runs are synchronous foreground processes (`nerdctl run --rm` with no
