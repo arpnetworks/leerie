@@ -5,6 +5,32 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1]
+
+### Added
+
+- **Migration-surface completeness checks (DESIGN §5).** When a planner
+  subtask introduces a new pattern replacing an old one (e.g., a new
+  accessor replacing direct field reads), `check_planner_output()` now
+  greps the repo for old-pattern call sites and emits
+  `UNCOVERED_MIGRATION_SURFACE` when > 5 files are uncovered. The CRITIC
+  loop feeds this back as structured feedback; multi-sample selection
+  deprioritizes samples that miss the surface. Motivated by a
+  funeralworks multi-tenant task that required 4 identical runs because
+  the planner designed a seam but nobody audited the ~200 routes still
+  using the old pattern.
+
+- **`warn_layer_gaps()` advisory cross-domain check.** Runs on the
+  reconciled plan before scheduling and surfaces two heuristic warnings:
+  (1) `schema.prisma` modified but no subtask touches seed or migration
+  files; (2) subtask `provides` tags contain env/bootstrap/secret
+  keywords but no subtask touches `.env.example`. Zero false positives
+  across 44 historical runs.
+
+- **Planner prompt migration-sweep guidance.** The planner prompt now
+  instructs planners to grep for old-pattern call sites when introducing
+  a replacement pattern and batch-plan the full migration surface.
+
 ## [0.8.0]
 
 ### Changed
