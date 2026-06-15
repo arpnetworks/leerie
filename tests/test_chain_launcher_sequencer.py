@@ -523,6 +523,32 @@ def test_resume_skips_done_waves(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_chain_forwards_per_job_flags(tmp_path: Path) -> None:
+    """--chain --effort high --dangerously-skip-permissions forwards
+    those flags to each per-job ./leerie invocation."""
+    p = _write_prompt(tmp_path, "a.md")
+    result = _run_chain(
+        tmp_path, [[p]],
+        extra_args=["--effort", "high", "--dangerously-skip-permissions"],
+    )
+    assert result.returncode == 0, result.stderr
+    log = result.self_log
+    assert "--effort" in log
+    assert "high" in log
+    assert "--dangerously-skip-permissions" in log
+
+
+def test_chain_forwards_equals_form_flags(tmp_path: Path) -> None:
+    """--chain --effort=high forwards the --flag=value form intact."""
+    p = _write_prompt(tmp_path, "a.md")
+    result = _run_chain(
+        tmp_path, [[p]],
+        extra_args=["--effort=high"],
+    )
+    assert result.returncode == 0, result.stderr
+    assert "--effort=high" in result.self_log
+
+
 def test_chain_rejects_target_flag(tmp_path: Path) -> None:
     """--chain --target <url> exits non-zero with a clear error message
     (chains operate against $USER_REPO directly; the flag is not

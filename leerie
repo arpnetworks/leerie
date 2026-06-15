@@ -1443,6 +1443,7 @@ PY
     shift
     _ch_waves=()
     _ch_id_override=""
+    _ch_passthrough=()
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --wave) _ch_waves+=("${2:-}"); shift 2 ;;
@@ -1461,7 +1462,16 @@ PY
           echo "  Cd into the target repo and re-run leerie --chain --wave ..." >&2
           exit 1
           ;;
-        --*) remote_log "--chain: unknown flag: $1"; exit 1 ;;
+        # Per-job flags forwarded to each wave's ./leerie invocation.
+        # The per-job child has its own argparse; no need to enumerate here.
+        --*=*) _ch_passthrough+=("$1"); shift ;;
+        --*)
+          if [ "$#" -ge 2 ] && [ "${2#-}" = "$2" ]; then
+            _ch_passthrough+=("$1" "$2"); shift 2
+          else
+            _ch_passthrough+=("$1"); shift
+          fi
+          ;;
         *) remote_log "--chain: unexpected argument: $1"; exit 1 ;;
       esac
     done
@@ -1620,7 +1630,7 @@ PY
           # own full provision → seed → orchestrator → fetch_branch →
           # host_finalize → destroy_machine pipeline on the laptop,
           # and writes its run state under $LEERIE_STATE_HOST_DIR/runs/.
-          "${LEERIE_SELF_CMD:-"$0"}" "$_prompt" --runtime fly --chain-id "$_ch_id" &
+          "${LEERIE_SELF_CMD:-"$0"}" "$_prompt" --runtime fly "${_ch_passthrough[@]}" --chain-id "$_ch_id" &
           _ch_wave_pids+=($!)
           _ch_wave_child_pids+=($!)
         done
