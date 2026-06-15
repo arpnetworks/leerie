@@ -53,6 +53,20 @@ The orchestrator gives you, in your prompt:
    Do not over-decompose past the verifiable-unit boundary. A subtask that
    cannot be independently verified is too small — merge it with its sibling.
 
+   **Migration sweep.** When a subtask introduces a new pattern replacing
+   an old one (a new accessor, a new seam, a new abstraction), quantify
+   the migration surface:
+
+   - Identify the old pattern being replaced (from the subtask's intent).
+   - `grep -rn` for the old pattern across the codebase.
+   - Count the total call sites and files.
+   - Ensure your plan includes subtasks covering ALL files that use the
+     old pattern, batched into groups of ~15–25 files each.
+
+   The orchestrator runs a mechanical `UNCOVERED_MIGRATION_SURFACE` check
+   that will flag plans where the migration surface is not covered.
+   Addressing it proactively in your decomposition avoids CRITIC retries.
+
 3. **Determine dependencies.**
    - Within your domain, set `depends_on` to the ids of subtasks that must
      finish first.

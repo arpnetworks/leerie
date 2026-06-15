@@ -3639,6 +3639,77 @@ def check_classifier_output(result: dict, repo_root: Path) -> list[str]:
     return issues
 
 
+# ---------------------------------------------------------------------------
+# Migration-surface completeness (DESIGN §5)
+# ---------------------------------------------------------------------------
+
+_MIGRATION_SIGNAL_RE = re.compile(
+    r"replac(?:es?|ing)\s+(?:direct\s+)?[`'\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`'\"]?"
+    r"|migrat(?:es?|ing)\s+from\s+[`'\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`'\"]?"
+    r"|extract(?:s|ing)\s+[`'\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`'\"]?\s+(?:from|replacing|as\b)"
+    r"|new\s+(?:accessor|seam|helper|abstraction)\s+(?:for|replacing)\s+[`'\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`'\"]?",
+    re.IGNORECASE,
+)
+
+_MIGRATION_SURFACE_THRESHOLD = 5
+
+
+def _grep_old_pattern(pattern: str, repo_root: Path) -> set[str]:
+    """Grep *repo_root* for *pattern*, return set of relative file paths."""
+    search_dir = repo_root / "src" if (repo_root / "src").is_dir() else repo_root
+    try:
+        cp = subprocess.run(
+            ["grep", "-rl", "--include=*.ts", "--include=*.tsx",
+             "--include=*.js", "--include=*.jsx", "--include=*.py",
+             "--include=*.rb", "--include=*.go", "--include=*.java",
+             "--include=*.rs", "--include=*.cs",
+             pattern, str(search_dir)],
+            capture_output=True, text=True, timeout=30,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return set()
+    files: set[str] = set()
+    for line in cp.stdout.splitlines():
+        line = line.strip()
+        if line:
+            try:
+                files.add(str(Path(line).relative_to(repo_root)))
+            except ValueError:
+                files.add(line)
+    return files
+
+
+def _check_migration_surface(
+    subtasks: list[dict], repo_root: Path,
+) -> list[str]:
+    """UNCOVERED_MIGRATION_SURFACE check (DESIGN §5)."""
+    issues: list[str] = []
+    all_touched: set[str] = set()
+    for s in subtasks:
+        all_touched.update(s.get("files_likely_touched") or [])
+
+    for s in subtasks:
+        sid = s.get("id", "?")
+        text = (s.get("intent") or "") + " " + (s.get("investigation_notes") or "")
+        for m in _MIGRATION_SIGNAL_RE.finditer(text):
+            old_pattern = next((g for g in m.groups() if g), None)
+            if not old_pattern or len(old_pattern) < 4:
+                continue
+            grep_hits = _grep_old_pattern(old_pattern, repo_root)
+            if not grep_hits:
+                continue
+            uncovered = grep_hits - all_touched
+            if len(uncovered) > _MIGRATION_SURFACE_THRESHOLD:
+                sample = sorted(uncovered)[:10]
+                issues.append(
+                    f"UNCOVERED_MIGRATION_SURFACE: {sid} introduces "
+                    f"replacement for {old_pattern!r} but {len(uncovered)} "
+                    f"of {len(grep_hits)} files containing the old pattern "
+                    f"are not in any subtask's files_likely_touched. "
+                    f"Uncovered sample: {sample}")
+    return issues
+
+
 def check_planner_output(
     result: dict, repo_root: Path, domain: str,
 ) -> list[str]:
@@ -3727,6 +3798,8 @@ def check_planner_output(
         issues.append(
             "INTRA_DOMAIN_CYCLE: dependency cycle detected within "
             f"this domain ({domain})")
+
+    issues.extend(_check_migration_surface(subtasks, repo_root))
 
     issues.extend(_confidence_issues(
         result.get("confidence") or {},
@@ -4194,6 +4267,51 @@ def warn_cross_planner_file_overlap(plans: list[dict]) -> None:
     for f, owners in sorted(overlaps.items()):
         per = ", ".join(f"{d}({sid})" for d, sid in sorted(owners))
         log(f"     {f}: {per}")
+
+
+_ENV_TAG_KEYWORDS = frozenset({"env", "bootstrap", "secret", "config-key",
+                               "credential"})
+
+
+def warn_layer_gaps(plans: list[dict]) -> None:
+    """Advisory cross-domain layer-gap warnings (DESIGN §5).
+
+    Runs on the reconciled plan before scheduling. Two heuristics:
+    1. schema.prisma touched but no seed/migration files in any subtask.
+    2. provides tags with env/bootstrap/secret keywords but no .env.example
+       touched."""
+    all_files: set[str] = set()
+    all_provides: list[tuple[str, str]] = []
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            sid = s.get("id", "?")
+            all_files.update(s.get("files_likely_touched") or [])
+            for tag in s.get("provides") or []:
+                all_provides.append((sid, tag))
+
+    # Heuristic 1: DB schema without seed/migration
+    touches_schema = any(
+        "schema.prisma" in f for f in all_files)
+    touches_seed = any(
+        "seed.ts" in f or "seed.js" in f or "seed.py" in f
+        for f in all_files)
+    touches_migration = any("migrations/" in f for f in all_files)
+    if touches_schema and not (touches_seed or touches_migration):
+        log("⚠  LAYER_GAP: schema.prisma modified but no subtask "
+            "touches seed or migration files — database initialization "
+            "may be incomplete")
+
+    # Heuristic 2: env-contract provider without env docs
+    env_provider_sids = [
+        sid for sid, tag in all_provides
+        if any(kw in tag.lower() for kw in _ENV_TAG_KEYWORDS)]
+    touches_env_template = any(
+        ".env.example" in f or ".env.local.example" in f
+        or ".env.template" in f for f in all_files)
+    if env_provider_sids and not touches_env_template:
+        log(f"⚠  LAYER_GAP: subtasks {env_provider_sids} provide "
+            "env/bootstrap/secret capabilities but no subtask updates "
+            ".env.example or env documentation")
 
 
 def _resolves_under(path_str: str, root: Path) -> bool:
@@ -14196,6 +14314,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # conflicts (yet); empirically these correlate strongly with
         # integrator design-conflict crashes downstream.
         warn_cross_planner_file_overlap(plans)
+        warn_layer_gaps(plans)
         # Drop subtasks whose files_likely_touched leak into inspect-dir
         # mounts (read-only) or other off-tree paths. Soft drop so the
         # surviving subtasks proceed; the drop is recorded in

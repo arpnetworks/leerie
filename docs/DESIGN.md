@@ -436,6 +436,37 @@ diagnostic; the actionable recovery is `--skip-overlap-judge` (let the
 integrator resolve file conflicts at integration time) or narrowing the
 task to reduce cross-planner overlap.
 
+### Migration-surface completeness
+
+When a plan introduces a new pattern replacing an old one — a new
+accessor replacing direct field reads, a new seam replacing scattered
+inline logic — the **migration surface** is the set of all call sites
+of the old pattern. A plan that creates the seam but does not cover the
+consumers is structurally incomplete: the seam exists but the codebase
+still uses the old path, and a follow-up run will discover the gap and
+repeat the classification/planning cost.
+
+This is enforced mechanically at two levels:
+
+- **Intra-domain (CRITIC-enforced).** `check_planner_output()` scans
+  each subtask's `intent` and `investigation_notes` for migration
+  signals (regex-detected phrases like "replaces direct `X`" or
+  "extract `X` as the new seam"). For each detected old-pattern
+  string, the check greps the repo for call sites, cross-references
+  against `files_likely_touched` across the domain's subtasks, and
+  emits `UNCOVERED_MIGRATION_SURFACE` when > 5 files are uncovered.
+  The CRITIC loop feeds this back as structured feedback; multi-sample
+  selection deprioritizes samples that miss the surface.
+
+- **Cross-domain (advisory).** `warn_layer_gaps()` runs on the
+  reconciled plan before scheduling and surfaces two heuristic warnings:
+  (1) a subtask modifies `schema.prisma` but no subtask touches seed
+  or migration files (database initialization gap); (2) a subtask's
+  `provides` tags contain env/bootstrap/secret/credential keywords but
+  no subtask touches `.env.example` or env documentation (env-contract
+  gap). These are advisory `log()` warnings following the same pattern
+  as `warn_cross_planner_file_overlap()`.
+
 ### Artifact passing between subtasks
 
 Some subtasks produce a structured deliverable that a downstream subtask
