@@ -5,6 +5,27 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3]
+
+### Fixed
+
+- **`--chain` now forwards per-job flags to wave invocations.** Flags
+  like `--effort high`, `--model opus`, and
+  `--dangerously-skip-permissions` are collected into a passthrough
+  array and appended to each per-job `./leerie` invocation. Previously
+  these were rejected with "unknown flag" and required env var
+  workarounds. The chain launcher uses a DRY catch-all (no flag
+  enumeration); the per-job child's own argparse validates.
+
+## [0.8.2]
+
+### Fixed
+
+- **Dockerfile: remove chmod for non-existent chain scripts.** The
+  `chain/` subpackage no longer has shell scripts after the v0.8.0
+  rewrite to a laptop-side wave sequencer; the Dockerfile's `chmod`
+  step failed on build.
+
 ## [0.8.1]
 
 ### Added
