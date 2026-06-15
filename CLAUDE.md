@@ -312,9 +312,12 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 # waves to build the next wave's base branch. The laptop is the sequencer;
 # no Fly coordinator machine. Each --wave flag defines one sequential wave
 # (N waves supported); waves execute in order, jobs inside a wave run in
-# parallel. No chain-specific env vars required — the per-job
-# `--runtime fly` invocations have their own env requirements unchanged.
+# parallel. Per-job flags (--effort, --model, --dangerously-skip-permissions,
+# etc.) are forwarded to each wave invocation. No chain-specific env vars
+# required — the per-job `--runtime fly` invocations have their own env
+# requirements unchanged.
 ./leerie --chain \
+  --effort high --dangerously-skip-permissions \
   --wave "prompts/fetch.md,prompts/lint.md" \
   --wave "prompts/publish.md"
 
