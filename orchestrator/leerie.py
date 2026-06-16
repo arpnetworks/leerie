@@ -14088,6 +14088,18 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     if proc.returncode != 0:
         die(f"finalize failed (run branch is intact): {proc.stderr.strip()}")
     await run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")
+    # Post-cleanup verification: the run branch must survive cleanup.
+    # finalize.sh verified it existed moments ago; if it's gone after
+    # cleanup.sh, something deleted it (a concurrent process, a git
+    # corruption, or a cleanup.sh bug). die() here routes to the pause
+    # branch via decide_teardown, preserving the machine for recovery.
+    branch_ref = f"refs/heads/leerie/runs/{st.run_id}"
+    verify = await run_proc(
+        ["git", "show-ref", "--verify", "--quiet", branch_ref], check=False)
+    if verify.returncode != 0:
+        die(f"CRITICAL: run branch leerie/runs/{st.run_id} disappeared "
+            f"after cleanup — branch existed before cleanup (finalize.sh "
+            f"passed) but is gone after")
 
     wc = st.data.get("worker_count", 0)
     nsub = len(st.data.get("subtask_status", {}))
@@ -14179,6 +14191,22 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         task = st.data["task"]
         log(f"resuming: {task!r} (worker count {st.data.get('worker_count', 0)})")
         log(f"per-worker logs: {st.run_dir / 'logs'}/")
+        # A successfully finalized run must not re-execute phases 4→5→6.
+        # Without this guard, `--resume` on a completed run re-runs
+        # setup-run.sh + finalize.sh + cleanup.sh, creating a window
+        # where a concurrent decide_teardown (from the prior exit's
+        # launcher child) can race with the second orchestrator and
+        # destroy the machine mid-cycle.
+        # Guard: finished_at + current_phase == finalize. The die()
+        # handler also sets finished_at (for fetch_branch discovery)
+        # but leaves current_phase at whatever phase died — those runs
+        # ARE resumable and must fall through.
+        if (st.data.get("finished_at")
+                and st.data.get("current_phase") == "phase 6: finalize"
+                and not st.data.get("no_work_required")):
+            log(f"run already completed at {st.data['finished_at']} — "
+                "nothing to resume (host launcher will push + open PR)")
+            return
         # A no-work run (DESIGN §8 *The cleared-but-empty terminal state*)
         # is already complete — finished_at is set, no run branch was
         # materialized, no commits exist. Falling through to phase_execute

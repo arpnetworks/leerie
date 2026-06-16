@@ -1781,9 +1781,17 @@ that runs classify, plan, and schedule — none of which re-execute on
 `--resume`. The resume path loads state and jumps to execution; the
 recipe lives in state, the version-manager cache survives across
 runs on disk, and workers see the right toolchain without anyone
-re-running provisioning. There is no top-of-function idempotency
-check because the structure of `orchestrate()` already provides
-it. (See *§12*.)
+re-running provisioning.
+
+A successfully finalized run (`finished_at` set AND `current_phase`
+== "phase 6: finalize") is terminal — `--resume` returns immediately
+without re-executing phases 4→5→6. Without this guard, a resume of
+a completed run re-runs setup-run.sh + finalize.sh + cleanup.sh,
+creating a window where a concurrent `decide_teardown` (from the
+prior exit's launcher child) can race and destroy the machine.
+The `die()` handler also sets `finished_at` (for `fetch_branch`
+discovery) but leaves `current_phase` at whatever phase died — those
+runs ARE resumable and fall through normally. (See *§12*.)
 
 ---
 
