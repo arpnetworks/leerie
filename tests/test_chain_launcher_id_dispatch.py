@@ -259,7 +259,7 @@ def test_resume_uuid_dispatches_paused_runs_only(tmp_path: Path) -> None:
 
 
 def test_resume_uuid_no_paused_runs_is_ok(tmp_path: Path) -> None:
-    """No paused runs → exit 0 with a friendly message."""
+    """No paused or running runs → exit 0 with a friendly message."""
     state_dir = tmp_path / ".leerie" / "myrepo"
     state_dir.mkdir(parents=True)
     _write_run(state_dir, RUN_ID_1, {
@@ -269,7 +269,7 @@ def test_resume_uuid_no_paused_runs_is_ok(tmp_path: Path) -> None:
     })
     result = _run(tmp_path, ["--resume", CHAIN_ID])
     assert result.returncode == 0
-    assert "no paused runs found" in (result.stdout + result.stderr).lower()
+    assert "no resumable runs found" in (result.stdout + result.stderr).lower()
 
 
 # ---------------------------------------------------------------------------

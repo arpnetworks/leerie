@@ -869,7 +869,7 @@ leerie --status   <chain-id>        # render per-run states from run.json
 leerie --attach   <chain-id>        # poll run.json files every 5s
 leerie --stop     <chain-id>        # pause every running chain run
 leerie --kill     <chain-id>        # destroy every chain run's machine
-leerie --resume   <chain-id>        # resume every paused chain run
+leerie --resume   <chain-id>        # resume paused + list running chain runs
 leerie --finalize <chain-id>        # push + open PR for every unpushed run
 leerie --list --chains              # group runs by chain_id
 
@@ -1802,7 +1802,7 @@ matching `chain_id`.
 | `leerie --attach <chain-id>` (alias: `--chain-attach`) | Polls run.json files every 5s; exits 0 when every chain run is in a terminal state (`pushed_at` / `paused_at` / `killed_at` / `sync_failed_at`). |
 | `leerie --kill <chain-id>` (alias: `--chain-kill`) | Enumerates run.json files with matching `chain_id` whose machines aren't already destroyed (`killed_at` is null), invokes `leerie --kill <run-id>` per discovered run. Idempotent. |
 | `leerie --stop <chain-id>` | Enumerates runs that are actively running (have `fly_machine_id`, no terminal state), invokes `leerie --stop <run-id>` per discovered run. |
-| `leerie --resume <chain-id>` | Enumerates paused runs (`paused_at` set, not `killed_at`), invokes `leerie --resume <run-id>` per discovered run. After paused runs complete, the user re-invokes `leerie --chain --chain-id <chain-id> --wave ...` to continue the wave loop from where it stopped — the `--chain-id` pin makes the wave-loop idempotency check skip the already-pushed wave(s) and resume at the first incomplete wave. |
+| `leerie --resume <chain-id>` | Two tiers: (1) auto-resumes paused runs (`paused_at` set, not `killed_at`) by invoking `leerie --resume <run-id>` per discovered run; (2) lists still-running runs (have `fly_machine_id` + `chain_id`, no terminal state) with machine IDs so the user can reattach via `leerie --resume <machine-id>`. Running runs are discoverable because the child writes `chain_id` into host-side `run.json` immediately after provisioning (early-write), before the orchestrator starts. After paused runs complete, the user re-invokes `leerie --chain --chain-id <chain-id> --wave ...` to continue the wave loop from where it stopped. |
 | `leerie --finalize <chain-id>` | Enumerates runs that haven't been pushed yet (`pushed_at` null, not `killed_at`), invokes `leerie --finalize <run-id>` per discovered run. |
 | `leerie --list --chains` (alias: `--list-chains`) | Iterates run.json files, groups by `chain_id`, renders one row per chain (chain_id, status, pushed/total, wave count, started_at). |
 
@@ -1885,7 +1885,7 @@ parameters (no env interpolation into Python source).
 |--------|------|----------|
 | `_wave_already_done <chain_id> <wave_idx> <n_expected>` | UUID, integer, integer | Exits 0 iff `n_expected` runs are tagged with `chain_id` + `wave_idx` AND every matching run has `pushed_at` set. Used by the `--chain` wave loop to skip fan-out on a resume submission. |
 | `_wave_branches <chain_id> <wave_idx>` | UUID, integer | Emits one branch-name per line for every matching run. Used by the wave loop to gather wave-N branches for synth-merge (works for both the just-fanned path and the resume path). |
-| `_chain_runs_filter <chain_id> <verb>` | UUID, one of `stop`/`kill`/`finalize`/`resume` | Emits matching run-ids one per line. The `verb` parameter selects a hardcoded filter inside the heredoc (`stop`: machine running; `kill`: not yet destroyed; `finalize`: not yet pushed; `resume`: paused). Used by the chain-scoped verb arms (`--stop`/`--kill`/`--finalize`/`--resume`) to enumerate runs for per-run dispatch. Returns rc=2 + `remote_log` error on unknown verb (bash-side assert; Python heredoc has its own `sys.exit(2)` backstop). |
+| `_chain_runs_filter <chain_id> <verb>` | UUID, one of `stop`/`kill`/`finalize`/`resume`/`running` | Emits matching run-ids one per line. The `verb` parameter selects a hardcoded filter inside the heredoc (`stop`: machine running; `kill`: not yet destroyed; `finalize`: not yet pushed; `resume`: paused; `running`: active with chain_id, no terminal state). Used by the chain-scoped verb arms (`--stop`/`--kill`/`--finalize`/`--resume`) to enumerate runs for per-run dispatch. Returns rc=2 + `remote_log` error on unknown verb (bash-side assert; Python heredoc has its own `sys.exit(2)` backstop). |
 
 The wave loop's tag-write step (`update_run_json … chain_id "$_ch_id"
 wave_idx "$_wave_idx"`) fires BEFORE the failure-pause check so
@@ -4300,7 +4300,7 @@ discovery without parsing the full `state.json`):
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped because the user opted out of pushing (`push_will_happen(no_push, host_no_push)` is False — local `--no-push` or Fly `host_no_push=true`), or had not yet run; `host_finalize` uses its deterministic fallback in that case. |
 | `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
-| `chain_id` | str \| null | UUID of the chain this run is part of (set by `leerie --chain` wave-sequencer via `update_run_json` after each wave job's `host_finalize` completes). Null for runs not spawned as part of a chain. Purely advisory — no state-machine coupling — used only by chain-scoped verbs (`leerie --list --chains`, `--status <chain-id>`, `--kill <chain-id>`, `--attach <chain-id>`, `--resume <chain-id>`) to discover the runs that belong to a chain. |
+| `chain_id` | str \| null | UUID of the chain this run is part of. Written twice: (1) early-write by the child process immediately after `provision_machine` succeeds (so chain-scoped verbs can discover the run while the orchestrator is still running); (2) re-written by the parent's post-wait tagging loop after `fetch_branch` overwrites run.json with the orchestrator's copy. Null for runs not spawned as part of a chain. Used by chain-scoped verbs (`--list --chains`, `--status`, `--kill`, `--attach`, `--resume`) to discover chain runs. |
 | `wave_idx` | int \| null | Zero-based wave index within the chain (set alongside `chain_id`). Used by the chain wave-sequencer to group runs by wave for synth-merge between waves. Null when `chain_id` is null. |
 
 `_validate_run_json(data)` enforces these invariants on read:

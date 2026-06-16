@@ -196,9 +196,9 @@ _chain_runs_filter() {
   # use; this assert surfaces typos via remote_log instead of the
   # misleading "no runs found" downstream).
   case "$verb" in
-    stop|kill|finalize|resume) ;;
+    stop|kill|finalize|resume|running) ;;
     *)
-      remote_log "_chain_runs_filter: unknown verb '$verb' (expected one of: stop kill finalize resume)"
+      remote_log "_chain_runs_filter: unknown verb '$verb' (expected one of: stop kill finalize resume running)"
       return 2
       ;;
   esac
@@ -228,6 +228,15 @@ def matches(data: dict, verb: str) -> bool:
     if verb == "resume":
         # Paused, not killed.
         return bool(data.get("paused_at")) and not data.get("killed_at")
+    if verb == "running":
+        # Active (has machine + chain_id, no terminal state).
+        return (
+            bool(data.get("fly_machine_id"))
+            and bool(data.get("chain_id"))
+            and not data.get("pushed_at")
+            and not data.get("paused_at")
+            and not data.get("killed_at")
+        )
     sys.stderr.write(f"_chain_runs_filter: unknown verb {verb!r}\n")
     sys.exit(2)
 
@@ -1396,26 +1405,52 @@ PY
     exit 1
     ;;
   --resume)
-    # ID-dispatch fast-path: `--resume <uuid>` resumes all paused runs
-    # belonging to a chain. Non-UUID args fall through to the existing
+    # ID-dispatch fast-path: `--resume <uuid>` handles chain runs in two
+    # tiers: (1) auto-resume paused runs, (2) list running runs for the
+    # user to reattach to. Non-UUID args fall through to the existing
     # run-id resume path below.
     if [ "$#" -ge 2 ] && echo "$2" | grep -qiE "$UUID_PATTERN"; then
       _rs_chain="$2"
       shift 2
       _rs_pass_args=("$@")
-      _rs_run_ids="$(_chain_runs_filter "$_rs_chain" resume)"
-      if [ -z "$_rs_run_ids" ]; then
-        remote_log "--resume: no paused runs found for chain $_rs_chain"
+      _rs_paused="$(_chain_runs_filter "$_rs_chain" resume)"
+      _rs_running="$(_chain_runs_filter "$_rs_chain" running)"
+      if [ -z "$_rs_paused" ] && [ -z "$_rs_running" ]; then
+        remote_log "--resume: no resumable runs found for chain $_rs_chain"
         exit 0
       fi
-      echo "$_rs_run_ids" | while read -r _rid; do
-        [ -z "$_rid" ] && continue
-        remote_log "--resume: resuming run $_rid (chain $_rs_chain)"
-        "${LEERIE_SELF_CMD:-"$0"}" --resume "$_rid" "${_rs_pass_args[@]}" || remote_log "--resume: $_rid failed (continuing with next)"
-      done
-      remote_log "--resume: chain $_rs_chain resume pass complete"
-      echo ""
-      echo "Re-run 'leerie --chain --wave ...' to resume the wave loop from where it paused."
+      # Tier 1: auto-resume paused runs.
+      if [ -n "$_rs_paused" ]; then
+        echo "$_rs_paused" | while read -r _rid; do
+          [ -z "$_rid" ] && continue
+          remote_log "--resume: resuming paused run $_rid (chain $_rs_chain)"
+          "${LEERIE_SELF_CMD:-"$0"}" --resume "$_rid" "${_rs_pass_args[@]}" || remote_log "--resume: $_rid failed (continuing with next)"
+        done
+      fi
+      # Tier 2: list running runs for the user to pick.
+      if [ -n "$_rs_running" ]; then
+        remote_log "--resume: running chain runs (reattach with leerie --resume <id>):"
+        echo "$_rs_running" | while read -r _rid; do
+          [ -z "$_rid" ] && continue
+          _rs_rj="$LEERIE_STATE_HOST_DIR/runs/$_rid/run.json"
+          _rs_info="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    wave = d.get("wave_idx", "?")
+    task = (d.get("task") or "")[:60]
+    print(f"wave={wave}  {task}")
+except Exception:
+    print("(details unavailable)")
+' "$_rs_rj" 2>/dev/null)"
+          echo "    $_rid  $_rs_info"
+        done
+      fi
+      if [ -n "$_rs_paused" ]; then
+        remote_log "--resume: chain $_rs_chain resume pass complete"
+        echo ""
+        echo "Re-run 'leerie --chain --wave ...' to resume the wave loop from where it paused."
+      fi
       exit 0
     fi
     # Non-UUID: fall through to the existing run-id resume.
@@ -1630,7 +1665,7 @@ PY
           # own full provision → seed → orchestrator → fetch_branch →
           # host_finalize → destroy_machine pipeline on the laptop,
           # and writes its run state under $LEERIE_STATE_HOST_DIR/runs/.
-          "${LEERIE_SELF_CMD:-"$0"}" "$_prompt" --runtime fly "${_ch_passthrough[@]}" --chain-id "$_ch_id" &
+          LEERIE_WAVE_IDX="$_wave_idx" "${LEERIE_SELF_CMD:-"$0"}" "$_prompt" --runtime fly "${_ch_passthrough[@]}" --chain-id "$_ch_id" &
           _ch_wave_pids+=($!)
           _ch_wave_child_pids+=($!)
         done
@@ -3351,6 +3386,18 @@ except Exception:
       _task_record="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt"
       if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$_task_record" ]; then
         printf '%s' "$LEERIE_TASK_ARG" > "$_task_record" 2>/dev/null || true
+      fi
+      # Early-write chain_id + wave_idx so chain-scoped verbs can discover
+      # this run while the orchestrator is still running (before fetch_branch
+      # copies the orchestrator's run.json back to the host). fetch_branch
+      # overwrites this file; the parent's post-wait tagging loop re-adds
+      # both fields immediately after.
+      if [ -n "${LEERIE_CHAIN_ID:-}" ]; then
+        _rj="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json"
+        update_run_json "$_rj" chain_id "$LEERIE_CHAIN_ID" || true
+        if [ -n "${LEERIE_WAVE_IDX:-}" ]; then
+          update_run_json "$_rj" wave_idx "$LEERIE_WAVE_IDX" || true
+        fi
       fi
     fi
 

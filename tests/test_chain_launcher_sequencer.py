@@ -982,3 +982,51 @@ def test_chain_id_tagged_via_fly_machine_json_fallback(tmp_path: Path) -> None:
     assert len(pointer_files) == 0, (
         f"remote pointer should not exist in this test: {pointer_files}"
     )
+
+
+# ---------------------------------------------------------------------------
+# _chain_runs_filter "running" verb
+# ---------------------------------------------------------------------------
+
+
+def test_chain_runs_filter_running_verb(tmp_path: Path) -> None:
+    """The `running` verb matches runs that have fly_machine_id +
+    chain_id set and no terminal state (pushed_at / paused_at /
+    killed_at). Used by `--resume <chain-id>` to discover active
+    machines the user can reattach to."""
+    state_dir = tmp_path / ".leerie" / "testrepo"
+    runs_dir = state_dir / "runs"
+    runs_dir.mkdir(parents=True)
+
+    cid = "test-chain-uuid"
+    fixtures = [
+        # Running: has machine + chain_id, no terminal state.
+        ("r0", {"chain_id": cid, "fly_machine_id": "m0"}),
+        # Pushed: terminal — should NOT match.
+        ("r1", {"chain_id": cid, "fly_machine_id": "m1",
+                "pushed_at": "2026-06-16T00:00:00Z"}),
+        # Paused: terminal — should NOT match.
+        ("r2", {"chain_id": cid, "fly_machine_id": "m2",
+                "paused_at": "2026-06-16T00:00:00Z"}),
+        # No chain_id: should NOT match.
+        ("r3", {"fly_machine_id": "m3"}),
+        # Different chain: should NOT match.
+        ("r4", {"chain_id": "other", "fly_machine_id": "m4"}),
+    ]
+    for run_id, data in fixtures:
+        d = runs_dir / run_id
+        d.mkdir()
+        (d / "run.json").write_text(json.dumps(data))
+
+    log_sh = REPO_ROOT / "scripts" / "remote" / "_log.sh"
+    result = subprocess.run(
+        ["bash", "-c",
+         f"source '{log_sh}'; "
+         f"source <(awk '/^_chain_runs_filter\\(\\)/,/^}}$/' '{LAUNCHER}'); "
+         f"LEERIE_STATE_HOST_DIR='{state_dir}' "
+         f"_chain_runs_filter '{cid}' 'running'"],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode == 0, result.stderr
+    matched = sorted(result.stdout.strip().splitlines())
+    assert matched == ["r0"], f"expected only r0, got {matched}"

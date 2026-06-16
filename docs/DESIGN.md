@@ -2902,19 +2902,23 @@ laptop:
           → fetch_branch (laptop pulls bundle + run-state)
           → host_finalize (laptop pushes branch + opens PR)
           → destroy_machine
-      → After each job's host_finalize: launcher writes
-        chain_id + wave_idx into the job's run.json via
-        update_run_json (the existing bash helper from
-        scripts/remote/lib.sh).
+      → Early-write: immediately after provision_machine, the
+        child writes chain_id + wave_idx into its host-side
+        run.json so chain-scoped verbs (--resume, --status) can
+        discover the run while the orchestrator is still running.
+        fetch_branch later overwrites run.json with the
+        orchestrator's copy; the parent's post-wait tagging loop
+        re-adds both fields.
 
     wait for ALL wave-N background jobs to finalize on laptop.
     ◀── At this point: every wave-N PR is open. Laptop has every
         wave-N branch (on origin via host_finalize).
 
     If any job failed → laptop wave loop exits non-zero. User runs
-      `leerie --resume <chain-id>` to retry paused runs, then
-      re-invokes `leerie --chain --wave ...` to continue (the wave
-      loop skips waves whose runs are all already pushed).
+      `leerie --resume <chain-id>` to retry paused runs (and see
+      any still-running runs), then re-invokes
+      `leerie --chain --wave ...` to continue (the wave loop skips
+      waves whose runs are all already pushed).
 
     If wave N+1 exists:
       → laptop synth-merges all wave-N branches (now on origin)
