@@ -1530,7 +1530,13 @@ boundary's terminal-side surface — not a new privileged channel.
 Detection: the launcher pipes a launch wrapper through `flyctl ssh
 console -C "python3 -"`; the wrapper takes a fast-path flock probe on
 the run directory (DESIGN §6 *Single owner per run dir*) and exits 75
-if the lock is held. The launcher's rc=75 branch pivots to attach
+if the lock is held. **flyctl exit-code limitation:** `flyctl ssh
+console` does not forward the remote process's exit code — it returns
+1 for any non-zero remote exit. The actual code appears only in
+stderr (`Error: ssh shell: Process exited with status <N>`). The
+launcher captures stderr and parses the real remote code via
+`_extract_flyctl_remote_rc` (lib.sh) so the rc=75 pivot fires
+correctly. The launcher's rc=75 branch pivots to attach
 behavior instead of launching a duplicate. The attach channel itself
 is `flyctl ssh console` against the run's Fly Machine, proxied
 through Fly's hallpass + WireGuard mesh, giving the user a real PTY

@@ -3556,10 +3556,21 @@ with open(pid_path, "w") as pid_f:
 PY
 )"
         _launch_rc=0
+        _launch_stderr="$(mktemp)"
         printf '%s' "$_launch_script" \
           | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
               --pty=false -C "python3 -" \
+              2>"$_launch_stderr" \
           || _launch_rc=$?
+        # flyctl ssh console does not forward remote exit codes — it
+        # returns 1 for any non-zero remote exit. The actual code is in
+        # stderr ("Process exited with status <N>"). Parse it so the
+        # smart-resume pivot (rc=75 → attach) fires correctly.
+        if [ "$_launch_rc" != "0" ]; then
+          _launch_rc="$(_extract_flyctl_remote_rc "$_launch_stderr" "$_launch_rc")"
+          cat "$_launch_stderr" >&2
+        fi
+        rm -f "$_launch_stderr"
         if [ "$_launch_rc" = "75" ]; then
           # The remote launch-wrapper's flock probe fired: an orchestrator
           # is already running for this run_id on the machine. This is

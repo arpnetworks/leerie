@@ -26,6 +26,34 @@ _seed_timeout_prefix() {
   printf 'timeout --kill-after=5 %s' "${LEERIE_SEED_TIMEOUT_S:-600}"
 }
 
+# --- _extract_flyctl_remote_rc -------------------------------------------
+# flyctl ssh console does not forward the remote process's exit code — it
+# returns 1 for any non-zero remote exit. The actual remote code appears
+# only in stderr:  Error: ssh shell: Process exited with status <N>
+# This helper extracts <N> from a captured stderr file.
+#
+# Usage:
+#   _extract_flyctl_remote_rc "$stderr_file" "$flyctl_rc"
+#
+# Prints the remote exit code if parseable, otherwise the original flyctl
+# rc unchanged. Returns 0 always (callers branch on the printed value).
+_extract_flyctl_remote_rc() {
+  local stderr_file="$1"
+  local flyctl_rc="$2"
+  if [ "$flyctl_rc" = "0" ]; then
+    printf '%s' "0"
+    return 0
+  fi
+  local remote_rc=""
+  remote_rc="$(sed -n 's/.*Process exited with status \([0-9][0-9]*\).*/\1/p' \
+                "$stderr_file" 2>/dev/null | tail -1)"
+  if [ -n "$remote_rc" ]; then
+    printf '%s' "$remote_rc"
+  else
+    printf '%s' "$flyctl_rc"
+  fi
+}
+
 # --- update_run_json -----------------------------------------------------
 # Atomically merge key/value pairs into a run.json sidecar on the host.
 #
