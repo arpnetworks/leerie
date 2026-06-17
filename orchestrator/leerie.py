@@ -14095,7 +14095,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # branch via decide_teardown, preserving the machine for recovery.
     branch_ref = f"refs/heads/leerie/runs/{st.run_id}"
     verify = await run_proc(
-        ["git", "show-ref", "--verify", "--quiet", branch_ref], check=False)
+        ["git", "show-ref", "--verify", "--quiet", branch_ref])
     if verify.returncode != 0:
         die(f"CRITICAL: run branch leerie/runs/{st.run_id} disappeared "
             f"after cleanup — branch existed before cleanup (finalize.sh "
