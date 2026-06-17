@@ -69,7 +69,7 @@ try:
 except Exception:
     pass
 " "$sidecar" 2>/dev/null || true)"
-    if [ -n "$stored_tag" ] && [ "$stored_tag" != "$current_tag" ]; then
+    if [ "$stored_tag" != "$current_tag" ]; then
       remote_log "remote: updating machine $mid image: $stored_tag → $current_tag"
       if ! flyctl machine update "$mid" --image "$current_tag" \
            --app "$fly_app" --skip-start -y 2>&1; then
