@@ -5,6 +5,17 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.4]
+
+### Fixed
+
+- **Rootless seccomp: tighten detection to containerd-rootless sentinel.**
+  The `--security-opt seccomp=unconfined` flag (required for
+  `unshare(CLONE_NEWUSER)` inside the container) was gated on `id -u != 0`,
+  which fired on every macOS/Colima run where containerd is rootful and no
+  seccomp lift is needed. Now gated on the `containerd-rootless/child_pid`
+  sentinel — the same signal the cgroup probe already uses.
+
 ## [0.9.3]
 
 ### Fixed
