@@ -3928,6 +3928,14 @@ if [ "$RUNTIME" != "fly" ]; then
       if [ "$(jq -r '.pushed_at // ""' "$run_json")" != "" ]; then
         continue
       fi
+      # branch and working_branch must both be present — a run.json
+      # without them was created by the die() handler before
+      # phase_classify completed (orchestrator/leerie.py:15116); it
+      # cannot be finalized.
+      if [ "$(jq -r '.branch // ""' "$run_json")" = "" ] || \
+         [ "$(jq -r '.working_branch // ""' "$run_json")" = "" ]; then
+        continue
+      fi
       # Use mtime of run.json as the recency proxy.
       mtime="$(stat -c %Y "$run_json" 2>/dev/null || stat -f %m "$run_json" 2>/dev/null || echo 0)"
       if [ "$mtime" -gt "$LATEST_RUN_MTIME" ]; then
