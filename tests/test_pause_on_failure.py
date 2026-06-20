@@ -547,9 +547,9 @@ def test_resume_machine_skips_image_update_when_same_version(tmp_path: Path):
     assert "machine start mach-same" in invocations
 
 
-def test_resume_machine_skips_image_update_when_no_stored_tag(tmp_path: Path):
-    """Backfill: runs provisioned before image_tag existed have no stored
-    tag — resume_machine skips the update (no false positive)."""
+def test_resume_machine_updates_image_when_no_stored_tag(tmp_path: Path):
+    """Legacy machines with no stored image_tag get updated to the current
+    image on resume (c3670af: empty stored tag != current tag → update)."""
     _make_flyctl_stub(tmp_path, behavior="happy")
     user_repo = tmp_path / "user-repo"
     run_dir = user_repo / ".leerie" / "runs" / "test-004"
@@ -567,12 +567,13 @@ def test_resume_machine_skips_image_update_when_no_stored_tag(tmp_path: Path):
             "PATH": f"{tmp_path}:/usr/bin:/bin",
             "USER_REPO": str(user_repo),
             "LEERIE_RUN_ID": "test-004",
+            "LEERIE_FLY_APP": "leerie",
             "FLY_IMAGE_TAG": "registry.fly.io/leerie:0.6.7",
         },
     )
     assert result.returncode == 0, result.stderr
     invocations = (tmp_path / "flyctl.log").read_text()
-    assert "machine update" not in invocations
+    assert "machine update mach-legacy --image registry.fly.io/leerie:0.6.7" in invocations
 
 
 def test_resume_machine_continues_on_image_update_failure(tmp_path: Path):
