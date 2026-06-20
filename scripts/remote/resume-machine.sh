@@ -15,7 +15,7 @@
 #
 # Environment variables (set by the launcher):
 #
-#   LEERIE_FLY_APP        — Fly.io app name (default: "leerie")
+#   LEERIE_FLY_APP        — Fly.io app name (required)
 #   FLY_IMAGE_TAG         — current image tag (registry.fly.io/<app>:<ver>)
 #   USER_REPO             — host-side path to the user's repo (for sidecar I/O)
 #   LEERIE_STATE_HOST_DIR — host-side state directory (preferred over USER_REPO)

@@ -32,7 +32,7 @@ set -euo pipefail
 #   $XDG_CACHE_HOME → forced to a temp dir so the test never touches
 #                     the real user cache.
 #   $LEERIE_REPO      → forced to a temp dir holding a stub build-push.sh.
-#   $LEERIE_FLY_APP   → app name (default: leerie).
+#   $LEERIE_FLY_APP   → app name (required).
 #   $LOCAL_BUILD    → "true" to forward --local-build to build-push.sh.
 #   PATH            → must include a stub `flyctl` that handles
 #                     `apps list --json` and `apps create`.
@@ -50,7 +50,7 @@ ensure_image() {
     echo "leerie: error: $build_push not found or not executable" >&2
     return 1
   fi
-  local fly_app="${LEERIE_FLY_APP:-leerie}"
+  local fly_app="$LEERIE_FLY_APP"
 
   # Auto-create the Fly app if missing. flyctl apps list returns a JSON
   # array; check for a Name match. The remote builder and registry push
@@ -174,6 +174,7 @@ def test_cache_hit_skips_build_push(tmp_path: Path):
         env={
             "XDG_CACHE_HOME": str(cache_home),
             "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "leerie",
         },
         cwd=tmp_path,
     )
@@ -235,6 +236,7 @@ def test_build_push_failure_propagates(tmp_path: Path):
         env={
             "XDG_CACHE_HOME": str(cache_home),
             "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "leerie",
         },
         cwd=tmp_path,
         flyctl_dir=tmp_path,
@@ -261,6 +263,7 @@ def test_missing_build_push_script_errors(tmp_path: Path):
         env={
             "XDG_CACHE_HOME": str(cache_home),
             "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "leerie",
         },
         cwd=tmp_path,
     )
@@ -289,6 +292,7 @@ def test_positive_cache_only_unrelated_tags_still_probe(tmp_path: Path):
         env={
             "XDG_CACHE_HOME": str(cache_home),
             "LEERIE_REPO": str(repo),
+            "LEERIE_FLY_APP": "leerie",
         },
         cwd=tmp_path,
         flyctl_dir=tmp_path,

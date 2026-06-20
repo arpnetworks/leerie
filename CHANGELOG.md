@@ -5,6 +5,22 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **`LEERIE_FLY_APP` is now required when `--runtime fly`** (Fly.io app
+  names are globally unique; the old `leerie` default silently failed for
+  other users). Set via `--fly-app <name>` or `export LEERIE_FLY_APP=<name>`.
+
+### Added
+
+- **`--fly-app` CLI flag** for setting the Fly app name on the command line.
+- **`libssl-dev`** added to the container image for Ruby OpenSSL extension
+  and gems linking against OpenSSL.
+- **Rootless containerd support** via PR #18: rootless privilege drop,
+  cgroup probe, Linux `stat` compatibility, Ruby dev libraries.
+
 ## [0.8.3]
 
 ### Fixed

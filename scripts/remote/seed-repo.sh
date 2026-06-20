@@ -70,7 +70,7 @@
 # Environment variables consumed:
 #
 #   LEERIE_MACHINE_ID   — ID of the started Fly Machine (set by provision.sh)
-#   LEERIE_FLY_APP      — Fly.io app name (default: "leerie")
+#   LEERIE_FLY_APP      — Fly.io app name (required)
 #   USER_REPO         — absolute path to the local git repo (set by launcher)
 #
 # Requires (host): flyctl on PATH and authenticated; git; python3;

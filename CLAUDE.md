@@ -200,6 +200,7 @@ export LEERIE_SOURCE_OF_TRUTH=codebase   # or: research, both
 # Select the execution runtime (default: local). `fly` routes each worker
 # through Fly.io machines instead of local nerdctl containers.
 export LEERIE_RUNTIME=local              # or: fly
+export LEERIE_FLY_APP=my-leerie-app      # required for --runtime fly (globally unique)
 ./leerie "task" --runtime fly
 # …or commit a leerie.toml at the repo root with: runtime = fly
 

@@ -345,6 +345,7 @@ details and sub-flags.
 | Flag | Description |
 |------|-------------|
 | `--state-dir PATH` | Override the per-repo state directory. Also `LEERIE_STATE_DIR` env var or `state_dir` in `leerie.toml`. |
+| `--fly-app NAME` | Fly.io app name (required for `--runtime fly`; globally unique). Also `LEERIE_FLY_APP` env var. |
 | `--fly-disk-gb N` | Provision a Fly volume of N GB mounted at `/home/leerie`. Also `FLY_VM_DISK_GB` env var. |
 | `--no-runtime-install` | Skip auto-install of container runtime (Colima / nerdctl / containerd). Also `LEERIE_NO_RUNTIME_INSTALL`. |
 | `--no-auto-publish` | Skip the image-publish probe on startup. Also `LEERIE_NO_AUTO_PUBLISH`. |

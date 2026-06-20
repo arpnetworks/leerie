@@ -1273,6 +1273,25 @@ Maps to: `resolve_source_of_truth` resolution pattern in `leerie.py`
 `resolve_runtime()` in `leerie.py`; constants are `RUNTIME_VALUES`,
 `RUNTIME_ENV`, `RUNTIME_FILE`; argparse flag is `--runtime {local,fly}`.
 
+### Fly app name
+
+Fly.io app names are globally unique. `LEERIE_FLY_APP` is required when
+`RUNTIME=fly`; the launcher `die()`s with setup instructions when unset.
+
+Resolution order (highest priority first):
+
+1. **`--fly-app NAME`** / `--fly-app=NAME` CLI flag. Launcher-only
+   (stripped from `REWRITTEN_ARGS`; the orchestrator never sees it).
+
+2. **`$LEERIE_FLY_APP`** environment variable.
+
+3. **(none)** — no default, no `leerie.toml` key. Required.
+
+The resolved value is exported as `LEERIE_FLY_APP` and assigned to
+`FLY_APP` before any remote script is sourced. Verb paths (`--stop`,
+`--kill`, `--finalize`, `--list --runtime fly`, `--re-seed`) validate
+independently since they exit before the main resolution gate.
+
 ### Prompt loading and the shared filter fragment
 
 Worker prompts are loaded by `load_prompt(name)` in

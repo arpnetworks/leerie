@@ -17,7 +17,7 @@
 #
 # Environment variables (set by the launcher before sourcing):
 #
-#   LEERIE_FLY_APP    — Fly.io app name (default: "leerie")
+#   LEERIE_FLY_APP    — Fly.io app name (required)
 #   FLY_IMAGE_TAG   — full image tag to launch (e.g. registry.fly.io/leerie:0.2.1)
 #   FLY_REGION      — Fly.io region (default: from fly.toml or "iad")
 #   FLY_VM_CPUS     — vCPUs for the machine (default: 4)

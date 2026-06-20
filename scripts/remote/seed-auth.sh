@@ -15,7 +15,7 @@
 # Environment variables (must be set by the launcher before sourcing):
 #
 #   LEERIE_MACHINE_ID  — ID of the provisioned Fly Machine (set by provision.sh)
-#   LEERIE_FLY_APP     — Fly.io app name (default: "leerie"; same as provision.sh)
+#   LEERIE_FLY_APP     — Fly.io app name (required; same as provision.sh)
 #   STAGE            — host-side scratch dir already assembled by the launcher
 #                      containing .claude/, .claude.json, and optional .gitconfig
 #   HOME             — standard; used to read host git identity

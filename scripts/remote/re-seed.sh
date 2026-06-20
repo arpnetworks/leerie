@@ -30,7 +30,7 @@
 #
 #   LEERIE_RUN_ID         — run id whose sidecar holds fly_machine_id
 #   USER_REPO           — host-side repo path (for git status + rsync source)
-#   LEERIE_FLY_APP        — Fly.io app name (default: "leerie")
+#   LEERIE_FLY_APP        — Fly.io app name (required)
 #   LEERIE_RE_SEED_FORCE  — set to "1" to bypass the dirty-machine safety check
 
 set -euo pipefail

@@ -750,6 +750,10 @@ PY
     fi
     export LEERIE_RUN_ID="$_re_seed_run_id"
     [ "$_re_seed_force" = "1" ] && export LEERIE_RE_SEED_FORCE=1
+    if [ -z "${LEERIE_FLY_APP:-}" ]; then
+      remote_log "--re-seed: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
+      exit 1
+    fi
     # shellcheck disable=SC1091
     . "$LEERIE_REPO/scripts/remote/provision.sh"
     # shellcheck disable=SC1091
