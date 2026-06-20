@@ -3856,7 +3856,7 @@ if [ "$RUNTIME" != "fly" ]; then
         continue
       fi
       # Use mtime of run.json as the recency proxy.
-      mtime="$(stat -f %m "$run_json" 2>/dev/null || stat -c %Y "$run_json" 2>/dev/null || echo 0)"
+      mtime="$(stat -c %Y "$run_json" 2>/dev/null || stat -f %m "$run_json" 2>/dev/null || echo 0)"
       if [ "$mtime" -gt "$LATEST_RUN_MTIME" ]; then
         LATEST_RUN_MTIME=$mtime
         LATEST_RUN_DIR="$(dirname "$run_json")"
