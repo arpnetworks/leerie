@@ -364,7 +364,10 @@ line → `ROOTLESS=true`). When rootless:
 `--dangerously-skip-permissions` from UID 0. The rootless entrypoint
 uses `unshare --user --map-user --map-group` to remap outer UID 0 to
 the `leerie` user in a nested user namespace, so the orchestrator runs
-as non-root and the flag is accepted. See DESIGN.md §6.
+as non-root and the flag is accepted. The OCI default seccomp profile
+blocks `unshare(CLONE_NEWUSER)`, so the launcher passes
+`--security-opt seccomp=unconfined` for rootless runs (gated on
+`containerd-rootless/child_pid`). See DESIGN.md §6.
 
 The orchestrator's source lives at `/opt/leerie-image/`. It is present
 in two ways depending on execution mode:

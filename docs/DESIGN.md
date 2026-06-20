@@ -1200,6 +1200,10 @@ nested user namespace. Bind-mounted host dirs remain owned by us
 `/opt/leerie-image/` (outer UID leerie) are traversed via their
 mode-755 bits. The orchestrator sees `getuid() == leerie` and Claude
 Code accepts `--dangerously-skip-permissions` without any escape hatch.
+The OCI default seccomp profile blocks `unshare(CLONE_NEWUSER)` inside
+containers, so the launcher passes `--security-opt seccomp=unconfined`
+for rootless runs (gated on the `containerd-rootless/child_pid`
+sentinel, not on `id -u`, so macOS/Colima runs are unaffected).
 
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,

@@ -3863,15 +3863,15 @@ else
     fi
   fi
 
-  # Rootless nerdctl (non-root host user) runs the container in a user
-  # namespace where PID 1 appears as UID 0. container-entry.sh uses
-  # `unshare --user` to remap to the leerie UID so claude accepts
-  # --dangerously-skip-permissions (which it refuses when getuid()==0).
-  # The OCI default seccomp profile blocks unshare(CLONE_NEWUSER) inside
-  # containers, so we lift it for rootless runs. Single-tenant dev tool;
-  # the security trade-off is acceptable.
+  # Rootless nerdctl: container-entry.sh uses `unshare --user` to remap
+  # UID 0 to leerie so claude accepts --dangerously-skip-permissions.
+  # The OCI default seccomp profile blocks unshare(CLONE_NEWUSER), so we
+  # lift it for rootless runs. Gate on the same containerd-rootless
+  # sentinel the cgroup probe uses — the file only exists when
+  # containerd-rootless-setuptool.sh was used on Linux; on macOS (Colima)
+  # containerd is rootful inside the VM and no seccomp lift is needed.
   ROOTLESS_SECOPT=()
-  if [ "$(id -u)" != "0" ]; then
+  if [ -f "/run/user/$(id -u)/containerd-rootless/child_pid" ]; then
     ROOTLESS_SECOPT=(--security-opt seccomp=unconfined)
   fi
 
