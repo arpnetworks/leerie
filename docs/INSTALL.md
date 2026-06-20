@@ -210,7 +210,7 @@ curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install
 ### Arch
 
 ```bash
-sudo pacman -S containerd nerdctl
+sudo pacman -S containerd nerdctl rootlesskit buildkit cni-plugins fuse-overlayfs
 sudo systemctl enable --now containerd
 
 curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash

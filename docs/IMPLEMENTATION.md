@@ -177,9 +177,12 @@ Base layers (top-down):
 
 - `debian:13-slim` — minimal, predictable, glibc-based.
 - `apt-get install`: `ca-certificates`, `curl`, `git`, `openssh-client`,
-  `python3`, `python3-pip`, `build-essential`. The build tools cover
-  native-module comleerietion in `npm install` (sharp, bcrypt, esbuild
-  fallback, etc.) so `node-gyp` doesn't fail on first run.
+  `python3`, `python3-pip`, `build-essential`, plus dev libraries
+  (`zlib1g-dev`, `libyaml-dev`, `libreadline-dev`, `libffi-dev`,
+  `libpq-dev`, `libsqlite3-dev`, `libgdbm-dev`). The build tools and
+  dev headers cover native-extension compilation: `node-gyp` (sharp,
+  bcrypt), Ruby C gems (`nokogiri`, `pg`, `sqlite3`, `ffi`), and
+  Python C extensions.
 - Node.js LTS, arch-aware via `TARGETARCH` / `dpkg --print-architecture`
   → `arm64` → `linux-arm64` tarball, `amd64` → `linux-x64`. Pinned via
   `ARG NODE_VERSION` so the version is reproducible across builds.
@@ -2931,6 +2934,8 @@ branch, after the `_write_run_json(...)` block and before
    `.python-version` / `.ruby-version` / `rust-toolchain.toml` /
    `.go-version` because the image sets
    `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=node,python,ruby,rust`.
+   Ruby uses precompiled binaries (`MISE_RUBY_COMPILE=false` in the
+   image) to avoid requiring the full ruby-build toolchain.
    Streams to `<state-root>/runs/<id>/logs/provision.log`. Nonzero exit
    surfaces the failing tool+version to `die()`.
 5. **Version capture.** Runs `mise ls --current --json` (the
