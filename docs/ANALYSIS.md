@@ -1,815 +1,6665 @@
-# Leerie — Deterministic Code Analysis (Compiler Front-End Lens)
-
-> **What this is.** A mechanically-extracted, reproducible analysis of the
-> leerie codebase. Every count, name, and table below was produced by
-> *parsing* the source (Python `ast` + `tokenize`), not by reading it
-> impressionistically. The analysis treats the code the way a compiler treats
-> source text — preprocess → lex → parse/AST → semantic graph — so the facts
-> are deterministic: same input, same output.
->
-> **Provenance.** Generated 2026-06-18 against commit `5b62ae3` (release
-> 0.8.9). The primary subject, `orchestrator/leerie.py`, is pinned by content
-> hash `sha256:7b657ac3e7fe7c5f91d21a73a12d8998f77932f8d30b951146c62b92848248af`.
->
-> **Regenerate.** `python3 docs/tools/leerie_extract.py orchestrator/leerie.py`.
-> If the headline numbers in §1–§2 differ from a fresh run, this document is
-> stale, not the code.
->
-> **Status — NOT canonical.** Per `CLAUDE.md`, the canonical chain is
-> `DESIGN.md` → `IMPLEMENTATION.md` → code. This file is a *derived fourth
-> view*: it explains the code through a structural lens and cross-references
-> the canon. If it disagrees with the code, the code wins; if it disagrees
-> with the spec, fix this file.
-
----
-
-## 0. The two-compiler thesis (how to read this whole document)
-
-There are two compilers in play, and keeping them apart is the key to a
-correct deep perspective on this project.
-
-- **Compiler A — the analysis tool.** `docs/tools/leerie_extract.py` is a real
-  front end run *over* leerie's source to produce the deterministic facts in
-  §1–§2. When this document says "896 `If` nodes" or "fan-in of `claude_p` is
-  13," that is Compiler A's output, not prose.
-
-- **Compiler B — leerie itself.** Leerie *is* a compiler. Its source language
-  is one natural-language task description; its object code is an integrated
-  git branch plus a pull request. Its module docstring is literally *"Leerie —
-  deterministic task orchestrator for Claude Code."* The orchestrator lowers a
-  task through stages that map one-to-one onto a compiler pipeline:
-
-  ```
-  task text ──▶ classify ──▶ plan ──▶ reconcile ──▶ schedule ──▶ execute ──▶ integrate ──▶ conform ──▶ finalize ──▶ PR
-              (lexing)     (parsing)  (name res.)   (linearize)  (codegen)   (linking)    (lint)       (emit)
-  ```
-
-  The non-obvious, load-bearing idea (DESIGN §3, §12) is the division of
-  labor: **judgment is delegated to LLM "workers"; everything checkable
-  mechanically is done by the orchestrator in real Python.** In compiler
-  terms, the LLM workers are the creative passes (they *write* the code) and
-  the orchestrator is the type checker, linker, and driver that refuses to
-  trust them. "Prompts are advisory; code enforces."
-
-§1–§2 are Compiler A's report on the static artifact. §3 onward reads that
-artifact as Compiler B and explains what it *does*.
-
----
-
-## 1. Compiler A — the method that produced this document
-
-Four stages, each emitting deterministic facts.
-
-### 1.1 Stage P — Preprocess (the input surface)
-
-The repository's tracked files are the "translation units." Counted from
-`git ls-files`, the surface partitions cleanly by role:
-
-| Layer | Files | Largest |
-|---|---|---|
-| Orchestrator (all control flow) | `orchestrator/leerie.py` | **15,158 lines** |
-| Launcher (portable bash) | `leerie` | 3,861 lines |
-| Canonical docs | `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`, `INSTALL`, `USAGE` | 3,026 / 4,706 |
-| Worker prompts | `prompts/*.md` (12 files) | `reconciler.md` 541 |
-| Worktree mechanics (bash) | `scripts/*.sh` | — |
-| Remote/Fly mechanics (bash) | `scripts/remote/*.sh` (11 files) | `seed-repo.sh` 850 |
-| Chain sequencer (laptop, Shape A) | `chain/*.py` (3 modules) | `git_ops.py` 363 |
-| Tests | `tests/test_*.py` (154 files) | `test_reconciler_cycle_gate.py` 2,739 |
-
-The single most important preprocessing fact: **one file, `leerie.py`, holds
-all orchestrator control flow** (a deliberate design choice — readable
-top-to-bottom in one sitting). That is why a structural extractor pays off so
-much here; almost the entire "semantics of leerie" lives in one parseable AST.
-
-### 1.2 Stage L — Lex (the token census)
-
-`tokenize` over `leerie.py`: **81,816 tokens**.
-
-| Token class | Count | Reading |
-|---|---|---|
-| `OP` | 29,411 | operator-dense (subscripts, calls, dict literals) |
-| `NAME` | 23,568 | identifiers + keywords |
-| `STRING` | 4,881 | many prompt fragments and messages |
-| `COMMENT` | 2,724 | **156,672 comment chars ≈ 22.2% of bytes** — heavily annotated "why" |
-| `FSTRING_START` | 941 | 941 f-strings (dynamic prompt/message assembly) |
-| `NUMBER` | 549 | caps, timeouts, byte budgets |
-
-Keyword frequency exposes the dominant idiom — **branching and guarding**:
-
-```
-if 1019   return 497   for 501   not 430   await 152   async 81
-try 114   except 124   raise 54   with 18
-```
-
-`if` appears 1,019 times. This is the lexical signature of the "code enforces"
-principle: the file is mostly conditionals that validate worker output and
-gate state transitions. The `async`/`await` counts (81 / 152) mark it as an
-asyncio program (parallel worker waves).
-
-The lexer also harvests the project's literal **vocabulary** from string
-tokens: **34 distinct `LEERIE_*` environment-variable names** and the exit-code
-symbols `EXIT_NEEDS_ANSWERS`, `EXIT_BUDGET_INFEASIBLE`, `EXIT_LOCKED`
-(see §2.2).
-
-### 1.3 Stage S — Parse / AST (the declared surface)
-
-`ast.parse` yields **61,632 AST nodes**. The node histogram is itself a
-fingerprint of the architecture:
-
-| Node | Count | Meaning |
-|---|---|---|
-| `If` | 896 | enforcement/guard density |
-| `Compare` | 634 | predicate-heavy validation |
-| `BoolOp` | 463 | compound conditions |
-| `Try` / `ExceptHandler` | 114 / 124 | defensive subprocess + IO handling |
-| `Call` | 3,646 | — |
-| `FunctionDef` / `AsyncFunctionDef` | 222 / 73 | 295 `def`s total |
-| `Await` | 152 | concurrency points |
-| `Raise` | 54 | explicit failure surfacing |
-
-Declared module surface:
-
-- **234 module-level functions**
-- **8 classes** (one core, `State`; the rest are small — see §2.5)
-- **145 module-level constants**
-- **21 import statements** (see §2.1)
-
-### 1.4 Determinism contract
-
-Compiler A is pure stdlib, reads only, and is order-stable. The committed
-tool was re-run during this analysis and reproduced the headline numbers
-byte-for-byte (`sha256` equal, 15158 / 81816 / 234 / 8 / 145). That is the
-operational meaning of "deterministic documentation": the report is a
-*function* of the source, and the function is checked into the repo.
-
----
-
-## 2. The static artifact — `orchestrator/leerie.py`
-
-### 2.1 Module identity and dependency closure
-
-Module docstring: **"Leerie — deterministic task orchestrator for Claude Code."**
-
-The import list proves the stdlib-preferred claim from `CLAUDE.md`. Of 21
-imports, **exactly one is third-party**:
-
-```
-stdlib: __future__.annotations  argparse asyncio contextlib copy fcntl json os re shutil signal
-        subprocess sys time uuid  +  collections.deque  collections.abc
-        datetime  pathlib  zoneinfo
-3rd-party: tenacity  (AsyncRetrying, RetryError, retry_if_result,
-                       stop_after_delay, wait_exponential_jitter, ...)
-```
-
-`tenacity` exists for exactly one job: exponential-backoff retry of transient
-`claude -p` envelope failures (auth/rate-limit). Everything else — async
-orchestration (`asyncio`), inter-process locking (`fcntl`), subtree signalling
-(`signal`/`subprocess`), atomic persistence (`os`/`json`/`pathlib`) — is
-stdlib. The dependency surface is deliberately tiny so the orchestrator is
-auditable.
-
-### 2.2 The lexical vocabulary — leerie's "reserved words"
-
-These module constants are the closed sets the rest of the program switches on.
-They are the type universe of Compiler B.
-
-**Worker roles** — `WORKER_TYPES` (8), the call-type partition (DESIGN §14):
-```
-classifier  planner  reconciler  plan_overlap_judge  provision
-implementer  integrator  conformer
-```
-Three more worker roles exist outside `WORKER_TYPES` (finalize/post-run):
-`pr_writer`, `judge`, `patch_generator`.
-
-**Task categories** — `CATEGORIES` (9) with `CATEGORY_ABBREV` id-prefixes:
-```
-feature-implementation→feat   bug-fixing→bugfix   refactoring→refactor
-performance-optimization→perf testing→test        dependency-migration→deps
-configuration-build→config    infrastructure→infra documentation→docs
-```
-
-**Enumerated knobs** (value sets + defaults):
-
-| Constant | Values | Default |
-|---|---|---|
-| `SOURCE_OF_TRUTH_VALUES` | `codebase` `research` `both` | `both` |
-| `RUNTIME_VALUES` | `local` `fly` | `local` |
-| `MODEL_VALUES` | `sonnet` `opus` `haiku` | `opus` (global) |
-| `EFFORT_VALUES` | `low` `medium` `high` `xhigh` `max` | `None` |
-| `VERBOSITY_VALUES` | `quiet` `normal` `stream` `debug` | `stream` |
-| `_TERMINAL_STATUSES` | `complete` `failed` `blocked` | — |
-
-**Per-worker model/effort defaults** (extracted literals):
-- `MODEL_DEFAULT_PER_WORKER = {implementer, conformer, judge, heal, pr_writer → sonnet}` (all others → `opus`).
-- `EFFORT_DEFAULT_PER_WORKER = {classifier, planner, reconciler, plan_overlap_judge, provision, integrator, pr_writer → high}` (acting/post-run workers unset).
-
-This is the mechanical truth behind "judgment workers default to opus/high;
-acting workers default to sonnet/unset."
-
-**Run lifecycle** — `RUN_STATUSES` (**11**, not 10):
-```
-seed-failed  corrupt-sidecar  in-progress  done  done-pushed-no-pr
-done-pushed-pr  push-failed  pr-failed  paused  killed  sync-failed
-```
-
-**Exit codes** (structured, non-error exits use `sys.exit`, not `die`):
-
-| Constant | Value | Meaning |
-|---|---|---|
-| `EXIT_NEEDS_ANSWERS` | 10 | non-TTY clarification deferred → `pending-questions.json` |
-| `EXIT_BUDGET_INFEASIBLE` | 11 | planner produced more subtasks than the budget fits |
-| `EXIT_LOCKED` | 75 | another orchestrator holds the run-dir flock |
-
-**Persistence schema** — `STATE_FIELDS` (33 keys) is the canonical shape of
-`state.json` (coupling-tested). **Tool grants** encode the §12 read-only
-enforcement directly as constants:
-```
-_READ_BASE   = "Read,Grep,Glob,WebSearch,WebFetch"
-INSPECT_TOOLS= _READ_BASE + read-only Bash(ls/find/cat/grep/git log/...)
-ACT_TOOLS    = _READ_BASE + "Bash,Write,Edit"
-_PROTECTED_PREFIXES        = (".leerie/", ".git/")
-_CLAUDE_DELIVERABLE_PREFIXES = (".claude/agents/", ".claude/commands/", ".claude/skills/")
-```
-Judgment workers are launched with `INSPECT_TOOLS` (cannot mutate); acting
-workers get `ACT_TOOLS` but are fenced from the protected prefixes. The
-permission boundary is a Python constant, not a prompt request.
-
-Also pinned: `MIN_CLAUDE_CLI = (2, 1, 22)` — the first `claude` CLI with
-working `--json-schema` in `-p` mode (enforced at preflight).
-
-### 2.3 The cap table — `DEFAULT_CAPS`
-
-Every bounded loop has a real counter here (DESIGN §13). Extracted values:
-
-| Cap | Default | Bounds |
-|---|---|---|
-| `max_total_workers` | 200 | total worker invocations per run |
-| `max_parallel` | 5 | concurrent workers per wave |
-| `subtask_continuations` | 3 | handoffs + clarifications per subtask (shared) |
-| `failed_retries` | 1 | retries of a retryable failure |
-| `conformance_rounds` | 3 | conformer iterations |
-| `judgment_check_rounds` | 3 | CRITIC rounds for judgment workers |
-| `planner_check_rounds` | 3 | CRITIC rounds for planners |
-| `implementer_confidence_retries` | 2 | implementer confidence-gate retries |
-| `planner_samples` | 3 | independent planner samples per domain |
-| `worker_timeout_sec` | 5400 | 90-min hard worker timeout |
-| `worker_idle_warn_sec` | 300 | idle-warning threshold |
-| `confidence_rounds` | 8 | worker-internal evidence-gate rounds |
-| `worker_memory_max_bytes` | `None` | auto-derived from `/proc/meminfo` |
-| `worker_pids_max` | 256 | per-worker cgroup pids.max |
-| `auth_retry_max_sec` | 300 | tenacity auth/quota backoff ceiling |
-| `subtask_call_estimate` | 2.5 | est. worker calls per subtask (budget preflight) |
-| `budget_safety_margin` | 1.15 | budget-preflight slack factor |
-
-The last two feed `check_budget_feasibility` (EXIT 11): when the estimated
-worker count (≈ `subtasks × subtask_call_estimate × budget_safety_margin`)
-exceeds `max_total_workers`, it fails fast at plan time with a recommended
-`--max-workers`.
-
-### 2.4 The type system on the wire — `SCHEMAS`
-
-Every worker returns JSON validated against a JSON-Schema passed via
-`--json-schema`. This is Compiler B's type system at process boundaries: a
-worker physically cannot return a shape the orchestrator does not expect
-without triggering one corrective retry then a hard `WorkerError`. The
-`SCHEMAS` dict has **11** entries; required fields (mechanically extracted):
-
-| Schema | `required` fields | `additionalProperties` |
-|---|---|---|
-| `classifier` | `categories`, `confidence` | open |
-| `planner` | `domain`, `subtasks`, `status`, `confidence` | open |
-| `reconciler` | 8 action arrays + `confidence` | open |
-| `implementer` | `subtask_id`, `status`, `confidence` | open |
-| `integrator` | `incoming_subtask`, `status`, `confidence` | open |
-| `conformer` | `subtask_id`, `rules_files_read`, `rule_violations_fixed/residual`, `docs_updates`, `tests_updates`, `build`, `lint`, `tests`, `summary`, `confidence` | open |
-| `plan_overlap_judge` | `collisions`, `confidence` | **closed** |
-| `provision` | `recipe`, `confidence` | open |
-| `judge` | `passed`, `dimensions`, `rationale`, `suggested_fixes` | open |
-| `patch_generator` | `anchor`, `replacement` | open |
-| `pr_writer` | `title`, `body`, `used_template` | open |
-
-The 8 reconciler arrays (`renames`, `added_provides`, `added_subtasks`,
-`conditional_drops`, `dropped_requires`, `dependency_edges`, `merged_subtasks`,
-`unresolvable`) are the full vocabulary of cross-domain plan repair (§3.4).
-Note every core worker carries `confidence` — the §8 evidence-gate object.
-
-### 2.5 The object model — 8 classes
-
-Leerie is "functional first"; `State` is the deliberate stateful exception.
-
-| Class | Base | Span | Role |
-|---|---|---|---|
-| `State` | — | 130 ln | run state + atomic persistence + per-dir flock (§4.1) |
-| `HealState` | — | 46 ln | per-`call_type` heal-loop state |
-| `_DescendantTracker` | — | 86 ln | background PID poller for subtree kill (§4.3) |
-| `_ReplayState` | — | 29 ln | no-write `State`-alike for telemetry replay |
-| `StateLockedError` | `Exception` | — | raised when the run-dir flock is held → `EXIT_LOCKED` |
-| `WorkerError` | `RuntimeError` | — | schema-invalid / dishonest worker |
-| `RateLimitedExit` | `BaseException` | — | `claude` subscription rate-limit (carries reset time) |
-| `InterruptedBySignal` | `BaseException` | — | raised by SIGTERM/SIGHUP handlers |
-
-The two `BaseException` subclasses are intentional: they bypass normal
-`except Exception` handlers so signal/rate-limit unwinding cannot be swallowed
-by routine error handling.
-
-`State` methods: `__init__` → `_acquire_lock` (`fcntl.flock(LOCK_EX|LOCK_NB)`
-on the run *directory*), `save` (temp-file write + `os.replace` = atomic),
-`load`, `bump_workers` (raises `WorkerError` past `max_total_workers` — the
-runtime budget backstop), `add_telemetry`, `release_lock`, `__del__`.
-
-### 2.6 The function surface — 234 functions, grouped
-
-Compiler A buckets the names by prefix; the buckets *are* the subsystem map:
-
-| Prefix | n | What it is |
-|---|---|---|
-| `resolve_*` | 30 | config resolution (CLI > env > toml > default), one per knob |
-| `phase_*` | 9 | the pipeline stages (§3) |
-| `check_*` | 14 | **deterministic enforcement gates** (return issue lists) |
-| `validate_*` | 6 | structural output validators (`die` on violation) |
-| `run_*` | 8 | subprocess + worker drivers (`run_proc`, `run_script`, `run_streaming`, `run_implementer`, `run_conformer`, …) |
-| `heal_*`, `judge_capture`, `phase_judge`, `replay_capture`, `request_patch` | — | self-improvement loop (§6) |
-| `_cgroup_*` | 4 | cgroup-v2 memory containment |
-| `_tarjan_sccs`, `_build_predecessor_graph`, `_attribute_cycle_edges`, `_shared_files_in_scc` | — | the scheduler's graph algorithms |
-| `_DescendantTracker`, `_enumerate_descendants`, `_terminate_proc_tree`, `_signal_pids` | — | worker subtree termination |
-| `_format_*` | 12 | prompt/diagnostic rendering |
-
-The 14 `check_*` functions are the heart of the "code enforces" principle:
-`check_branch_has_commits`, `check_budget_feasibility`, `check_classifier_output`,
-`check_convergence`, `check_diff_scope`, `check_implementer_output`,
-`check_integrator_commit`, `check_integrator_output`, `check_merge_committed`,
-`check_overlap_judge_output`, `check_planner_output`, `check_provision_output`,
-`check_reconciler_output`, `check_task_file_coverage`.
-
-### 2.7 The semantic graph — the call graph
-
-**Fan-in (most-depended-on primitives)** — the leaf utilities every pass calls:
-
-```
-log 42   die 33   run_proc 18   claude_p 13   load_prompt 12   now 11
-_read_toml_key 10   compute_run_branch 8   _resolve_positive_int_pref 8
-_confidence_issues 6   _run_checked_loop 6
-```
-
-`log`/`die` are universal. `claude_p` (fan-in 13) is the single chokepoint for
-*all* LLM work — every worker, judge, and heal call funnels through it (§4.2).
-`load_prompt` (fan-in 12) is the prompt preprocessor (§5.1). `_run_checked_loop`
-(fan-in 6) is the CRITIC pattern reused by every judgment phase.
-
-**Fan-out (the drivers)** — functions that orchestrate many others:
-
-```
-main 40   _run_phases 28   phase_reconcile 21   run_final_conformance 16
-settle_subtask 16   _run_conformance_phase 14   phase_provision 13
-phase_plan 11   phase_overlap_judge 11   integrate_wave 11
-```
-
-`main` is the dispatcher; `_run_phases` is the pipeline body; `phase_reconcile`
-(fan-out 21) is the most complex single stage — it is the "semantic analysis"
-pass and it shows (§3.4).
-
-**The pipeline edge** (who calls `phase_*`), extracted exactly:
-- `_run_phases` → `phase_classify`, `phase_provision`, `phase_plan`,
-  `phase_reconcile`, `phase_overlap_judge`, `phase_execute`, `phase_finalize`
-- `main` → `phase_judge`, `phase_heal` (separate post-run sub-commands)
-
-So the normal compile is `main → orchestrate → _run_phases → [7 phases]`, and
-`phase_judge`/`phase_heal` are offline tools over a finished run's telemetry.
-
----
-
-## 3. Compiler B — leerie as a task→PR compiler
-
-### 3.1 The pipeline as compiler stages
-
-Mapping the verified `phase_*` set onto a compiler, with the LLM worker (if
-any) and the deterministic gate that follows it:
-
-| # | Phase (fn) | Compiler analog | Worker (judgment) | Deterministic gate (code) |
-|---|---|---|---|---|
-| 0 | `preflight` | environment/sanity check | — | CLI version `(2,1,22)`, git, auth |
-| 1 | `phase_classify` | **lexing** — task → category tokens | classifier (opus) | `check_classifier_output`, same-work risk |
-| 1½ | `phase_provision` | toolchain resolution | provision (fallback only) | `validate_provision_recipe`, argv-allowlist |
-| 2 | `phase_plan` | **parsing** — domain → subtask AST | planner ×N (opus, 3 samples) | `validate_plan`, `check_planner_output`, coverage |
-| 2½ | `phase_reconcile` | **name resolution** — bridge tag vocab | reconciler (opus, conditional) | `_tarjan_sccs` acyclicity gate |
-| 2¾ | `phase_overlap_judge` | **conflict detection** | plan_overlap_judge (conditional) | `_apply_overlap_collisions` + `_tarjan_sccs` |
-| 3 | `schedule` | **linearization** — DAG → waves | — (pure) | topological sort (Kahn) |
-| 4 | (`setup-run.sh`) | allocate output buffer | — | run branch "create-if-absent, never reset" |
-| 5 | `phase_execute` | **code generation** (per wave) | implementer ×N (sonnet) | `check_diff_scope`, `settle_subtask` |
-| 5a | `integrate_wave` | **linking** — merge subtask branches | integrator (on conflict) | `scan_conflict_markers`, `check_merge_committed` |
-| 5b | `run_conformer` | **lint/peephole** | conformer (sonnet) | protected-path re-check (advisory) |
-| 6 | `phase_finalize` | **emit object code** | pr_writer (sonnet) | `finalize.sh` verify + push/PR (host) |
-
-Visual control flow (verified by reading the `_run_phases` source body,
-`orchestrator/leerie.py:14276-14385`; a static call list does not encode
-order, so this was confirmed line-by-line, not inferred):
-
-```
-preflight
-   │
-   ▼
-phase_classify ──▶ phase_provision ──▶ gather_answers?   (provision precedes clarify; both skipped on --resume)
-   │
-   ▼
-phase_plan (×planner_samples → select best)
-   │
-   ▼
-phase_reconcile ──[unresolved requires]──▶ reconciler ──▶ _tarjan_sccs (acyclic?) ──[cycle]──▶ retry/die
-   │
-   ▼
-detect_no_work? ──[every planner cleared its gate + plan empty]──▶ _finish_no_work_run ──▶ done (exit 0)
-   │ (work remains)
-   ▼
-phase_overlap_judge ──[>1 planner]──▶ overlap judge ──▶ apply collisions ──▶ _tarjan_sccs
-   │
-   ▼
-schedule (topo-sort → waves[]) ──▶ check_budget_feasibility (EXIT 11?) ──▶ validate_plan ──▶ write_plan
-   │
-   ▼
-phase_execute   for wave in waves:   implementers ‖ ... ──▶ integrate_wave ──▶ conform ──▶ settle_subtask
-   │
-   ▼
-run_final_conformance ──▶ phase_finalize (verify ──▶ push ──▶ gh pr create)
-```
-
-### 3.2 Front end
-
-**Classify (lexing).** `phase_classify`'s extracted body is
-`load_prompt → _run_checked_loop(claude_p, check_classifier_output)`. The task
-text is tokenized into 1..9 of the nine `CATEGORIES`. Classification precedes
-clarification because *what to ask* depends on *what kind of task it is*
-(DESIGN §3).
-
-**Provision (toolchain resolution).** `phase_provision` is the model of
-"top-down by determinism": its ordered calls are
-`synth_mise_go_override → detect_recipe_from_lockfiles → run_setup_hook →
-run_mise_install → [fallback] gather_provision_fixtures → load_prompt →
-claude_p → check_provision_output`. The LLM `provision` worker fires *only*
-when the deterministic lockfile table returns empty. This is the single §12
-carve-out in the live compile (DESIGN §6½): the only place in the task→PR
-pipeline where an LLM-generated artifact is rendered into a later prompt (the
-offline heal loop in §6 does too, but post-run) — contained by a frozen
-argv-allowlist
-(`_PROVISION_ARGV0_ALLOW`: pnpm/npm/yarn/pip/uv/go/cargo/...) and a
-shell-metachar denylist.
-
-**Plan (parsing).** `phase_plan` runs `planner_samples` (default 3)
-independent planner workers per matched category in parallel
-(`gather_or_cancel`), then `_select_best_planner_sample` picks mechanically
-(fewest issues, most subtasks — avoids LLM self-bias), then
-`_run_checked_loop(check_planner_output)`, then `check_task_file_coverage`.
-Output is the subtask AST: each subtask is a node with `provides`/`requires`/
-`depends_on`/`files_likely_touched`/`size`.
-
-### 3.3 Back end
-
-**Schedule (linearization).** Pure graph computation, no worker: merge all
-plans, match `requires`↔`provides` into a global DAG, topologically sort into
-sequential waves. The scheduler "never has to trust a model's ordering"
-(DESIGN §3) — the non-deterministic pass produced data, the deterministic pass
-consumes it.
-
-**Execute (codegen) + Integrate (linking).** `phase_execute` per wave:
-`run_script` (new worktree) → parallel implementers (`gather_or_cancel`) →
-`integrate_wave` → `scan_conflict_markers` → `settle_subtask`. Each implementer
-runs in its own git worktree on branch `leerie/subtasks/<run-id>/<sid>` off the
-run branch, so a wave's workers cannot clobber each other. Integration is
-`git merge --no-ff` (not cherry-pick — recorded ancestry gives a real
-three-way base and an audit trail). On conflict, an integrator worker resolves
-*behaviorally* (preserving each side's intent), and its `resolved` claim is
-verified by `check_merge_committed`/`check_integrator_commit`.
-
-**Conform (lint) + Finalize (emit).** `run_conformer` brings each change into
-good standing with repo rules/tests/docs — advisory only (bounded by
-`conformance_rounds=3`; a failure never escalates). `phase_finalize`'s body:
-`push_will_happen → _write_run_json → run_script(finalize.sh verify) →
-_compose_pr_via_llm`. The actual push + `gh pr create` happen on the *host*
-after the container exits (`scripts/host-finalize.sh`), because the container
-exists to bound subprocess subtrees, not to be a git client.
-
-### 3.4 The intermediate representation
-
-The IR is the merged subtask graph. Three constructs carry it:
-
-- **Subtask node** (planner schema): `{id, intent, success_criteria_seed,
-  files_likely_touched, depends_on, requires[], provides[], size}` where
-  `size ∈ {small, medium}` (large is rejected by `validate_plan`).
-- **Capability tags**: `provides` is bare strings a subtask exports;
-  `requires` is `{tag, extent ∈ {in_plan, external}, reason}`. Matching
-  `requires`↔`provides` builds the dependency edges.
-- **The reconciler** (`phase_reconcile`, fan-out 21 — the heaviest pass)
-  bridges vocabulary drift between independently-run planners via its 8 action
-  arrays, then proves the result is a DAG with `_tarjan_sccs`. Its extracted
-  call sequence shows the full repair loop: apply reconciler output → build
-  predecessor graph → Tarjan SCC → on cycle, `_build_cycle_retry_prompt` and
-  respawn once → else `die` naming the SCC. **Acyclicity is a first-class
-  output property**, not a hope.
-
-### 3.5 The type system — deterministic enforcement (§12)
-
-This is what makes leerie trustworthy: the orchestrator never trusts a worker's
-self-report when it can check mechanically. The 14 `check_*` and 6 `validate_*`
-functions are the type checker. Representative gates:
-
-| Gate | Enforces |
-|---|---|
-| `validate_plan` | subtask shape, `size ≠ large`, required confidence axes |
-| `check_diff_scope` / `is_protected_path` | no writes to `.leerie/`, `.git/`, top-level `.claude/` |
-| `check_branch_has_commits` | implementer actually committed work (`no_commits`) |
-| `check_merge_committed` / `scan_conflict_markers` | integrator finished the merge; no `<<<<<<<` left |
-| `check_budget_feasibility` | plan fits `max_total_workers` (EXIT 11) |
-| `_tarjan_sccs` | merged plan is acyclic |
-| `validate_resume_state` | a resumed run's state is self-consistent |
-
-The **one** load-bearing LLM signal that *is* trusted is the evidence-anchored
-confidence score (DESIGN §8), and even it is hardened: workers must list
-`falsifiers_tested`, `contradictions_reconciled`, and `gap_to_close`. Tests,
-lint, and build are deliberately *advisory* — a code-enforced "tests must pass"
-gate would invite a stuck model to weaken the test instead of fixing the code.
-
-### 3.6 Error recovery
-
-Three nested recovery mechanisms, all bounded by caps:
-
-1. **Schema retry** — one corrective retry on schema violation, then
-   `WorkerError`.
-2. **Two-tier failure policy** — `_retryable_failure` over
-   `_RETRYABLE_FAILURE_KINDS = {no_commits, dirty_worktree, empty_handoff}`:
-   only a *correctable* mistake gets a fresh worker; a broken/dishonest worker
-   terminates immediately ("re-running a broken worker does not make it
-   honest"). A coupling test pins these literals so a rename can never silently
-   downgrade a retryable failure into a hang.
-3. **Handoff, not compaction** (DESIGN §10) — an implementer near context
-   exhaustion writes a fixed-schema checkpoint and a fresh worker continues,
-   bounded by `subtask_continuations = 3` (shared with clarifications).
-
----
-
-## 4. Runtime and ABI
-
-### 4.1 The `State` machine
-
-All run state flows through `State`. `save()` writes a temp file then
-`os.replace()`s it — atomic, crash-safe. Concurrency model: a single asyncio
-event loop, so coroutines interleave only at `await` and never inside a
-`st.data[k]=v; st.save()` pair (no in-process lock needed). Cross-process
-safety is the **single-owner-per-run-dir** invariant: `State.__init__` takes an
-exclusive `fcntl.flock` on the run *directory* (its inode is stable; the lock
-survives the per-save inode swap of `state.json`). A second orchestrator on the
-same run gets `StateLockedError` → `EXIT_LOCKED` (75).
-
-### 4.2 Worker invocation ABI — `claude_p`
-
-The whole LLM surface is one function. `claude_p(worker_type, prompt, schema,
-model, effort, tools, ...)` → `_invoke` → `run_proc`
-(`asyncio.create_subprocess_exec` of `claude -p`). It passes `--json-schema`,
-`--model`, optional `--effort`, the tool grant (`INSPECT_TOOLS`/`ACT_TOOLS`),
-and reads the validated payload from the `structured_output` event. Around it
-sits the `tenacity` backoff (auth/quota, ceiling `auth_retry_max_sec=300`) and
-the one-shot schema-corrective retry. Every invocation appends one row to
-`calls.ndjson` via `_capture_call` (§6). **No subagents**: workers are OS
-subprocesses, not in-session agents (DESIGN §2, Constraint 1).
-
-### 4.3 The container as the cleanup boundary
-
-Leerie runs inside one container per run; the orchestrator is PID 1 and every
-worker (and every Bash call a worker makes) shares that PID namespace. The
-abnormal-exit cleanup guarantee is the *kernel reaping the namespace*, not
-Python signal handling (DESIGN §6). The happy path is faster and in-process:
-`_DescendantTracker` polls `/proc` to accumulate every PID a worker ever
-spawned, and `_terminate_proc_tree`/`_signal_pids` SIGKILL the whole subtree on
-exit — catching even processes that detached. Memory is contained per worker
-via cgroup v2 (`_cgroup_create/enroll/destroy`, `pids.max=256`,
-`memory.swap.max=0`), so one worker's OOM cannot collapse its siblings or the
-orchestrator.
-
-### 4.4 The run lifecycle automaton
-
-`RUN_STATUSES` (11) is the observable state of a run, derived by
-`_derive_run_status` from on-disk sidecars:
-
-```
-                ┌─ seed-failed         (aborted before classify; resumable)
-                ├─ corrupt-sidecar     (run.json unreadable)
- start ─▶ in-progress ─┬─▶ done                    (no_work_required; no push)
-                       ├─▶ done-pushed-no-pr        (pushed, --no-push-PR/offline)
-                       ├─▶ done-pushed-pr           (full success)
-                       ├─▶ push-failed / pr-failed  (recorded with retry cmd)
-                       ├─▶ paused                   (Fly pause-on-failure)
-                       ├─▶ killed                   (operator --kill)
-                       └─▶ sync-failed              (remote fetch-back failed)
-```
-
-The branch `leerie/runs/<run-id>` is the durable resume contract: state records
-*which wave* to resume from; the run branch holds *the work* every prior wave
-produced. "Create if absent, never reset" is the invariant that makes
-`--resume` safe.
-
----
-
-## 5. Sub-languages and satellite programs
-
-### 5.1 The prompt language and its preprocessor
-
-Worker prompts in `prompts/*.md` are a real sub-language with a real
-preprocessor. `load_prompt(name)` (L75) reads `prompts/<name>.md` and expands
-the include directive:
-
-```python
-_PROMPT_INCLUDE_RE = re.compile(r"\{\{\s*include:\s*(_[a-z0-9_]+\.md)\s*\}\}")
-def load_prompt(name):
-    raw = (PROMPTS / f"{name}.md").read_text()
-    return _PROMPT_INCLUDE_RE.sub(lambda m: (PROMPTS / m.group(1)).read_text(), raw)
-```
-
-It is a **single-pass, non-recursive** textual include (one `.sub` over the
-top file; the included fragment's own directives are not re-expanded). Only
-fragments whose names start with `_` can be included. Mechanically, exactly two
-prompts use it today — `classifier.md` and `implementer.md`, both pulling in
-`_clarification_filter.md` — so the clarification-filter wording lives in one
-place (DESIGN §11). Every other prompt ends with a `SCHEMAS`-validated JSON
-object; the confidence object recurs across all 8 core-worker prompts.
-
-### 5.2 The configuration language
-
-30 `resolve_*` functions implement one precedence rule everywhere:
-**CLI flag > env var > `leerie.toml` key > default.** Invalid env/toml values
-`die` at startup; CLI values are constrained by argparse `choices=`. The knob
-names are themselves a closed vocabulary (the 34 `LEERIE_*` env vars from the
-lexer in §1.2). Per-worker overrides follow a uniform pattern
-(`--model-<W>` / `LEERIE_MODEL_<W>` / `model_<w>`).
-
-### 5.3 The bash worktree mechanics
-
-`scripts/*.sh` are the deterministic git plumbing, run in a fixed order:
-`setup-run.sh` (run branch + staging worktree, idempotent) → `new-worktree.sh`
-(per-subtask isolated checkout) → `integrate.sh` (`git merge --no-ff` into the
-run branch; exit 0 clean / 1 conflict / 2 precondition) → `finalize.sh`
-(read-only push-readiness check) → `host-finalize.sh` (push + `gh pr create`,
-idempotent on `pushed_at`) → `cleanup.sh` (remove worktrees, keep the run
-branch and state as audit trail). `container-entry.sh` is PID 1: it does
-cgroup-v2 delegation as root, `chown`s `/work`, then drops to the `leerie` user
-via `runuser`.
-
-### 5.4 The Fly remote runtime
-
-`--runtime fly` runs the *same* pipeline on a Fly machine (run_id = machine
-ID). `scripts/remote/*.sh` wrap it: `provision.sh` (create machine) →
-`seed-auth.sh` (tar-pipe `~/.claude*` over `flyctl ssh`) → `seed-repo.sh`
-(`git bundle` the repo + dirty delta) → orchestrator → `fetch-branch.sh`
-(stream branches + state back). Recovery paths: `force-finalize.sh` (only after
-proving the orchestrator is dead via `/proc` scan), `collect-subtrees.sh`,
-`re-seed.sh`, `resume-machine.sh`. The "never lose work" contract:
-`decide_teardown` runs `fetch_branch` *before* `destroy_machine`, and any sync
-failure leaves the machine RUNNING.
-
-### 5.5 The chain sequencer — a meta-compiler over runs (Shape A)
-
-`chain/` is **not** a service. As of 0.8.x (DESIGN §19, "Shape A") a chain is a
-**laptop-side wave sequencer**: `leerie --chain --wave a,b --wave c` mints a
-`chain_id`, then for each wave runs N normal `./leerie "<prompt>" --runtime fly
---chain-id <id>` jobs in parallel, waits for all to finalize, and synth-merges
-that wave's branches into a staging branch `leerie/stage/<chain-id>-wave-<N+1>`
-that seeds the next wave. Each job reuses the single-run path verbatim
-(provision → seed → orchestrator → `decide_teardown` → `fetch_branch` →
-`host_finalize` → `destroy_machine`); the wrapper just loops and merges.
-
-There is **no coordinator** — no SQLite, no HTTP server, no webhooks, and no Fly
-machine that holds credentials (the v3/v4 designs that had those were rejected
-for adding failure modes without reducing footprint). A chain exists only as the
-set of single runs sharing a `chain_id` tag in their `run.json`; `wave_idx`
-records membership. Chain-scoped verbs (`--status` / `--stop` / `--kill` /
-`--resume` / `--finalize <chain-id>`, `--list --chains`) work by iterating
-`$LEERIE_STATE_HOST_DIR/runs/*/run.json`, filtering on `chain_id`, and
-dispatching to the existing single-run verb per discovered run. GitHub
-credentials live only on the laptop (`gh auth`, `~/.git-credentials`); workers
-never see them (the `seed-auth.sh` exclusion list). The `chain/` Python package
-is now just `__init__.py`, `_log.py` (its own `log`/`die` — the package may not
-import `orchestrator/leerie.py`), and `git_ops.py` (`synth_merge_branches`,
-`create_stage_branch`, `push_branch`, `open_pr`, …). It is still a meta-compiler
-over runs — a chain is sequenced waves of compiles — only now laptop-sequenced,
-not service-coordinated.
-
----
-
-## 6. The self-referential loop (telemetry → judge → heal)
-
-Leerie is a compiler that profiles itself and rewrites its own passes. Every
-`claude_p` call writes a fixed-envelope row to `<run>/calls.ndjson`
-(`_capture_call`), partitioned by `call_type` (= `WORKER_TYPES`). Two offline
-sub-commands consume it:
-
-- **`phase_judge`** (`main → phase_judge`): replays harvested calls through a
-  `judge` worker scoring `{schema_ok, factual_ok, hallucination_ok}` →
-  verdict files.
-- **`phase_heal`**: `heal_baseline` runs once to measure the noise floor, then
-  a loop of `request_patch → heal_apply_patch → heal_replay_patched →
-  check_convergence`. The `patch_generator` worker proposes a
-  minimal edit to a *worker system prompt* (`anchor` must be a literal
-  substring of the live prompt — code-validated), and the loop replays to see
-  if pass-rate improves (threshold `0.9`, ≤10 rounds, plateau detection). This
-  closes the loop the project's three-layer rule opens: a prompt-level rule
-  that matters becomes a measured, testable change.
-
----
-
-## 7. How the project keeps itself deterministic
-
-The orchestrator shells out to `claude` and `flyctl` — both non-deterministic —
-yet the suite (154 test files) is fully deterministic via three techniques:
-
-1. **Pure-function unit tests** for everything checkable (the 30 `resolve_*`,
-   6 `validate_*`, 14 `check_*`, `_derive_run_status`), loaded by importing
-   `leerie.py` as a module through an `importlib` conftest fixture.
-2. **Monkeypatched `_invoke`** returning canned JSON envelopes, so async phase
-   / heal / telemetry logic runs against a fake LLM; the chain is covered by
-   `git_ops` unit tests plus a bash launcher-sequencer harness (no HTTP/SQLite).
-3. **A bash subprocess harness** that *sources* the real `.sh` scripts with a
-   fake `flyctl`/`claude` placed first on `PATH`, asserting exit codes and
-   stdout.
-
-The standout is `test_retryable_failure.py`'s **coupling test**: it parses the
-source with `ast`/`inspect`/`re` to assert the producer-emitted `failure_kind`
-literals stay a subset of `_RETRYABLE_FAILURE_KINDS`. That is the §12 principle
-turned on the codebase itself — pinning a load-bearing invariant against the
-source text so it cannot silently drift.
-
----
-
-## 8. A grammar of the pipeline
-
-A normal run, as a grammar (verified against the `_run_phases` source body;
-`?` = conditional, `‖` = parallel, `{n}` = bounded by a cap):
-
-```
-run            ::= preflight classify provision clarify? plan reconcile?
-                   ( no_work_exit | overlap_judge? schedule setup execute_waves finalize )
-
-classify       ::= classifier_worker  ▷ check_classifier_output            [opus]
-clarify?       ::= gather_answers      ▷ SOURCE_OF_TRUTH_VALUES gate       (zero questions by default)
-provision      ::= lockfile_detect | mise_install | provision_worker      (first deterministic hit wins)
-plan           ::= ( planner_worker ){planner_samples}  ▷ select_best
-                   ▷ check_planner_output ▷ check_task_file_coverage       [opus, per matched category, ‖]
-reconcile?     ::= reconciler_worker  ▷ apply  ▷ tarjan_scc(acyclic!)      (iff unresolved requires)
-overlap_judge? ::= overlap_worker  ▷ apply_collisions ▷ tarjan_scc         (iff >1 planner)
-schedule       ::= topo_sort(dependency_dag) -> wave+   ▷ budget_feasible? (pure)
-execute_waves  ::= wave+
-wave           ::= ( implementer_worker ){max_parallel,‖}                  [sonnet]
-                   ▷ integrate( integrator_worker? )  ▷ scan_conflict_markers
-                   ▷ conformer_worker?  ▷ settle_subtask
-finalize       ::= final_conformer ▷ pr_writer ▷ host( push ▷ gh_pr_create )
-
-no_work_exit   ::= ε                  (decided after reconcile: every planner cleared its gate + plan empty → exit 0)
-```
-
-Total worker invocations across the whole derivation are hard-bounded by
-`max_total_workers = 200`; concurrency within any `‖` by `max_parallel = 5`.
-
----
-
-## Appendix A — Reproduce these facts
-
-```bash
-# Stages P/L/S/SEM over the orchestrator (JSON to stdout, digest to stderr):
-python3 docs/tools/leerie_extract.py orchestrator/leerie.py /tmp/leerie_ast.json
-
-# Headline numbers expected at commit 5b62ae3:
-#   lines=15158 tokens=81816 ast_nodes=61632 functions=234 classes=8 constants=145
-#   sha256=7b657ac3e7fe7c5f91d21a73a12d8998f77932f8d30b951146c62b92848248af
-```
-
-The extractor (`docs/tools/leerie_extract.py`) is pure stdlib and read-only.
-Its four stages correspond to §1.1–§1.4. The JSON it emits contains the full
-constant list, function/class records (with signatures, line spans, and
-one-line docstrings), and the complete intra-module call graph with per-function
-call sequences ordered by source position — the raw material for the tables
-above. (Runtime control-flow order — the §3.1 pipeline and the §8 grammar — was
-confirmed by reading the `_run_phases` and `phase_heal` driver bodies directly,
-because a static call list does not encode branches or loops.)
-
-## Appendix B — Subsystem index (where to look in the code)
-
-| Concern | Entry points |
-|---|---|
-| Pipeline driver | `main` → `orchestrate` → `_run_phases` |
-| Phases | `phase_classify` `phase_provision` `phase_plan` `phase_reconcile` `phase_overlap_judge` `phase_execute` `phase_finalize` |
-| Worker invocation | `claude_p` → `_invoke` → `run_proc`; telemetry `_capture_call` |
-| Enforcement | `check_*` (14), `validate_*` (6), `is_protected_path` |
-| Scheduling | `schedule`, `_build_predecessor_graph`, `_tarjan_sccs` |
-| State / locking | `State` (`save`/`_acquire_lock`/`bump_workers`), `StateLockedError` |
-| Cleanup / containment | `_DescendantTracker`, `_terminate_proc_tree`, `_cgroup_*` |
-| Config | `resolve_*` (30), `_read_toml_key`, `_parse_bool_envtoml` |
-| Self-heal | `phase_judge`, `phase_heal`, `heal_*`, `request_patch`, `replay_capture` |
-| Prompt preprocessor | `load_prompt`, `_PROMPT_INCLUDE_RE` |
-| Chain (laptop sequencer) | `leerie --chain` wave loop (launcher); `chain/git_ops.py` (`synth_merge_branches`) |
-
-## Appendix C — Cross-reference to the canon
-
-| This file | Canonical source |
-|---|---|
-| §2.2 vocabulary, §2.3 caps, §2.4 schemas | `docs/IMPLEMENTATION.md` §0/§2/§6/§9 |
-| §3 pipeline, §3.5 enforcement (§12) | `docs/DESIGN.md` §3, §5, §12, §13 |
-| §4.1 state/lock, §4.3 container boundary | `docs/DESIGN.md` §6 |
-| §5.4 Fly remote, §5.5 chain | `docs/DESIGN.md` §6 (remote), §19 |
-| §6 telemetry/judge/heal | `docs/DESIGN.md` §14 |
-| §7 testing | `CLAUDE.md` "Testing", `tests/test_retryable_failure.py` |
+{
+  "preprocess": {
+    "path": "orchestrator/leerie.py",
+    "sha256": "64c89bb9910d366ddf81f813e6eecae4f34d7c97abcefd9260e00c9ae1f88651",
+    "lines": 15178,
+    "bytes": 706213,
+    "module_doc": "Leerie \u2014 deterministic task orchestrator for Claude Code."
+  },
+  "lex": {
+    "total_tokens": 74203,
+    "token_class_counts": {
+      "OP": 26498,
+      "NAME": 22297,
+      "NL": 6965,
+      "NEWLINE": 5811,
+      "STRING": 5692,
+      "COMMENT": 2729,
+      "INDENT": 1848,
+      "DEDENT": 1848,
+      "NUMBER": 514,
+      "ENDMARKER": 1
+    },
+    "keyword_counts": {
+      "if": 1015,
+      "in": 671,
+      "None": 564,
+      "for": 499,
+      "return": 497,
+      "not": 430,
+      "or": 338,
+      "def": 295,
+      "and": 165,
+      "await": 152,
+      "is": 151,
+      "True": 126,
+      "except": 124,
+      "continue": 120,
+      "try": 114,
+      "else": 111,
+      "False": 83,
+      "async": 81,
+      "raise": 54,
+      "as": 41,
+      "break": 35,
+      "pass": 31,
+      "elif": 30,
+      "import": 25,
+      "with": 18
+    },
+    "top_identifiers": {
+      "str": 767,
+      "get": 689,
+      "dict": 417,
+      "st": 348,
+      "append": 273,
+      "list": 265,
+      "s": 253,
+      "repo_root": 220,
+      "sid": 194,
+      "data": 181,
+      "Path": 166,
+      "log": 166,
+      "caps": 141,
+      "r": 138,
+      "int": 134,
+      "plans": 110,
+      "e": 107,
+      "set": 106,
+      "die": 105,
+      "args": 105,
+      "self": 103,
+      "len": 102,
+      "plan": 97,
+      "strip": 90,
+      "out": 88,
+      "f": 82,
+      "entry": 81,
+      "parts": 79,
+      "p": 76,
+      "output": 74,
+      "models": 68,
+      "efforts": 68,
+      "line": 67,
+      "c": 67,
+      "bool": 66,
+      "join": 63,
+      "leerie_dir": 62,
+      "cli_value": 61,
+      "save": 61,
+      "ValueError": 60,
+      "tuple": 58,
+      "v": 57,
+      "subtasks": 57,
+      "tag": 57,
+      "json": 56,
+      "lines": 56,
+      "asyncio": 55,
+      "result": 55,
+      "isinstance": 54,
+      "issues": 54,
+      "os": 52,
+      "text": 52,
+      "OSError": 52,
+      "cwd": 52,
+      "dep": 51,
+      "is_file": 49,
+      "ap": 49,
+      "n": 48,
+      "envelope": 48,
+      "name": 47
+    },
+    "top_operators": {
+      "(": 4164,
+      ")": 4164,
+      ",": 3857,
+      ":": 3570,
+      "=": 2675,
+      ".": 2569,
+      "[": 1672,
+      "]": 1672,
+      "{": 484,
+      "}": 484,
+      "->": 285,
+      "/": 188,
+      "|": 159,
+      "==": 159,
+      "+": 85,
+      "*": 54,
+      "!=": 51,
+      "-": 42,
+      ">": 39,
+      "+=": 36,
+      "<": 33,
+      ">=": 18,
+      "<=": 16,
+      "**": 9,
+      "&": 5
+    },
+    "comment_chars": 157003,
+    "string_literal_count": 5692,
+    "env_vars": [
+      "LEERIE_CLARIFY",
+      "LEERIE_CONFIDENCE_ROUNDS",
+      "LEERIE_DANGEROUSLY_SKIP_PERMISSIONS",
+      "LEERIE_DIR",
+      "LEERIE_EFFORT",
+      "LEERIE_EFFORT_",
+      "LEERIE_HEAL_DIR",
+      "LEERIE_HEAL_MAX_ROUNDS",
+      "LEERIE_HEAL_SUCCESS_THRESHOLD",
+      "LEERIE_IMPLEMENTER_CONFIDENCE_RETRIES",
+      "LEERIE_INSPECT_DIRS",
+      "LEERIE_JUDGE_DIR",
+      "LEERIE_JUDGMENT_CHECK_ROUNDS",
+      "LEERIE_MAX_PARALLEL",
+      "LEERIE_MAX_WORKERS",
+      "LEERIE_MODEL",
+      "LEERIE_MODEL_",
+      "LEERIE_MODEL_HEAL",
+      "LEERIE_MODEL_JUDGE",
+      "LEERIE_MODEL_PR_WRITER",
+      "LEERIE_NO_PUSH",
+      "LEERIE_PLANNER_CHECK_ROUNDS",
+      "LEERIE_PLANNER_SAMPLES",
+      "LEERIE_PR_TEMPLATE",
+      "LEERIE_RUNTIME",
+      "LEERIE_SKIP_BUDGET_CHECK",
+      "LEERIE_SKIP_OVERLAP_JUDGE",
+      "LEERIE_SOURCE_OF_TRUTH",
+      "LEERIE_STATE_DIR",
+      "LEERIE_STATE_HOST_DIR",
+      "LEERIE_TELEMETRY",
+      "LEERIE_TELEMETRY_DIR",
+      "LEERIE_VERBOSITY",
+      "LEERIE_WORKER_DEBUG",
+      "LEERIE_WORKER_MEMORY_MAX"
+    ],
+    "exit_symbols": [
+      "EXIT_BUDGET_INFEASIBLE",
+      "EXIT_LOCKED",
+      "EXIT_NEEDS_ANSWERS"
+    ]
+  },
+  "ast": {
+    "node_class_counts": {
+      "Load": 15607,
+      "Name": 13426,
+      "Constant": 7134,
+      "Call": 3648,
+      "Store": 2784,
+      "Attribute": 2739,
+      "Assign": 1757,
+      "Expr": 1198,
+      "Subscript": 1158,
+      "FormattedValue": 1119,
+      "If": 897,
+      "arg": 694,
+      "keyword": 647,
+      "Compare": 635,
+      "JoinedStr": 631,
+      "List": 533,
+      "Tuple": 518,
+      "Return": 497,
+      "BinOp": 492,
+      "BoolOp": 463,
+      "Dict": 443,
+      "For": 331,
+      "Or": 313,
+      "arguments": 309,
+      "UnaryOp": 277,
+      "Not": 248,
+      "FunctionDef": 222,
+      "AnnAssign": 199,
+      "Div": 189,
+      "comprehension": 167,
+      "BitOr": 160,
+      "Eq": 159,
+      "Await": 152,
+      "And": 150,
+      "Add": 127,
+      "ExceptHandler": 124,
+      "Continue": 120,
+      "Try": 114,
+      "IsNot": 109,
+      "In": 99,
+      "IfExp": 77,
+      "AsyncFunctionDef": 73,
+      "NotIn": 73,
+      "ListComp": 71,
+      "GeneratorExp": 67,
+      "Raise": 54,
+      "NotEq": 52,
+      "Slice": 42,
+      "Is": 42,
+      "AugAssign": 40,
+      "Gt": 39,
+      "alias": 35,
+      "Break": 35,
+      "Lt": 33,
+      "Pass": 31,
+      "USub": 29,
+      "Mult": 23,
+      "Starred": 19,
+      "Import": 18,
+      "withitem": 18,
+      "GtE": 18,
+      "Sub": 17,
+      "LtE": 16,
+      "While": 15,
+      "SetComp": 15,
+      "DictComp": 14,
+      "Lambda": 14,
+      "Set": 13,
+      "With": 13,
+      "ClassDef": 8,
+      "ImportFrom": 7,
+      "Pow": 6,
+      "FloorDiv": 5,
+      "AsyncWith": 5,
+      "BitAnd": 5,
+      "AsyncFor": 3,
+      "Nonlocal": 3,
+      "Global": 2,
+      "Delete": 2,
+      "Del": 2,
+      "Module": 1,
+      "Yield": 1,
+      "NamedExpr": 1
+    },
+    "imports": [
+      "from __future__ import annotations",
+      "argparse",
+      "asyncio",
+      "contextlib",
+      "copy",
+      "fcntl",
+      "json",
+      "os",
+      "re",
+      "shutil",
+      "signal",
+      "subprocess",
+      "sys",
+      "time",
+      "uuid",
+      "from collections import deque",
+      "from collections.abc import Awaitable, Callable, Iterator",
+      "from datetime import datetime, timedelta, timezone",
+      "from pathlib import Path",
+      "from zoneinfo import ZoneInfo, ZoneInfoNotFoundError",
+      "from tenacity import AsyncRetrying, RetryCallState, RetryError, retry_if_result, stop_after_delay, wait_exponential_jitter"
+    ],
+    "constant_count": 145,
+    "function_count": 234,
+    "class_count": 8
+  },
+  "constants": [
+    {
+      "name": "ROOT",
+      "lineno": 52,
+      "kind": "expr",
+      "expr": "Path(__file__).resolve().parent.parent"
+    },
+    {
+      "name": "PROMPTS",
+      "lineno": 53,
+      "kind": "expr",
+      "expr": "ROOT / 'prompts'"
+    },
+    {
+      "name": "SCRIPTS",
+      "lineno": 54,
+      "kind": "expr",
+      "expr": "ROOT / 'scripts'"
+    },
+    {
+      "name": "_PROMPT_INCLUDE_RE",
+      "lineno": 72,
+      "kind": "expr",
+      "expr": "re.compile('\\\\{\\\\{\\\\s*include:\\\\s*(_[a-z0-9_]+\\\\.md)\\\\s*\\\\}\\\\}')"
+    },
+    {
+      "name": "MIN_CLAUDE_CLI",
+      "lineno": 91,
+      "kind": "tuple",
+      "len": 3,
+      "values": [
+        2,
+        1,
+        22
+      ]
+    },
+    {
+      "name": "DEFAULT_CAPS",
+      "lineno": 94,
+      "kind": "dict",
+      "len": 17,
+      "keys": [
+        "max_total_workers",
+        "max_parallel",
+        "subtask_continuations",
+        "failed_retries",
+        "conformance_rounds",
+        "judgment_check_rounds",
+        "planner_check_rounds",
+        "implementer_confidence_retries",
+        "planner_samples",
+        "worker_timeout_sec",
+        "worker_idle_warn_sec",
+        "confidence_rounds",
+        "worker_memory_max_bytes",
+        "worker_pids_max",
+        "auth_retry_max_sec",
+        "subtask_call_estimate",
+        "budget_safety_margin"
+      ]
+    },
+    {
+      "name": "STATE_FIELDS",
+      "lineno": 202,
+      "kind": "tuple",
+      "len": 33,
+      "values": [
+        "task",
+        "started_at",
+        "finished_at",
+        "waves",
+        "completed_waves",
+        "subtask_status",
+        "blocked",
+        "worker_count",
+        "telemetry",
+        "categories",
+        "classifier_questions",
+        "answers",
+        "needs_source_of_truth",
+        "source_of_truth_pref",
+        "clarify",
+        "dangerously_skip_permissions",
+        "skip_overlap_judge",
+        "skip_budget_check",
+        "verbosity",
+        "inspect_dirs",
+        "integrator_warnings",
+        "scope_warnings",
+        "conformance",
+        "provision",
+        "external_preconditions",
+        "current_phase",
+        "dropped_subtasks",
+        "conditional_drops",
+        "plan_overlap_judge",
+        "plan_overlap_applied",
+        "no_work_required",
+        "no_work_reasons",
+        "working_branch"
+      ]
+    },
+    {
+      "name": "CATEGORIES",
+      "lineno": 268,
+      "kind": "list",
+      "len": 9,
+      "values": [
+        "feature-implementation",
+        "bug-fixing",
+        "refactoring",
+        "performance-optimization",
+        "testing",
+        "dependency-migration",
+        "configuration-build",
+        "infrastructure",
+        "documentation"
+      ]
+    },
+    {
+      "name": "CATEGORY_ABBREV",
+      "lineno": 277,
+      "kind": "dict",
+      "len": 9,
+      "keys": [
+        "feature-implementation",
+        "bug-fixing",
+        "refactoring",
+        "performance-optimization",
+        "testing",
+        "dependency-migration",
+        "configuration-build",
+        "infrastructure",
+        "documentation"
+      ]
+    },
+    {
+      "name": "_PROTECTED_PREFIXES",
+      "lineno": 303,
+      "kind": "tuple",
+      "len": 2,
+      "values": [
+        ".leerie/",
+        ".git/"
+      ]
+    },
+    {
+      "name": "_CLAUDE_DELIVERABLE_PREFIXES",
+      "lineno": 304,
+      "kind": "tuple",
+      "len": 3,
+      "values": [
+        ".claude/agents/",
+        ".claude/commands/",
+        ".claude/skills/"
+      ]
+    },
+    {
+      "name": "_READ_BASE",
+      "lineno": 319,
+      "kind": "str",
+      "value": "Read,Grep,Glob,WebSearch,WebFetch"
+    },
+    {
+      "name": "INSPECT_TOOLS",
+      "lineno": 337,
+      "kind": "expr",
+      "expr": "f'{_READ_BASE},Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),Bash(wc:*),Bash(grep:*),Bash(rg:*),Bash(file:*),Bash(stat:*),Bash(tree:*),Bash(pwd),Bash(echo:*),Bash(git log:*),Bash(git s"
+    },
+    {
+      "name": "ACT_TOOLS",
+      "lineno": 345,
+      "kind": "expr",
+      "expr": "f'{_READ_BASE},Bash,Write,Edit'"
+    },
+    {
+      "name": "INSPECT_DIRS_ENV",
+      "lineno": 354,
+      "kind": "str",
+      "value": "LEERIE_INSPECT_DIRS"
+    },
+    {
+      "name": "INSPECT_DIRS_FILE",
+      "lineno": 355,
+      "kind": "str",
+      "value": "leerie.toml"
+    },
+    {
+      "name": "EXIT_NEEDS_ANSWERS",
+      "lineno": 357,
+      "kind": "int",
+      "value": 10
+    },
+    {
+      "name": "EXIT_BUDGET_INFEASIBLE",
+      "lineno": 368,
+      "kind": "int",
+      "value": 11
+    },
+    {
+      "name": "EXIT_LOCKED",
+      "lineno": 376,
+      "kind": "int",
+      "value": 75
+    },
+    {
+      "name": "SOURCE_OF_TRUTH_VALUES",
+      "lineno": 384,
+      "kind": "tuple",
+      "len": 3,
+      "values": [
+        "codebase",
+        "research",
+        "both"
+      ]
+    },
+    {
+      "name": "SOURCE_OF_TRUTH_ENV",
+      "lineno": 385,
+      "kind": "str",
+      "value": "LEERIE_SOURCE_OF_TRUTH"
+    },
+    {
+      "name": "SOURCE_OF_TRUTH_FILE",
+      "lineno": 386,
+      "kind": "str",
+      "value": "leerie.toml"
+    },
+    {
+      "name": "RUNTIME_VALUES",
+      "lineno": 391,
+      "kind": "tuple",
+      "len": 2,
+      "values": [
+        "local",
+        "fly"
+      ]
+    },
+    {
+      "name": "RUNTIME_ENV",
+      "lineno": 392,
+      "kind": "str",
+      "value": "LEERIE_RUNTIME"
+    },
+    {
+      "name": "RUNTIME_FILE",
+      "lineno": 393,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "CONFIDENCE_ROUNDS_ENV",
+      "lineno": 400,
+      "kind": "str",
+      "value": "LEERIE_CONFIDENCE_ROUNDS"
+    },
+    {
+      "name": "CONFIDENCE_ROUNDS_FILE",
+      "lineno": 401,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "JUDGMENT_CHECK_ROUNDS_ENV",
+      "lineno": 404,
+      "kind": "str",
+      "value": "LEERIE_JUDGMENT_CHECK_ROUNDS"
+    },
+    {
+      "name": "PLANNER_CHECK_ROUNDS_ENV",
+      "lineno": 405,
+      "kind": "str",
+      "value": "LEERIE_PLANNER_CHECK_ROUNDS"
+    },
+    {
+      "name": "IMPLEMENTER_CONFIDENCE_RETRIES_ENV",
+      "lineno": 406,
+      "kind": "str",
+      "value": "LEERIE_IMPLEMENTER_CONFIDENCE_RETRIES"
+    },
+    {
+      "name": "PLANNER_SAMPLES_ENV",
+      "lineno": 407,
+      "kind": "str",
+      "value": "LEERIE_PLANNER_SAMPLES"
+    },
+    {
+      "name": "MAX_WORKERS_ENV",
+      "lineno": 412,
+      "kind": "str",
+      "value": "LEERIE_MAX_WORKERS"
+    },
+    {
+      "name": "MAX_WORKERS_FILE",
+      "lineno": 413,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "MAX_PARALLEL_ENV",
+      "lineno": 418,
+      "kind": "str",
+      "value": "LEERIE_MAX_PARALLEL"
+    },
+    {
+      "name": "MAX_PARALLEL_FILE",
+      "lineno": 419,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "WORKER_MEMORY_MAX_ENV",
+      "lineno": 426,
+      "kind": "str",
+      "value": "LEERIE_WORKER_MEMORY_MAX"
+    },
+    {
+      "name": "WORKER_MEMORY_MAX_FILE",
+      "lineno": 427,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "NO_PUSH_ENV",
+      "lineno": 435,
+      "kind": "str",
+      "value": "LEERIE_NO_PUSH"
+    },
+    {
+      "name": "NO_PUSH_FILE",
+      "lineno": 436,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "CLARIFY_ENV",
+      "lineno": 444,
+      "kind": "str",
+      "value": "LEERIE_CLARIFY"
+    },
+    {
+      "name": "CLARIFY_FILE",
+      "lineno": 445,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "DANGEROUS_SKIP_PERMS_ENV",
+      "lineno": 455,
+      "kind": "str",
+      "value": "LEERIE_DANGEROUSLY_SKIP_PERMISSIONS"
+    },
+    {
+      "name": "DANGEROUS_SKIP_PERMS_FILE",
+      "lineno": 456,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "SKIP_OVERLAP_JUDGE_ENV",
+      "lineno": 465,
+      "kind": "str",
+      "value": "LEERIE_SKIP_OVERLAP_JUDGE"
+    },
+    {
+      "name": "SKIP_OVERLAP_JUDGE_FILE",
+      "lineno": 466,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "SKIP_BUDGET_CHECK_ENV",
+      "lineno": 478,
+      "kind": "str",
+      "value": "LEERIE_SKIP_BUDGET_CHECK"
+    },
+    {
+      "name": "SKIP_BUDGET_CHECK_FILE",
+      "lineno": 479,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "PR_TEMPLATE_ENV",
+      "lineno": 488,
+      "kind": "str",
+      "value": "LEERIE_PR_TEMPLATE"
+    },
+    {
+      "name": "PR_TEMPLATE_FILE",
+      "lineno": 489,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "VERBOSITY_VALUES",
+      "lineno": 497,
+      "kind": "tuple",
+      "len": 4,
+      "values": [
+        "quiet",
+        "normal",
+        "stream",
+        "debug"
+      ]
+    },
+    {
+      "name": "VERBOSITY_DEFAULT",
+      "lineno": 498,
+      "kind": "str",
+      "value": "stream"
+    },
+    {
+      "name": "VERBOSITY_ENV",
+      "lineno": 499,
+      "kind": "str",
+      "value": "LEERIE_VERBOSITY"
+    },
+    {
+      "name": "VERBOSITY_FILE",
+      "lineno": 500,
+      "kind": "expr",
+      "expr": "SOURCE_OF_TRUTH_FILE"
+    },
+    {
+      "name": "_TERMINAL_STATUSES",
+      "lineno": 503,
+      "kind": "expr",
+      "expr": "frozenset({'complete', 'failed', 'blocked'})"
+    },
+    {
+      "name": "MODEL_VALUES",
+      "lineno": 509,
+      "kind": "tuple",
+      "len": 3,
+      "values": [
+        "sonnet",
+        "opus",
+        "haiku"
+      ]
+    },
+    {
+      "name": "MODEL_DEFAULT",
+      "lineno": 516,
+      "kind": "str",
+      "value": "opus"
+    },
+    {
+      "name": "MODEL_DEFAULT_PER_WORKER",
+      "lineno": 520,
+      "kind": "dict",
+      "len": 5,
+      "keys": [
+        "implementer",
+        "conformer",
+        "judge",
+        "heal",
+        "pr_writer"
+      ]
+    },
+    {
+      "name": "MODEL_ENV",
+      "lineno": 527,
+      "kind": "str",
+      "value": "LEERIE_MODEL"
+    },
+    {
+      "name": "MODEL_FILE",
+      "lineno": 528,
+      "kind": "str",
+      "value": "leerie.toml"
+    },
+    {
+      "name": "EFFORT_VALUES",
+      "lineno": 536,
+      "kind": "tuple",
+      "len": 5,
+      "values": [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+        "max"
+      ]
+    },
+    {
+      "name": "EFFORT_DEFAULT",
+      "lineno": 537,
+      "kind": "NoneType",
+      "value": null
+    },
+    {
+      "name": "EFFORT_DEFAULT_PER_WORKER",
+      "lineno": 538,
+      "kind": "dict",
+      "len": 7,
+      "keys": [
+        "classifier",
+        "planner",
+        "reconciler",
+        "plan_overlap_judge",
+        "provision",
+        "integrator",
+        "pr_writer"
+      ]
+    },
+    {
+      "name": "EFFORT_ENV",
+      "lineno": 547,
+      "kind": "str",
+      "value": "LEERIE_EFFORT"
+    },
+    {
+      "name": "WORKER_TYPES",
+      "lineno": 548,
+      "kind": "tuple",
+      "len": 8,
+      "values": [
+        "classifier",
+        "planner",
+        "reconciler",
+        "plan_overlap_judge",
+        "provision",
+        "implementer",
+        "integrator",
+        "conformer"
+      ]
+    },
+    {
+      "name": "MODEL_JUDGE_ENV",
+      "lineno": 553,
+      "kind": "str",
+      "value": "LEERIE_MODEL_JUDGE"
+    },
+    {
+      "name": "MODEL_HEAL_ENV",
+      "lineno": 554,
+      "kind": "str",
+      "value": "LEERIE_MODEL_HEAL"
+    },
+    {
+      "name": "MODEL_PR_WRITER_ENV",
+      "lineno": 555,
+      "kind": "str",
+      "value": "LEERIE_MODEL_PR_WRITER"
+    },
+    {
+      "name": "TELEMETRY_DEFAULT",
+      "lineno": 562,
+      "kind": "bool",
+      "value": true
+    },
+    {
+      "name": "TELEMETRY_ENV",
+      "lineno": 563,
+      "kind": "str",
+      "value": "LEERIE_TELEMETRY"
+    },
+    {
+      "name": "TELEMETRY_FILE",
+      "lineno": 564,
+      "kind": "str",
+      "value": "leerie.toml"
+    },
+    {
+      "name": "TELEMETRY_SUBDIR_DEFAULT",
+      "lineno": 569,
+      "kind": "str",
+      "value": "events"
+    },
+    {
+      "name": "TELEMETRY_SUBDIR_ENV",
+      "lineno": 570,
+      "kind": "str",
+      "value": "LEERIE_TELEMETRY_DIR"
+    },
+    {
+      "name": "TELEMETRY_SUBDIR_FILE",
+      "lineno": 571,
+      "kind": "str",
+      "value": "leerie.toml"
+    },
+    {
+      "name": "JUDGE_DIR_DEFAULT",
+      "lineno": 576,
+      "kind": "str",
+      "value": "judge-out"
+    },
+    {
+      "name": "JUDGE_DIR_ENV",
+      "lineno": 577,
+      "kind": "str",
+      "value": "LEERIE_JUDGE_DIR"
+    },
+    {
+      "name": "JUDGE_DIR_FILE",
+      "lineno": 578,
+      "kind": "str",
+      "value": "leerie.toml"
+    },
+    {
+      "name": "HEAL_DIR_DEFAULT",
+      "lineno": 583,
+      "kind": "str",
+      "value": "heal-out"
+    },
+    {
+      "name": "HEAL_DIR_ENV",
+      "lineno": 584,
+      "kind": "str",
+      "value": "LEERIE_HEAL_DIR"
+    },
+    {
+      "name": "HEAL_DIR_FILE",
+      "lineno": 585,
+      "kind": "str",
+      "value": "leerie.toml"
+    },
+    {
+      "name": "HEAL_MAX_ROUNDS_DEFAULT",
+      "lineno": 590,
+      "kind": "int",
+      "value": 10
+    },
+    {
+      "name": "HEAL_SUCCESS_THRESHOLD_DEFAULT",
+      "lineno": 591,
+      "kind": "float",
+      "value": 0.9
+    },
+    {
+      "name": "HEAL_PLATEAU_WINDOW_DEFAULT",
+      "lineno": 592,
+      "kind": "int",
+      "value": 3
+    },
+    {
+      "name": "HEAL_PLATEAU_DELTA_DEFAULT",
+      "lineno": 593,
+      "kind": "float",
+      "value": 0.03
+    },
+    {
+      "name": "HEAL_N_REPLAYS_DEFAULT",
+      "lineno": 594,
+      "kind": "int",
+      "value": 5
+    },
+    {
+      "name": "HEAL_MAX_ROUNDS_ENV",
+      "lineno": 595,
+      "kind": "str",
+      "value": "LEERIE_HEAL_MAX_ROUNDS"
+    },
+    {
+      "name": "HEAL_SUCCESS_THRESHOLD_ENV",
+      "lineno": 596,
+      "kind": "str",
+      "value": "LEERIE_HEAL_SUCCESS_THRESHOLD"
+    },
+    {
+      "name": "HEAL_MAX_ROUNDS_FILE",
+      "lineno": 597,
+      "kind": "str",
+      "value": "leerie.toml"
+    },
+    {
+      "name": "HEAL_SUCCESS_THRESHOLD_FILE",
+      "lineno": 598,
+      "kind": "str",
+      "value": "leerie.toml"
+    },
+    {
+      "name": "STATE_DIR_ENV",
+      "lineno": 606,
+      "kind": "str",
+      "value": "LEERIE_STATE_DIR"
+    },
+    {
+      "name": "_CONFORMER_BLT_PROP",
+      "lineno": 639,
+      "kind": "dict",
+      "len": 3,
+      "keys": [
+        "type",
+        "required",
+        "properties"
+      ]
+    },
+    {
+      "name": "_REQUIRES_ITEM",
+      "lineno": 658,
+      "kind": "dict",
+      "len": 3,
+      "keys": [
+        "type",
+        "required",
+        "properties"
+      ]
+    },
+    {
+      "name": "SCHEMAS",
+      "lineno": 694,
+      "kind": "dict",
+      "len": 11,
+      "keys": [
+        "classifier",
+        "planner",
+        "reconciler",
+        "implementer",
+        "integrator",
+        "judge",
+        "conformer",
+        "patch_generator",
+        "pr_writer",
+        "provision",
+        "plan_overlap_judge"
+      ]
+    },
+    {
+      "name": "_SESSION_LIMIT_PREFIX",
+      "lineno": 1361,
+      "kind": "expr",
+      "expr": "re.compile(\"you've hit your session limit\", re.IGNORECASE)"
+    },
+    {
+      "name": "_SESSION_LIMIT_RESET",
+      "lineno": 1363,
+      "kind": "expr",
+      "expr": "re.compile('resets?\\\\s+(\\\\d{1,2}):(\\\\d{2})\\\\s*([ap]m)\\\\s*\\\\(([^)]+)\\\\)', re.IGNORECASE)"
+    },
+    {
+      "name": "_RATE_LIMIT_ALLOWED_STATUSES",
+      "lineno": 1372,
+      "kind": "tuple",
+      "len": 2,
+      "values": [
+        "allowed",
+        "allowed_warning"
+      ]
+    },
+    {
+      "name": "_PROC_TREE_GRACE_SEC",
+      "lineno": 1430,
+      "kind": "float",
+      "value": 2.0
+    },
+    {
+      "name": "_DESCENDANT_POLL_SEC",
+      "lineno": 1487,
+      "kind": "float",
+      "value": 0.5
+    },
+    {
+      "name": "RUN_STATUSES",
+      "lineno": 2267,
+      "kind": "tuple",
+      "len": 11,
+      "values": [
+        "seed-failed",
+        "corrupt-sidecar",
+        "in-progress",
+        "done",
+        "done-pushed-no-pr",
+        "done-pushed-pr",
+        "push-failed",
+        "pr-failed",
+        "paused",
+        "killed",
+        "sync-failed"
+      ]
+    },
+    {
+      "name": "TASK_FILE_SUFFIXES",
+      "lineno": 2447,
+      "kind": "tuple",
+      "len": 2,
+      "values": [
+        ".txt",
+        ".md"
+      ]
+    },
+    {
+      "name": "_MEMORY_SUFFIX_MULTIPLIER",
+      "lineno": 2702,
+      "kind": "dict",
+      "len": 5,
+      "keys": [
+        "",
+        "K",
+        "M",
+        "G",
+        "T"
+      ]
+    },
+    {
+      "name": "_ID_PREFIXES",
+      "lineno": 3580,
+      "kind": "expr",
+      "expr": "frozenset((f'{v}-' for v in CATEGORY_ABBREV.values()))"
+    },
+    {
+      "name": "_VALID_EXTENTS",
+      "lineno": 3583,
+      "kind": "expr",
+      "expr": "frozenset({'in_plan', 'external'})"
+    },
+    {
+      "name": "_MIGRATION_SIGNAL_RE",
+      "lineno": 3666,
+      "kind": "expr",
+      "expr": "re.compile('replac(?:es?|ing)\\\\s+(?:direct\\\\s+)?[`\\'\\\\\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`\\'\\\\\"]?|migrat(?:es?|ing)\\\\s+from\\\\s+[`\\'\\\\\"]?([a-zA-Z_][a-zA-Z0-9_.]*)[`\\'\\\\\"]?|extract(?:s|ing)\\\\s+[`\\'\\\\\"]?([a-zA"
+    },
+    {
+      "name": "_MIGRATION_SURFACE_THRESHOLD",
+      "lineno": 3674,
+      "kind": "int",
+      "value": 5
+    },
+    {
+      "name": "_GLOB_CHARS",
+      "lineno": 4009,
+      "kind": "expr",
+      "expr": "frozenset('*?[{')"
+    },
+    {
+      "name": "_BRACE_RE",
+      "lineno": 4010,
+      "kind": "expr",
+      "expr": "re.compile('\\\\{([^}]+)\\\\}')"
+    },
+    {
+      "name": "_MAX_COVERAGE_ITEMS",
+      "lineno": 4098,
+      "kind": "int",
+      "value": 50
+    },
+    {
+      "name": "_ENV_TAG_KEYWORDS",
+      "lineno": 4292,
+      "kind": "expr",
+      "expr": "frozenset({'env', 'bootstrap', 'secret', 'config-key', 'credential'})"
+    },
+    {
+      "name": "_PROVISION_ARGV0_ALLOW",
+      "lineno": 4421,
+      "kind": "expr",
+      "expr": "frozenset({'pnpm', 'npm', 'yarn', 'pip', 'pip3', 'uv', 'poetry', 'pipenv', 'go', 'cargo', 'bundle', 'gem', 'mvn', 'gradle', 'gradlew', 'make'})"
+    },
+    {
+      "name": "_PROVISION_SHELL_METACHARS",
+      "lineno": 4431,
+      "kind": "expr",
+      "expr": "frozenset(set('|&;$`><\\n\\r'))"
+    },
+    {
+      "name": "_README_SECTION_RE",
+      "lineno": 4610,
+      "kind": "expr",
+      "expr": "re.compile('(?i)\\\\b(install|getting[\\\\s-]?started|quick[\\\\s-]?start|setup|usage|\\\\brun\\\\b|develop|build(ing)?( from source| instructions)?|compil(e|ing)( from source)?|download|from source|requirement"
+    },
+    {
+      "name": "_HEADER_DECOR_RE",
+      "lineno": 4635,
+      "kind": "expr",
+      "expr": "re.compile('^[^\\\\w]+', flags=re.UNICODE)"
+    },
+    {
+      "name": "_INSTALL_CMD_HINT_RE",
+      "lineno": 4640,
+      "kind": "expr",
+      "expr": "re.compile('\\\\b(pip|pip3|npm|pnpm|yarn|uv|poetry|cargo|brew|apt|apt-get|dnf|yum|pacman|go install|make|bundle install|gem install|mise install)\\\\b')"
+    },
+    {
+      "name": "_README_INTRO_BUDGET",
+      "lineno": 4753,
+      "kind": "int",
+      "value": 1024
+    },
+    {
+      "name": "_README_EXTRACT_BUDGET",
+      "lineno": 4754,
+      "kind": "int",
+      "value": 8192
+    },
+    {
+      "name": "_README_FALLBACK_BUDGET",
+      "lineno": 4755,
+      "kind": "int",
+      "value": 6144
+    },
+    {
+      "name": "_FIXTURE_TOTAL_BUDGET",
+      "lineno": 4756,
+      "kind": "int",
+      "value": 24576
+    },
+    {
+      "name": "_PROVISION_ROOT_MANIFESTS",
+      "lineno": 4830,
+      "kind": "tuple",
+      "len": 9,
+      "values": [
+        "package.json",
+        "pyproject.toml",
+        "go.mod",
+        "Cargo.toml",
+        "Gemfile",
+        "Makefile",
+        "pom.xml",
+        "build.gradle",
+        "build.gradle.kts"
+      ]
+    },
+    {
+      "name": "_PROVISION_WORKFLOW_PREFERRED_RE",
+      "lineno": 4835,
+      "kind": "expr",
+      "expr": "re.compile('(?i)\\\\b(ci|test|build|release)\\\\b')"
+    },
+    {
+      "name": "_PROVISION_WORKFLOW_SKIP_RE",
+      "lineno": 4836,
+      "kind": "expr",
+      "expr": "re.compile('(?i)\\\\b(codeql|stale|dependabot)\\\\b')"
+    },
+    {
+      "name": "_CHECKPOINT_SECTIONS",
+      "lineno": 4992,
+      "kind": "list",
+      "len": 7,
+      "values": [
+        "## Frozen success criteria",
+        "## Current status",
+        "## Files touched",
+        "## Decisions made",
+        "## Evidence gate status",
+        "## Next action",
+        "## Open unknowns"
+      ]
+    },
+    {
+      "name": "_CHECKPOINT_SECTIONS_ALLOW_NONE",
+      "lineno": 5005,
+      "kind": "set",
+      "len": 2,
+      "values": [
+        "## Decisions made",
+        "## Open unknowns"
+      ]
+    },
+    {
+      "name": "_NOISE_TOKENS",
+      "lineno": 5013,
+      "kind": "set",
+      "len": 12,
+      "values": [
+        "none",
+        "n/a",
+        "na",
+        "tbd",
+        "nothing",
+        "unknown",
+        "todo",
+        "pending",
+        "\u2014",
+        "--",
+        "-",
+        "?"
+      ]
+    },
+    {
+      "name": "_CGROUP_ROOT",
+      "lineno": 5781,
+      "kind": "expr",
+      "expr": "Path('/sys/fs/cgroup')"
+    },
+    {
+      "name": "_CGROUP_DELEGATED_SLICE",
+      "lineno": 5782,
+      "kind": "expr",
+      "expr": "Path('/sys/fs/cgroup/leerie.slice')"
+    },
+    {
+      "name": "_CGROUP_PROBE_RESULT",
+      "lineno": 5783,
+      "kind": "NoneType",
+      "value": null
+    },
+    {
+      "name": "_CGROUP_DETECTED_ROOT",
+      "lineno": 5784,
+      "kind": "NoneType",
+      "value": null
+    },
+    {
+      "name": "_DOCS_ONLY_CATEGORIES",
+      "lineno": 7569,
+      "kind": "expr",
+      "expr": "frozenset({'documentation'})"
+    },
+    {
+      "name": "_GO_MOD_VERSION_RE",
+      "lineno": 7646,
+      "kind": "expr",
+      "expr": "re.compile('^\\\\s*go\\\\s+(\\\\d+(?:\\\\.\\\\d+){0,2})\\\\s*$', re.MULTILINE)"
+    },
+    {
+      "name": "_LEADING_V_RE",
+      "lineno": 7701,
+      "kind": "expr",
+      "expr": "re.compile('^[vV]+')"
+    },
+    {
+      "name": "_IDIOMATIC_VERSION_FILES",
+      "lineno": 7712,
+      "kind": "tuple",
+      "len": 4,
+      "values": [
+        "('.nvmrc', 'node', lambda s: _LEADING_V_RE.sub('', s))",
+        "('.node-version', 'node', lambda s: _LEADING_V_RE.sub('', s))",
+        "('.python-version', 'python', lambda s: s)",
+        "('.ruby-version', 'ruby', lambda s: s)"
+      ]
+    },
+    {
+      "name": "_ASDF_TOOL_ALIASES",
+      "lineno": 7727,
+      "kind": "dict",
+      "len": 2,
+      "keys": [
+        "nodejs",
+        "python3"
+      ]
+    },
+    {
+      "name": "_MISE_SIGNAL_FILES",
+      "lineno": 7954,
+      "kind": "tuple",
+      "len": 9,
+      "values": [
+        "mise.toml",
+        ".mise.toml",
+        ".tool-versions",
+        ".nvmrc",
+        ".node-version",
+        ".python-version",
+        ".ruby-version",
+        "rust-toolchain.toml",
+        ".go-version"
+      ]
+    },
+    {
+      "name": "_RETRYABLE_FAILURE_KINDS",
+      "lineno": 12249,
+      "kind": "expr",
+      "expr": "frozenset({'no_commits', 'dirty_worktree', 'empty_handoff'})"
+    },
+    {
+      "name": "_RULES_FILE_CANDIDATES",
+      "lineno": 12299,
+      "kind": "tuple",
+      "len": 13,
+      "values": [
+        "CLAUDE.md",
+        "AGENTS.md",
+        ".agent.md",
+        ".cursorrules",
+        ".windsurfrules",
+        "docs/CLAUDE.md",
+        "docs/AGENTS.md",
+        "docs/CONVENTIONS.md",
+        "docs/STYLE.md",
+        "README.md",
+        "CONTRIBUTING.md",
+        "docs/DESIGN.md",
+        "docs/IMPLEMENTATION.md"
+      ]
+    },
+    {
+      "name": "_BLT_AXIS_RES",
+      "lineno": 12705,
+      "kind": "dict",
+      "len": 3,
+      "keys": [
+        "test",
+        "build",
+        "lint"
+      ]
+    },
+    {
+      "name": "_BG_RESULT_PREFIX",
+      "lineno": 12719,
+      "kind": "str",
+      "value": "Command running in background with ID:"
+    },
+    {
+      "name": "_BG_ID_RE",
+      "lineno": 12720,
+      "kind": "expr",
+      "expr": "re.compile('Command running in background with ID:\\\\s*(\\\\w+)')"
+    },
+    {
+      "name": "_PR_TEMPLATE_SINGLE_LOCATIONS",
+      "lineno": 13690,
+      "kind": "tuple",
+      "len": 3,
+      "values": [
+        ".github/pull_request_template.md",
+        "pull_request_template.md",
+        "docs/pull_request_template.md"
+      ]
+    },
+    {
+      "name": "_PR_TEMPLATE_MULTI_DIRS",
+      "lineno": 13698,
+      "kind": "tuple",
+      "len": 3,
+      "values": [
+        ".github/PULL_REQUEST_TEMPLATE",
+        "PULL_REQUEST_TEMPLATE",
+        "docs/PULL_REQUEST_TEMPLATE"
+      ]
+    },
+    {
+      "name": "PR_WRITER_COMMIT_LOG_MAX_BYTES",
+      "lineno": 13759,
+      "kind": "int",
+      "value": 80000
+    },
+    {
+      "name": "PR_WRITER_TEMPLATE_MAX_BYTES",
+      "lineno": 13760,
+      "kind": "int",
+      "value": 32000
+    },
+    {
+      "name": "PR_WRITER_DIFF_SAMPLE_MAX_LINES",
+      "lineno": 13761,
+      "kind": "int",
+      "value": 500
+    },
+    {
+      "name": "PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES",
+      "lineno": 13767,
+      "kind": "int",
+      "value": 8000
+    },
+    {
+      "name": "_LEERIE_PREFIX_RE",
+      "lineno": 13795,
+      "kind": "expr",
+      "expr": "re.compile('^leerie:\\\\s*', re.IGNORECASE)"
+    }
+  ],
+  "functions": [
+    {
+      "name": "_read_version",
+      "qualname": "_read_version",
+      "async": false,
+      "lineno": 57,
+      "end_lineno": 66,
+      "span": 10,
+      "decorators": [],
+      "signature": "()",
+      "returns": "str",
+      "doc": "Single source of truth: `.claude-plugin/plugin.json`'s `version`"
+    },
+    {
+      "name": "load_prompt",
+      "qualname": "load_prompt",
+      "async": false,
+      "lineno": 75,
+      "end_lineno": 84,
+      "span": 10,
+      "decorators": [],
+      "signature": "(name: str)",
+      "returns": "str",
+      "doc": "Read prompts/<name>.md and expand any {{include: _foo.md}}"
+    },
+    {
+      "name": "is_protected_path",
+      "qualname": "is_protected_path",
+      "async": false,
+      "lineno": 309,
+      "end_lineno": 317,
+      "span": 9,
+      "decorators": [],
+      "signature": "(path: str)",
+      "returns": "bool",
+      "doc": "Return True if `path` is a meta-directory the implementer must not"
+    },
+    {
+      "name": "resolve_prompt",
+      "qualname": "resolve_prompt",
+      "async": false,
+      "lineno": 611,
+      "end_lineno": 626,
+      "span": 16,
+      "decorators": [],
+      "signature": "(call_type: str)",
+      "returns": "tuple[str, str, str]",
+      "doc": "Return (source_kind, content, location_hint) for a worker call_type."
+    },
+    {
+      "name": "_confidence_schema",
+      "qualname": "_confidence_schema",
+      "async": false,
+      "lineno": 669,
+      "end_lineno": 692,
+      "span": 24,
+      "decorators": [],
+      "signature": "(axes: list[str])",
+      "returns": "dict",
+      "doc": "Build the \u00a78 confidence sub-schema for the given score axes."
+    },
+    {
+      "name": "now",
+      "qualname": "now",
+      "async": false,
+      "lineno": 1297,
+      "end_lineno": 1298,
+      "span": 2,
+      "decorators": [],
+      "signature": "()",
+      "returns": "str",
+      "doc": null
+    },
+    {
+      "name": "log",
+      "qualname": "log",
+      "async": false,
+      "lineno": 1301,
+      "end_lineno": 1304,
+      "span": 4,
+      "decorators": [],
+      "signature": "(msg: str)",
+      "returns": "None",
+      "doc": null
+    },
+    {
+      "name": "die",
+      "qualname": "die",
+      "async": false,
+      "lineno": 1307,
+      "end_lineno": 1309,
+      "span": 3,
+      "decorators": [],
+      "signature": "(msg: str, code: int = 1)",
+      "returns": null,
+      "doc": null
+    },
+    {
+      "name": "detect_session_limit",
+      "qualname": "detect_session_limit",
+      "async": false,
+      "lineno": 1375,
+      "end_lineno": 1414,
+      "span": 40,
+      "decorators": [],
+      "signature": "(text: str)",
+      "returns": "RateLimitedExit | None",
+      "doc": "Return a RateLimitedExit if `text` matches the Claude Code"
+    },
+    {
+      "name": "_install_signal_handlers",
+      "qualname": "_install_signal_handlers",
+      "async": false,
+      "lineno": 1417,
+      "end_lineno": 1427,
+      "span": 11,
+      "decorators": [],
+      "signature": "()",
+      "returns": "None",
+      "doc": "Install SIGTERM/SIGHUP handlers that raise InterruptedBySignal."
+    },
+    {
+      "name": "_enumerate_descendants",
+      "qualname": "_enumerate_descendants",
+      "async": false,
+      "lineno": 1433,
+      "end_lineno": 1472,
+      "span": 40,
+      "decorators": [],
+      "signature": "(root_pid: int)",
+      "returns": "set[int]",
+      "doc": "Return every PID reachable from `root_pid` via PPID links."
+    },
+    {
+      "name": "_signal_pids",
+      "qualname": "_signal_pids",
+      "async": false,
+      "lineno": 1475,
+      "end_lineno": 1484,
+      "span": 10,
+      "decorators": [],
+      "signature": "(pids: set[int], sig: int)",
+      "returns": "None",
+      "doc": "Best-effort signal delivery to a set of PIDs. Drops ProcessLookupError"
+    },
+    {
+      "name": "_terminate_proc_tree",
+      "qualname": "_terminate_proc_tree",
+      "async": true,
+      "lineno": 1578,
+      "end_lineno": 1646,
+      "span": 69,
+      "decorators": [],
+      "signature": "(proc: asyncio.subprocess.Process)",
+      "returns": "None",
+      "doc": "Terminate a subprocess AND every descendant process, then reap."
+    },
+    {
+      "name": "_cleanup_on_abnormal_exit",
+      "qualname": "_cleanup_on_abnormal_exit",
+      "async": false,
+      "lineno": 1649,
+      "end_lineno": 1764,
+      "span": 116,
+      "decorators": [],
+      "signature": "(st: 'State', *, full_purge: bool)",
+      "returns": "None",
+      "doc": "Clean up after an abnormal exit (signal, exception, WorkerError)."
+    },
+    {
+      "name": "_reset_subtask_worktree",
+      "qualname": "_reset_subtask_worktree",
+      "async": true,
+      "lineno": 1767,
+      "end_lineno": 1790,
+      "span": 24,
+      "decorators": [],
+      "signature": "(sid: str, leerie_dir: Path, run_id: str)",
+      "returns": "None",
+      "doc": "Remove the per-subtask worktree directory and branch so a corrective"
+    },
+    {
+      "name": "_parse_claude_version",
+      "qualname": "_parse_claude_version",
+      "async": false,
+      "lineno": 1793,
+      "end_lineno": 1798,
+      "span": 6,
+      "decorators": [],
+      "signature": "(version_output: str | None)",
+      "returns": "tuple[int, int, int] | None",
+      "doc": "Pull MAJOR.MINOR.PATCH out of `claude --version` output."
+    },
+    {
+      "name": "_check_claude_cli_version",
+      "qualname": "_check_claude_cli_version",
+      "async": false,
+      "lineno": 1801,
+      "end_lineno": 1831,
+      "span": 31,
+      "decorators": [],
+      "signature": "()",
+      "returns": "None",
+      "doc": "die() if `claude` is too old for --json-schema. Without this, a"
+    },
+    {
+      "name": "compute_run_branch",
+      "qualname": "compute_run_branch",
+      "async": false,
+      "lineno": 1845,
+      "end_lineno": 1856,
+      "span": 12,
+      "decorators": [],
+      "signature": "(run_id: str)",
+      "returns": "str",
+      "doc": "The git branch name carrying a run's integrated work."
+    },
+    {
+      "name": "compute_subtask_branch",
+      "qualname": "compute_subtask_branch",
+      "async": false,
+      "lineno": 1859,
+      "end_lineno": 1868,
+      "span": 10,
+      "decorators": [],
+      "signature": "(run_id: str, sid: str)",
+      "returns": "str",
+      "doc": "The git branch name for one subtask's worktree."
+    },
+    {
+      "name": "_validate_run_json",
+      "qualname": "_validate_run_json",
+      "async": false,
+      "lineno": 1873,
+      "end_lineno": 1969,
+      "span": 97,
+      "decorators": [],
+      "signature": "(data: dict)",
+      "returns": "None",
+      "doc": "Enforce the logical invariants on a `run.json` sidecar."
+    },
+    {
+      "name": "compose_pr_body",
+      "qualname": "compose_pr_body",
+      "async": false,
+      "lineno": 1974,
+      "end_lineno": 2026,
+      "span": 53,
+      "decorators": [],
+      "signature": "(state: dict, run_id: str)",
+      "returns": "str",
+      "doc": "Generate the deterministic fallback PR body from run state +"
+    },
+    {
+      "name": "_write_run_json",
+      "qualname": "_write_run_json",
+      "async": false,
+      "lineno": 2029,
+      "end_lineno": 2054,
+      "span": 26,
+      "decorators": [],
+      "signature": "(run_dir: Path, **fields)",
+      "returns": "None",
+      "doc": "Merge fields into the run.json sidecar at `run_dir/run.json`,"
+    },
+    {
+      "name": "discover_runs",
+      "qualname": "discover_runs",
+      "async": false,
+      "lineno": 2059,
+      "end_lineno": 2146,
+      "span": 88,
+      "decorators": [],
+      "signature": "(leerie_root: Path)",
+      "returns": "list[dict]",
+      "doc": "Enumerate `<state-root>/runs/*/state.json`, returning one summary"
+    },
+    {
+      "name": "resolve_run_id",
+      "qualname": "resolve_run_id",
+      "async": false,
+      "lineno": 2149,
+      "end_lineno": 2183,
+      "span": 35,
+      "decorators": [],
+      "signature": "(leerie_root: Path, cli_run_id: str | None)",
+      "returns": "str",
+      "doc": "Pick the run_id to operate on. Used by `--resume`."
+    },
+    {
+      "name": "_format_run_for_disambiguation",
+      "qualname": "_format_run_for_disambiguation",
+      "async": false,
+      "lineno": 2186,
+      "end_lineno": 2231,
+      "span": 46,
+      "decorators": [],
+      "signature": "(run: dict, leerie_root: Path)",
+      "returns": "str",
+      "doc": "Build the per-row hint string for `resolve_run_id`'s"
+    },
+    {
+      "name": "_format_age",
+      "qualname": "_format_age",
+      "async": false,
+      "lineno": 2234,
+      "end_lineno": 2251,
+      "span": 18,
+      "decorators": [],
+      "signature": "(seconds: float)",
+      "returns": "str",
+      "doc": "Render a duration in seconds as a short human-friendly age:"
+    },
+    {
+      "name": "_derive_run_status",
+      "qualname": "_derive_run_status",
+      "async": false,
+      "lineno": 2282,
+      "end_lineno": 2346,
+      "span": 65,
+      "decorators": [],
+      "signature": "(run_json: dict | None, state_json: dict | None)",
+      "returns": "str",
+      "doc": "Pure function: derive a run's status from run.json + state.json."
+    },
+    {
+      "name": "_collect_run_rows",
+      "qualname": "_collect_run_rows",
+      "async": false,
+      "lineno": 2349,
+      "end_lineno": 2374,
+      "span": 26,
+      "decorators": [],
+      "signature": "(leerie_root: Path)",
+      "returns": "list[tuple[str, str, str, str, bool]]",
+      "doc": "Build (run_id, started_at, status, branch, is_fly) rows for every"
+    },
+    {
+      "name": "_render_run_table",
+      "qualname": "_render_run_table",
+      "async": false,
+      "lineno": 2377,
+      "end_lineno": 2387,
+      "span": 11,
+      "decorators": [],
+      "signature": "(rows: list[tuple[str, str, str, str, bool]])",
+      "returns": "None",
+      "doc": "Print rows as a columnar table with auto-sized columns."
+    },
+    {
+      "name": "list_runs",
+      "qualname": "list_runs",
+      "async": false,
+      "lineno": 2390,
+      "end_lineno": 2424,
+      "span": 35,
+      "decorators": [],
+      "signature": "(leerie_root: Path, status_filter: str | None = None, runtime_filter: str | None = None)",
+      "returns": "None",
+      "doc": "Render a sortable columnar table of runs to stdout. Used by"
+    },
+    {
+      "name": "_read_toml_key",
+      "qualname": "_read_toml_key",
+      "async": false,
+      "lineno": 2428,
+      "end_lineno": 2444,
+      "span": 17,
+      "decorators": [],
+      "signature": "(path: Path, key: str)",
+      "returns": "str | None",
+      "doc": "Read a single `key = value` from a flat leerie.toml. Returns"
+    },
+    {
+      "name": "resolve_task_argument",
+      "qualname": "resolve_task_argument",
+      "async": false,
+      "lineno": 2450,
+      "end_lineno": 2476,
+      "span": 27,
+      "decorators": [],
+      "signature": "(raw: str)",
+      "returns": "str",
+      "doc": "Resolve the positional `task` argument to the task string."
+    },
+    {
+      "name": "resolve_leerie_root",
+      "qualname": "resolve_leerie_root",
+      "async": false,
+      "lineno": 2479,
+      "end_lineno": 2494,
+      "span": 16,
+      "decorators": [],
+      "signature": "(repo_root: Path)",
+      "returns": "Path",
+      "doc": "Resolve the leerie state root directory."
+    },
+    {
+      "name": "_resolve_enum_pref",
+      "qualname": "_resolve_enum_pref",
+      "async": false,
+      "lineno": 2497,
+      "end_lineno": 2516,
+      "span": 20,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: str | None, *, env_var: str, file_key: str, file_name: str, allowed: frozenset[str] | tuple[str, ...], default: str)",
+      "returns": "str",
+      "doc": "Shared resolution for enum-valued prefs. CLI > env > file > default."
+    },
+    {
+      "name": "resolve_source_of_truth",
+      "qualname": "resolve_source_of_truth",
+      "async": false,
+      "lineno": 2519,
+      "end_lineno": 2531,
+      "span": 13,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: str | None = None)",
+      "returns": "str",
+      "doc": "Resolve the source-of-truth preference. Order:"
+    },
+    {
+      "name": "resolve_runtime",
+      "qualname": "resolve_runtime",
+      "async": false,
+      "lineno": 2534,
+      "end_lineno": 2545,
+      "span": 12,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: str | None = None)",
+      "returns": "str",
+      "doc": "Resolve the runtime mode. Order:"
+    },
+    {
+      "name": "_resolve_str_pref",
+      "qualname": "_resolve_str_pref",
+      "async": false,
+      "lineno": 2548,
+      "end_lineno": 2562,
+      "span": 15,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: str | None, *, env_var: str, file_key: str, file_name: str, default: str | None)",
+      "returns": "str | None",
+      "doc": "Shared resolution for unvalidated string prefs. CLI > env > file >"
+    },
+    {
+      "name": "resolve_pr_template",
+      "qualname": "resolve_pr_template",
+      "async": false,
+      "lineno": 2565,
+      "end_lineno": 2577,
+      "span": 13,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: str | None = None)",
+      "returns": "str | None",
+      "doc": "Resolve the --pr-template selector. Order:"
+    },
+    {
+      "name": "_resolve_positive_int_pref",
+      "qualname": "_resolve_positive_int_pref",
+      "async": false,
+      "lineno": 2580,
+      "end_lineno": 2606,
+      "span": 27,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: int | None, *, env_var: str, file_key: str, file_name: str, default: int)",
+      "returns": "int",
+      "doc": "Shared resolution for positive-int prefs. CLI > env > file > default."
+    },
+    {
+      "name": "resolve_confidence_rounds",
+      "qualname": "resolve_confidence_rounds",
+      "async": false,
+      "lineno": 2609,
+      "end_lineno": 2621,
+      "span": 13,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: int | None = None)",
+      "returns": "int",
+      "doc": "Resolve the confidence-rounds cap. Order:"
+    },
+    {
+      "name": "resolve_max_workers",
+      "qualname": "resolve_max_workers",
+      "async": false,
+      "lineno": 2624,
+      "end_lineno": 2636,
+      "span": 13,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: int | None = None)",
+      "returns": "int",
+      "doc": "Resolve the max-workers cap. Order:"
+    },
+    {
+      "name": "resolve_max_parallel",
+      "qualname": "resolve_max_parallel",
+      "async": false,
+      "lineno": 2639,
+      "end_lineno": 2651,
+      "span": 13,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: int | None = None)",
+      "returns": "int",
+      "doc": "Resolve the max-parallel cap. Order:"
+    },
+    {
+      "name": "resolve_judgment_check_rounds",
+      "qualname": "resolve_judgment_check_rounds",
+      "async": false,
+      "lineno": 2654,
+      "end_lineno": 2663,
+      "span": 10,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: int | None = None)",
+      "returns": "int",
+      "doc": "Resolve the judgment-check-rounds cap (CRITIC-pattern re-invocations"
+    },
+    {
+      "name": "resolve_planner_check_rounds",
+      "qualname": "resolve_planner_check_rounds",
+      "async": false,
+      "lineno": 2666,
+      "end_lineno": 2675,
+      "span": 10,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: int | None = None)",
+      "returns": "int",
+      "doc": "Resolve the planner-check-rounds cap (CRITIC-pattern re-invocations"
+    },
+    {
+      "name": "resolve_implementer_confidence_retries",
+      "qualname": "resolve_implementer_confidence_retries",
+      "async": false,
+      "lineno": 2678,
+      "end_lineno": 2688,
+      "span": 11,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: int | None = None)",
+      "returns": "int",
+      "doc": "Resolve the implementer-confidence-retries cap (separate from"
+    },
+    {
+      "name": "resolve_planner_samples",
+      "qualname": "resolve_planner_samples",
+      "async": false,
+      "lineno": 2691,
+      "end_lineno": 2699,
+      "span": 9,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: int | None = None)",
+      "returns": "int",
+      "doc": "Resolve the planner-samples cap (multi-sample; 1 disables)."
+    },
+    {
+      "name": "_parse_memory_size",
+      "qualname": "_parse_memory_size",
+      "async": false,
+      "lineno": 2707,
+      "end_lineno": 2731,
+      "span": 25,
+      "decorators": [],
+      "signature": "(value: str, context: str)",
+      "returns": "int",
+      "doc": "Parse a memory size string like \"4G\", \"512M\", \"1024\" into bytes."
+    },
+    {
+      "name": "_auto_worker_memory_max",
+      "qualname": "_auto_worker_memory_max",
+      "async": false,
+      "lineno": 2734,
+      "end_lineno": 2759,
+      "span": 26,
+      "decorators": [],
+      "signature": "(max_parallel: int)",
+      "returns": "int",
+      "doc": "Auto-derive a per-worker memory cap from /proc/meminfo."
+    },
+    {
+      "name": "resolve_worker_memory_max",
+      "qualname": "resolve_worker_memory_max",
+      "async": false,
+      "lineno": 2762,
+      "end_lineno": 2782,
+      "span": 21,
+      "decorators": [],
+      "signature": "(repo_root: Path, max_parallel: int, cli_value: str | None = None)",
+      "returns": "int",
+      "doc": "Resolve the per-worker cgroup memory cap (bytes). Order:"
+    },
+    {
+      "name": "resolve_inspect_dirs",
+      "qualname": "resolve_inspect_dirs",
+      "async": false,
+      "lineno": 2785,
+      "end_lineno": 2823,
+      "span": 39,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_values: list[str] | None = None)",
+      "returns": "list[str]",
+      "doc": "Resolve the extra inspection directories for classifier/planner/"
+    },
+    {
+      "name": "_parse_bool_envtoml",
+      "qualname": "_parse_bool_envtoml",
+      "async": false,
+      "lineno": 2826,
+      "end_lineno": 2838,
+      "span": 13,
+      "decorators": [],
+      "signature": "(value: str)",
+      "returns": "bool | None",
+      "doc": "Parse a boolean from an env var or TOML scalar. Returns True/False"
+    },
+    {
+      "name": "_resolve_bool_pref",
+      "qualname": "_resolve_bool_pref",
+      "async": false,
+      "lineno": 2841,
+      "end_lineno": 2868,
+      "span": 28,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: bool, *, env_var: str, file_key: str, file_name: str)",
+      "returns": "bool",
+      "doc": "Shared resolution for `store_true` CLI flags that also have an"
+    },
+    {
+      "name": "resolve_no_push",
+      "qualname": "resolve_no_push",
+      "async": false,
+      "lineno": 2871,
+      "end_lineno": 2878,
+      "span": 8,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: bool)",
+      "returns": "bool",
+      "doc": "Resolve the --no-push preference. Order:"
+    },
+    {
+      "name": "push_will_happen",
+      "qualname": "push_will_happen",
+      "async": false,
+      "lineno": 2881,
+      "end_lineno": 2905,
+      "span": 25,
+      "decorators": [],
+      "signature": "(no_push: bool, host_no_push: bool | None)",
+      "returns": "bool",
+      "doc": "Whether the host will push after this orchestrator exits."
+    },
+    {
+      "name": "resolve_clarify",
+      "qualname": "resolve_clarify",
+      "async": false,
+      "lineno": 2908,
+      "end_lineno": 2915,
+      "span": 8,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: bool)",
+      "returns": "bool",
+      "doc": "Resolve the --clarify preference. Order:"
+    },
+    {
+      "name": "resolve_dangerously_skip_permissions",
+      "qualname": "resolve_dangerously_skip_permissions",
+      "async": false,
+      "lineno": 2918,
+      "end_lineno": 2937,
+      "span": 20,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: bool)",
+      "returns": "bool",
+      "doc": "Resolve the --dangerously-skip-permissions preference. Order:"
+    },
+    {
+      "name": "resolve_skip_overlap_judge",
+      "qualname": "resolve_skip_overlap_judge",
+      "async": false,
+      "lineno": 2940,
+      "end_lineno": 2957,
+      "span": 18,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: bool)",
+      "returns": "bool",
+      "doc": "Resolve the --skip-overlap-judge preference. Order:"
+    },
+    {
+      "name": "resolve_skip_budget_check",
+      "qualname": "resolve_skip_budget_check",
+      "async": false,
+      "lineno": 2960,
+      "end_lineno": 2979,
+      "span": 20,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: bool)",
+      "returns": "bool",
+      "doc": "Resolve the --skip-budget-check preference. Order:"
+    },
+    {
+      "name": "_positive_int",
+      "qualname": "_positive_int",
+      "async": false,
+      "lineno": 2982,
+      "end_lineno": 2991,
+      "span": 10,
+      "decorators": [],
+      "signature": "(s: str)",
+      "returns": "int",
+      "doc": "argparse `type=` helper. Rejects non-positive integers with the"
+    },
+    {
+      "name": "resolve_verbosity",
+      "qualname": "resolve_verbosity",
+      "async": false,
+      "lineno": 2994,
+      "end_lineno": 3013,
+      "span": 20,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: str | None = None)",
+      "returns": "str",
+      "doc": "Resolve the verbosity level. Order:"
+    },
+    {
+      "name": "verbosity_from_shortcuts",
+      "qualname": "verbosity_from_shortcuts",
+      "async": false,
+      "lineno": 3016,
+      "end_lineno": 3034,
+      "span": 19,
+      "decorators": [],
+      "signature": "(verbose: int, quiet: int)",
+      "returns": "str | None",
+      "doc": "Map argparse -v/-vv/-q/-qq counts to a verbosity level."
+    },
+    {
+      "name": "resolve_models",
+      "qualname": "resolve_models",
+      "async": false,
+      "lineno": 3037,
+      "end_lineno": 3110,
+      "span": 74,
+      "decorators": [],
+      "signature": "(repo_root: Path, args)",
+      "returns": "dict[str, str]",
+      "doc": "Resolve the model alias for each worker type. Per-worker"
+    },
+    {
+      "name": "resolve_efforts",
+      "qualname": "resolve_efforts",
+      "async": false,
+      "lineno": 3113,
+      "end_lineno": 3171,
+      "span": 59,
+      "decorators": [],
+      "signature": "(repo_root: Path, args)",
+      "returns": "dict[str, str | None]",
+      "doc": "Resolve the --effort value for each worker type. Mirrors"
+    },
+    {
+      "name": "resolve_telemetry_enabled",
+      "qualname": "resolve_telemetry_enabled",
+      "async": false,
+      "lineno": 3174,
+      "end_lineno": 3203,
+      "span": 30,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: bool | None = None)",
+      "returns": "bool",
+      "doc": "Resolve the telemetry enabled/disabled preference. Order:"
+    },
+    {
+      "name": "resolve_telemetry_subdir",
+      "qualname": "resolve_telemetry_subdir",
+      "async": false,
+      "lineno": 3206,
+      "end_lineno": 3216,
+      "span": 11,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: str | None = None)",
+      "returns": "str",
+      "doc": "Resolve the telemetry event subdirectory name. Order:"
+    },
+    {
+      "name": "resolve_judge_dir",
+      "qualname": "resolve_judge_dir",
+      "async": false,
+      "lineno": 3219,
+      "end_lineno": 3228,
+      "span": 10,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: str | None = None)",
+      "returns": "str",
+      "doc": "Resolve the judge output directory name. Order:"
+    },
+    {
+      "name": "resolve_heal_dir",
+      "qualname": "resolve_heal_dir",
+      "async": false,
+      "lineno": 3231,
+      "end_lineno": 3240,
+      "span": 10,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: str | None = None)",
+      "returns": "str",
+      "doc": "Resolve the heal output directory name. Order:"
+    },
+    {
+      "name": "resolve_heal_max_rounds",
+      "qualname": "resolve_heal_max_rounds",
+      "async": false,
+      "lineno": 3243,
+      "end_lineno": 3252,
+      "span": 10,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: int | None = None)",
+      "returns": "int",
+      "doc": "Resolve the heal-loop max-iterations cap. Order:"
+    },
+    {
+      "name": "resolve_heal_success_threshold",
+      "qualname": "resolve_heal_success_threshold",
+      "async": false,
+      "lineno": 3255,
+      "end_lineno": 3282,
+      "span": 28,
+      "decorators": [],
+      "signature": "(repo_root: Path, cli_value: float | None = None)",
+      "returns": "float",
+      "doc": "Resolve the heal-loop success pass-rate threshold. Order:"
+    },
+    {
+      "name": "run_proc",
+      "qualname": "run_proc",
+      "async": true,
+      "lineno": 3285,
+      "end_lineno": 3329,
+      "span": 45,
+      "decorators": [],
+      "signature": "(cmd: list[str], *, cwd: str | None = None, timeout: float | None = None)",
+      "returns": "subprocess.CompletedProcess",
+      "doc": "Async equivalent of `subprocess.run(cmd, capture_output=True, text=True)`."
+    },
+    {
+      "name": "run_streaming",
+      "qualname": "run_streaming",
+      "async": true,
+      "lineno": 3332,
+      "end_lineno": 3455,
+      "span": 124,
+      "decorators": [],
+      "signature": "(cmd: list[str], *, cwd: str | None = None, env: dict[str, str] | None = None, timeout: float | None = None, log_path: Path | None = None, label: str | None = None, verbosity: str = 'stream', line_prefix: str = '  | ', tail_lines: int = 40)",
+      "returns": "tuple[int, str]",
+      "doc": "Run a subprocess with stdout+stderr streamed live, persisted to a"
+    },
+    {
+      "name": "gather_or_cancel",
+      "qualname": "gather_or_cancel",
+      "async": true,
+      "lineno": 3458,
+      "end_lineno": 3479,
+      "span": 22,
+      "decorators": [],
+      "signature": "(*aws)",
+      "returns": null,
+      "doc": "Like asyncio.gather, but on the first exception cancel every other"
+    },
+    {
+      "name": "run_script",
+      "qualname": "run_script",
+      "async": true,
+      "lineno": 3482,
+      "end_lineno": 3484,
+      "span": 3,
+      "decorators": [],
+      "signature": "(name: str, *args: str)",
+      "returns": "subprocess.CompletedProcess",
+      "doc": "Run one of the bundled git worktree scripts in the target repo."
+    },
+    {
+      "name": "preflight",
+      "qualname": "preflight",
+      "async": true,
+      "lineno": 3497,
+      "end_lineno": 3577,
+      "span": 81,
+      "decorators": [],
+      "signature": "(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT, skip_smoke: bool = False, no_push: bool = False)",
+      "returns": "None",
+      "doc": "Hard checks before any LLM work. Fails fast rather than wasting workers."
+    },
+    {
+      "name": "_confidence_issues",
+      "qualname": "_confidence_issues",
+      "async": false,
+      "lineno": 3592,
+      "end_lineno": 3610,
+      "span": 19,
+      "decorators": [],
+      "signature": "(conf: dict, axes: list[str], threshold: float = 9.0)",
+      "returns": "list[str]",
+      "doc": "Return one LOW_CONFIDENCE issue per axis below *threshold*."
+    },
+    {
+      "name": "check_classifier_output",
+      "qualname": "check_classifier_output",
+      "async": false,
+      "lineno": 3613,
+      "end_lineno": 3659,
+      "span": 47,
+      "decorators": [],
+      "signature": "(result: dict, repo_root: Path)",
+      "returns": "list[str]",
+      "doc": "Thin mechanical checks on the classifier's category selection."
+    },
+    {
+      "name": "_grep_old_pattern",
+      "qualname": "_grep_old_pattern",
+      "async": false,
+      "lineno": 3677,
+      "end_lineno": 3699,
+      "span": 23,
+      "decorators": [],
+      "signature": "(pattern: str, repo_root: Path)",
+      "returns": "set[str]",
+      "doc": "Grep *repo_root* for *pattern*, return set of relative file paths."
+    },
+    {
+      "name": "_check_migration_surface",
+      "qualname": "_check_migration_surface",
+      "async": false,
+      "lineno": 3702,
+      "end_lineno": 3730,
+      "span": 29,
+      "decorators": [],
+      "signature": "(subtasks: list[dict], repo_root: Path)",
+      "returns": "list[str]",
+      "doc": "UNCOVERED_MIGRATION_SURFACE check (DESIGN \u00a75)."
+    },
+    {
+      "name": "check_planner_output",
+      "qualname": "check_planner_output",
+      "async": false,
+      "lineno": 3733,
+      "end_lineno": 3827,
+      "span": 95,
+      "decorators": [],
+      "signature": "(result: dict, repo_root: Path, domain: str)",
+      "returns": "list[str]",
+      "doc": "Rich mechanical checks on a single planner domain's output."
+    },
+    {
+      "name": "check_reconciler_output",
+      "qualname": "check_reconciler_output",
+      "async": false,
+      "lineno": 3830,
+      "end_lineno": 3861,
+      "span": 32,
+      "decorators": [],
+      "signature": "(output: dict, plans: list[dict])",
+      "returns": "list[str]",
+      "doc": "Mechanical checks on the reconciler's output beyond the existing"
+    },
+    {
+      "name": "check_overlap_judge_output",
+      "qualname": "check_overlap_judge_output",
+      "async": false,
+      "lineno": 3864,
+      "end_lineno": 3925,
+      "span": 62,
+      "decorators": [],
+      "signature": "(output: dict, plans: list[dict], repo_root: Path)",
+      "returns": "list[str]",
+      "doc": "Mechanical checks on the overlap judge's collision list."
+    },
+    {
+      "name": "check_provision_output",
+      "qualname": "check_provision_output",
+      "async": false,
+      "lineno": 3928,
+      "end_lineno": 3967,
+      "span": 40,
+      "decorators": [],
+      "signature": "(result: dict, repo_root: Path)",
+      "returns": "list[str]",
+      "doc": "Mechanical checks on the provision LLM fallback's recipe."
+    },
+    {
+      "name": "check_integrator_output",
+      "qualname": "check_integrator_output",
+      "async": false,
+      "lineno": 3970,
+      "end_lineno": 3973,
+      "span": 4,
+      "decorators": [],
+      "signature": "(result: dict)",
+      "returns": "list[str]",
+      "doc": "Confidence gate for the integrator."
+    },
+    {
+      "name": "check_implementer_output",
+      "qualname": "check_implementer_output",
+      "async": false,
+      "lineno": 3976,
+      "end_lineno": 3998,
+      "span": 23,
+      "decorators": [],
+      "signature": "(result: dict, subtask: dict, actual_files: set[str])",
+      "returns": "list[str]",
+      "doc": "Mechanical checks on an implementer's complete result."
+    },
+    {
+      "name": "_expand_braces",
+      "qualname": "_expand_braces",
+      "async": false,
+      "lineno": 4013,
+      "end_lineno": 4026,
+      "span": 14,
+      "decorators": [],
+      "signature": "(pattern: str)",
+      "returns": "list[str]",
+      "doc": "Expand shell-style ``{a,b}`` brace groups into multiple patterns."
+    },
+    {
+      "name": "glob_task_references",
+      "qualname": "glob_task_references",
+      "async": false,
+      "lineno": 4029,
+      "end_lineno": 4058,
+      "span": 30,
+      "decorators": [],
+      "signature": "(task: str, repo_root: Path)",
+      "returns": "list[Path]",
+      "doc": "Find file references in the task string via glob expansion."
+    },
+    {
+      "name": "extract_task_file_structure",
+      "qualname": "extract_task_file_structure",
+      "async": false,
+      "lineno": 4061,
+      "end_lineno": 4095,
+      "span": 35,
+      "decorators": [],
+      "signature": "(task: str, repo_root: Path)",
+      "returns": "list[str] | None",
+      "doc": "Extract structural elements from files referenced in the task."
+    },
+    {
+      "name": "check_task_file_coverage",
+      "qualname": "check_task_file_coverage",
+      "async": false,
+      "lineno": 4101,
+      "end_lineno": 4132,
+      "span": 32,
+      "decorators": [],
+      "signature": "(extracted: list[str], subtasks: list[dict])",
+      "returns": "list[str]",
+      "doc": "Check which extracted items are NOT referenced by any subtask."
+    },
+    {
+      "name": "_format_task_file_structure",
+      "qualname": "_format_task_file_structure",
+      "async": false,
+      "lineno": 4135,
+      "end_lineno": 4146,
+      "span": 12,
+      "decorators": [],
+      "signature": "(items: list[str])",
+      "returns": "str",
+      "doc": "Format extracted structure as an external coverage reference"
+    },
+    {
+      "name": "validate_plan",
+      "qualname": "validate_plan",
+      "async": false,
+      "lineno": 4149,
+      "end_lineno": 4255,
+      "span": 107,
+      "decorators": [],
+      "signature": "(subtasks: dict)",
+      "returns": "None",
+      "doc": "Structural validation of the merged plan \u2014 pure Python set operations."
+    },
+    {
+      "name": "warn_cross_planner_file_overlap",
+      "qualname": "warn_cross_planner_file_overlap",
+      "async": false,
+      "lineno": 4258,
+      "end_lineno": 4289,
+      "span": 32,
+      "decorators": [],
+      "signature": "(plans: list[dict])",
+      "returns": "None",
+      "doc": "Log a warning when subtasks from different planner outputs both list"
+    },
+    {
+      "name": "warn_layer_gaps",
+      "qualname": "warn_layer_gaps",
+      "async": false,
+      "lineno": 4296,
+      "end_lineno": 4334,
+      "span": 39,
+      "decorators": [],
+      "signature": "(plans: list[dict])",
+      "returns": "None",
+      "doc": "Advisory cross-domain layer-gap warnings (DESIGN \u00a75)."
+    },
+    {
+      "name": "_resolves_under",
+      "qualname": "_resolves_under",
+      "async": false,
+      "lineno": 4337,
+      "end_lineno": 4349,
+      "span": 13,
+      "decorators": [],
+      "signature": "(path_str: str, root: Path)",
+      "returns": "bool",
+      "doc": "True iff `path_str` (relative or absolute) resolves under `root`."
+    },
+    {
+      "name": "filter_offtree_subtasks",
+      "qualname": "filter_offtree_subtasks",
+      "async": false,
+      "lineno": 4352,
+      "end_lineno": 4409,
+      "span": 58,
+      "decorators": [],
+      "signature": "(plans: list[dict], repo_root: Path, inspect_dirs: list[str], st: 'State')",
+      "returns": "None",
+      "doc": "Mutate `plans` in place: drop any subtask whose `files_likely_touched`"
+    },
+    {
+      "name": "_lockfile_table_entries",
+      "qualname": "_lockfile_table_entries",
+      "async": false,
+      "lineno": 4434,
+      "end_lineno": 4529,
+      "span": 96,
+      "decorators": [],
+      "signature": "(repo_root: Path)",
+      "returns": "list[dict]",
+      "doc": "The deterministic lockfile \u2192 install-command table. Returns a list of"
+    },
+    {
+      "name": "detect_recipe_from_lockfiles",
+      "qualname": "detect_recipe_from_lockfiles",
+      "async": false,
+      "lineno": 4532,
+      "end_lineno": 4537,
+      "span": 6,
+      "decorators": [],
+      "signature": "(repo_root: Path)",
+      "returns": "list[dict]",
+      "doc": "Public entry point for the deterministic detection layer. Returns"
+    },
+    {
+      "name": "validate_provision_recipe",
+      "qualname": "validate_provision_recipe",
+      "async": false,
+      "lineno": 4540,
+      "end_lineno": 4601,
+      "span": 62,
+      "decorators": [],
+      "signature": "(recipe: list[dict])",
+      "returns": "None",
+      "doc": "Mechanically bound the provision recipe. Raises ValueError on any"
+    },
+    {
+      "name": "_split_readme_headers",
+      "qualname": "_split_readme_headers",
+      "async": false,
+      "lineno": 4646,
+      "end_lineno": 4695,
+      "span": 50,
+      "decorators": [],
+      "signature": "(text: str)",
+      "returns": "list[tuple[int, str, str]]",
+      "doc": "Return [(line_index, header_text, body_until_next_header), ...] for"
+    },
+    {
+      "name": "_is_install_section",
+      "qualname": "_is_install_section",
+      "async": false,
+      "lineno": 4698,
+      "end_lineno": 4705,
+      "span": 8,
+      "decorators": [],
+      "signature": "(header: str)",
+      "returns": "bool",
+      "doc": "True if a header (after decoration-strip) matches the section"
+    },
+    {
+      "name": "_slice_code_fences_with_install_hints",
+      "qualname": "_slice_code_fences_with_install_hints",
+      "async": false,
+      "lineno": 4708,
+      "end_lineno": 4747,
+      "span": 40,
+      "decorators": [],
+      "signature": "(text: str, ctx_lines: int = 10)",
+      "returns": "str",
+      "doc": "Fallback layer: scan for fenced code blocks containing recognized"
+    },
+    {
+      "name": "extract_readme_sections",
+      "qualname": "extract_readme_sections",
+      "async": false,
+      "lineno": 4759,
+      "end_lineno": 4816,
+      "span": 58,
+      "decorators": [],
+      "signature": "(text: str)",
+      "returns": "str",
+      "doc": "Extract the install/setup-relevant slice of a README."
+    },
+    {
+      "name": "_read_file_safely",
+      "qualname": "_read_file_safely",
+      "async": false,
+      "lineno": 4819,
+      "end_lineno": 4826,
+      "span": 8,
+      "decorators": [],
+      "signature": "(path: Path, budget: int)",
+      "returns": "str",
+      "doc": "Read a file with a byte ceiling, swallowing missing-file and"
+    },
+    {
+      "name": "_sample_workspace_manifests",
+      "qualname": "_sample_workspace_manifests",
+      "async": false,
+      "lineno": 4839,
+      "end_lineno": 4876,
+      "span": 38,
+      "decorators": [],
+      "signature": "(repo_root: Path, pkg_json_text: str, per_file_budget: int, max_files: int)",
+      "returns": "list[tuple[str, str]]",
+      "doc": "For a monorepo whose root package.json declares `workspaces`,"
+    },
+    {
+      "name": "gather_provision_fixtures",
+      "qualname": "gather_provision_fixtures",
+      "async": false,
+      "lineno": 4879,
+      "end_lineno": 4987,
+      "span": 109,
+      "decorators": [],
+      "signature": "(repo_root: Path)",
+      "returns": "dict",
+      "doc": "Assemble the LLM-fallback worker's input set. Returns a dict with"
+    },
+    {
+      "name": "_split_checkpoint_sections",
+      "qualname": "_split_checkpoint_sections",
+      "async": false,
+      "lineno": 5020,
+      "end_lineno": 5036,
+      "span": 17,
+      "decorators": [],
+      "signature": "(content: str)",
+      "returns": "dict[str, list[str]]",
+      "doc": "Split a checkpoint file by `## ` headers into {header: lines}."
+    },
+    {
+      "name": "validate_checkpoint",
+      "qualname": "validate_checkpoint",
+      "async": false,
+      "lineno": 5039,
+      "end_lineno": 5088,
+      "span": 50,
+      "decorators": [],
+      "signature": "(path: str, worktree_root: Path | None = None)",
+      "returns": "str | None",
+      "doc": "Return an error description if the checkpoint is structurally incomplete,"
+    },
+    {
+      "name": "_normalize_for_noise",
+      "qualname": "_normalize_for_noise",
+      "async": false,
+      "lineno": 5091,
+      "end_lineno": 5103,
+      "span": 13,
+      "decorators": [],
+      "signature": "(line: str)",
+      "returns": "str",
+      "doc": "Reduce a checkpoint line to its comparison key for `_NOISE_TOKENS`."
+    },
+    {
+      "name": "_strip_bullet",
+      "qualname": "_strip_bullet",
+      "async": false,
+      "lineno": 5106,
+      "end_lineno": 5120,
+      "span": 15,
+      "decorators": [],
+      "signature": "(line: str)",
+      "returns": "str",
+      "doc": "Strip leading markdown bullet markers (`-`, `*`, `1.`) before noise"
+    },
+    {
+      "name": "_parse_touched_file_line",
+      "qualname": "_parse_touched_file_line",
+      "async": false,
+      "lineno": 5123,
+      "end_lineno": 5143,
+      "span": 21,
+      "decorators": [],
+      "signature": "(line: str)",
+      "returns": "tuple[str | None, bool]",
+      "doc": "Extract a file path from a `## Files touched` line and detect the"
+    },
+    {
+      "name": "validate_result",
+      "qualname": "validate_result",
+      "async": false,
+      "lineno": 5148,
+      "end_lineno": 5216,
+      "span": 69,
+      "decorators": [],
+      "signature": "(result: dict)",
+      "returns": "tuple[str, str] | None",
+      "doc": "Cross-field invariant checks that JSON Schema cannot express."
+    },
+    {
+      "name": "check_diff_scope",
+      "qualname": "check_diff_scope",
+      "async": true,
+      "lineno": 5221,
+      "end_lineno": 5264,
+      "span": 44,
+      "decorators": [],
+      "signature": "(sid: str, worktree: str, subtask: dict, st: State)",
+      "returns": "str | None",
+      "doc": "Check the implementer's diff for violations."
+    },
+    {
+      "name": "check_merge_committed",
+      "qualname": "check_merge_committed",
+      "async": true,
+      "lineno": 5269,
+      "end_lineno": 5292,
+      "span": 24,
+      "decorators": [],
+      "signature": "(staging: Path)",
+      "returns": "str | None",
+      "doc": "Return an error if the staging worktree is still mid-merge."
+    },
+    {
+      "name": "check_integrator_commit",
+      "qualname": "check_integrator_commit",
+      "async": true,
+      "lineno": 5295,
+      "end_lineno": 5308,
+      "span": 14,
+      "decorators": [],
+      "signature": "(staging: Path)",
+      "returns": "str | None",
+      "doc": "Return an error if the integrator's merge commit touched .leerie/ files."
+    },
+    {
+      "name": "check_branch_has_commits",
+      "qualname": "check_branch_has_commits",
+      "async": true,
+      "lineno": 5313,
+      "end_lineno": 5338,
+      "span": 26,
+      "decorators": [],
+      "signature": "(sid: str, worktree: str, parent_branch: str)",
+      "returns": "tuple[str, str] | None",
+      "doc": "Return `(failure_kind, message)` if the implementer's subtask"
+    },
+    {
+      "name": "scan_conflict_markers",
+      "qualname": "scan_conflict_markers",
+      "async": true,
+      "lineno": 5343,
+      "end_lineno": 5361,
+      "span": 19,
+      "decorators": [],
+      "signature": "(staging: Path)",
+      "returns": "str | None",
+      "doc": "Return error if unresolved conflict markers remain in the staging tree."
+    },
+    {
+      "name": "validate_resume_state",
+      "qualname": "validate_resume_state",
+      "async": false,
+      "lineno": 5366,
+      "end_lineno": 5391,
+      "span": 26,
+      "decorators": [],
+      "signature": "(data: dict)",
+      "returns": "None",
+      "doc": "Assert the structure of a loaded state.json before resuming. A corrupt"
+    },
+    {
+      "name": "_is_auth_or_quota_failure",
+      "qualname": "_is_auth_or_quota_failure",
+      "async": false,
+      "lineno": 5401,
+      "end_lineno": 5418,
+      "span": 18,
+      "decorators": [],
+      "signature": "(envelope: dict)",
+      "returns": "bool",
+      "doc": "True if the `claude -p` envelope looks like a 401/429/auth-message"
+    },
+    {
+      "name": "_extract_tool_result_text",
+      "qualname": "_extract_tool_result_text",
+      "async": false,
+      "lineno": 5421,
+      "end_lineno": 5434,
+      "span": 14,
+      "decorators": [],
+      "signature": "(block: dict)",
+      "returns": "str",
+      "doc": "Tool-result `content` is either a string or a list of content"
+    },
+    {
+      "name": "_tag_each_line",
+      "qualname": "_tag_each_line",
+      "async": false,
+      "lineno": 5437,
+      "end_lineno": 5472,
+      "span": 36,
+      "decorators": [],
+      "signature": "(prefix: str, content: str)",
+      "returns": "str",
+      "doc": "Prefix the first non-empty line of `content` with `prefix`;"
+    },
+    {
+      "name": "_summarize_tool_use",
+      "qualname": "_summarize_tool_use",
+      "async": false,
+      "lineno": 5475,
+      "end_lineno": 5514,
+      "span": 40,
+      "decorators": [],
+      "signature": "(sid: str, block: dict, verbosity: str)",
+      "returns": "str",
+      "doc": "Map one `tool_use` content block to a one-line inline summary."
+    },
+    {
+      "name": "_summarize_stream_event",
+      "qualname": "_summarize_stream_event",
+      "async": false,
+      "lineno": 5517,
+      "end_lineno": 5671,
+      "span": 155,
+      "decorators": [],
+      "signature": "(sid: str, event: dict, verbosity: str)",
+      "returns": "str | None",
+      "doc": "Return the one-line inline-log summary for one stream event, or"
+    },
+    {
+      "name": "_format_progress_prefix",
+      "qualname": "_format_progress_prefix",
+      "async": false,
+      "lineno": 5674,
+      "end_lineno": 5697,
+      "span": 24,
+      "decorators": [],
+      "signature": "(prog: tuple[int, int, int, int, int] | None)",
+      "returns": "str",
+      "doc": "Render the activity prefix from a `_get_progress` tuple, or \"\" when"
+    },
+    {
+      "name": "_get_progress",
+      "qualname": "_get_progress",
+      "async": false,
+      "lineno": 5700,
+      "end_lineno": 5743,
+      "span": 44,
+      "decorators": [],
+      "signature": "(st: 'State')",
+      "returns": "tuple[int, int, int, int, int] | None",
+      "doc": "Return (running, in_conformer, done, wave_idx, wave_total) for the"
+    },
+    {
+      "name": "_detect_cgroup_root",
+      "qualname": "_detect_cgroup_root",
+      "async": false,
+      "lineno": 5787,
+      "end_lineno": 5804,
+      "span": 18,
+      "decorators": [],
+      "signature": "()",
+      "returns": "Path",
+      "doc": "Pick the cgroup root for worker subtrees. Prefer the delegated"
+    },
+    {
+      "name": "_cgroup_probe",
+      "qualname": "_cgroup_probe",
+      "async": false,
+      "lineno": 5807,
+      "end_lineno": 5852,
+      "span": 46,
+      "decorators": [],
+      "signature": "()",
+      "returns": "bool",
+      "doc": "Once-per-run probe: can we create cgroups under the detected"
+    },
+    {
+      "name": "_cgroup_create",
+      "qualname": "_cgroup_create",
+      "async": false,
+      "lineno": 5855,
+      "end_lineno": 5879,
+      "span": 25,
+      "decorators": [],
+      "signature": "(sid: str, memory_max_bytes: int, pids_max: int)",
+      "returns": "Path | None",
+      "doc": "Create a child cgroup for a worker and set its caps. Returns the"
+    },
+    {
+      "name": "_cgroup_enroll",
+      "qualname": "_cgroup_enroll",
+      "async": false,
+      "lineno": 5882,
+      "end_lineno": 5893,
+      "span": 12,
+      "decorators": [],
+      "signature": "(cgroup_path: Path, pid: int)",
+      "returns": "bool",
+      "doc": "Move `pid` into the cgroup. Called immediately after the worker"
+    },
+    {
+      "name": "_cgroup_destroy",
+      "qualname": "_cgroup_destroy",
+      "async": false,
+      "lineno": 5896,
+      "end_lineno": 5909,
+      "span": 14,
+      "decorators": [],
+      "signature": "(cgroup_path: Path | None)",
+      "returns": "None",
+      "doc": "Tear down the worker's cgroup. Best-effort:"
+    },
+    {
+      "name": "_invoke",
+      "qualname": "_invoke",
+      "async": true,
+      "lineno": 5912,
+      "end_lineno": 6251,
+      "span": 340,
+      "decorators": [],
+      "signature": "(cmd: list[str], cwd: str, timeout: int, sid: str, leerie_dir: Path, verbosity: str, progress: Callable[[], tuple[int, int, int, int] | None] | None = None, idle_warn_sec: float | None = None, worker_memory_max_bytes: int | None = None, worker_pids_max: int | None = None)",
+      "returns": "dict",
+      "doc": "Run a `claude -p` command, streaming events as they arrive."
+    },
+    {
+      "name": "_capture_call",
+      "qualname": "_capture_call",
+      "async": false,
+      "lineno": 6254,
+      "end_lineno": 6264,
+      "span": 11,
+      "decorators": [],
+      "signature": "(run_dir: Path, record: dict)",
+      "returns": "None",
+      "doc": "Append one NDJSON record to calls.ndjson with fsync-per-line durability."
+    },
+    {
+      "name": "_collect_memory_sample",
+      "qualname": "_collect_memory_sample",
+      "async": false,
+      "lineno": 6267,
+      "end_lineno": 6316,
+      "span": 50,
+      "decorators": [],
+      "signature": "(st: 'State')",
+      "returns": "dict",
+      "doc": "Snapshot orchestrator RSS / current phase / worker count / open FDs /"
+    },
+    {
+      "name": "_memory_sampler",
+      "qualname": "_memory_sampler",
+      "async": true,
+      "lineno": 6319,
+      "end_lineno": 6361,
+      "span": 43,
+      "decorators": [],
+      "signature": "(st: 'State', interval_sec: float = 30.0)",
+      "returns": "None",
+      "doc": "Periodic orchestrator-memory sample for leak detection."
+    },
+    {
+      "name": "claude_p",
+      "qualname": "claude_p",
+      "async": true,
+      "lineno": 6364,
+      "end_lineno": 6611,
+      "span": 248,
+      "decorators": [],
+      "signature": "(user_prompt: str, system_prompt: str, *, schema_key: str, cwd: str, allowed_tools: str, max_turns: int, autonomous: bool, caps: dict, st: 'State', model: str, sid: str, add_dirs: list[str] | None = None, effort: str | None = None, _suppress_capture: bool = False)",
+      "returns": "dict",
+      "doc": "Run one headless Claude Code worker and return its validated"
+    },
+    {
+      "name": "replay_capture",
+      "qualname": "replay_capture",
+      "async": true,
+      "lineno": 6614,
+      "end_lineno": 6678,
+      "span": 65,
+      "decorators": [],
+      "signature": "(record: dict, *, override_system_prompt: str | None = None, cwd: str | None = None)",
+      "returns": "tuple[dict, dict]",
+      "doc": "Replay one captured call from a calls.ndjson record."
+    },
+    {
+      "name": "_accumulate_telemetry",
+      "qualname": "_accumulate_telemetry",
+      "async": false,
+      "lineno": 6681,
+      "end_lineno": 6691,
+      "span": 11,
+      "decorators": [],
+      "signature": "(data: dict, envelope: dict)",
+      "returns": "None",
+      "doc": "Accumulate run-weight signals from a worker envelope into `data`."
+    },
+    {
+      "name": "judge_capture",
+      "qualname": "judge_capture",
+      "async": true,
+      "lineno": 6879,
+      "end_lineno": 6927,
+      "span": 49,
+      "decorators": [],
+      "signature": "(record: dict, models: dict[str, str], efforts: dict[str, str | None], caps: dict, st: 'State')",
+      "returns": "dict",
+      "doc": "Run a judge worker against one captured call record."
+    },
+    {
+      "name": "phase_judge",
+      "qualname": "phase_judge",
+      "async": true,
+      "lineno": 6930,
+      "end_lineno": 6998,
+      "span": 69,
+      "decorators": [],
+      "signature": "(run_dir: Path, judge_out_dir: Path, caps: dict, st: 'State', models: dict[str, str], efforts: dict[str, str | None], judge_call_types: list[str] | None = None)",
+      "returns": "dict",
+      "doc": "Judge all captured call records in run_dir/calls.ndjson."
+    },
+    {
+      "name": "heal_baseline",
+      "qualname": "heal_baseline",
+      "async": true,
+      "lineno": 7053,
+      "end_lineno": 7132,
+      "span": 80,
+      "decorators": [],
+      "signature": "(call_type: str, failing_records: list[dict], n: int, heal_dir: Path, caps: dict, st: 'State', models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "HealState",
+      "doc": "Run n unpatched replays per failing capture to establish a noise-floor."
+    },
+    {
+      "name": "heal_apply_patch",
+      "qualname": "heal_apply_patch",
+      "async": false,
+      "lineno": 7135,
+      "end_lineno": 7158,
+      "span": 24,
+      "decorators": [],
+      "signature": "(call_type: str, iter_n: int, patch_text: str, anchor_match: str, heal_dir: Path, failing_records: list[dict])",
+      "returns": "list[Path]",
+      "doc": "Materialise per-sample patched prompts under iter-<N>/patched-prompts/."
+    },
+    {
+      "name": "heal_replay_patched",
+      "qualname": "heal_replay_patched",
+      "async": true,
+      "lineno": 7161,
+      "end_lineno": 7260,
+      "span": 100,
+      "decorators": [],
+      "signature": "(call_type: str, iter_n: int, n: int, heal_dir: Path, caps: dict, st: 'State', models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "HealState",
+      "doc": "Run n patched replays per failing capture and append an iteration record."
+    },
+    {
+      "name": "check_convergence",
+      "qualname": "check_convergence",
+      "async": false,
+      "lineno": 7263,
+      "end_lineno": 7323,
+      "span": 61,
+      "decorators": [],
+      "signature": "(state: HealState, config: dict)",
+      "returns": "str",
+      "doc": "Evaluate whether the heal loop has converged."
+    },
+    {
+      "name": "write_heal_report",
+      "qualname": "write_heal_report",
+      "async": false,
+      "lineno": 7326,
+      "end_lineno": 7378,
+      "span": 53,
+      "decorators": [],
+      "signature": "(call_type: str, state: HealState, best_patch_text: str = '')",
+      "returns": "Path",
+      "doc": "Render a markdown heal report to <heal_dir>/<call_type>/healing-<call_type>.md."
+    },
+    {
+      "name": "request_patch",
+      "qualname": "request_patch",
+      "async": true,
+      "lineno": 7381,
+      "end_lineno": 7468,
+      "span": 88,
+      "decorators": [],
+      "signature": "(state: HealState, iter_n: int, st: 'State', caps: dict, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "tuple[str, str]",
+      "doc": "Invoke the patch-generator worker to propose a minimal prompt edit."
+    },
+    {
+      "name": "phase_heal",
+      "qualname": "phase_heal",
+      "async": true,
+      "lineno": 7471,
+      "end_lineno": 7556,
+      "span": 86,
+      "decorators": [],
+      "signature": "(call_type: str, failing_records: list[dict], heal_dir: Path, caps: dict, st: 'State', models: dict[str, str], efforts: dict[str, str | None], request_patch_fn = None, n: int = HEAL_N_REPLAYS_DEFAULT, config: dict | None = None)",
+      "returns": "str",
+      "doc": "Drive the full heal loop for one call_type."
+    },
+    {
+      "name": "run_setup_hook",
+      "qualname": "run_setup_hook",
+      "async": true,
+      "lineno": 7572,
+      "end_lineno": 7641,
+      "span": 70,
+      "decorators": [],
+      "signature": "(repo_root: Path, log_dir: Path, st: 'State')",
+      "returns": "None",
+      "doc": "Execute `<repo>/.leerie-setup.sh` if present. Idempotent via"
+    },
+    {
+      "name": "_existing_mise_toml_path",
+      "qualname": "_existing_mise_toml_path",
+      "async": false,
+      "lineno": 7649,
+      "end_lineno": 7661,
+      "span": 13,
+      "decorators": [],
+      "signature": "(repo_root: Path)",
+      "returns": "Path | None",
+      "doc": "Return the path to whichever of `mise.toml` or `.mise.toml`"
+    },
+    {
+      "name": "_go_already_pinned",
+      "qualname": "_go_already_pinned",
+      "async": false,
+      "lineno": 7664,
+      "end_lineno": 7696,
+      "span": 33,
+      "decorators": [],
+      "signature": "(repo_root: Path)",
+      "returns": "bool",
+      "doc": "Return True if the repo already specifies a Go version mise would"
+    },
+    {
+      "name": "_existing_mise_toml_tool_keys",
+      "qualname": "_existing_mise_toml_tool_keys",
+      "async": false,
+      "lineno": 7733,
+      "end_lineno": 7755,
+      "span": 23,
+      "decorators": [],
+      "signature": "(text: str | None)",
+      "returns": "set[str]",
+      "doc": "Return the set of tool keys pinned by a `[tools]` section in the"
+    },
+    {
+      "name": "_read_idiomatic_pins",
+      "qualname": "_read_idiomatic_pins",
+      "async": false,
+      "lineno": 7758,
+      "end_lineno": 7818,
+      "span": 61,
+      "decorators": [],
+      "signature": "(repo_root: Path, already_pinned: set[str])",
+      "returns": "list[tuple[str, str]]",
+      "doc": "Return [(tool, version), ...] for every idiomatic version file in"
+    },
+    {
+      "name": "synth_mise_go_override",
+      "qualname": "synth_mise_go_override",
+      "async": false,
+      "lineno": 7821,
+      "end_lineno": 7947,
+      "span": 127,
+      "decorators": [],
+      "signature": "(repo_root: Path, run_dir: Path)",
+      "returns": "Path | None",
+      "doc": "If `go.mod` exists and no other Go pin is in place, write a mise"
+    },
+    {
+      "name": "_repo_has_version_signal",
+      "qualname": "_repo_has_version_signal",
+      "async": false,
+      "lineno": 7965,
+      "end_lineno": 7976,
+      "span": 12,
+      "decorators": [],
+      "signature": "(repo_root: Path, override_file: Path | None)",
+      "returns": "bool",
+      "doc": "Return True if the repo declares any runtime version pin mise"
+    },
+    {
+      "name": "run_mise_install",
+      "qualname": "run_mise_install",
+      "async": true,
+      "lineno": 7979,
+      "end_lineno": 8066,
+      "span": 88,
+      "decorators": [],
+      "signature": "(repo_root: Path, log_dir: Path, st: 'State', override_file: Path | None = None)",
+      "returns": "None",
+      "doc": "Invoke `mise install` at the repo root. If `override_file` is"
+    },
+    {
+      "name": "phase_classify",
+      "qualname": "phase_classify",
+      "async": true,
+      "lineno": 8072,
+      "end_lineno": 8125,
+      "span": 54,
+      "decorators": [],
+      "signature": "(task: str, st: State, caps: dict, clarify: bool, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "dict",
+      "doc": "Phase 1 (classify), which also produces the Clarify sub-step's"
+    },
+    {
+      "name": "gather_answers",
+      "qualname": "gather_answers",
+      "async": false,
+      "lineno": 8128,
+      "end_lineno": 8173,
+      "span": 46,
+      "decorators": [],
+      "signature": "(st: State, supplied: dict | None)",
+      "returns": "dict",
+      "doc": "Collect clarification answers \u2014 from --answers, from the resolved"
+    },
+    {
+      "name": "absorb_supplied_answers",
+      "qualname": "absorb_supplied_answers",
+      "async": false,
+      "lineno": 8176,
+      "end_lineno": 8238,
+      "span": 63,
+      "decorators": [],
+      "signature": "(args, st: State, leerie_dir: Path)",
+      "returns": "None",
+      "doc": "Merge --answers FILE into st.data['answers'] and propagate the"
+    },
+    {
+      "name": "surface_clarification",
+      "qualname": "surface_clarification",
+      "async": false,
+      "lineno": 8241,
+      "end_lineno": 8286,
+      "span": 46,
+      "decorators": [],
+      "signature": "(sid: str, question: dict, checkpoint_path: str, st: State)",
+      "returns": "bool",
+      "doc": "Surface a mid-execution clarification question to the user"
+    },
+    {
+      "name": "_format_provision_user_prompt",
+      "qualname": "_format_provision_user_prompt",
+      "async": false,
+      "lineno": 8289,
+      "end_lineno": 8317,
+      "span": 29,
+      "decorators": [],
+      "signature": "(fixtures: dict, task: str)",
+      "returns": "str",
+      "doc": "Compose the LLM-fallback user prompt from the assembled fixture"
+    },
+    {
+      "name": "phase_provision",
+      "qualname": "phase_provision",
+      "async": true,
+      "lineno": 8320,
+      "end_lineno": 8471,
+      "span": 152,
+      "decorators": [],
+      "signature": "(repo_root: Path, st: State, caps: dict, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "None",
+      "doc": "Phase 1\u00bd: per-repo dependency *detection*."
+    },
+    {
+      "name": "_select_best_planner_sample",
+      "qualname": "_select_best_planner_sample",
+      "async": false,
+      "lineno": 8474,
+      "end_lineno": 8496,
+      "span": 23,
+      "decorators": [],
+      "signature": "(samples: list[dict], repo_root: Path, domain: str)",
+      "returns": "dict",
+      "doc": "Mechanically select the best planner sample for a domain."
+    },
+    {
+      "name": "phase_plan",
+      "qualname": "phase_plan",
+      "async": true,
+      "lineno": 8499,
+      "end_lineno": 8637,
+      "span": 139,
+      "decorators": [],
+      "signature": "(task: str, st: State, caps: dict, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "list[dict]",
+      "doc": "Phase 2: one planner per category, run in parallel (bounded by"
+    },
+    {
+      "name": "_promote_external_collisions",
+      "qualname": "_promote_external_collisions",
+      "async": false,
+      "lineno": 8640,
+      "end_lineno": 8664,
+      "span": 25,
+      "decorators": [],
+      "signature": "(plans: list[dict])",
+      "returns": "int",
+      "doc": "In-place: for every `requires` entry with `extent: external` whose"
+    },
+    {
+      "name": "_collect_external_preconditions",
+      "qualname": "_collect_external_preconditions",
+      "async": false,
+      "lineno": 8667,
+      "end_lineno": 8697,
+      "span": 31,
+      "decorators": [],
+      "signature": "(plans: list[dict])",
+      "returns": "list[dict]",
+      "doc": "Walk plans and return the deduped list of planner-declared"
+    },
+    {
+      "name": "_compute_unresolved_requires",
+      "qualname": "_compute_unresolved_requires",
+      "async": false,
+      "lineno": 8700,
+      "end_lineno": 8739,
+      "span": 40,
+      "decorators": [],
+      "signature": "(plans: list[dict])",
+      "returns": "list[dict]",
+      "doc": "Pure-Python lookup: every (sid, tag, domain) where a subtask"
+    },
+    {
+      "name": "_find_oversized_added_subtasks",
+      "qualname": "_find_oversized_added_subtasks",
+      "async": false,
+      "lineno": 8742,
+      "end_lineno": 8761,
+      "span": 20,
+      "decorators": [],
+      "signature": "(plans: list[dict])",
+      "returns": "list[dict]",
+      "doc": "Pure-Python lookup: every reconciler-added subtask (carrying"
+    },
+    {
+      "name": "_apply_reconciler_output",
+      "qualname": "_apply_reconciler_output",
+      "async": false,
+      "lineno": 8764,
+      "end_lineno": 9157,
+      "span": 394,
+      "decorators": [],
+      "signature": "(plans: list[dict], output: dict, attempt_1_renames: list[dict] | None = None)",
+      "returns": "list[dict]",
+      "doc": "Mutate `plans` per the reconciler's output. On success, returns"
+    },
+    {
+      "name": "phase_reconcile",
+      "qualname": "phase_reconcile",
+      "async": true,
+      "lineno": 9160,
+      "end_lineno": 9736,
+      "span": 577,
+      "decorators": [],
+      "signature": "(plans: list[dict], task: str, st: State, caps: dict, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "list[dict]",
+      "doc": "Phase 2\u00bd: reconcile cross-domain capability-tag drift between"
+    },
+    {
+      "name": "_tarjan_sccs",
+      "qualname": "_tarjan_sccs",
+      "async": false,
+      "lineno": 9739,
+      "end_lineno": 9807,
+      "span": 69,
+      "decorators": [],
+      "signature": "(nodes: set[str], succ: dict[str, set[str]])",
+      "returns": "list[list[str]]",
+      "doc": "Tarjan's strongly-connected-components algorithm."
+    },
+    {
+      "name": "_attribute_cycle_edges",
+      "qualname": "_attribute_cycle_edges",
+      "async": false,
+      "lineno": 9810,
+      "end_lineno": 9873,
+      "span": 64,
+      "decorators": [],
+      "signature": "(scc: list[str], succ: dict[str, set[str]], edge_sources: dict[tuple[str, str], str], output: dict, subtasks: dict[str, dict])",
+      "returns": "list[dict]",
+      "doc": "For each edge inside an SCC, attribute it back to the reconciler"
+    },
+    {
+      "name": "_format_cycle_diagnostic",
+      "qualname": "_format_cycle_diagnostic",
+      "async": false,
+      "lineno": 9876,
+      "end_lineno": 9916,
+      "span": 41,
+      "decorators": [],
+      "signature": "(sccs: list[list[str]], succ: dict[str, set[str]], edge_sources: dict[tuple[str, str], str], output: dict, subtasks: dict[str, dict])",
+      "returns": "str",
+      "doc": "Render an SCC list + edge attributions into the multi-line"
+    },
+    {
+      "name": "_shared_files_in_scc",
+      "qualname": "_shared_files_in_scc",
+      "async": false,
+      "lineno": 9919,
+      "end_lineno": 9934,
+      "span": 16,
+      "decorators": [],
+      "signature": "(scc: list[str], subtasks: dict[str, dict])",
+      "returns": "list[str]",
+      "doc": "Files that appear in `files_likely_touched` of \u2265 2 SCC members."
+    },
+    {
+      "name": "_original_tag_for_rename_edge",
+      "qualname": "_original_tag_for_rename_edge",
+      "async": false,
+      "lineno": 9937,
+      "end_lineno": 9967,
+      "span": 31,
+      "decorators": [],
+      "signature": "(edge: dict, output: dict)",
+      "returns": "str",
+      "doc": "Given a cycle-edge dict (from `_attribute_cycle_edges`) and the"
+    },
+    {
+      "name": "_recommend_cycle_resolution",
+      "qualname": "_recommend_cycle_resolution",
+      "async": false,
+      "lineno": 9970,
+      "end_lineno": 10165,
+      "span": 196,
+      "decorators": [],
+      "signature": "(scc: list[str], succ: dict[str, set[str]], edge_sources: dict[tuple[str, str], str], subtasks: dict[str, dict], output: dict, pre_providers: dict[str, list[str]])",
+      "returns": "dict",
+      "doc": "Deterministic recommendation for breaking one SCC."
+    },
+    {
+      "name": "_format_recommendation",
+      "qualname": "_format_recommendation",
+      "async": false,
+      "lineno": 10168,
+      "end_lineno": 10188,
+      "span": 21,
+      "decorators": [],
+      "signature": "(rec: dict)",
+      "returns": "str",
+      "doc": "Render a recommendation dict (from `_recommend_cycle_resolution`)"
+    },
+    {
+      "name": "_format_must_include",
+      "qualname": "_format_must_include",
+      "async": false,
+      "lineno": 10191,
+      "end_lineno": 10228,
+      "span": 38,
+      "decorators": [],
+      "signature": "(scc: list[str], edges: list[dict], output: dict)",
+      "returns": "list[str]",
+      "doc": "For one SCC, list the bounded set of legal cycle-breaking"
+    },
+    {
+      "name": "_build_cycle_retry_prompt",
+      "qualname": "_build_cycle_retry_prompt",
+      "async": false,
+      "lineno": 10231,
+      "end_lineno": 10319,
+      "span": 89,
+      "decorators": [],
+      "signature": "(sccs: list[list[str]], succ: dict[str, set[str]], edge_sources: dict[tuple[str, str], str], output: dict, subtasks: dict[str, dict], recommendations: list[dict], original_user_prompt: str)",
+      "returns": "str",
+      "doc": "Build the retry prompt sent to the reconciler when the"
+    },
+    {
+      "name": "_build_size_retry_prompt",
+      "qualname": "_build_size_retry_prompt",
+      "async": false,
+      "lineno": 10322,
+      "end_lineno": 10390,
+      "span": 69,
+      "decorators": [],
+      "signature": "(oversized: list[dict], original_user_prompt: str)",
+      "returns": "str",
+      "doc": "Build the retry prompt sent to the reconciler when the size gate"
+    },
+    {
+      "name": "_matches_recommendation",
+      "qualname": "_matches_recommendation",
+      "async": false,
+      "lineno": 10393,
+      "end_lineno": 10407,
+      "span": 15,
+      "decorators": [],
+      "signature": "(option_str: str, rec: dict)",
+      "returns": "bool",
+      "doc": "Whether a must-include option string matches the recommendation"
+    },
+    {
+      "name": "_validate_must_include",
+      "qualname": "_validate_must_include",
+      "async": false,
+      "lineno": 10410,
+      "end_lineno": 10452,
+      "span": 43,
+      "decorators": [],
+      "signature": "(output: dict, sccs: list[list[str]])",
+      "returns": "list[str]",
+      "doc": "For each SCC, check that the reconciler's revised output includes"
+    },
+    {
+      "name": "_tag_jaccard",
+      "qualname": "_tag_jaccard",
+      "async": false,
+      "lineno": 10455,
+      "end_lineno": 10472,
+      "span": 18,
+      "decorators": [],
+      "signature": "(a: str, b: str)",
+      "returns": "float",
+      "doc": "Token-set Jaccard similarity over hyphen-split tokens."
+    },
+    {
+      "name": "_recommend_unresolved_resolution",
+      "qualname": "_recommend_unresolved_resolution",
+      "async": false,
+      "lineno": 10475,
+      "end_lineno": 10572,
+      "span": 98,
+      "decorators": [],
+      "signature": "(consumer_sid: str, unresolved_tag: str, providers: dict[str, list[str]], output: dict)",
+      "returns": "dict | None",
+      "doc": "Deterministic recommendation for resolving one unresolved"
+    },
+    {
+      "name": "_build_unresolved_retry_prompt",
+      "qualname": "_build_unresolved_retry_prompt",
+      "async": false,
+      "lineno": 10575,
+      "end_lineno": 10728,
+      "span": 154,
+      "decorators": [],
+      "signature": "(unresolved: list[dict], providers: dict[str, list[str]], recommendations: dict[tuple[str, str], dict | None], output: dict, original_user_prompt: str)",
+      "returns": "str",
+      "doc": "Build the retry prompt sent to the reconciler when the"
+    },
+    {
+      "name": "_validate_unresolved_must_include",
+      "qualname": "_validate_unresolved_must_include",
+      "async": false,
+      "lineno": 10731,
+      "end_lineno": 10863,
+      "span": 133,
+      "decorators": [],
+      "signature": "(output: dict, unresolved: list[dict], attempt_1_output: dict | None)",
+      "returns": "list[str]",
+      "doc": "For each unresolved (sid, tag), check the reconciler's revised"
+    },
+    {
+      "name": "_compute_overlap_anchors",
+      "qualname": "_compute_overlap_anchors",
+      "async": false,
+      "lineno": 10893,
+      "end_lineno": 10915,
+      "span": 23,
+      "decorators": [],
+      "signature": "(collisions: list[dict])",
+      "returns": "set[str]",
+      "doc": "An *anchor* is a sid that appears in two or more non-"
+    },
+    {
+      "name": "_validate_overlap_judge_output",
+      "qualname": "_validate_overlap_judge_output",
+      "async": false,
+      "lineno": 10918,
+      "end_lineno": 11015,
+      "span": 98,
+      "decorators": [],
+      "signature": "(output: dict, subtasks_by_id: dict[str, dict])",
+      "returns": "None",
+      "doc": "Apply the merge-feasibility backstop and structural sanity checks"
+    },
+    {
+      "name": "_apply_overlap_drop",
+      "qualname": "_apply_overlap_drop",
+      "async": false,
+      "lineno": 11018,
+      "end_lineno": 11124,
+      "span": 107,
+      "decorators": [],
+      "signature": "(plans: list[dict], dropped_sid: str, surviving_sid: str)",
+      "returns": "None",
+      "doc": "Remove `dropped_sid` from its plan, union its `provides` tags"
+    },
+    {
+      "name": "_apply_overlap_merge",
+      "qualname": "_apply_overlap_merge",
+      "async": false,
+      "lineno": 11127,
+      "end_lineno": 11319,
+      "span": 193,
+      "decorators": [],
+      "signature": "(plans: list[dict], a_sid: str, b_sid: str, artifact: str, merge_feasibility: str, survivor_hint: str | None = None)",
+      "returns": "str",
+      "doc": "Collapse `a_sid` and `b_sid` into one subtask. Returns the"
+    },
+    {
+      "name": "_apply_overlap_collisions",
+      "qualname": "_apply_overlap_collisions",
+      "async": false,
+      "lineno": 11322,
+      "end_lineno": 11475,
+      "span": 154,
+      "decorators": [],
+      "signature": "(plans: list[dict], collisions: list[dict])",
+      "returns": "list[dict]",
+      "doc": "Apply a validated list of overlap-judge collisions to `plans`"
+    },
+    {
+      "name": "phase_overlap_judge",
+      "qualname": "phase_overlap_judge",
+      "async": true,
+      "lineno": 11478,
+      "end_lineno": 11688,
+      "span": 211,
+      "decorators": [],
+      "signature": "(plans: list[dict], task: str, st: State, caps: dict, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "list[dict]",
+      "doc": "Phase 2\u00be: detect cross-planner surface-overlap collisions"
+    },
+    {
+      "name": "_build_predecessor_graph",
+      "qualname": "_build_predecessor_graph",
+      "async": false,
+      "lineno": 11691,
+      "end_lineno": 11742,
+      "span": 52,
+      "decorators": [],
+      "signature": "(subtasks: dict[str, dict])",
+      "returns": "tuple[dict[str, set[str]], dict[str, list[str]], dict[tuple[str, str], str]]",
+      "doc": "Build the predecessor graph from a merged subtasks dict."
+    },
+    {
+      "name": "detect_no_work",
+      "qualname": "detect_no_work",
+      "async": false,
+      "lineno": 11745,
+      "end_lineno": 11773,
+      "span": 29,
+      "decorators": [],
+      "signature": "(plans: list[dict])",
+      "returns": "dict[str, str] | None",
+      "doc": "Return a `{domain: basis}` map iff *every* plan satisfies"
+    },
+    {
+      "name": "_finish_no_work_run",
+      "qualname": "_finish_no_work_run",
+      "async": false,
+      "lineno": 11776,
+      "end_lineno": 11818,
+      "span": 43,
+      "decorators": [],
+      "signature": "(st: State, no_work_map: dict[str, str])",
+      "returns": "None",
+      "doc": "Terminal-state handler for the cleared-but-empty case"
+    },
+    {
+      "name": "schedule",
+      "qualname": "schedule",
+      "async": false,
+      "lineno": 11821,
+      "end_lineno": 11870,
+      "span": 50,
+      "decorators": [],
+      "signature": "(plans: list[dict])",
+      "returns": "tuple[dict, list[list[str]]]",
+      "doc": "Phase 3 (pure Python): merge plans, resolve intra- and cross-domain"
+    },
+    {
+      "name": "check_budget_feasibility",
+      "qualname": "check_budget_feasibility",
+      "async": false,
+      "lineno": 11873,
+      "end_lineno": 11934,
+      "span": 62,
+      "decorators": [],
+      "signature": "(st: State, caps: dict, subtasks: dict, waves: list[list[str]])",
+      "returns": "None",
+      "doc": "Phase 3 pure-Python gate (DESIGN \u00a713 *Budget feasibility \u2014 fail"
+    },
+    {
+      "name": "_write_subtask_artifacts",
+      "qualname": "_write_subtask_artifacts",
+      "async": false,
+      "lineno": 11937,
+      "end_lineno": 11958,
+      "span": 22,
+      "decorators": [],
+      "signature": "(leerie_dir: Path, sid: str, artifacts: list)",
+      "returns": "None",
+      "doc": "Persist a subtask's `artifacts` result field to"
+    },
+    {
+      "name": "_read_upstream_artifacts",
+      "qualname": "_read_upstream_artifacts",
+      "async": false,
+      "lineno": 11961,
+      "end_lineno": 11981,
+      "span": 21,
+      "decorators": [],
+      "signature": "(leerie_dir: Path, predecessor_ids: list[str])",
+      "returns": "list[dict]",
+      "doc": "Read the artifacts files for `predecessor_ids` and return them"
+    },
+    {
+      "name": "_format_upstream_artifacts_for_sid",
+      "qualname": "_format_upstream_artifacts_for_sid",
+      "async": false,
+      "lineno": 11984,
+      "end_lineno": 12013,
+      "span": 30,
+      "decorators": [],
+      "signature": "(leerie_dir: Path, sid: str)",
+      "returns": "str | None",
+      "doc": "End-to-end helper: load the persisted plan, recompute the"
+    },
+    {
+      "name": "_format_upstream_artifacts_section",
+      "qualname": "_format_upstream_artifacts_section",
+      "async": false,
+      "lineno": 12016,
+      "end_lineno": 12043,
+      "span": 28,
+      "decorators": [],
+      "signature": "(payloads: list[dict])",
+      "returns": "str | None",
+      "doc": "Render upstream artifact payloads as a prompt section, or None"
+    },
+    {
+      "name": "write_plan",
+      "qualname": "write_plan",
+      "async": false,
+      "lineno": 12046,
+      "end_lineno": 12071,
+      "span": 26,
+      "decorators": [],
+      "signature": "(leerie_dir: Path, task: str, st: State, subtasks: dict, waves: list[list[str]])",
+      "returns": "None",
+      "doc": "Persist the merged plan and per-subtask spec files the implementers read."
+    },
+    {
+      "name": "_format_provision_recipe_section",
+      "qualname": "_format_provision_recipe_section",
+      "async": false,
+      "lineno": 12074,
+      "end_lineno": 12127,
+      "span": 54,
+      "decorators": [],
+      "signature": "(recipe: list[dict], *, audience: str)",
+      "returns": "str | None",
+      "doc": "Render the persisted provision recipe as a prompt section, or"
+    },
+    {
+      "name": "run_implementer",
+      "qualname": "run_implementer",
+      "async": true,
+      "lineno": 12130,
+      "end_lineno": 12238,
+      "span": 109,
+      "decorators": [],
+      "signature": "(sid: str, leerie_dir: Path, caps: dict, st: State, models: dict[str, str], efforts: dict[str, str | None], continuation: bool = False, note: str = '')",
+      "returns": "dict",
+      "doc": "Spawn one implementer for one subtask in its own worktree. Handles"
+    },
+    {
+      "name": "_retryable_failure",
+      "qualname": "_retryable_failure",
+      "async": false,
+      "lineno": 12268,
+      "end_lineno": 12282,
+      "span": 15,
+      "decorators": [],
+      "signature": "(kind: str)",
+      "returns": "bool",
+      "doc": "The retry policy, in one place. Dispatches on a structured"
+    },
+    {
+      "name": "discover_rules_files",
+      "qualname": "discover_rules_files",
+      "async": false,
+      "lineno": 12309,
+      "end_lineno": 12321,
+      "span": 13,
+      "decorators": [],
+      "signature": "(repo_root: Path)",
+      "returns": "list[Path]",
+      "doc": "Return existing rule-file paths from `_RULES_FILE_CANDIDATES`, in"
+    },
+    {
+      "name": "_infer_build_lint_test",
+      "qualname": "_infer_build_lint_test",
+      "async": false,
+      "lineno": 12324,
+      "end_lineno": 12360,
+      "span": 37,
+      "decorators": [],
+      "signature": "(repo_root: Path)",
+      "returns": "dict[str, str]",
+      "doc": "Best-effort guess at the repo's build / lint / test commands. Returns"
+    },
+    {
+      "name": "validate_conformance_result",
+      "qualname": "validate_conformance_result",
+      "async": false,
+      "lineno": 12363,
+      "end_lineno": 12416,
+      "span": 54,
+      "decorators": [],
+      "signature": "(result: dict, worktree: str)",
+      "returns": "str | None",
+      "doc": "Cross-field invariants for the conformer's structured output."
+    },
+    {
+      "name": "_branch_head_sha",
+      "qualname": "_branch_head_sha",
+      "async": true,
+      "lineno": 12419,
+      "end_lineno": 12425,
+      "span": 7,
+      "decorators": [],
+      "signature": "(worktree: str)",
+      "returns": "str",
+      "doc": "HEAD sha in the worktree, or empty string on failure. Used as the"
+    },
+    {
+      "name": "_protected_paths_since",
+      "qualname": "_protected_paths_since",
+      "async": true,
+      "lineno": 12428,
+      "end_lineno": 12449,
+      "span": 22,
+      "decorators": [],
+      "signature": "(worktree: str, before_sha: str)",
+      "returns": "list[str]",
+      "doc": "Return the list of protected paths the diff `before_sha..HEAD`"
+    },
+    {
+      "name": "rollback_conformer_commits",
+      "qualname": "rollback_conformer_commits",
+      "async": true,
+      "lineno": 12452,
+      "end_lineno": 12463,
+      "span": 12,
+      "decorators": [],
+      "signature": "(worktree: str, before_sha: str)",
+      "returns": "None",
+      "doc": "Hard-reset the subtask branch back to `before_sha`. Used when the"
+    },
+    {
+      "name": "_uncommitted_paths",
+      "qualname": "_uncommitted_paths",
+      "async": true,
+      "lineno": 12466,
+      "end_lineno": 12480,
+      "span": 15,
+      "decorators": [],
+      "signature": "(worktree: str)",
+      "returns": "list[str]",
+      "doc": "Return tracked-file paths with uncommitted changes in the worktree,"
+    },
+    {
+      "name": "_unprefixed_conformer_commits",
+      "qualname": "_unprefixed_conformer_commits",
+      "async": true,
+      "lineno": 12483,
+      "end_lineno": 12505,
+      "span": 23,
+      "decorators": [],
+      "signature": "(worktree: str, before_sha: str, prefix: str = 'conformer:')",
+      "returns": "list[str]",
+      "doc": "Return subject lines of commits between before_sha..HEAD whose"
+    },
+    {
+      "name": "run_conformer",
+      "qualname": "run_conformer",
+      "async": true,
+      "lineno": 12508,
+      "end_lineno": 12574,
+      "span": 67,
+      "decorators": [],
+      "signature": "(sid: str, leerie_dir: Path, worktree: str, caps: dict, st: State, models: dict[str, str], efforts: dict[str, str | None], rules_files: list[Path], blt_commands: dict[str, str], diff_base: str, extra_feedback: str | None = None)",
+      "returns": "dict | None",
+      "doc": "Spawn one conformer for one subtask in its existing worktree."
+    },
+    {
+      "name": "_summarize_residuals",
+      "qualname": "_summarize_residuals",
+      "async": false,
+      "lineno": 12577,
+      "end_lineno": 12590,
+      "span": 14,
+      "decorators": [],
+      "signature": "(conf_res: dict)",
+      "returns": "list[str]",
+      "doc": "One advisory string per residual / failing build-lint-test axis."
+    },
+    {
+      "name": "_confidence_axes_clear",
+      "qualname": "_confidence_axes_clear",
+      "async": false,
+      "lineno": 12593,
+      "end_lineno": 12604,
+      "span": 12,
+      "decorators": [],
+      "signature": "(conf: dict, axes: list[str], threshold: float = 9.0)",
+      "returns": "bool",
+      "doc": "True when every named axis in *conf* is a number >= *threshold*."
+    },
+    {
+      "name": "_format_check_feedback",
+      "qualname": "_format_check_feedback",
+      "async": false,
+      "lineno": 12607,
+      "end_lineno": 12627,
+      "span": 21,
+      "decorators": [],
+      "signature": "(issues: list[str], rnd: int, max_rounds: int)",
+      "returns": "str",
+      "doc": "Format a structured feedback block for a re-invocation."
+    },
+    {
+      "name": "_run_checked_loop",
+      "qualname": "_run_checked_loop",
+      "async": true,
+      "lineno": 12630,
+      "end_lineno": 12683,
+      "span": 54,
+      "decorators": [],
+      "signature": "(*, invoke: Callable[..., Awaitable[dict]], check: Callable[[dict], list[str]], name: str, max_rounds: int, make_feedback_prompt: Callable[[str], Awaitable[dict]] | None = None)",
+      "returns": "tuple[dict | None, list[str]]",
+      "doc": "Generic mechanical-feedback retry loop (CRITIC pattern)."
+    },
+    {
+      "name": "_conformance_clean",
+      "qualname": "_conformance_clean",
+      "async": false,
+      "lineno": 12686,
+      "end_lineno": 12696,
+      "span": 11,
+      "decorators": [],
+      "signature": "(conf_res: dict)",
+      "returns": "bool",
+      "doc": "True when the conformer reports no residuals and every axis is"
+    },
+    {
+      "name": "_iter_log_tool_use",
+      "qualname": "_iter_log_tool_use",
+      "async": false,
+      "lineno": 12723,
+      "end_lineno": 12777,
+      "span": 55,
+      "decorators": [],
+      "signature": "(log_path: Path)",
+      "returns": "Iterator[tuple[str, dict, str]]",
+      "doc": "Yield each Bash/BashOutput/KillBash/Read `tool_use` block from a"
+    },
+    {
+      "name": "_count_bash_axis_invocations",
+      "qualname": "_count_bash_axis_invocations",
+      "async": false,
+      "lineno": 12780,
+      "end_lineno": 12791,
+      "span": 12,
+      "decorators": [],
+      "signature": "(log_path: Path, axis_re: re.Pattern[str])",
+      "returns": "int",
+      "doc": "Count distinct Bash `tool_use` invocations in `log_path` whose"
+    },
+    {
+      "name": "_count_orphaned_bg_axis",
+      "qualname": "_count_orphaned_bg_axis",
+      "async": false,
+      "lineno": 12794,
+      "end_lineno": 12855,
+      "span": 62,
+      "decorators": [],
+      "signature": "(log_path: Path, axis_re: re.Pattern[str])",
+      "returns": "list[str]",
+      "doc": "Return the bash_ids of BLT commands matching `axis_re` that"
+    },
+    {
+      "name": "_emit_bash_axis_warnings",
+      "qualname": "_emit_bash_axis_warnings",
+      "async": false,
+      "lineno": 12858,
+      "end_lineno": 12883,
+      "span": 26,
+      "decorators": [],
+      "signature": "(log_path: Path, round_label: str, warnings: list[str])",
+      "returns": "None",
+      "doc": "Helper called once per conformer round: append advisory warnings"
+    },
+    {
+      "name": "_run_conformance_phase",
+      "qualname": "_run_conformance_phase",
+      "async": true,
+      "lineno": 12886,
+      "end_lineno": 12982,
+      "span": 97,
+      "decorators": [],
+      "signature": "(sid: str, leerie_dir: Path, worktree: str, subtask: dict, caps: dict, st: State, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "tuple[dict | None, list[str]]",
+      "doc": "Drive the orchestrator-level conformer loop for one subtask."
+    },
+    {
+      "name": "run_final_conformance",
+      "qualname": "run_final_conformance",
+      "async": true,
+      "lineno": 12985,
+      "end_lineno": 13169,
+      "span": 185,
+      "decorators": [],
+      "signature": "(leerie_dir: Path, st: State, caps: dict, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "None",
+      "doc": "Whole-tree conformance pass on the integrated staging worktree"
+    },
+    {
+      "name": "settle_subtask",
+      "qualname": "settle_subtask",
+      "async": true,
+      "lineno": 13172,
+      "end_lineno": 13456,
+      "span": 285,
+      "decorators": [],
+      "signature": "(sid: str, leerie_dir: Path, caps: dict, st: State, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "dict",
+      "doc": "Drive one subtask to a terminal state."
+    },
+    {
+      "name": "integrate_wave",
+      "qualname": "integrate_wave",
+      "async": true,
+      "lineno": 13459,
+      "end_lineno": 13572,
+      "span": 114,
+      "decorators": [],
+      "signature": "(wave: list[str], results: dict[str, dict], leerie_dir: Path, caps: dict, st: State, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "list[str]",
+      "doc": "Merge each completed subtask branch into staging (git merge, not"
+    },
+    {
+      "name": "phase_execute",
+      "qualname": "phase_execute",
+      "async": true,
+      "lineno": 13575,
+      "end_lineno": 13668,
+      "span": 94,
+      "decorators": [],
+      "signature": "(leerie_dir: Path, st: State, caps: dict, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "None",
+      "doc": "Phases 4-5: create staging, then run waves sequentially; within a wave,"
+    },
+    {
+      "name": "find_pr_template",
+      "qualname": "find_pr_template",
+      "async": false,
+      "lineno": 13705,
+      "end_lineno": 13750,
+      "span": 46,
+      "decorators": [],
+      "signature": "(repo_root: Path, override: str | None = None)",
+      "returns": "tuple[Path, str] | None",
+      "doc": "Locate the PR template the worker should fill out, or None when"
+    },
+    {
+      "name": "_cap_text",
+      "qualname": "_cap_text",
+      "async": false,
+      "lineno": 13770,
+      "end_lineno": 13789,
+      "span": 20,
+      "decorators": [],
+      "signature": "(s: str, max_bytes: int, label: str)",
+      "returns": "tuple[str, bool]",
+      "doc": "Return (capped_text, was_truncated). Cap `s` at `max_bytes` of"
+    },
+    {
+      "name": "_strip_leerie_prefix",
+      "qualname": "_strip_leerie_prefix",
+      "async": false,
+      "lineno": 13798,
+      "end_lineno": 13808,
+      "span": 11,
+      "decorators": [],
+      "signature": "(title: str)",
+      "returns": "str",
+      "doc": "Strip a leading `leerie:` from a worker-emitted PR title so the"
+    },
+    {
+      "name": "_truncate_diff_sample",
+      "qualname": "_truncate_diff_sample",
+      "async": false,
+      "lineno": 13811,
+      "end_lineno": 13825,
+      "span": 15,
+      "decorators": [],
+      "signature": "(diff_text: str, max_lines: int)",
+      "returns": "tuple[str, bool]",
+      "doc": "Return (truncated_text, was_truncated). Splits on newlines and"
+    },
+    {
+      "name": "_final_conformance_payload",
+      "qualname": "_final_conformance_payload",
+      "async": false,
+      "lineno": 13828,
+      "end_lineno": 13884,
+      "span": 57,
+      "decorators": [],
+      "signature": "(st: 'State')",
+      "returns": "dict | None",
+      "doc": "Compact view of the final-tree conformer pass for the pr_writer"
+    },
+    {
+      "name": "_compose_pr_via_llm",
+      "qualname": "_compose_pr_via_llm",
+      "async": true,
+      "lineno": 13887,
+      "end_lineno": 14064,
+      "span": 178,
+      "decorators": [],
+      "signature": "(st: 'State', caps: dict, models: dict[str, str], efforts: dict[str, str | None], repo_root: Path, pr_template_override: str | None)",
+      "returns": "None",
+      "doc": "Run the pr_writer worker and persist its title/body to run.json."
+    },
+    {
+      "name": "phase_finalize",
+      "qualname": "phase_finalize",
+      "async": true,
+      "lineno": 14067,
+      "end_lineno": 14171,
+      "span": 105,
+      "decorators": [],
+      "signature": "(leerie_dir: Path, st: State, no_push: bool, no_verify: bool, caps: dict | None = None, models: dict[str, str] | None = None, efforts: dict[str, str | None] | None = None, pr_template_override: str | None = None, host_no_push: bool | None = None)",
+      "returns": "None",
+      "doc": "Phase 6: verify the run branch and record finalize state."
+    },
+    {
+      "name": "orchestrate",
+      "qualname": "orchestrate",
+      "async": true,
+      "lineno": 14177,
+      "end_lineno": 14195,
+      "span": 19,
+      "decorators": [],
+      "signature": "(args, caps: dict, leerie_dir: Path, st: State, sot_pref: str, verbosity: str, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "None",
+      "doc": "The async portion of a run: every phase that spawns a `claude -p`"
+    },
+    {
+      "name": "_run_phases",
+      "qualname": "_run_phases",
+      "async": true,
+      "lineno": 14198,
+      "end_lineno": 14411,
+      "span": 214,
+      "decorators": [],
+      "signature": "(args, caps: dict, leerie_dir: Path, st: State, sot_pref: str, verbosity: str, models: dict[str, str], efforts: dict[str, str | None])",
+      "returns": "None",
+      "doc": "The phase sequence of one run. Split out from `orchestrate()`"
+    },
+    {
+      "name": "main",
+      "qualname": "main",
+      "async": false,
+      "lineno": 14414,
+      "end_lineno": 15174,
+      "span": 761,
+      "decorators": [],
+      "signature": "()",
+      "returns": "None",
+      "doc": null
+    }
+  ],
+  "classes": [
+    {
+      "name": "InterruptedBySignal",
+      "bases": [
+        "BaseException"
+      ],
+      "lineno": 1312,
+      "end_lineno": 1324,
+      "span": 13,
+      "doc": "Raised by signal handlers (SIGTERM, SIGHUP) installed in main().",
+      "methods": []
+    },
+    {
+      "name": "RateLimitedExit",
+      "bases": [
+        "BaseException"
+      ],
+      "lineno": 1327,
+      "end_lineno": 1348,
+      "span": 22,
+      "doc": "Raised when claude -p reports the Claude Code subscription",
+      "methods": [
+        {
+          "name": "__init__",
+          "qualname": "RateLimitedExit.__init__",
+          "async": false,
+          "lineno": 1345,
+          "end_lineno": 1348,
+          "span": 4,
+          "decorators": [],
+          "signature": "(self, reset_at: datetime | None, raw_message: str)",
+          "returns": null,
+          "doc": null
+        }
+      ]
+    },
+    {
+      "name": "_DescendantTracker",
+      "bases": [],
+      "lineno": 1490,
+      "end_lineno": 1575,
+      "span": 86,
+      "doc": "Background poller that accumulates every PID ever observed as a",
+      "methods": [
+        {
+          "name": "__init__",
+          "qualname": "_DescendantTracker.__init__",
+          "async": false,
+          "lineno": 1519,
+          "end_lineno": 1523,
+          "span": 5,
+          "decorators": [],
+          "signature": "(self, leader_pid: int)",
+          "returns": null,
+          "doc": null
+        },
+        {
+          "name": "start",
+          "qualname": "_DescendantTracker.start",
+          "async": false,
+          "lineno": 1525,
+          "end_lineno": 1528,
+          "span": 4,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "None",
+          "doc": "Spawn the polling task on the current event loop."
+        },
+        {
+          "name": "_poll_loop",
+          "qualname": "_DescendantTracker._poll_loop",
+          "async": true,
+          "lineno": 1530,
+          "end_lineno": 1552,
+          "span": 23,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "None",
+          "doc": null
+        },
+        {
+          "name": "stop_and_reap",
+          "qualname": "_DescendantTracker.stop_and_reap",
+          "async": true,
+          "lineno": 1554,
+          "end_lineno": 1575,
+          "span": 22,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "int",
+          "doc": "Stop polling, SIGKILL every accumulated PID, return the"
+        }
+      ]
+    },
+    {
+      "name": "WorkerError",
+      "bases": [
+        "RuntimeError"
+      ],
+      "lineno": 5397,
+      "end_lineno": 5398,
+      "span": 2,
+      "doc": null,
+      "methods": []
+    },
+    {
+      "name": "_ReplayState",
+      "bases": [],
+      "lineno": 6694,
+      "end_lineno": 6722,
+      "span": 29,
+      "doc": "Minimal State-alike for replay_capture: no persistent writes.",
+      "methods": [
+        {
+          "name": "__init__",
+          "qualname": "_ReplayState.__init__",
+          "async": false,
+          "lineno": 6703,
+          "end_lineno": 6712,
+          "span": 10,
+          "decorators": [],
+          "signature": "(self, run_dir: Path, state_path: Path)",
+          "returns": "None",
+          "doc": null
+        },
+        {
+          "name": "save",
+          "qualname": "_ReplayState.save",
+          "async": false,
+          "lineno": 6714,
+          "end_lineno": 6715,
+          "span": 2,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "None",
+          "doc": null
+        },
+        {
+          "name": "bump_workers",
+          "qualname": "_ReplayState.bump_workers",
+          "async": false,
+          "lineno": 6717,
+          "end_lineno": 6718,
+          "span": 2,
+          "decorators": [],
+          "signature": "(self, caps: dict)",
+          "returns": "None",
+          "doc": null
+        },
+        {
+          "name": "add_telemetry",
+          "qualname": "_ReplayState.add_telemetry",
+          "async": false,
+          "lineno": 6720,
+          "end_lineno": 6722,
+          "span": 3,
+          "decorators": [],
+          "signature": "(self, envelope: dict)",
+          "returns": "None",
+          "doc": null
+        }
+      ]
+    },
+    {
+      "name": "StateLockedError",
+      "bases": [
+        "Exception"
+      ],
+      "lineno": 6725,
+      "end_lineno": 6737,
+      "span": 13,
+      "doc": "Raised when State.__init__ cannot acquire the per-run-directory",
+      "methods": [
+        {
+          "name": "__init__",
+          "qualname": "StateLockedError.__init__",
+          "async": false,
+          "lineno": 6735,
+          "end_lineno": 6737,
+          "span": 3,
+          "decorators": [],
+          "signature": "(self, run_dir: Path)",
+          "returns": null,
+          "doc": null
+        }
+      ]
+    },
+    {
+      "name": "State",
+      "bases": [],
+      "lineno": 6743,
+      "end_lineno": 6872,
+      "span": 130,
+      "doc": "In-memory run state with atomic on-disk persistence.",
+      "methods": [
+        {
+          "name": "__init__",
+          "qualname": "State.__init__",
+          "async": false,
+          "lineno": 6772,
+          "end_lineno": 6792,
+          "span": 21,
+          "decorators": [],
+          "signature": "(self, leerie_root: Path, run_id: str, repo_root: Path | None = None)",
+          "returns": null,
+          "doc": null
+        },
+        {
+          "name": "_acquire_lock",
+          "qualname": "State._acquire_lock",
+          "async": false,
+          "lineno": 6794,
+          "end_lineno": 6808,
+          "span": 15,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "None",
+          "doc": "Open run_dir for flock and acquire EX|NB. Raises"
+        },
+        {
+          "name": "release_lock",
+          "qualname": "State.release_lock",
+          "async": false,
+          "lineno": 6810,
+          "end_lineno": 6825,
+          "span": 16,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "None",
+          "doc": "Explicit release. Idempotent. The kernel also releases on"
+        },
+        {
+          "name": "__del__",
+          "qualname": "State.__del__",
+          "async": false,
+          "lineno": 6827,
+          "end_lineno": 6838,
+          "span": 12,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "None",
+          "doc": null
+        },
+        {
+          "name": "load",
+          "qualname": "State.load",
+          "async": false,
+          "lineno": 6840,
+          "end_lineno": 6844,
+          "span": 5,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "bool",
+          "doc": null
+        },
+        {
+          "name": "save",
+          "qualname": "State.save",
+          "async": false,
+          "lineno": 6846,
+          "end_lineno": 6855,
+          "span": 10,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "None",
+          "doc": "Atomic write via temp-file rename."
+        },
+        {
+          "name": "bump_workers",
+          "qualname": "State.bump_workers",
+          "async": false,
+          "lineno": 6857,
+          "end_lineno": 6865,
+          "span": 9,
+          "decorators": [],
+          "signature": "(self, caps: dict)",
+          "returns": "None",
+          "doc": null
+        },
+        {
+          "name": "add_telemetry",
+          "qualname": "State.add_telemetry",
+          "async": false,
+          "lineno": 6867,
+          "end_lineno": 6872,
+          "span": 6,
+          "decorators": [],
+          "signature": "(self, envelope: dict)",
+          "returns": "None",
+          "doc": "Accumulate run-weight signals from a worker envelope. On a"
+        }
+      ]
+    },
+    {
+      "name": "HealState",
+      "bases": [],
+      "lineno": 7005,
+      "end_lineno": 7050,
+      "span": 46,
+      "doc": "Persistent state for one heal-loop run scoped to a single call_type.",
+      "methods": [
+        {
+          "name": "__init__",
+          "qualname": "HealState.__init__",
+          "async": false,
+          "lineno": 7018,
+          "end_lineno": 7026,
+          "span": 9,
+          "decorators": [],
+          "signature": "(self, heal_dir: Path, call_type: str)",
+          "returns": "None",
+          "doc": null
+        },
+        {
+          "name": "save",
+          "qualname": "HealState.save",
+          "async": false,
+          "lineno": 7028,
+          "end_lineno": 7039,
+          "span": 12,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "None",
+          "doc": "Atomic write via temp-file rename."
+        },
+        {
+          "name": "load",
+          "qualname": "HealState.load",
+          "async": false,
+          "lineno": 7041,
+          "end_lineno": 7050,
+          "span": 10,
+          "decorators": [],
+          "signature": "(self)",
+          "returns": "bool",
+          "doc": "Load state from disk. Returns True if file existed and was loaded."
+        }
+      ]
+    }
+  ],
+  "callgraph": {
+    "fan_in_top": {
+      "log": 42,
+      "die": 33,
+      "run_proc": 18,
+      "claude_p": 13,
+      "load_prompt": 12,
+      "now": 11,
+      "_read_toml_key": 10,
+      "compute_run_branch": 8,
+      "_resolve_positive_int_pref": 8,
+      "_confidence_issues": 6,
+      "_run_checked_loop": 6,
+      "_resolve_bool_pref": 5,
+      "gather_or_cancel": 5,
+      "_write_run_json": 5,
+      "_resolve_str_pref": 4,
+      "is_protected_path": 4,
+      "_build_predecessor_graph": 4,
+      "run_script": 4,
+      "_format_check_feedback": 4,
+      "_enumerate_descendants": 3,
+      "_resolve_enum_pref": 3,
+      "_terminate_proc_tree": 3,
+      "judge_capture": 3,
+      "_attribute_cycle_edges": 3,
+      "_shared_files_in_scc": 3,
+      "_format_provision_recipe_section": 3,
+      "_signal_pids": 2,
+      "_validate_run_json": 2,
+      "discover_runs": 2,
+      "_derive_run_status": 2,
+      "_parse_bool_envtoml": 2,
+      "_invoke": 2,
+      "_expand_braces": 2,
+      "_read_file_safely": 2,
+      "_strip_bullet": 2,
+      "_detect_cgroup_root": 2,
+      "_accumulate_telemetry": 2,
+      "replay_capture": 2,
+      "run_streaming": 2,
+      "_existing_mise_toml_path": 2
+    },
+    "fan_out_top": {
+      "main": 40,
+      "_run_phases": 28,
+      "phase_reconcile": 21,
+      "run_final_conformance": 16,
+      "settle_subtask": 16,
+      "_run_conformance_phase": 14,
+      "phase_provision": 13,
+      "phase_plan": 11,
+      "phase_overlap_judge": 11,
+      "integrate_wave": 11,
+      "_compose_pr_via_llm": 10,
+      "phase_finalize": 9,
+      "_invoke": 8,
+      "phase_execute": 8,
+      "phase_heal": 7,
+      "claude_p": 6,
+      "phase_classify": 6,
+      "preflight": 5,
+      "_build_cycle_retry_prompt": 5,
+      "run_implementer": 5,
+      "check_diff_scope": 4,
+      "_summarize_stream_event": 4,
+      "heal_baseline": 4,
+      "heal_replay_patched": 4,
+      "synth_mise_go_override": 4,
+      "run_mise_install": 4,
+      "_apply_overlap_collisions": 4,
+      "run_conformer": 4,
+      "resolve_run_id": 3,
+      "_format_run_for_disambiguation": 3,
+      "_collect_run_rows": 3,
+      "resolve_worker_memory_max": 3,
+      "_resolve_bool_pref": 3,
+      "resolve_telemetry_enabled": 3,
+      "check_planner_output": 3,
+      "validate_plan": 3,
+      "extract_readme_sections": 3,
+      "gather_provision_fixtures": 3,
+      "validate_checkpoint": 3,
+      "_cgroup_create": 3
+    },
+    "edges": {
+      "_read_version": [],
+      "load_prompt": [],
+      "is_protected_path": [],
+      "resolve_prompt": [],
+      "_confidence_schema": [],
+      "now": [
+        "now"
+      ],
+      "log": [
+        "now"
+      ],
+      "die": [],
+      "RateLimitedExit.__init__": [],
+      "detect_session_limit": [
+        "now"
+      ],
+      "_install_signal_handlers": [],
+      "_enumerate_descendants": [],
+      "_signal_pids": [],
+      "_DescendantTracker.__init__": [],
+      "_DescendantTracker.start": [],
+      "_DescendantTracker._poll_loop": [
+        "_enumerate_descendants"
+      ],
+      "_DescendantTracker.stop_and_reap": [
+        "_enumerate_descendants",
+        "_signal_pids"
+      ],
+      "_terminate_proc_tree": [
+        "_enumerate_descendants",
+        "_signal_pids"
+      ],
+      "_cleanup_on_abnormal_exit": [
+        "log"
+      ],
+      "_reset_subtask_worktree": [
+        "run_proc"
+      ],
+      "_parse_claude_version": [],
+      "_check_claude_cli_version": [
+        "die",
+        "_parse_claude_version"
+      ],
+      "compute_run_branch": [],
+      "compute_subtask_branch": [],
+      "_validate_run_json": [],
+      "compose_pr_body": [],
+      "_write_run_json": [
+        "_validate_run_json"
+      ],
+      "discover_runs": [
+        "log"
+      ],
+      "resolve_run_id": [
+        "discover_runs",
+        "die",
+        "_format_run_for_disambiguation"
+      ],
+      "_format_run_for_disambiguation": [
+        "_derive_run_status",
+        "_format_age",
+        "now"
+      ],
+      "_format_age": [],
+      "_derive_run_status": [
+        "_validate_run_json"
+      ],
+      "_collect_run_rows": [
+        "discover_runs",
+        "_derive_run_status",
+        "compute_run_branch"
+      ],
+      "_render_run_table": [],
+      "list_runs": [
+        "_collect_run_rows",
+        "_render_run_table"
+      ],
+      "_read_toml_key": [],
+      "resolve_task_argument": [
+        "die"
+      ],
+      "resolve_leerie_root": [],
+      "_resolve_enum_pref": [
+        "die",
+        "_read_toml_key"
+      ],
+      "resolve_source_of_truth": [
+        "_resolve_enum_pref"
+      ],
+      "resolve_runtime": [
+        "_resolve_enum_pref"
+      ],
+      "_resolve_str_pref": [
+        "_read_toml_key"
+      ],
+      "resolve_pr_template": [
+        "_resolve_str_pref"
+      ],
+      "_resolve_positive_int_pref": [
+        "die",
+        "_read_toml_key"
+      ],
+      "resolve_confidence_rounds": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_max_workers": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_max_parallel": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_judgment_check_rounds": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_planner_check_rounds": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_implementer_confidence_retries": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_planner_samples": [
+        "_resolve_positive_int_pref"
+      ],
+      "_parse_memory_size": [
+        "die"
+      ],
+      "_auto_worker_memory_max": [],
+      "resolve_worker_memory_max": [
+        "_parse_memory_size",
+        "_read_toml_key",
+        "_auto_worker_memory_max"
+      ],
+      "resolve_inspect_dirs": [
+        "_read_toml_key"
+      ],
+      "_parse_bool_envtoml": [],
+      "_resolve_bool_pref": [
+        "_parse_bool_envtoml",
+        "die",
+        "_read_toml_key"
+      ],
+      "resolve_no_push": [
+        "_resolve_bool_pref"
+      ],
+      "push_will_happen": [],
+      "resolve_clarify": [
+        "_resolve_bool_pref"
+      ],
+      "resolve_dangerously_skip_permissions": [
+        "_resolve_bool_pref"
+      ],
+      "resolve_skip_overlap_judge": [
+        "_resolve_bool_pref"
+      ],
+      "resolve_skip_budget_check": [
+        "_resolve_bool_pref"
+      ],
+      "_positive_int": [],
+      "resolve_verbosity": [
+        "_resolve_enum_pref"
+      ],
+      "verbosity_from_shortcuts": [],
+      "resolve_models": [
+        "die",
+        "_read_toml_key"
+      ],
+      "resolve_efforts": [
+        "die",
+        "_read_toml_key"
+      ],
+      "resolve_telemetry_enabled": [
+        "_parse_bool_envtoml",
+        "die",
+        "_read_toml_key"
+      ],
+      "resolve_telemetry_subdir": [
+        "_resolve_str_pref"
+      ],
+      "resolve_judge_dir": [
+        "_resolve_str_pref"
+      ],
+      "resolve_heal_dir": [
+        "_resolve_str_pref"
+      ],
+      "resolve_heal_max_rounds": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_heal_success_threshold": [
+        "die",
+        "_read_toml_key"
+      ],
+      "run_proc": [
+        "_terminate_proc_tree"
+      ],
+      "run_streaming": [
+        "log",
+        "_terminate_proc_tree"
+      ],
+      "gather_or_cancel": [],
+      "run_script": [
+        "run_proc"
+      ],
+      "preflight": [
+        "run_proc",
+        "die",
+        "_check_claude_cli_version",
+        "log",
+        "_invoke"
+      ],
+      "_confidence_issues": [],
+      "check_classifier_output": [
+        "_confidence_issues"
+      ],
+      "_grep_old_pattern": [],
+      "_check_migration_surface": [
+        "_grep_old_pattern"
+      ],
+      "check_planner_output": [
+        "is_protected_path",
+        "_check_migration_surface",
+        "_confidence_issues"
+      ],
+      "check_reconciler_output": [
+        "_confidence_issues"
+      ],
+      "check_overlap_judge_output": [
+        "_confidence_issues"
+      ],
+      "check_provision_output": [
+        "_confidence_issues"
+      ],
+      "check_integrator_output": [
+        "_confidence_issues"
+      ],
+      "check_implementer_output": [],
+      "_expand_braces": [
+        "_expand_braces"
+      ],
+      "glob_task_references": [
+        "_expand_braces"
+      ],
+      "extract_task_file_structure": [
+        "glob_task_references"
+      ],
+      "check_task_file_coverage": [],
+      "_format_task_file_structure": [],
+      "validate_plan": [
+        "is_protected_path",
+        "die",
+        "log"
+      ],
+      "warn_cross_planner_file_overlap": [
+        "log"
+      ],
+      "warn_layer_gaps": [
+        "log"
+      ],
+      "_resolves_under": [],
+      "filter_offtree_subtasks": [
+        "_resolves_under",
+        "log"
+      ],
+      "_lockfile_table_entries": [],
+      "detect_recipe_from_lockfiles": [
+        "_lockfile_table_entries"
+      ],
+      "validate_provision_recipe": [],
+      "_split_readme_headers": [],
+      "_is_install_section": [],
+      "_slice_code_fences_with_install_hints": [],
+      "extract_readme_sections": [
+        "_split_readme_headers",
+        "_is_install_section",
+        "_slice_code_fences_with_install_hints"
+      ],
+      "_read_file_safely": [],
+      "_sample_workspace_manifests": [
+        "_read_file_safely"
+      ],
+      "gather_provision_fixtures": [
+        "_read_file_safely",
+        "extract_readme_sections",
+        "_sample_workspace_manifests"
+      ],
+      "_split_checkpoint_sections": [],
+      "validate_checkpoint": [
+        "_split_checkpoint_sections",
+        "_normalize_for_noise",
+        "_parse_touched_file_line"
+      ],
+      "_normalize_for_noise": [
+        "_strip_bullet"
+      ],
+      "_strip_bullet": [],
+      "_parse_touched_file_line": [
+        "_strip_bullet"
+      ],
+      "validate_result": [],
+      "check_diff_scope": [
+        "compute_run_branch",
+        "run_proc",
+        "is_protected_path",
+        "log"
+      ],
+      "check_merge_committed": [
+        "run_proc"
+      ],
+      "check_integrator_commit": [
+        "run_proc"
+      ],
+      "check_branch_has_commits": [
+        "run_proc"
+      ],
+      "scan_conflict_markers": [
+        "run_proc"
+      ],
+      "validate_resume_state": [
+        "die"
+      ],
+      "_is_auth_or_quota_failure": [],
+      "_extract_tool_result_text": [],
+      "_tag_each_line": [],
+      "_summarize_tool_use": [],
+      "_summarize_stream_event": [
+        "detect_session_limit",
+        "_summarize_tool_use",
+        "_extract_tool_result_text",
+        "_tag_each_line"
+      ],
+      "_format_progress_prefix": [],
+      "_get_progress": [],
+      "_detect_cgroup_root": [],
+      "_cgroup_probe": [
+        "_detect_cgroup_root",
+        "log"
+      ],
+      "_cgroup_create": [
+        "_cgroup_probe",
+        "_detect_cgroup_root",
+        "log"
+      ],
+      "_cgroup_enroll": [
+        "log"
+      ],
+      "_cgroup_destroy": [],
+      "_invoke": [
+        "log",
+        "_cgroup_create",
+        "_cgroup_enroll",
+        "now",
+        "_summarize_stream_event",
+        "_format_progress_prefix",
+        "_terminate_proc_tree",
+        "_cgroup_destroy"
+      ],
+      "_capture_call": [],
+      "_collect_memory_sample": [
+        "now"
+      ],
+      "_memory_sampler": [
+        "_collect_memory_sample"
+      ],
+      "claude_p": [
+        "_invoke",
+        "_get_progress",
+        "_capture_call",
+        "now",
+        "log",
+        "_is_auth_or_quota_failure"
+      ],
+      "replay_capture": [
+        "claude_p"
+      ],
+      "_accumulate_telemetry": [],
+      "_ReplayState.__init__": [],
+      "_ReplayState.save": [],
+      "_ReplayState.bump_workers": [],
+      "_ReplayState.add_telemetry": [
+        "_accumulate_telemetry"
+      ],
+      "StateLockedError.__init__": [],
+      "State.__init__": [],
+      "State._acquire_lock": [],
+      "State.release_lock": [],
+      "State.__del__": [],
+      "State.load": [],
+      "State.save": [],
+      "State.bump_workers": [],
+      "State.add_telemetry": [
+        "_accumulate_telemetry"
+      ],
+      "judge_capture": [
+        "load_prompt",
+        "claude_p"
+      ],
+      "phase_judge": [
+        "log",
+        "judge_capture",
+        "gather_or_cancel"
+      ],
+      "HealState.__init__": [],
+      "HealState.save": [],
+      "HealState.load": [],
+      "heal_baseline": [
+        "replay_capture",
+        "judge_capture",
+        "gather_or_cancel",
+        "log"
+      ],
+      "heal_apply_patch": [
+        "log"
+      ],
+      "heal_replay_patched": [
+        "replay_capture",
+        "judge_capture",
+        "log",
+        "gather_or_cancel"
+      ],
+      "check_convergence": [],
+      "write_heal_report": [
+        "log"
+      ],
+      "request_patch": [
+        "resolve_prompt",
+        "load_prompt",
+        "claude_p"
+      ],
+      "phase_heal": [
+        "log",
+        "heal_baseline",
+        "request_patch",
+        "heal_apply_patch",
+        "heal_replay_patched",
+        "check_convergence",
+        "write_heal_report"
+      ],
+      "run_setup_hook": [
+        "die",
+        "log",
+        "run_streaming"
+      ],
+      "_existing_mise_toml_path": [],
+      "_go_already_pinned": [
+        "_existing_mise_toml_path"
+      ],
+      "_existing_mise_toml_tool_keys": [],
+      "_read_idiomatic_pins": [],
+      "synth_mise_go_override": [
+        "_go_already_pinned",
+        "_existing_mise_toml_path",
+        "_existing_mise_toml_tool_keys",
+        "_read_idiomatic_pins"
+      ],
+      "_repo_has_version_signal": [],
+      "run_mise_install": [
+        "_repo_has_version_signal",
+        "log",
+        "run_streaming",
+        "die"
+      ],
+      "phase_classify": [
+        "log",
+        "load_prompt",
+        "claude_p",
+        "_run_checked_loop",
+        "check_classifier_output",
+        "die"
+      ],
+      "gather_answers": [
+        "die",
+        "log"
+      ],
+      "absorb_supplied_answers": [
+        "die"
+      ],
+      "surface_clarification": [
+        "log"
+      ],
+      "_format_provision_user_prompt": [],
+      "phase_provision": [
+        "log",
+        "run_setup_hook",
+        "synth_mise_go_override",
+        "run_mise_install",
+        "detect_recipe_from_lockfiles",
+        "gather_provision_fixtures",
+        "load_prompt",
+        "_format_provision_user_prompt",
+        "claude_p",
+        "_run_checked_loop",
+        "check_provision_output",
+        "die",
+        "validate_provision_recipe"
+      ],
+      "_select_best_planner_sample": [
+        "check_planner_output",
+        "log"
+      ],
+      "phase_plan": [
+        "log",
+        "load_prompt",
+        "extract_task_file_structure",
+        "_format_task_file_structure",
+        "claude_p",
+        "check_planner_output",
+        "check_task_file_coverage",
+        "_run_checked_loop",
+        "die",
+        "gather_or_cancel",
+        "_select_best_planner_sample"
+      ],
+      "_promote_external_collisions": [],
+      "_collect_external_preconditions": [],
+      "_compute_unresolved_requires": [],
+      "_find_oversized_added_subtasks": [],
+      "_apply_reconciler_output": [
+        "die"
+      ],
+      "phase_reconcile": [
+        "die",
+        "_promote_external_collisions",
+        "log",
+        "_collect_external_preconditions",
+        "_compute_unresolved_requires",
+        "load_prompt",
+        "claude_p",
+        "_run_checked_loop",
+        "check_reconciler_output",
+        "_apply_reconciler_output",
+        "_find_oversized_added_subtasks",
+        "_build_size_retry_prompt",
+        "_build_predecessor_graph",
+        "_tarjan_sccs",
+        "_format_cycle_diagnostic",
+        "_recommend_cycle_resolution",
+        "_build_cycle_retry_prompt",
+        "_validate_must_include",
+        "_recommend_unresolved_resolution",
+        "_build_unresolved_retry_prompt",
+        "_validate_unresolved_must_include"
+      ],
+      "_tarjan_sccs": [],
+      "_attribute_cycle_edges": [],
+      "_format_cycle_diagnostic": [
+        "_attribute_cycle_edges",
+        "_shared_files_in_scc"
+      ],
+      "_shared_files_in_scc": [],
+      "_original_tag_for_rename_edge": [],
+      "_recommend_cycle_resolution": [
+        "_attribute_cycle_edges",
+        "_original_tag_for_rename_edge",
+        "_shared_files_in_scc"
+      ],
+      "_format_recommendation": [],
+      "_format_must_include": [
+        "_original_tag_for_rename_edge"
+      ],
+      "_build_cycle_retry_prompt": [
+        "_attribute_cycle_edges",
+        "_shared_files_in_scc",
+        "_format_recommendation",
+        "_format_must_include",
+        "_matches_recommendation"
+      ],
+      "_build_size_retry_prompt": [],
+      "_matches_recommendation": [],
+      "_validate_must_include": [],
+      "_tag_jaccard": [],
+      "_recommend_unresolved_resolution": [
+        "_tag_jaccard"
+      ],
+      "_build_unresolved_retry_prompt": [
+        "_tag_jaccard"
+      ],
+      "_validate_unresolved_must_include": [],
+      "_compute_overlap_anchors": [],
+      "_validate_overlap_judge_output": [
+        "die",
+        "_compute_overlap_anchors"
+      ],
+      "_apply_overlap_drop": [],
+      "_apply_overlap_merge": [
+        "die"
+      ],
+      "_apply_overlap_collisions": [
+        "_compute_overlap_anchors",
+        "log",
+        "_apply_overlap_merge",
+        "_apply_overlap_drop"
+      ],
+      "phase_overlap_judge": [
+        "log",
+        "load_prompt",
+        "claude_p",
+        "_run_checked_loop",
+        "check_overlap_judge_output",
+        "die",
+        "_validate_overlap_judge_output",
+        "_apply_overlap_collisions",
+        "_build_predecessor_graph",
+        "_tarjan_sccs",
+        "_format_cycle_diagnostic"
+      ],
+      "_build_predecessor_graph": [],
+      "detect_no_work": [],
+      "_finish_no_work_run": [
+        "log",
+        "now",
+        "_write_run_json"
+      ],
+      "schedule": [
+        "log",
+        "die",
+        "_build_predecessor_graph"
+      ],
+      "check_budget_feasibility": [
+        "die"
+      ],
+      "_write_subtask_artifacts": [],
+      "_read_upstream_artifacts": [],
+      "_format_upstream_artifacts_for_sid": [
+        "_build_predecessor_graph",
+        "_read_upstream_artifacts",
+        "_format_upstream_artifacts_section"
+      ],
+      "_format_upstream_artifacts_section": [],
+      "write_plan": [],
+      "_format_provision_recipe_section": [],
+      "run_implementer": [
+        "load_prompt",
+        "run_script",
+        "_format_provision_recipe_section",
+        "_format_upstream_artifacts_for_sid",
+        "claude_p"
+      ],
+      "_retryable_failure": [],
+      "discover_rules_files": [],
+      "_infer_build_lint_test": [],
+      "validate_conformance_result": [],
+      "_branch_head_sha": [
+        "run_proc"
+      ],
+      "_protected_paths_since": [
+        "run_proc",
+        "is_protected_path"
+      ],
+      "rollback_conformer_commits": [
+        "run_proc"
+      ],
+      "_uncommitted_paths": [
+        "run_proc"
+      ],
+      "_unprefixed_conformer_commits": [
+        "run_proc"
+      ],
+      "run_conformer": [
+        "load_prompt",
+        "_format_provision_recipe_section",
+        "claude_p",
+        "log"
+      ],
+      "_summarize_residuals": [],
+      "_confidence_axes_clear": [],
+      "_format_check_feedback": [],
+      "_run_checked_loop": [
+        "_format_check_feedback"
+      ],
+      "_conformance_clean": [],
+      "_iter_log_tool_use": [],
+      "_count_bash_axis_invocations": [
+        "_iter_log_tool_use"
+      ],
+      "_count_orphaned_bg_axis": [
+        "_iter_log_tool_use"
+      ],
+      "_emit_bash_axis_warnings": [
+        "_count_bash_axis_invocations",
+        "_count_orphaned_bg_axis"
+      ],
+      "_run_conformance_phase": [
+        "discover_rules_files",
+        "_infer_build_lint_test",
+        "compute_run_branch",
+        "_branch_head_sha",
+        "run_conformer",
+        "validate_conformance_result",
+        "check_diff_scope",
+        "_uncommitted_paths",
+        "rollback_conformer_commits",
+        "_unprefixed_conformer_commits",
+        "_emit_bash_axis_warnings",
+        "_format_check_feedback",
+        "_conformance_clean",
+        "_summarize_residuals"
+      ],
+      "run_final_conformance": [
+        "log",
+        "discover_rules_files",
+        "_infer_build_lint_test",
+        "load_prompt",
+        "_branch_head_sha",
+        "_format_provision_recipe_section",
+        "claude_p",
+        "validate_conformance_result",
+        "_protected_paths_since",
+        "_uncommitted_paths",
+        "rollback_conformer_commits",
+        "_unprefixed_conformer_commits",
+        "_emit_bash_axis_warnings",
+        "_format_check_feedback",
+        "_conformance_clean",
+        "_summarize_residuals"
+      ],
+      "settle_subtask": [
+        "_retryable_failure",
+        "log",
+        "_reset_subtask_worktree",
+        "run_implementer",
+        "validate_result",
+        "_confidence_axes_clear",
+        "compute_run_branch",
+        "run_proc",
+        "check_implementer_output",
+        "_format_check_feedback",
+        "check_branch_has_commits",
+        "check_diff_scope",
+        "_write_subtask_artifacts",
+        "_run_conformance_phase",
+        "validate_checkpoint",
+        "surface_clarification"
+      ],
+      "integrate_wave": [
+        "run_script",
+        "die",
+        "log",
+        "load_prompt",
+        "claude_p",
+        "_run_checked_loop",
+        "check_integrator_output",
+        "run_proc",
+        "check_merge_committed",
+        "compute_run_branch",
+        "check_integrator_commit"
+      ],
+      "phase_execute": [
+        "log",
+        "run_script",
+        "die",
+        "run_proc",
+        "settle_subtask",
+        "gather_or_cancel",
+        "integrate_wave",
+        "scan_conflict_markers"
+      ],
+      "find_pr_template": [],
+      "_cap_text": [],
+      "_strip_leerie_prefix": [],
+      "_truncate_diff_sample": [],
+      "_final_conformance_payload": [],
+      "_compose_pr_via_llm": [
+        "find_pr_template",
+        "_cap_text",
+        "log",
+        "compute_run_branch",
+        "_truncate_diff_sample",
+        "_final_conformance_payload",
+        "load_prompt",
+        "claude_p",
+        "_strip_leerie_prefix",
+        "_write_run_json"
+      ],
+      "phase_finalize": [
+        "log",
+        "run_script",
+        "die",
+        "run_proc",
+        "now",
+        "push_will_happen",
+        "_write_run_json",
+        "_compose_pr_via_llm",
+        "compute_run_branch"
+      ],
+      "orchestrate": [
+        "_memory_sampler",
+        "_run_phases"
+      ],
+      "_run_phases": [
+        "die",
+        "validate_resume_state",
+        "log",
+        "absorb_supplied_answers",
+        "resolve_task_argument",
+        "now",
+        "preflight",
+        "phase_classify",
+        "run_proc",
+        "_write_run_json",
+        "compute_run_branch",
+        "phase_provision",
+        "gather_answers",
+        "phase_plan",
+        "phase_reconcile",
+        "detect_no_work",
+        "_finish_no_work_run",
+        "phase_overlap_judge",
+        "warn_cross_planner_file_overlap",
+        "warn_layer_gaps",
+        "filter_offtree_subtasks",
+        "schedule",
+        "check_budget_feasibility",
+        "validate_plan",
+        "write_plan",
+        "phase_execute",
+        "run_final_conformance",
+        "phase_finalize"
+      ],
+      "main": [
+        "_read_version",
+        "resolve_leerie_root",
+        "list_runs",
+        "die",
+        "resolve_max_workers",
+        "resolve_max_parallel",
+        "resolve_confidence_rounds",
+        "resolve_judgment_check_rounds",
+        "resolve_planner_check_rounds",
+        "resolve_implementer_confidence_retries",
+        "resolve_planner_samples",
+        "resolve_worker_memory_max",
+        "verbosity_from_shortcuts",
+        "resolve_verbosity",
+        "resolve_run_id",
+        "log",
+        "resolve_source_of_truth",
+        "resolve_runtime",
+        "resolve_models",
+        "resolve_efforts",
+        "resolve_no_push",
+        "resolve_clarify",
+        "resolve_dangerously_skip_permissions",
+        "resolve_skip_overlap_judge",
+        "resolve_skip_budget_check",
+        "resolve_pr_template",
+        "resolve_inspect_dirs",
+        "resolve_telemetry_enabled",
+        "resolve_telemetry_subdir",
+        "resolve_judge_dir",
+        "resolve_heal_dir",
+        "resolve_heal_max_rounds",
+        "resolve_heal_success_threshold",
+        "phase_judge",
+        "phase_heal",
+        "_install_signal_handlers",
+        "orchestrate",
+        "_cleanup_on_abnormal_exit",
+        "now",
+        "_write_run_json"
+      ]
+    },
+    "ordered_calls": {
+      "_read_version": [],
+      "load_prompt": [],
+      "is_protected_path": [],
+      "resolve_prompt": [],
+      "_confidence_schema": [],
+      "now": [
+        "now"
+      ],
+      "log": [
+        "now"
+      ],
+      "die": [],
+      "RateLimitedExit.__init__": [],
+      "detect_session_limit": [
+        "now"
+      ],
+      "_install_signal_handlers": [],
+      "_enumerate_descendants": [],
+      "_signal_pids": [],
+      "_DescendantTracker.__init__": [],
+      "_DescendantTracker.start": [],
+      "_DescendantTracker._poll_loop": [
+        "_enumerate_descendants"
+      ],
+      "_DescendantTracker.stop_and_reap": [
+        "_enumerate_descendants",
+        "_signal_pids"
+      ],
+      "_terminate_proc_tree": [
+        "_enumerate_descendants",
+        "_signal_pids",
+        "_enumerate_descendants",
+        "_signal_pids"
+      ],
+      "_cleanup_on_abnormal_exit": [
+        "log",
+        "log",
+        "log",
+        "log",
+        "log"
+      ],
+      "_reset_subtask_worktree": [
+        "run_proc",
+        "run_proc",
+        "run_proc"
+      ],
+      "_parse_claude_version": [],
+      "_check_claude_cli_version": [
+        "die",
+        "_parse_claude_version",
+        "die"
+      ],
+      "compute_run_branch": [],
+      "compute_subtask_branch": [],
+      "_validate_run_json": [],
+      "compose_pr_body": [],
+      "_write_run_json": [
+        "_validate_run_json"
+      ],
+      "discover_runs": [
+        "log",
+        "log",
+        "log",
+        "log"
+      ],
+      "resolve_run_id": [
+        "discover_runs",
+        "die",
+        "die",
+        "_format_run_for_disambiguation",
+        "die"
+      ],
+      "_format_run_for_disambiguation": [
+        "_derive_run_status",
+        "_format_age",
+        "now"
+      ],
+      "_format_age": [],
+      "_derive_run_status": [
+        "_validate_run_json"
+      ],
+      "_collect_run_rows": [
+        "discover_runs",
+        "_derive_run_status",
+        "compute_run_branch"
+      ],
+      "_render_run_table": [],
+      "list_runs": [
+        "_collect_run_rows",
+        "_render_run_table"
+      ],
+      "_read_toml_key": [],
+      "resolve_task_argument": [
+        "die"
+      ],
+      "resolve_leerie_root": [],
+      "_resolve_enum_pref": [
+        "die",
+        "_read_toml_key",
+        "die"
+      ],
+      "resolve_source_of_truth": [
+        "_resolve_enum_pref"
+      ],
+      "resolve_runtime": [
+        "_resolve_enum_pref"
+      ],
+      "_resolve_str_pref": [
+        "_read_toml_key"
+      ],
+      "resolve_pr_template": [
+        "_resolve_str_pref"
+      ],
+      "_resolve_positive_int_pref": [
+        "die",
+        "die",
+        "_read_toml_key",
+        "die",
+        "die"
+      ],
+      "resolve_confidence_rounds": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_max_workers": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_max_parallel": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_judgment_check_rounds": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_planner_check_rounds": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_implementer_confidence_retries": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_planner_samples": [
+        "_resolve_positive_int_pref"
+      ],
+      "_parse_memory_size": [
+        "die",
+        "die",
+        "die"
+      ],
+      "_auto_worker_memory_max": [],
+      "resolve_worker_memory_max": [
+        "_parse_memory_size",
+        "_parse_memory_size",
+        "_read_toml_key",
+        "_parse_memory_size",
+        "_auto_worker_memory_max"
+      ],
+      "resolve_inspect_dirs": [
+        "_read_toml_key"
+      ],
+      "_parse_bool_envtoml": [],
+      "_resolve_bool_pref": [
+        "_parse_bool_envtoml",
+        "die",
+        "_read_toml_key",
+        "_parse_bool_envtoml",
+        "die"
+      ],
+      "resolve_no_push": [
+        "_resolve_bool_pref"
+      ],
+      "push_will_happen": [],
+      "resolve_clarify": [
+        "_resolve_bool_pref"
+      ],
+      "resolve_dangerously_skip_permissions": [
+        "_resolve_bool_pref"
+      ],
+      "resolve_skip_overlap_judge": [
+        "_resolve_bool_pref"
+      ],
+      "resolve_skip_budget_check": [
+        "_resolve_bool_pref"
+      ],
+      "_positive_int": [],
+      "resolve_verbosity": [
+        "_resolve_enum_pref"
+      ],
+      "verbosity_from_shortcuts": [],
+      "resolve_models": [
+        "die",
+        "_read_toml_key",
+        "die"
+      ],
+      "resolve_efforts": [
+        "die",
+        "_read_toml_key",
+        "die"
+      ],
+      "resolve_telemetry_enabled": [
+        "_parse_bool_envtoml",
+        "die",
+        "_read_toml_key",
+        "_parse_bool_envtoml",
+        "die"
+      ],
+      "resolve_telemetry_subdir": [
+        "_resolve_str_pref"
+      ],
+      "resolve_judge_dir": [
+        "_resolve_str_pref"
+      ],
+      "resolve_heal_dir": [
+        "_resolve_str_pref"
+      ],
+      "resolve_heal_max_rounds": [
+        "_resolve_positive_int_pref"
+      ],
+      "resolve_heal_success_threshold": [
+        "die",
+        "die",
+        "_read_toml_key",
+        "die",
+        "die"
+      ],
+      "run_proc": [
+        "_terminate_proc_tree",
+        "_terminate_proc_tree"
+      ],
+      "run_streaming": [
+        "log",
+        "_terminate_proc_tree",
+        "_terminate_proc_tree"
+      ],
+      "gather_or_cancel": [],
+      "run_script": [
+        "run_proc"
+      ],
+      "preflight": [
+        "run_proc",
+        "die",
+        "run_proc",
+        "die",
+        "_check_claude_cli_version",
+        "die",
+        "log",
+        "_invoke",
+        "die",
+        "die",
+        "die",
+        "log"
+      ],
+      "_confidence_issues": [],
+      "check_classifier_output": [
+        "_confidence_issues"
+      ],
+      "_grep_old_pattern": [],
+      "_check_migration_surface": [
+        "_grep_old_pattern"
+      ],
+      "check_planner_output": [
+        "is_protected_path",
+        "_check_migration_surface",
+        "_confidence_issues"
+      ],
+      "check_reconciler_output": [
+        "_confidence_issues"
+      ],
+      "check_overlap_judge_output": [
+        "_confidence_issues"
+      ],
+      "check_provision_output": [
+        "_confidence_issues"
+      ],
+      "check_integrator_output": [
+        "_confidence_issues"
+      ],
+      "check_implementer_output": [],
+      "_expand_braces": [
+        "_expand_braces"
+      ],
+      "glob_task_references": [
+        "_expand_braces"
+      ],
+      "extract_task_file_structure": [
+        "glob_task_references"
+      ],
+      "check_task_file_coverage": [],
+      "_format_task_file_structure": [],
+      "validate_plan": [
+        "is_protected_path",
+        "die",
+        "log"
+      ],
+      "warn_cross_planner_file_overlap": [
+        "log",
+        "log"
+      ],
+      "warn_layer_gaps": [
+        "log",
+        "log"
+      ],
+      "_resolves_under": [],
+      "filter_offtree_subtasks": [
+        "_resolves_under",
+        "_resolves_under",
+        "log",
+        "log"
+      ],
+      "_lockfile_table_entries": [],
+      "detect_recipe_from_lockfiles": [
+        "_lockfile_table_entries"
+      ],
+      "validate_provision_recipe": [],
+      "_split_readme_headers": [],
+      "_is_install_section": [],
+      "_slice_code_fences_with_install_hints": [],
+      "extract_readme_sections": [
+        "_split_readme_headers",
+        "_is_install_section",
+        "_slice_code_fences_with_install_hints"
+      ],
+      "_read_file_safely": [],
+      "_sample_workspace_manifests": [
+        "_read_file_safely"
+      ],
+      "gather_provision_fixtures": [
+        "_read_file_safely",
+        "extract_readme_sections",
+        "_read_file_safely",
+        "_sample_workspace_manifests",
+        "_read_file_safely",
+        "_read_file_safely"
+      ],
+      "_split_checkpoint_sections": [],
+      "validate_checkpoint": [
+        "_split_checkpoint_sections",
+        "_normalize_for_noise",
+        "_parse_touched_file_line"
+      ],
+      "_normalize_for_noise": [
+        "_strip_bullet"
+      ],
+      "_strip_bullet": [],
+      "_parse_touched_file_line": [
+        "_strip_bullet"
+      ],
+      "validate_result": [],
+      "check_diff_scope": [
+        "compute_run_branch",
+        "run_proc",
+        "is_protected_path",
+        "log"
+      ],
+      "check_merge_committed": [
+        "run_proc",
+        "run_proc"
+      ],
+      "check_integrator_commit": [
+        "run_proc"
+      ],
+      "check_branch_has_commits": [
+        "run_proc"
+      ],
+      "scan_conflict_markers": [
+        "run_proc"
+      ],
+      "validate_resume_state": [
+        "die",
+        "die",
+        "die",
+        "die"
+      ],
+      "_is_auth_or_quota_failure": [],
+      "_extract_tool_result_text": [],
+      "_tag_each_line": [],
+      "_summarize_tool_use": [],
+      "_summarize_stream_event": [
+        "detect_session_limit",
+        "_summarize_tool_use",
+        "_extract_tool_result_text",
+        "_tag_each_line",
+        "_tag_each_line"
+      ],
+      "_format_progress_prefix": [],
+      "_get_progress": [],
+      "_detect_cgroup_root": [],
+      "_cgroup_probe": [
+        "_detect_cgroup_root",
+        "log"
+      ],
+      "_cgroup_create": [
+        "_cgroup_probe",
+        "_detect_cgroup_root",
+        "log"
+      ],
+      "_cgroup_enroll": [
+        "log"
+      ],
+      "_cgroup_destroy": [],
+      "_invoke": [
+        "log",
+        "_cgroup_create",
+        "_cgroup_enroll",
+        "now",
+        "now",
+        "_summarize_stream_event",
+        "_format_progress_prefix",
+        "log",
+        "now",
+        "log",
+        "log",
+        "_terminate_proc_tree",
+        "_terminate_proc_tree",
+        "_cgroup_destroy",
+        "log"
+      ],
+      "_capture_call": [],
+      "_collect_memory_sample": [
+        "now"
+      ],
+      "_memory_sampler": [
+        "_collect_memory_sample",
+        "_collect_memory_sample"
+      ],
+      "claude_p": [
+        "_invoke",
+        "_get_progress",
+        "_capture_call",
+        "now",
+        "log",
+        "log",
+        "_is_auth_or_quota_failure",
+        "log",
+        "_is_auth_or_quota_failure"
+      ],
+      "replay_capture": [
+        "claude_p"
+      ],
+      "_accumulate_telemetry": [],
+      "_ReplayState.__init__": [],
+      "_ReplayState.save": [],
+      "_ReplayState.bump_workers": [],
+      "_ReplayState.add_telemetry": [
+        "_accumulate_telemetry"
+      ],
+      "StateLockedError.__init__": [],
+      "State.__init__": [],
+      "State._acquire_lock": [],
+      "State.release_lock": [],
+      "State.__del__": [],
+      "State.load": [],
+      "State.save": [],
+      "State.bump_workers": [],
+      "State.add_telemetry": [
+        "_accumulate_telemetry"
+      ],
+      "judge_capture": [
+        "load_prompt",
+        "claude_p"
+      ],
+      "phase_judge": [
+        "log",
+        "log",
+        "log",
+        "log",
+        "judge_capture",
+        "log",
+        "gather_or_cancel",
+        "log"
+      ],
+      "HealState.__init__": [],
+      "HealState.save": [],
+      "HealState.load": [],
+      "heal_baseline": [
+        "replay_capture",
+        "judge_capture",
+        "gather_or_cancel",
+        "log"
+      ],
+      "heal_apply_patch": [
+        "log"
+      ],
+      "heal_replay_patched": [
+        "replay_capture",
+        "judge_capture",
+        "log",
+        "gather_or_cancel",
+        "log"
+      ],
+      "check_convergence": [],
+      "write_heal_report": [
+        "log"
+      ],
+      "request_patch": [
+        "resolve_prompt",
+        "load_prompt",
+        "claude_p"
+      ],
+      "phase_heal": [
+        "log",
+        "heal_baseline",
+        "request_patch",
+        "heal_apply_patch",
+        "heal_replay_patched",
+        "check_convergence",
+        "log",
+        "write_heal_report",
+        "log"
+      ],
+      "run_setup_hook": [
+        "die",
+        "log",
+        "run_streaming",
+        "die",
+        "die"
+      ],
+      "_existing_mise_toml_path": [],
+      "_go_already_pinned": [
+        "_existing_mise_toml_path"
+      ],
+      "_existing_mise_toml_tool_keys": [],
+      "_read_idiomatic_pins": [],
+      "synth_mise_go_override": [
+        "_go_already_pinned",
+        "_existing_mise_toml_path",
+        "_existing_mise_toml_tool_keys",
+        "_read_idiomatic_pins"
+      ],
+      "_repo_has_version_signal": [],
+      "run_mise_install": [
+        "_repo_has_version_signal",
+        "log",
+        "run_streaming",
+        "die",
+        "die",
+        "log"
+      ],
+      "phase_classify": [
+        "log",
+        "load_prompt",
+        "claude_p",
+        "_run_checked_loop",
+        "check_classifier_output",
+        "die",
+        "log",
+        "die",
+        "log"
+      ],
+      "gather_answers": [
+        "die",
+        "log"
+      ],
+      "absorb_supplied_answers": [
+        "die",
+        "die",
+        "die",
+        "die"
+      ],
+      "surface_clarification": [
+        "log"
+      ],
+      "_format_provision_user_prompt": [],
+      "phase_provision": [
+        "log",
+        "log",
+        "run_setup_hook",
+        "synth_mise_go_override",
+        "log",
+        "run_mise_install",
+        "log",
+        "detect_recipe_from_lockfiles",
+        "log",
+        "log",
+        "gather_provision_fixtures",
+        "load_prompt",
+        "_format_provision_user_prompt",
+        "claude_p",
+        "_run_checked_loop",
+        "check_provision_output",
+        "die",
+        "log",
+        "validate_provision_recipe",
+        "die",
+        "log"
+      ],
+      "_select_best_planner_sample": [
+        "check_planner_output",
+        "log"
+      ],
+      "phase_plan": [
+        "log",
+        "load_prompt",
+        "extract_task_file_structure",
+        "_format_task_file_structure",
+        "log",
+        "claude_p",
+        "check_planner_output",
+        "check_task_file_coverage",
+        "_run_checked_loop",
+        "log",
+        "die",
+        "log",
+        "gather_or_cancel",
+        "log",
+        "gather_or_cancel",
+        "die",
+        "_select_best_planner_sample",
+        "log",
+        "log"
+      ],
+      "_promote_external_collisions": [],
+      "_collect_external_preconditions": [],
+      "_compute_unresolved_requires": [],
+      "_find_oversized_added_subtasks": [],
+      "_apply_reconciler_output": [
+        "die",
+        "die",
+        "die",
+        "die",
+        "die",
+        "die"
+      ],
+      "phase_reconcile": [
+        "die",
+        "_promote_external_collisions",
+        "log",
+        "_collect_external_preconditions",
+        "log",
+        "_compute_unresolved_requires",
+        "log",
+        "load_prompt",
+        "claude_p",
+        "die",
+        "_run_checked_loop",
+        "check_reconciler_output",
+        "die",
+        "log",
+        "_apply_reconciler_output",
+        "_find_oversized_added_subtasks",
+        "log",
+        "_build_size_retry_prompt",
+        "log",
+        "check_reconciler_output",
+        "log",
+        "_apply_reconciler_output",
+        "_find_oversized_added_subtasks",
+        "die",
+        "_build_predecessor_graph",
+        "_tarjan_sccs",
+        "_format_cycle_diagnostic",
+        "log",
+        "_recommend_cycle_resolution",
+        "_build_cycle_retry_prompt",
+        "log",
+        "_validate_must_include",
+        "die",
+        "check_reconciler_output",
+        "log",
+        "_apply_reconciler_output",
+        "_build_predecessor_graph",
+        "_tarjan_sccs",
+        "_format_cycle_diagnostic",
+        "die",
+        "_promote_external_collisions",
+        "log",
+        "_collect_external_preconditions",
+        "log",
+        "_compute_unresolved_requires",
+        "log",
+        "_recommend_unresolved_resolution",
+        "log",
+        "_build_unresolved_retry_prompt",
+        "log",
+        "_validate_unresolved_must_include",
+        "die",
+        "check_reconciler_output",
+        "log",
+        "_apply_reconciler_output",
+        "_promote_external_collisions",
+        "_collect_external_preconditions",
+        "_build_predecessor_graph",
+        "_tarjan_sccs",
+        "_format_cycle_diagnostic",
+        "die",
+        "_compute_unresolved_requires",
+        "die",
+        "log"
+      ],
+      "_tarjan_sccs": [],
+      "_attribute_cycle_edges": [],
+      "_format_cycle_diagnostic": [
+        "_attribute_cycle_edges",
+        "_shared_files_in_scc"
+      ],
+      "_shared_files_in_scc": [],
+      "_original_tag_for_rename_edge": [],
+      "_recommend_cycle_resolution": [
+        "_attribute_cycle_edges",
+        "_original_tag_for_rename_edge",
+        "_shared_files_in_scc",
+        "_original_tag_for_rename_edge"
+      ],
+      "_format_recommendation": [],
+      "_format_must_include": [
+        "_original_tag_for_rename_edge"
+      ],
+      "_build_cycle_retry_prompt": [
+        "_attribute_cycle_edges",
+        "_shared_files_in_scc",
+        "_format_recommendation",
+        "_format_must_include",
+        "_matches_recommendation"
+      ],
+      "_build_size_retry_prompt": [],
+      "_matches_recommendation": [],
+      "_validate_must_include": [],
+      "_tag_jaccard": [],
+      "_recommend_unresolved_resolution": [
+        "_tag_jaccard"
+      ],
+      "_build_unresolved_retry_prompt": [
+        "_tag_jaccard"
+      ],
+      "_validate_unresolved_must_include": [],
+      "_compute_overlap_anchors": [],
+      "_validate_overlap_judge_output": [
+        "die",
+        "die",
+        "die",
+        "die",
+        "die",
+        "die",
+        "_compute_overlap_anchors",
+        "die",
+        "die"
+      ],
+      "_apply_overlap_drop": [],
+      "_apply_overlap_merge": [
+        "die",
+        "die"
+      ],
+      "_apply_overlap_collisions": [
+        "_compute_overlap_anchors",
+        "log",
+        "_apply_overlap_merge",
+        "log",
+        "_apply_overlap_drop",
+        "log",
+        "_apply_overlap_drop",
+        "log"
+      ],
+      "phase_overlap_judge": [
+        "log",
+        "log",
+        "log",
+        "log",
+        "load_prompt",
+        "claude_p",
+        "_run_checked_loop",
+        "check_overlap_judge_output",
+        "die",
+        "log",
+        "log",
+        "_validate_overlap_judge_output",
+        "die",
+        "_apply_overlap_collisions",
+        "_build_predecessor_graph",
+        "_tarjan_sccs",
+        "_format_cycle_diagnostic",
+        "die",
+        "log"
+      ],
+      "_build_predecessor_graph": [],
+      "detect_no_work": [],
+      "_finish_no_work_run": [
+        "log",
+        "log",
+        "now",
+        "_write_run_json",
+        "log",
+        "log"
+      ],
+      "schedule": [
+        "log",
+        "die",
+        "die",
+        "log",
+        "_build_predecessor_graph",
+        "die",
+        "log"
+      ],
+      "check_budget_feasibility": [
+        "die"
+      ],
+      "_write_subtask_artifacts": [],
+      "_read_upstream_artifacts": [],
+      "_format_upstream_artifacts_for_sid": [
+        "_build_predecessor_graph",
+        "_read_upstream_artifacts",
+        "_format_upstream_artifacts_section"
+      ],
+      "_format_upstream_artifacts_section": [],
+      "write_plan": [],
+      "_format_provision_recipe_section": [],
+      "run_implementer": [
+        "load_prompt",
+        "run_script",
+        "_format_provision_recipe_section",
+        "_format_upstream_artifacts_for_sid",
+        "claude_p"
+      ],
+      "_retryable_failure": [],
+      "discover_rules_files": [],
+      "_infer_build_lint_test": [],
+      "validate_conformance_result": [],
+      "_branch_head_sha": [
+        "run_proc"
+      ],
+      "_protected_paths_since": [
+        "run_proc",
+        "is_protected_path"
+      ],
+      "rollback_conformer_commits": [
+        "run_proc"
+      ],
+      "_uncommitted_paths": [
+        "run_proc"
+      ],
+      "_unprefixed_conformer_commits": [
+        "run_proc"
+      ],
+      "run_conformer": [
+        "load_prompt",
+        "_format_provision_recipe_section",
+        "claude_p",
+        "log",
+        "log"
+      ],
+      "_summarize_residuals": [],
+      "_confidence_axes_clear": [],
+      "_format_check_feedback": [],
+      "_run_checked_loop": [
+        "_format_check_feedback"
+      ],
+      "_conformance_clean": [],
+      "_iter_log_tool_use": [],
+      "_count_bash_axis_invocations": [
+        "_iter_log_tool_use"
+      ],
+      "_count_orphaned_bg_axis": [
+        "_iter_log_tool_use"
+      ],
+      "_emit_bash_axis_warnings": [
+        "_count_bash_axis_invocations",
+        "_count_orphaned_bg_axis"
+      ],
+      "_run_conformance_phase": [
+        "discover_rules_files",
+        "_infer_build_lint_test",
+        "compute_run_branch",
+        "_branch_head_sha",
+        "run_conformer",
+        "validate_conformance_result",
+        "check_diff_scope",
+        "_uncommitted_paths",
+        "rollback_conformer_commits",
+        "_uncommitted_paths",
+        "_unprefixed_conformer_commits",
+        "_emit_bash_axis_warnings",
+        "_format_check_feedback",
+        "_conformance_clean",
+        "_summarize_residuals"
+      ],
+      "run_final_conformance": [
+        "log",
+        "log",
+        "log",
+        "log",
+        "discover_rules_files",
+        "_infer_build_lint_test",
+        "load_prompt",
+        "_branch_head_sha",
+        "_format_provision_recipe_section",
+        "claude_p",
+        "validate_conformance_result",
+        "_protected_paths_since",
+        "_uncommitted_paths",
+        "rollback_conformer_commits",
+        "_uncommitted_paths",
+        "_unprefixed_conformer_commits",
+        "_emit_bash_axis_warnings",
+        "_format_check_feedback",
+        "_conformance_clean",
+        "_summarize_residuals",
+        "log"
+      ],
+      "settle_subtask": [
+        "_retryable_failure",
+        "log",
+        "log",
+        "_reset_subtask_worktree",
+        "run_implementer",
+        "validate_result",
+        "log",
+        "_confidence_axes_clear",
+        "log",
+        "compute_run_branch",
+        "run_proc",
+        "check_implementer_output",
+        "log",
+        "_format_check_feedback",
+        "check_branch_has_commits",
+        "compute_run_branch",
+        "log",
+        "run_proc",
+        "check_diff_scope",
+        "_write_subtask_artifacts",
+        "_run_conformance_phase",
+        "log",
+        "validate_checkpoint",
+        "log",
+        "validate_checkpoint",
+        "log",
+        "surface_clarification"
+      ],
+      "integrate_wave": [
+        "run_script",
+        "die",
+        "log",
+        "load_prompt",
+        "claude_p",
+        "_run_checked_loop",
+        "check_integrator_output",
+        "run_proc",
+        "die",
+        "log",
+        "check_merge_committed",
+        "run_proc",
+        "die",
+        "compute_run_branch",
+        "check_integrator_commit",
+        "log",
+        "log",
+        "run_proc",
+        "die",
+        "compute_run_branch"
+      ],
+      "phase_execute": [
+        "log",
+        "run_script",
+        "die",
+        "run_proc",
+        "settle_subtask",
+        "log",
+        "log",
+        "log",
+        "log",
+        "gather_or_cancel",
+        "integrate_wave",
+        "scan_conflict_markers",
+        "die",
+        "log",
+        "die"
+      ],
+      "find_pr_template": [],
+      "_cap_text": [],
+      "_strip_leerie_prefix": [],
+      "_truncate_diff_sample": [],
+      "_final_conformance_payload": [],
+      "_compose_pr_via_llm": [
+        "find_pr_template",
+        "_cap_text",
+        "log",
+        "log",
+        "compute_run_branch",
+        "_cap_text",
+        "_truncate_diff_sample",
+        "_final_conformance_payload",
+        "load_prompt",
+        "log",
+        "claude_p",
+        "_strip_leerie_prefix",
+        "log",
+        "_write_run_json",
+        "log",
+        "log"
+      ],
+      "phase_finalize": [
+        "log",
+        "run_script",
+        "die",
+        "run_script",
+        "run_proc",
+        "die",
+        "now",
+        "push_will_happen",
+        "_write_run_json",
+        "_compose_pr_via_llm",
+        "log",
+        "compute_run_branch",
+        "log",
+        "compute_run_branch",
+        "log",
+        "compute_run_branch",
+        "log"
+      ],
+      "orchestrate": [
+        "_memory_sampler",
+        "_run_phases"
+      ],
+      "_run_phases": [
+        "die",
+        "validate_resume_state",
+        "log",
+        "log",
+        "log",
+        "log",
+        "die",
+        "die",
+        "absorb_supplied_answers",
+        "die",
+        "resolve_task_argument",
+        "now",
+        "preflight",
+        "phase_classify",
+        "log",
+        "run_proc",
+        "_write_run_json",
+        "compute_run_branch",
+        "phase_provision",
+        "gather_answers",
+        "phase_plan",
+        "phase_reconcile",
+        "detect_no_work",
+        "_finish_no_work_run",
+        "phase_overlap_judge",
+        "warn_cross_planner_file_overlap",
+        "warn_layer_gaps",
+        "filter_offtree_subtasks",
+        "schedule",
+        "check_budget_feasibility",
+        "validate_plan",
+        "write_plan",
+        "phase_execute",
+        "run_final_conformance",
+        "log",
+        "phase_finalize"
+      ],
+      "main": [
+        "_read_version",
+        "resolve_leerie_root",
+        "list_runs",
+        "die",
+        "resolve_max_workers",
+        "resolve_max_parallel",
+        "resolve_confidence_rounds",
+        "resolve_judgment_check_rounds",
+        "resolve_planner_check_rounds",
+        "resolve_implementer_confidence_retries",
+        "resolve_planner_samples",
+        "resolve_worker_memory_max",
+        "verbosity_from_shortcuts",
+        "resolve_verbosity",
+        "resolve_leerie_root",
+        "resolve_run_id",
+        "die",
+        "log",
+        "resolve_source_of_truth",
+        "resolve_runtime",
+        "resolve_models",
+        "log",
+        "resolve_efforts",
+        "log",
+        "resolve_no_push",
+        "resolve_clarify",
+        "resolve_dangerously_skip_permissions",
+        "log",
+        "resolve_skip_overlap_judge",
+        "resolve_skip_budget_check",
+        "resolve_pr_template",
+        "resolve_inspect_dirs",
+        "resolve_telemetry_enabled",
+        "resolve_telemetry_subdir",
+        "resolve_judge_dir",
+        "resolve_heal_dir",
+        "resolve_heal_max_rounds",
+        "resolve_heal_success_threshold",
+        "resolve_run_id",
+        "log",
+        "die",
+        "phase_judge",
+        "log",
+        "phase_judge",
+        "die",
+        "log",
+        "log",
+        "phase_heal",
+        "_install_signal_handlers",
+        "orchestrate",
+        "log",
+        "_cleanup_on_abnormal_exit",
+        "log",
+        "now",
+        "log",
+        "log",
+        "log",
+        "log",
+        "log",
+        "log",
+        "now",
+        "_write_run_json",
+        "log",
+        "_cleanup_on_abnormal_exit",
+        "log",
+        "die"
+      ]
+    }
+  }
+}

@@ -3527,6 +3527,26 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     #    'unknown option' that tells the user nothing actionable.
     _check_claude_cli_version()
 
+    # 4b. UID 0 + --dangerously-skip-permissions incompatibility.
+    #     Claude Code refuses --dangerously-skip-permissions from root.
+    #     Acting workers (autonomous=True) always pass the flag, so no
+    #     acting worker can ever run as UID 0. Rootless containerd maps
+    #     host UID → container UID 0 (safe, but Claude Code doesn't know).
+    if os.getuid() == 0:
+        die(
+            "running as UID 0 (root). Claude Code rejects "
+            "--dangerously-skip-permissions from root, and all acting "
+            "workers (implementer, conformer, integrator) require that "
+            "flag for unattended operation.\n"
+            "\n"
+            "If this is rootless containerd: the mapped-root user is "
+            "safe but Claude Code does not distinguish it from real "
+            "root. Rootless containerd is not currently supported.\n"
+            "\n"
+            "Use standard (non-rootless) containerd or Fly.io instead. "
+            "See DESIGN.md §6 'Rootless exception'."
+        )
+
     # 5. gh CLI preflight moved to the host launcher (DESIGN §6
     #    *Finalization*). The launcher checks `gh auth status` + origin
     #    remote presence before spinning up this container; if they

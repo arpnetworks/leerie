@@ -1190,6 +1190,15 @@ range, breaking host-side access). The cgroup delegation chowns are
 best-effort (`|| true`) and harmlessly fail. The orchestrator runs as
 the mapped root user, which has the same access as the host user.
 
+**Claude Code incompatibility.** Claude Code rejects
+`--dangerously-skip-permissions` when `os.getuid() == 0`, regardless of
+whether root is real or mapped. Acting workers (`autonomous=True` in
+`claude_p`) unconditionally pass this flag for unattended operation, so
+no acting worker can run as UID 0. The `preflight()` check detects
+UID 0 and `die()`s with an actionable diagnostic before any workers
+spawn. Rootless containerd is therefore not currently supported; use
+standard (non-rootless) containerd or Fly.io.
+
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
 bind-propagation=rshared` in the bash launcher's nerdctl invocation —
