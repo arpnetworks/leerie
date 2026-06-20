@@ -24,6 +24,18 @@ set -e
 # shellcheck disable=SC3045  # ulimit -c is non-POSIX but supported by dash (Debian's /bin/sh) and bash
 ulimit -c 0
 
+# Rootless containerd detection. rootlesskit maps host UID → container
+# UID 0, so /proc/self/uid_map's first line has a non-zero host-start
+# field (e.g. "0 1000 1"). In rootless mode, root inside the container
+# IS the unprivileged host user — no privilege escalation. We must skip
+# the privilege drop to leerie (whose mapped UID can't access bind-
+# mounted host dirs) and the /work chown (which would reassign host
+# ownership to the subuid range, breaking host-side access).
+ROOTLESS=false
+if awk 'NR==1 && $2 != 0 { exit 0 } { exit 1 }' /proc/self/uid_map 2>/dev/null; then
+  ROOTLESS=true
+fi
+
 # Cgroup v2 delegation. PID 1 runs as root, so chown succeeds; the
 # orchestrator subsequently runs as leerie and operates inside the
 # delegated slice. Best-effort: missing controllers or an older kernel
@@ -66,7 +78,7 @@ cd /work
 # (rootfs /work is leerie-owned from image build; local bind-mount
 # preserves host ownership).
 # (DESIGN §6 *Remote disk policy*; IMPLEMENTATION §0.5 *Container shape*.)
-if getent passwd leerie >/dev/null 2>&1; then
+if ! $ROOTLESS && getent passwd leerie >/dev/null 2>&1; then
   chown leerie: /work 2>/dev/null || true
 fi
 
@@ -80,6 +92,10 @@ fi
 # as leerie, not root. Local nerdctl always passes argv (the task +
 # flags), so this branch never fires in local mode.
 if [ "$#" -eq 0 ]; then
+  if $ROOTLESS; then
+    exec env HOME=/home/leerie USER=leerie LOGNAME=leerie \
+      sleep infinity
+  fi
   exec runuser -u leerie -- \
     env HOME=/home/leerie USER=leerie LOGNAME=leerie \
     sleep infinity
@@ -103,6 +119,12 @@ fi
 # which could mutate PATH unpredictably). HOME is load-bearing for
 # claude (creds at ~/.claude/.credentials.json); USER/LOGNAME are read
 # by tools that introspect identity.
+# In rootless mode root IS the host user — skip the privilege drop so
+# bind-mounted host dirs remain accessible.
+if $ROOTLESS; then
+  exec env HOME=/home/leerie USER=leerie LOGNAME=leerie \
+    python3 /opt/leerie-image/orchestrator/leerie.py "$@"
+fi
 exec runuser -u leerie -- \
   env HOME=/home/leerie USER=leerie LOGNAME=leerie \
   python3 /opt/leerie-image/orchestrator/leerie.py "$@"
