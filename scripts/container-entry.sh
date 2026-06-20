@@ -120,9 +120,11 @@ fi
 # claude (creds at ~/.claude/.credentials.json); USER/LOGNAME are read
 # by tools that introspect identity.
 # In rootless mode root IS the host user — skip the privilege drop so
-# bind-mounted host dirs remain accessible.
+# bind-mounted host dirs remain accessible. IS_SANDBOX=1 tells Claude
+# Code the container is the sandbox boundary so it accepts
+# --dangerously-skip-permissions from UID 0 (mapped root).
 if [ "$ROOTLESS" = "true" ]; then
-  exec env HOME=/home/leerie USER=leerie LOGNAME=leerie \
+  exec env IS_SANDBOX=1 HOME=/home/leerie USER=leerie LOGNAME=leerie \
     python3 /opt/leerie-image/orchestrator/leerie.py "$@"
 fi
 exec runuser -u leerie -- \

@@ -1190,14 +1190,14 @@ range, breaking host-side access). The cgroup delegation chowns are
 best-effort (`|| true`) and harmlessly fail. The orchestrator runs as
 the mapped root user, which has the same access as the host user.
 
-**Claude Code incompatibility.** Claude Code rejects
-`--dangerously-skip-permissions` when `os.getuid() == 0`, regardless of
-whether root is real or mapped. Acting workers (`autonomous=True` in
-`claude_p`) unconditionally pass this flag for unattended operation, so
-no acting worker can run as UID 0. The `preflight()` check detects
-UID 0 and `die()`s with an actionable diagnostic before any workers
-spawn. Rootless containerd is therefore not currently supported; use
-standard (non-rootless) containerd or Fly.io.
+**`IS_SANDBOX=1` for `--dangerously-skip-permissions` at UID 0.**
+Claude Code rejects `--dangerously-skip-permissions` from UID 0 unless
+`IS_SANDBOX=1` is set. The rootless entrypoint path in
+`container-entry.sh` sets this variable, signalling that the container
+is the sandbox boundary — the same principle stated above ("the
+abnormal-exit cleanup guarantee is the container boundary"). Acting
+workers then run with `--dangerously-skip-permissions` identically to
+non-rootless mode.
 
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,

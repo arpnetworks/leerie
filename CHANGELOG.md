@@ -9,11 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- **Rootless containerd: preflight dies on UID 0.** Claude Code rejects
-  `--dangerously-skip-permissions` from root. Acting workers
-  unconditionally pass this flag, making rootless containerd unsupported.
-  `preflight()` now detects UID 0 and dies with an actionable diagnostic
-  instead of letting workers crash cryptically.
+- **Rootless containerd: `IS_SANDBOX=1` for UID 0.** Claude Code rejects
+  `--dangerously-skip-permissions` from UID 0 unless `IS_SANDBOX=1` is
+  set. The rootless entrypoint path now sets this variable, signalling
+  that the container is the sandbox boundary. Acting workers run
+  identically to non-rootless mode.
 
 ## [0.9.0]
 

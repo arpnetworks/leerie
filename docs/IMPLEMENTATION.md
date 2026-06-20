@@ -360,12 +360,10 @@ line → `ROOTLESS=true`). When rootless:
   `rootlesskit --propagation=rslave` causes this probe to fail, so
   the mount is omitted and `_cgroup_probe` falls back to uncapped.
 
-**Not currently supported.** Claude Code rejects
-`--dangerously-skip-permissions` from UID 0. Acting workers
-(`autonomous=True`) unconditionally pass this flag, so no acting
-worker can run in rootless mode. `preflight()` detects UID 0 and
-`die()`s early with a diagnostic pointing to standard containerd or
-Fly.io. See DESIGN.md §6 "Claude Code incompatibility."
+**`IS_SANDBOX=1`.** Claude Code rejects `--dangerously-skip-permissions`
+from UID 0 unless `IS_SANDBOX=1` is set. The rootless entrypoint path
+sets this variable so acting workers run with the flag identically to
+non-rootless mode. See DESIGN.md §6.
 
 The orchestrator's source lives at `/opt/leerie-image/`. It is present
 in two ways depending on execution mode:
