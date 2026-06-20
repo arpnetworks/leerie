@@ -3767,6 +3767,29 @@ else
   # Write the container ID to a cidfile and bind-mount it into the
   # container so container-entry.sh can inject --run-id <container-id>.
   # nerdctl writes the cidfile before PID 1 starts.
+
+  # Probe whether the container runtime's namespace has /sys/fs/cgroup
+  # as shared (required for rshared bind-propagation). Rootless
+  # containerd (rootlesskit --propagation=rslave) demotes it to
+  # master (slave), making the bind-mount fail. When skipped, the
+  # orchestrator's _cgroup_probe detects the missing mount and falls
+  # back to uncapped workers with one warn line.
+  CGROUP_MOUNT_ARG=()
+  if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+    _cg_shared=true
+    _rl_child="/run/user/$(id -u)/containerd-rootless/child_pid"
+    if [ -f "$_rl_child" ]; then
+      _child_pid=$(cat "$_rl_child" 2>/dev/null)
+      if [ -n "$_child_pid" ] && \
+         ! grep -q ' /sys/fs/cgroup .*shared:' "/proc/$_child_pid/mountinfo" 2>/dev/null; then
+        _cg_shared=false
+      fi
+    fi
+    if $_cg_shared; then
+      CGROUP_MOUNT_ARG=(--mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared")
+    fi
+  fi
+
   _cidfile="$LEERIE_STATE_HOST_DIR/.cidfile-$$"
   rm -f "$_cidfile"
   nerdctl run \
@@ -3776,7 +3799,7 @@ else
     -v "$_cidfile:/run/leerie-cidfile:ro" \
     -e LEERIE_INSPECT_DIRS= \
     -e LEERIE_STATE_DIR=/leerie-state \
-    --mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared \
+    ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"} \
     -v "$USER_REPO:/work" \
     -v "$LEERIE_REPO:/opt/leerie-image:ro" \
     -v "$LEERIE_STATE_HOST_DIR:/leerie-state" \
