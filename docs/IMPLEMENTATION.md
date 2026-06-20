@@ -346,6 +346,20 @@ exec runuser -u leerie -- \
   python3 /opt/leerie-image/orchestrator/leerie.py "$@"
 ```
 
+**Rootless containerd.** Under rootless containerd (Linux), rootlesskit
+maps the host UID to container UID 0. The entrypoint detects this by
+checking `/proc/self/uid_map` (non-zero host-start field on the first
+line → `ROOTLESS=true`). When rootless:
+
+- The `chown leerie: /work` and `runuser -u leerie --` steps are
+  skipped — container "root" IS the host user, so privilege drop would
+  break bind-mount access and chown would reassign to the subuid range.
+- The cgroup delegation chowns (`|| true`) harmlessly fail.
+- The launcher probes whether `/sys/fs/cgroup` is `shared` before
+  adding the `rshared` bind-mount; rootless containerd with
+  `rootlesskit --propagation=rslave` causes this probe to fail, so
+  the mount is omitted and `_cgroup_probe` falls back to uncapped.
+
 The orchestrator's source lives at `/opt/leerie-image/`. It is present
 in two ways depending on execution mode:
 

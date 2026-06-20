@@ -1180,12 +1180,26 @@ out-of-band by the launcher's ssh-console wrapper that explicitly
 drops via `Popen(user="leerie")`). Either way the orchestrator runs
 as leerie and operates inside the delegated slice.
 
+**Rootless exception.** Under rootless containerd (Linux), rootlesskit
+maps the host UID to container UID 0, so "root" inside the container IS
+the unprivileged host user — no actual privilege escalation occurs. In
+this mode the entrypoint detects rootless via `/proc/self/uid_map`
+(non-zero host-start field) and skips both the privilege drop (`runuser`)
+and the `/work` chown (which would reassign ownership into the subuid
+range, breaking host-side access). The cgroup delegation chowns are
+best-effort (`|| true`) and harmlessly fail. The orchestrator runs as
+the mapped root user, which has the same access as the host user.
+
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
 bind-propagation=rshared` in the bash launcher's nerdctl invocation —
-so the in-container entrypoint can see the host VM's cgroupfs. Fly's
-Firecracker microVM exposes cgroupfs directly with no launcher flag
-required.
+so the in-container entrypoint can see the host VM's cgroupfs. The
+launcher probes whether `/sys/fs/cgroup` is shared before adding this
+mount; rootless containerd with `rootlesskit --propagation=rslave`
+demotes it to slave, making `rshared` fail. When the probe detects
+this, the mount is omitted and the orchestrator's `_cgroup_probe` falls
+back to uncapped workers with one warn line. Fly's Firecracker microVM
+exposes cgroupfs directly with no launcher flag required.
 
 The orchestrator's `_detect_cgroup_root` prefers
 `/sys/fs/cgroup/leerie.slice` and falls back to `/sys/fs/cgroup`.

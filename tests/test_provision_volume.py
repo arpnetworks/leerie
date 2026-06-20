@@ -138,6 +138,7 @@ def test_no_volume_when_disk_gb_unset(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
         "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
+        "LEERIE_FLY_APP": "leerie",
         "FLY_APP": "leerie",
         "USER_REPO": str(user_repo),
         "LEERIE_RUN_ID": run_id,
@@ -187,6 +188,7 @@ def test_volume_created_when_disk_gb_set(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
         "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
+        "LEERIE_FLY_APP": "leerie",
         "FLY_APP": "leerie",
         "USER_REPO": str(user_repo),
         "LEERIE_RUN_ID": run_id,
@@ -244,6 +246,7 @@ def test_destroy_machine_destroys_volume_when_set(tmp_path):
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
+        "LEERIE_FLY_APP": "leerie",
         "FLY_APP": "leerie",
     }
     result = _run_bash(
@@ -279,6 +282,7 @@ def test_destroy_machine_does_not_call_volumes_when_unset(tmp_path):
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
+        "LEERIE_FLY_APP": "leerie",
         "FLY_APP": "leerie",
     }
     result = _run_bash(
@@ -371,6 +375,7 @@ def test_orphan_volume_cleaned_on_machine_create_failure(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
         "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
+        "LEERIE_FLY_APP": "leerie",
         "FLY_APP": "leerie",
         "USER_REPO": str(user_repo),
         "LEERIE_RUN_ID": run_id,
