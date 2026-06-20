@@ -18,8 +18,10 @@
 FROM debian:13-slim
 
 # Base tools leerie + claude -p + typical worker tasks need.
-# build-essential covers native-module comleerietion (sharp, bcrypt, etc.) so
-# `npm install` doesn't fail on first run in a fresh worktree.
+# build-essential + dev libraries cover native-extension compilation:
+# node-gyp (sharp, bcrypt), Ruby C gems (nokogiri, pg, sqlite3, ffi),
+# and Python C extensions. The -dev packages provide headers that
+# `bundle install` / `pip install` need for gems/wheels with C code.
 # procps provides `ps`, which the orchestrator's PPID-walk fast-cleanup path
 # (leerie.py:925) calls between waves. Without it the walk silently degrades
 # to no-op via the OSError catch — correctness is fine, but the documented
@@ -34,6 +36,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       rsync \
       tzdata \
+      zlib1g-dev libyaml-dev libreadline-dev libffi-dev \
+      libpq-dev libsqlite3-dev libgdbm-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Python runtime deps. See docs/IMPLEMENTATION.md §0 "Python runtime"
@@ -86,6 +90,10 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="${MISE_VERSION}" sh \
 # field is honored — repo's pinned pnpm version wins, no global pin
 # needed.
 #
+# RUBY_COMPILE=false uses precompiled Ruby binaries instead of building
+# from source. Avoids needing the full ruby-build toolchain (autoconf,
+# bison, etc.) inside the container. Becomes the mise default in 2026.8.0.
+#
 # DATA_DIR is where mise installs per-repo runtime versions; the
 # launcher bind-mounts this from ~/.cache/leerie/mise-data so installs
 # survive across runs. SYSTEM_DATA_DIR is where the LTS fallback
@@ -93,6 +101,7 @@ RUN curl -fsSL https://mise.run | MISE_VERSION="${MISE_VERSION}" sh \
 # through to SYSTEM_DATA_DIR (mise.jdx.dev/mise-cookbook/docker.html).
 ENV MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS=node,python,ruby,rust
 ENV MISE_NODE_COREPACK=true
+ENV MISE_RUBY_COMPILE=false
 ENV MISE_DATA_DIR=/home/leerie/.local/share/mise
 ENV MISE_SYSTEM_DATA_DIR=/usr/local/share/mise
 
