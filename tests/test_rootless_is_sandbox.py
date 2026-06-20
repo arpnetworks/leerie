@@ -1,8 +1,9 @@
-"""Source-text pin: rootless entrypoint sets IS_SANDBOX=1.
+"""Source-text pin: rootless entrypoint remaps UID via unshare.
 
-Claude Code rejects --dangerously-skip-permissions from UID 0 unless
-IS_SANDBOX=1 is set. The rootless path in container-entry.sh must set
-this variable so acting workers run identically to non-rootless mode.
+Claude Code rejects --dangerously-skip-permissions from UID 0. The
+rootless path in container-entry.sh uses unshare --user to remap outer
+UID 0 to the leerie user in a nested user namespace, so the
+orchestrator runs as non-root and the flag is accepted.
 """
 from __future__ import annotations
 
@@ -18,29 +19,38 @@ def _orchestrator_rootless_block() -> str:
     src = ENTRY_SH.read_text()
     marker = "python3 /opt/leerie-image/orchestrator/leerie.py"
     py_pos = src.index(marker)
-    # Walk backward to the enclosing ROOTLESS if-block.
     block_start_marker = 'if [ "$ROOTLESS" = "true" ]; then'
     start = src.rindex(block_start_marker, 0, py_pos)
     end = src.index("\nfi", start) + len("\nfi")
     return src[start:end]
 
 
-def test_rootless_sets_is_sandbox():
-    """The rootless exec must export IS_SANDBOX=1 so Claude Code accepts
-    --dangerously-skip-permissions from mapped root."""
+def test_rootless_uses_unshare():
+    """The rootless exec must use unshare --user to remap UID 0 to
+    a non-root user so Claude Code accepts --dangerously-skip-permissions."""
     block = _orchestrator_rootless_block()
-    assert "IS_SANDBOX=1" in block, (
-        "rootless entrypoint must set IS_SANDBOX=1 — without it, "
+    assert "unshare --user" in block, (
+        "rootless entrypoint must use unshare --user — without it, "
         "Claude Code rejects --dangerously-skip-permissions from UID 0"
     )
 
 
-def test_is_sandbox_precedes_exec():
-    """IS_SANDBOX=1 must appear in the env block before python3, not
-    after exec (where it would be a no-op)."""
+def test_unshare_maps_leerie_uid():
+    """unshare must map to the leerie user's UID/GID, not a hardcoded value."""
     block = _orchestrator_rootless_block()
-    sandbox_pos = block.index("IS_SANDBOX=1")
+    assert "--map-user=" in block, (
+        "unshare must use --map-user to remap to leerie's UID"
+    )
+    assert "--map-group=" in block, (
+        "unshare must use --map-group to remap to leerie's GID"
+    )
+
+
+def test_unshare_precedes_python():
+    """unshare must appear before python3 in the exec chain."""
+    block = _orchestrator_rootless_block()
+    unshare_pos = block.index("unshare")
     exec_pos = block.index("python3")
-    assert sandbox_pos < exec_pos, (
-        "IS_SANDBOX=1 must precede the python3 invocation"
+    assert unshare_pos < exec_pos, (
+        "unshare must precede the python3 invocation"
     )

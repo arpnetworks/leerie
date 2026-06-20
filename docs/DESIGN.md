@@ -1190,14 +1190,16 @@ range, breaking host-side access). The cgroup delegation chowns are
 best-effort (`|| true`) and harmlessly fail. The orchestrator runs as
 the mapped root user, which has the same access as the host user.
 
-**`IS_SANDBOX=1` for `--dangerously-skip-permissions` at UID 0.**
-Claude Code rejects `--dangerously-skip-permissions` from UID 0 unless
-`IS_SANDBOX=1` is set. The rootless entrypoint path in
-`container-entry.sh` sets this variable, signalling that the container
-is the sandbox boundary — the same principle stated above ("the
-abnormal-exit cleanup guarantee is the container boundary"). Acting
-workers then run with `--dangerously-skip-permissions` identically to
-non-rootless mode.
+**User-namespace remap for `--dangerously-skip-permissions`.**
+Claude Code rejects `--dangerously-skip-permissions` when
+`os.getuid() == 0`. In rootless mode the entrypoint uses
+`unshare --user --map-user=<leerie-uid> --map-group=<leerie-gid>` to
+remap outer UID 0 (the mapped host user) to inner UID leerie in a
+nested user namespace. Bind-mounted host dirs remain owned by us
+(outer UID 0 → inner UID leerie), and image dirs at
+`/opt/leerie-image/` (outer UID leerie) are traversed via their
+mode-755 bits. The orchestrator sees `getuid() == leerie` and Claude
+Code accepts `--dangerously-skip-permissions` without any escape hatch.
 
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
