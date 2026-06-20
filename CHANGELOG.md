@@ -5,6 +5,16 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.1]
+
+### Fixed
+
+- **Rootless containerd: preflight dies on UID 0.** Claude Code rejects
+  `--dangerously-skip-permissions` from root. Acting workers
+  unconditionally pass this flag, making rootless containerd unsupported.
+  `preflight()` now detects UID 0 and dies with an actionable diagnostic
+  instead of letting workers crash cryptically.
+
 ## [0.9.0]
 
 ### Added
