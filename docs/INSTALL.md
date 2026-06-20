@@ -261,8 +261,9 @@ Prerequisites for the fly runtime:
 That's it. The launcher handles everything else automatically on first
 `--runtime fly` invocation:
 
-- **Auto-creates the Fly app** (`flyctl apps create $LEERIE_FLY_APP`,
-  default `leerie`) if it doesn't exist yet. Idempotent.
+- **Auto-creates the Fly app** (`flyctl apps create $LEERIE_FLY_APP`)
+  if it doesn't exist yet. Fly app names are globally unique — set yours
+  via `export LEERIE_FLY_APP=my-app` or `--fly-app my-app`. Idempotent.
 - **Builds the leerie image on Fly's remote builder** (no host Docker
   daemon required) and pushes it to `registry.fly.io/$LEERIE_FLY_APP`.
   This step takes ~3-5 min the first time per leerie version; subsequent

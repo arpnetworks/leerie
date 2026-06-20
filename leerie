@@ -644,7 +644,11 @@ PY
       exit 0
     fi
     if [ "$_list_runtime" = "fly" ] || [ "${LEERIE_RUNTIME:-}" = "fly" ]; then
-      FLY_APP="${LEERIE_FLY_APP:-leerie}"
+      if [ -z "${LEERIE_FLY_APP:-}" ]; then
+        echo "leerie: --list --runtime fly: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app" >&2
+        exit 1
+      fi
+      FLY_APP="$LEERIE_FLY_APP"
       USER_REPO="${USER_REPO:-$PWD}"
       if ! command -v flyctl >/dev/null 2>&1; then
         echo "leerie: --list --runtime fly: flyctl not found on PATH; falling back to local sidecars." >&2
@@ -822,7 +826,11 @@ PY
       echo "  Check 'leerie --list' for active runs." >&2
       exit 1
     fi
-    FLY_APP="${LEERIE_FLY_APP:-leerie}"
+    if [ "$_stop_runtime" = "fly" ] && [ -z "${LEERIE_FLY_APP:-}" ]; then
+      remote_log "--stop: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
+      exit 1
+    fi
+    FLY_APP="${LEERIE_FLY_APP:-}"
     export FLY_APP
     export LEERIE_RUN_ID="$_stop_run_id"
     # shellcheck disable=SC1091
@@ -911,7 +919,11 @@ PY
       _kill_runtime="fly"
     fi
     [ -n "${LEERIE_FORCE_KILL:-}" ] && _kill_force=1
-    FLY_APP="${_kill_app:-${LEERIE_FLY_APP:-leerie}}"
+    if [ "$_kill_runtime" = "fly" ] && [ -z "${_kill_app:-}" ] && [ -z "${LEERIE_FLY_APP:-}" ]; then
+      remote_log "--kill: LEERIE_FLY_APP is required (or pass --app <name>). Set it: export LEERIE_FLY_APP=my-app"
+      exit 1
+    fi
+    FLY_APP="${_kill_app:-${LEERIE_FLY_APP:-}}"
     export FLY_APP
     _kill_run_dir=""
     _kill_sidecar=""
@@ -1096,8 +1108,15 @@ PY
         exit 0
       fi
     fi
-    FLY_APP="${LEERIE_FLY_APP:-leerie}"
-    export FLY_APP LEERIE_RUN_ID="$_fin_run_id"
+    if [ "$_fin_runtime" = "fly" ]; then
+      if [ -z "${LEERIE_FLY_APP:-}" ]; then
+        remote_log "--finalize: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
+        exit 1
+      fi
+      FLY_APP="$LEERIE_FLY_APP"
+      export FLY_APP
+    fi
+    export LEERIE_RUN_ID="$_fin_run_id"
     # Detect "already synced" — the auto-sync path in decide_teardown's
     # rc=0 branch may have already pulled the branch + state to the
     # host BEFORE destroying the machine. In that case, run.json has
@@ -2169,6 +2188,44 @@ if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
   fi
 fi
 
+# --- LEERIE_FLY_APP (Fly.io app name) ------------------------------------
+# Fly.io app names are globally unique — the hardcoded default "leerie" is
+# already taken, so every user must set their own. Resolution:
+#   1. --fly-app NAME / --fly-app=NAME on the CLI
+#   2. $LEERIE_FLY_APP already set in the env
+# When RUNTIME=fly and no value is set, die with a clear message.
+_cli_fly_app=""
+for arg in "$@"; do
+  case "$arg" in
+    --fly-app=*) _cli_fly_app="${arg#--fly-app=}" ;;
+  esac
+done
+# Handle two-argument form: --fly-app NAME
+_prev_was_fly_app=false
+for arg in "$@"; do
+  if [ "$_prev_was_fly_app" = "true" ]; then
+    _cli_fly_app="$arg"
+    _prev_was_fly_app=false
+    continue
+  fi
+  if [ "$arg" = "--fly-app" ]; then
+    _prev_was_fly_app=true
+  fi
+done
+if [ -n "$_cli_fly_app" ]; then
+  LEERIE_FLY_APP="$_cli_fly_app"
+  export LEERIE_FLY_APP
+fi
+unset _cli_fly_app _prev_was_fly_app
+if [ "$RUNTIME" = "fly" ] && [ -z "${LEERIE_FLY_APP:-}" ]; then
+  remote_log "LEERIE_FLY_APP is required when --runtime fly."
+  echo "  Fly.io app names are globally unique. Set your app name:" >&2
+  echo "    export LEERIE_FLY_APP=my-leerie-app" >&2
+  echo "    # or: ./leerie \"task\" --fly-app my-leerie-app" >&2
+  echo "  Create the app first if needed: flyctl apps create my-leerie-app" >&2
+  exit 1
+fi
+
 # --- FLY_VM_DISK_GB (per-machine Fly volume size in GB) -------------------
 # Resolution ladder (highest → lowest):
 #   1. --fly-disk-gb N / --fly-disk-gb=N on the CLI
@@ -2605,7 +2662,12 @@ fi
 prev_was_inspect=false
 _prev_was_resume=false
 _prev_was_chain_id=false
+_prev_was_fly_app_rewrite=false
 for arg in "$@"; do
+  if [ "$_prev_was_fly_app_rewrite" = "true" ]; then
+    _prev_was_fly_app_rewrite=false
+    continue
+  fi
   if $prev_was_inspect; then
     collect_inspect_path "$arg"
     prev_was_inspect=false
@@ -2646,6 +2708,13 @@ for arg in "$@"; do
       ;;
     --no-auto-publish)
       # Launcher-only flag; consumed by ensure_image() in the remote path.
+      ;;
+    --fly-app)
+      # Launcher-only flag; consumed by the LEERIE_FLY_APP resolver above.
+      _prev_was_fly_app_rewrite=true
+      ;;
+    --fly-app=*)
+      # Launcher-only flag (=form); consumed above.
       ;;
     --local-build)
       # Launcher-only flag; consumed by ensure_image() to forward
@@ -3075,7 +3144,7 @@ CACHE_MOUNTS=(
 # does not pay the version-lookup cost.
 resolve_fly_image_tag() {
   local fly_app region version tag
-  fly_app="${LEERIE_FLY_APP:-leerie}"
+  fly_app="$LEERIE_FLY_APP"
   region="${FLY_REGION:-iad}"
   version="$LEERIE_VERSION"
   tag="registry.fly.io/$fly_app:$version"
@@ -3105,7 +3174,7 @@ ensure_image() {
     remote_log "error: $build_push not found or not executable"
     return 1
   fi
-  local fly_app="${LEERIE_FLY_APP:-leerie}"
+  local fly_app="$LEERIE_FLY_APP"
 
   # Auto-create the Fly app if missing. flyctl apps list returns a JSON
   # array; check for a Name match. The remote builder and registry push
@@ -3785,7 +3854,7 @@ else
         _cg_shared=false
       fi
     fi
-    if $_cg_shared; then
+    if [ "$_cg_shared" = "true" ]; then
       CGROUP_MOUNT_ARG=(--mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared")
     fi
   fi

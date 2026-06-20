@@ -287,7 +287,7 @@ as today).
 
 **Fly app auto-create + remote image build.** On first `--runtime
 fly` invocation per Fly account, leerie also auto-creates the Fly app
-(default name: `leerie`; override with `LEERIE_FLY_APP=<name>`) and
+(set via `LEERIE_FLY_APP=<name>` or `--fly-app <name>`) and
 builds the leerie image on Fly's remote builder. The remote build runs
 inside Fly's infrastructure — no host Docker daemon required. Takes
 ~3-5 min the first time per leerie version; subsequent runs reuse the
@@ -349,7 +349,7 @@ local setup) because nerdctl can't reach Keychain. See
   containers. Default: `local` (nerdctl on the local container
   runtime). `fly` routes each worker through Fly.io Machines instead
   — requires only `flyctl` logged in (`flyctl auth login`). The
-  launcher auto-creates the Fly app (`LEERIE_FLY_APP`, default `leerie`)
+  launcher auto-creates the Fly app (`LEERIE_FLY_APP`, required)
   and builds the leerie image on Fly's remote builder if the registry
   tag is missing; opt out with `--no-auto-publish`. Opt into local
   build with `--local-build` / `LEERIE_LOCAL_BUILD=1` (requires

@@ -32,7 +32,7 @@
 # Environment variables consumed:
 #
 #   LEERIE_MACHINE_ID  — ID of the Fly Machine (set by provision.sh)
-#   LEERIE_FLY_APP     — Fly.io app name (default: "leerie")
+#   LEERIE_FLY_APP     — Fly.io app name (required)
 #   USER_REPO        — absolute path to the local git repo (set by launcher)
 #
 # Exports (set by fetch_branch on success):
@@ -47,7 +47,7 @@ _FETCH_BRANCH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$_FETCH_BRANCH_DIR/_log.sh"
 
-FLY_APP="${LEERIE_FLY_APP:-leerie}"
+FLY_APP="${LEERIE_FLY_APP:-}"
 
 # ---------------------------------------------------------------------------
 # _fetch_machine_exec <cmd>...

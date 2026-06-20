@@ -43,7 +43,7 @@ set -eu -o pipefail
 . "${LEERIE_REPO:-$(cd -- "$(dirname "$(dirname "$(dirname "${BASH_SOURCE[0]}")")")" && pwd -P)}/scripts/remote/_log.sh"
 
 collect_subtrees_remote() {
-  local app="${1:-${FLY_APP:-leerie}}"
+  local app="${1:-${FLY_APP:-}}"
   local machine="${2:-${LEERIE_MACHINE_ID:-}}"
 
   if [ -z "$machine" ]; then

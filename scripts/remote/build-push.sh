@@ -10,7 +10,7 @@
 # Usage:
 #   ./scripts/remote/build-push.sh [OPTIONS]
 #
-#   --app NAME       fly.io app name (default: LEERIE_FLY_APP env or "leerie")
+#   --app NAME       fly.io app name (default: LEERIE_FLY_APP env, required)
 #   --registry REG   registry prefix (default: registry.fly.io/<APP>)
 #   --tag TAG        override the full image tag (default: <REGISTRY>:<VERSION>)
 #   --push           build and push in one step (implied by both modes below)
@@ -67,7 +67,7 @@ LEERIE_VERSION="$(awk -F'"' '/"version"/ {print $4; exit}' \
                   "$LEERIE_REPO/.claude-plugin/plugin.json" 2>/dev/null || echo dev)"
 
 # --- defaults -------------------------------------------------------------
-FLY_APP="${LEERIE_FLY_APP:-leerie}"
+FLY_APP="${LEERIE_FLY_APP:-}"
 REGISTRY=""      # resolved below after --app is parsed
 TAG_OVERRIDE=""
 PUSH=false
@@ -110,6 +110,12 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# Validate: FLY_APP must be set (either via LEERIE_FLY_APP env or --app flag).
+if [ -z "$FLY_APP" ]; then
+  echo "build-push: LEERIE_FLY_APP must be set (or pass --app <name>)" >&2
+  exit 1
+fi
 
 # Resolve registry and tag now that --app may have been overridden.
 if [ -z "$REGISTRY" ]; then

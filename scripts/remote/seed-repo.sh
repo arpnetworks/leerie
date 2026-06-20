@@ -84,7 +84,7 @@ _SEED_REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$_SEED_REPO_DIR/lib.sh"
 
-FLY_APP="${LEERIE_FLY_APP:-leerie}"
+FLY_APP="${LEERIE_FLY_APP:-}"
 
 # ---------------------------------------------------------------------------
 # _seed_repo_preflight

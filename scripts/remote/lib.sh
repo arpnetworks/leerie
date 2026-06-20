@@ -161,7 +161,7 @@ iso_now() {
 # Returns: prints the wrapper's path to stdout. Caller is responsible
 # for `rm -f` on the path when done.
 fly_rsync_wrapper() {
-  local fly_app="${1:-${LEERIE_FLY_APP:-leerie}}"
+  local fly_app="${1:-${LEERIE_FLY_APP:-}}"
   local wrapper
   wrapper="$(mktemp -t leerie-fly-rsync.XXXXXX)"
   # The wrapper itself is portable POSIX sh. The heredoc is UNquoted so

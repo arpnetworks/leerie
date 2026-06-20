@@ -59,7 +59,7 @@ re_seed() {
   LEERIE_MACHINE_ID="$mid"
   export LEERIE_MACHINE_ID
 
-  local fly_app="${LEERIE_FLY_APP:-leerie}"
+  local fly_app="${LEERIE_FLY_APP:-}"
   FLY_APP="$fly_app"
   export FLY_APP
 

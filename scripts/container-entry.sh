@@ -78,7 +78,7 @@ cd /work
 # (rootfs /work is leerie-owned from image build; local bind-mount
 # preserves host ownership).
 # (DESIGN §6 *Remote disk policy*; IMPLEMENTATION §0.5 *Container shape*.)
-if ! $ROOTLESS && getent passwd leerie >/dev/null 2>&1; then
+if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   chown leerie: /work 2>/dev/null || true
 fi
 
@@ -92,7 +92,7 @@ fi
 # as leerie, not root. Local nerdctl always passes argv (the task +
 # flags), so this branch never fires in local mode.
 if [ "$#" -eq 0 ]; then
-  if $ROOTLESS; then
+  if [ "$ROOTLESS" = "true" ]; then
     exec env HOME=/home/leerie USER=leerie LOGNAME=leerie \
       sleep infinity
   fi
@@ -121,7 +121,7 @@ fi
 # by tools that introspect identity.
 # In rootless mode root IS the host user — skip the privilege drop so
 # bind-mounted host dirs remain accessible.
-if $ROOTLESS; then
+if [ "$ROOTLESS" = "true" ]; then
   exec env HOME=/home/leerie USER=leerie LOGNAME=leerie \
     python3 /opt/leerie-image/orchestrator/leerie.py "$@"
 fi

@@ -179,7 +179,7 @@ Base layers (top-down):
 - `apt-get install`: `ca-certificates`, `curl`, `git`, `openssh-client`,
   `python3`, `python3-pip`, `build-essential`, plus dev libraries
   (`zlib1g-dev`, `libyaml-dev`, `libreadline-dev`, `libffi-dev`,
-  `libpq-dev`, `libsqlite3-dev`, `libgdbm-dev`). The build tools and
+  `libssl-dev`, `libpq-dev`, `libsqlite3-dev`, `libgdbm-dev`). The build tools and
   dev headers cover native-extension compilation: `node-gyp` (sharp,
   bcrypt), Ruby C gems (`nokogiri`, `pg`, `sqlite3`, `ffi`), and
   Python C extensions.
@@ -3235,7 +3235,7 @@ Environment variables consumed by `provision.sh`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `LEERIE_FLY_APP` | `leerie` | Fly.io app name |
+| `LEERIE_FLY_APP` | — (required) | Fly.io app name. Fly app names are globally unique; set via `--fly-app` or env. |
 | `FLY_IMAGE_TAG` | `registry.fly.io/<app>:<version>` | Full image tag to launch (set by the launcher) |
 | `FLY_REGION` | `iad` | Fly.io region |
 | `FLY_VM_CPUS` | `4` | vCPU count for the machine. Setting >8 auto-promotes to Fly's `performance` CPU class (much more expensive — ~14x per CPU-second). |
@@ -3696,7 +3696,7 @@ Environment variables consumed by `seed-repo.sh`:
 | Variable | Default | Purpose |
 |---|---|---|
 | `LEERIE_MACHINE_ID` | — | ID of the started Fly Machine (exported by `provision.sh`) |
-| `LEERIE_FLY_APP` | `leerie` | Fly.io app name |
+| `LEERIE_FLY_APP` | — (required) | Fly.io app name. Fly app names are globally unique; set via `--fly-app` or env. |
 | `USER_REPO` | — | Absolute path to the local git repo (set by launcher) |
 
 Requires: `flyctl` on `PATH` (authenticated); `git`; `python3`; `rsync`.
@@ -3796,7 +3796,7 @@ Environment variables consumed by `fetch-branch.sh`:
 | Variable | Default | Purpose |
 |---|---|---|
 | `LEERIE_MACHINE_ID` | — | ID of the started Fly Machine (exported by `provision.sh`) |
-| `LEERIE_FLY_APP` | `leerie` | Fly.io app name |
+| `LEERIE_FLY_APP` | — (required) | Fly.io app name. Fly app names are globally unique; set via `--fly-app` or env. |
 | `USER_REPO` | — | Absolute path to the local git repo (set by launcher) |
 
 Exports: `LEERIE_REMOTE_RUN_ID` — the run-id of the completed run on the machine.
@@ -3861,7 +3861,7 @@ Schema for the record (both paths):
 
 ```json
 {
-  "fly_app": "leerie",
+  "fly_app": "my-leerie-app",
   "fly_machine_id": "148e445b911389",
   "started_at": "2026-05-29T16:00:00+00:00",
   "run_id": "feat-foo-abc123",

@@ -64,7 +64,7 @@ _SEED_AUTH_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck disable=SC1091
 . "$_SEED_AUTH_DIR/_log.sh"
 
-FLY_APP="${LEERIE_FLY_APP:-leerie}"
+FLY_APP="${LEERIE_FLY_APP:-}"
 
 # --- seed_auth -----------------------------------------------------------
 # Seeds Claude config + git identity into the provisioned Fly Machine.

@@ -40,7 +40,7 @@ resume_machine() {
     remote_log "resume_machine: machine id required"
     return 1
   fi
-  local fly_app="${LEERIE_FLY_APP:-leerie}"
+  local fly_app="${LEERIE_FLY_APP:-}"
   remote_log "remote: resuming machine $mid (app=$fly_app)..."
 
   # Resolve sidecar path once — used by the image-update block below

@@ -47,7 +47,7 @@ _PROVISION_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$_PROVISION_DIR/lib.sh"
 
 # --- configuration with defaults -----------------------------------------
-FLY_APP="${LEERIE_FLY_APP:-leerie}"
+FLY_APP="${LEERIE_FLY_APP:-}"
 FLY_REGION="${FLY_REGION:-iad}"
 FLY_VM_CPUS="${FLY_VM_CPUS:-4}"
 FLY_VM_MEMORY="${FLY_VM_MEMORY:-8192}"

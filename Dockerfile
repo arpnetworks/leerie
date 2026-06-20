@@ -36,7 +36,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential \
       rsync \
       tzdata \
-      zlib1g-dev libyaml-dev libreadline-dev libffi-dev \
+      zlib1g-dev libyaml-dev libreadline-dev libffi-dev libssl-dev \
       libpq-dev libsqlite3-dev libgdbm-dev \
     && rm -rf /var/lib/apt/lists/*
 
