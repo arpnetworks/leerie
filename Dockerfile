@@ -19,9 +19,11 @@ FROM debian:13-slim
 
 # Base tools leerie + claude -p + typical worker tasks need.
 # build-essential + dev libraries cover native-extension compilation:
-# node-gyp (sharp, bcrypt), Ruby C gems (nokogiri, pg, sqlite3, ffi),
+# node-gyp (sharp, bcrypt), Ruby C gems (nokogiri, pg, sqlite3, mysql2, ffi),
 # and Python C extensions. The -dev packages provide headers that
 # `bundle install` / `pip install` need for gems/wheels with C code.
+# default-libmysqlclient-dev provides both the headers for mysql2 gem
+# compilation and libmariadb.so.3 for runtime linking.
 # procps provides `ps`, which the orchestrator's PPID-walk fast-cleanup path
 # (leerie.py:925) calls between waves. Without it the walk silently degrades
 # to no-op via the OSError catch — correctness is fine, but the documented
@@ -38,6 +40,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       tzdata \
       zlib1g-dev libyaml-dev libreadline-dev libffi-dev libssl-dev \
       libpq-dev libsqlite3-dev libgdbm-dev \
+      default-libmysqlclient-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Python runtime deps. See docs/IMPLEMENTATION.md §0 "Python runtime"
