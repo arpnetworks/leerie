@@ -179,9 +179,10 @@ Base layers (top-down):
 - `apt-get install`: `ca-certificates`, `curl`, `git`, `openssh-client`,
   `python3`, `python3-pip`, `build-essential`, plus dev libraries
   (`zlib1g-dev`, `libyaml-dev`, `libreadline-dev`, `libffi-dev`,
-  `libssl-dev`, `libpq-dev`, `libsqlite3-dev`, `libgdbm-dev`). The build tools and
+  `libssl-dev`, `libpq-dev`, `libsqlite3-dev`, `libgdbm-dev`,
+  `default-libmysqlclient-dev`). The build tools and
   dev headers cover native-extension compilation: `node-gyp` (sharp,
-  bcrypt), Ruby C gems (`nokogiri`, `pg`, `sqlite3`, `ffi`), and
+  bcrypt), Ruby C gems (`nokogiri`, `pg`, `sqlite3`, `mysql2`, `ffi`), and
   Python C extensions.
 - Node.js LTS, arch-aware via `TARGETARCH` / `dpkg --print-architecture`
   → `arm64` → `linux-arm64` tarball, `amd64` → `linux-x64`. Pinned via
