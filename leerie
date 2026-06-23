@@ -3002,6 +3002,15 @@ if [ -d "$HOME/.gnupg" ]; then
     find "$STAGE/.gnupg" -name '*.sock' -delete 2>/dev/null
   fi
   chmod 700 "$STAGE/.gnupg"
+  # Strip use-keyboxd: macOS GnuPG 2.4+ enables keyboxd by default, but
+  # the container can't reach the host daemon (socket excluded above) and
+  # gpg crashes with "SQL library used incorrectly" during mise's Node
+  # signature verification. Falling back to file-based pubring.kbx lookup.
+  if [ -f "$STAGE/.gnupg/common.conf" ]; then
+    grep -v '^[[:space:]]*use-keyboxd[[:space:]]*$' "$STAGE/.gnupg/common.conf" \
+      > "$STAGE/.gnupg/common.conf.tmp" || true
+    mv "$STAGE/.gnupg/common.conf.tmp" "$STAGE/.gnupg/common.conf"
+  fi
 fi
 
 # -- ~/.aws/ (Bedrock mode only) --
