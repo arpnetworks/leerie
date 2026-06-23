@@ -5,6 +5,19 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.5]
+
+### Fixed
+
+- **Local container: strip `use-keyboxd` from staged `.gnupg/common.conf`.**
+  macOS GnuPG 2.4+ sets `use-keyboxd` in `~/.gnupg/common.conf`. The
+  launcher copied this into the container staging dir, but excluded the
+  `S.keyboxd` socket. Inside the container, `gpg` tried to reach the
+  host keyboxd daemon and crashed with "SQL library used incorrectly",
+  killing `mise install` during phase 1½. The directive is now stripped
+  after staging so gpg falls back to file-based `pubring.kbx` lookup.
+  Fly was unaffected (`seed-auth.sh` excludes `.gnupg` entirely).
+
 ## [0.9.4]
 
 ### Fixed
