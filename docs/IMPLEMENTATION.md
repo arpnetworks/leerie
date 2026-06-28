@@ -1151,10 +1151,14 @@ orchestrator already owns. Two code-surface elements implement this:
 
 The lock primitive itself:
 
-- `State.__init__` opens `self.run_dir` with `os.open(..., O_RDONLY)`,
-  stores the fd on `self._lock_fd`, and acquires
-  `fcntl.flock(LOCK_EX | LOCK_NB)`. The fd is held for the life of
-  the State instance.
+- `State.__init__(leerie_root, run_id, repo_root=None)` opens
+  `self.run_dir` with `os.open(..., O_RDONLY)`, stores the fd on
+  `self._lock_fd`, and acquires `fcntl.flock(LOCK_EX | LOCK_NB)`. The
+  fd is held for the life of the State instance. The optional
+  `repo_root: Path | None` parameter defaults to `leerie_root.parent`
+  when not provided — needed because `LEERIE_STATE_DIR` can place
+  `leerie_root` outside the repo, making `leerie_root.parent`
+  incorrect as a repo root.
 - `State.release_lock()` closes the fd. Idempotent. Used by tests;
   the production path relies on the kernel's process-exit cleanup.
 - `State.__del__` is defensive (calls `release_lock` only if
@@ -1167,7 +1171,7 @@ The lock primitive itself:
   lock. Docstring updated to make this explicit.
 Two checked construction sites that catch `StateLockedError`:
 
-- `main()` at the `State(leerie_root, run_id)` call:
+- `main()` at the `State(leerie_root, run_id, repo_root=repo_root)` call:
   logs the message + `sys.exit(EXIT_LOCKED)`.
 - `--phase judge|heal` at the `phase_st = State(...)` call: same
   pattern, since `--phase` mutates state and would race the same
@@ -2192,8 +2196,28 @@ on the classification.
 Between Phase 3 and Phase 4, `write_plan()` persists the merged plan
 (`<state-root>/runs/<run-id>/plan.json`) and per-subtask spec files
 (`<state-root>/runs/<run-id>/subtasks/<id>.json`). The conformance
-phase derives its advisory test command separately via
-`_infer_build_lint_test()`.
+phase derives its advisory build/lint/test commands separately via
+`_infer_build_lint_test(repo_root)`, which performs best-effort
+discovery by checking for configuration files and lockfiles. Supported
+families (checked in this order; first match wins per axis via
+`out[axis] = out[axis] or "..."`):
+
+- **Makefile** → `make` (build)
+- **Node/JS** (`package.json`) → `npm run build` (build), `npm test` (test)
+- **Python** (`pyproject.toml` / `pytest.ini` / `setup.cfg`) → `pytest` (test)
+- **Rust** (`Cargo.toml`) → `cargo build` (build), `cargo test` (test)
+- **Go** (`go.mod`) → `go build ./...` (build), `go test ./...` (test)
+- **ESLint** (`.eslintrc.*`) → `npx eslint .` (lint)
+- **Ruff** (`.ruff.toml` / `ruff.toml`) → `ruff check .` (lint)
+- **Ruby/Rails** (`.rubocop.yml` / `.rubocop.yaml`) → `bundle exec rubocop` (lint);
+  `_is_rails_repo(repo_root)` (requires both `Gemfile.lock` and `bin/rails` —
+  the two-file check distinguishes Rails from Sinatra/Grape/etc.) →
+  `bin/rails test` (test)
+
+The short-circuit semantics mean earlier families take precedence: in a
+polyglot Node+Rails repo, `npm test` wins the test axis while
+`bundle exec rubocop` still fills the lint axis if no ESLint/Ruff config
+exists.
 
 `plan.json` carries `{task, waves, subtasks, preconditions}`. The
 `preconditions` array is the deduped list of `extent: external` `requires`
@@ -2477,7 +2501,7 @@ Implements DESIGN §9 *Post-work conformance*.
 | Validate output | `validate_conformance_result()` | Cross-field invariants — `rule_violations_residual` non-empty requires `rules_files_read` non-empty; each `rule_violations_fixed` item must cite a non-empty `rule` string; each `docs_updates` / `tests_updates` item must cite a `path` that exists. On failure → warning, loop breaks. |
 | Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions used on the implementer, re-applied to any new commits the conformer added. A scope-protected-path violation triggers `rollback_conformer_commits()` (reset to `before_sha`) and is recorded as a warning, **not** as `failed` / `blocked`. |
 | Loop bound | `caps["conformance_rounds"]` (default 3) | Re-runs the conformer if its output is malformed or residuals remain. Exhausting the cap with residuals still present is a warning, not a failure. |
-| BLT-axis observability + feedback | `_emit_bash_axis_warnings()` | After each round, parses the per-worker JSONL log at `<state-root>/runs/<id>/logs/<sid>-conformer.log` (or `final-conformer-r<N>.log` for the final pass) and surfaces two types: (1) **multi-invocation** (advisory only) — `conformer round N: ran <AXIS>_CMD K times in one round` — legitimate progressive testing (targeted → full suite → grep) is the common cause; surfaced for observability. (2) **retry-after-backgrounded** (feedback-injected) — `conformer round N: <AXIS>_CMD auto-backgrounded (bash_id=<id>) and was followed by another <AXIS>_CMD invocation` — the "retry-instead-of-recover" pattern. These Pattern B warnings are collected after each round and, if non-empty, formatted via `_format_check_feedback()` and passed as `extra_feedback` to the next round's `run_conformer()` call so the conformer can correct the behavior. Helpers `_count_bash_axis_invocations()` and `_count_orphaned_bg_axis()` are pure log-parsing — never raise. The `_count_orphaned_bg_axis` detection logic also accepts `BashOutput shell_id=<id>` polls as a valid recovery path — forward-compatible with future tool-surface changes. |
+| BLT-axis observability + feedback | `_emit_bash_axis_warnings()` | After each round, parses the per-worker JSONL log at `<state-root>/runs/<id>/logs/<sid>-conformer.log` (or `final-conformer-r<N>.log` for the final pass) and surfaces two types: (1) **multi-invocation** (advisory only) — `conformer round N: ran <AXIS>_CMD K times in one round` — legitimate progressive testing (targeted → full suite → grep) is the common cause; surfaced for observability. (2) **retry-after-backgrounded** (feedback-injected) — `conformer round N: <AXIS>_CMD auto-backgrounded (bash_id=<id>) and was followed by another <AXIS>_CMD invocation` — the "retry-instead-of-recover" pattern. These Pattern B warnings are collected after each round and, if non-empty, formatted via `_format_check_feedback()` and passed as `extra_feedback` to the next round's `run_conformer()` call so the conformer can correct the behavior. Helpers `_count_bash_axis_invocations()` and `_count_orphaned_bg_axis()` are pure log-parsing — never raise. `_BLT_AXIS_RES` is a `dict[str, re.Pattern[str]]` containing compiled regexes for the test, build, and lint axes: test matches `pnpm/npm/yarn/npx test` (and `vitest`), `vitest run`, `bin/rails test`; build matches `pnpm/npm/yarn build`, `tsc`, `next build`; lint matches `pnpm/npm/yarn lint`, `biome check`, `eslint`, `rubocop`. The `_count_orphaned_bg_axis` detection logic also accepts `BashOutput shell_id=<id>` polls as a valid recovery path — forward-compatible with future tool-surface changes. |
 | Attach result | — | `res["conformance"]` (worker output blob) and `res["conformance_warnings"]` (list of strings) are added to the implementer's result. The subtask still returns `complete`. |
 
 The phase is advisory: **no path through the conformance phase produces a
@@ -4765,7 +4789,7 @@ enforcement functions:
 | `test_inspect_tools.py` | `INSPECT_TOOLS` composition and the inspect-callsite wirings (classifier, planner, reconciler, plan_overlap_judge, provision) — pins that the inspect bucket grants `Bash(<verb>:*)` patterns but never `Write`/`Edit` or bare `Bash`, the same DESIGN §12 enforcement applied to workers that don't get `--dangerously-skip-permissions` |
 | `test_resolve_inspect_dirs.py` | `resolve_inspect_dirs()` precedence (CLI → env → TOML → `[]`), `~` expansion, dedup, and `STATE_FIELDS` membership |
 | `test_resolve_prompt.py` | `resolve_prompt()` — every `WORKER_TYPES` member returns a `("file", content, "prompts/<call_type>.md")` triple; parity/coupling test; unknown call_type raises |
-| `test_discover_rules_files.py`, `test_validate_conformance_result.py`, `test_run_conformance_phase.py`, `test_run_final_conformance.py`, `test_infer_build_lint_test.py` | the post-work conformance phase (DESIGN §9) and the post-integration whole-tree conformance pass (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph): rule-file discovery against the fixed capped allowlist, schema cross-field invariants including path-traversal rejection, the orchestrator-level loop covering clean / malformed / crashed / rolled-back / cap-exhausted paths, the commit-prefix observability check, the dirty-state warning before rollback, the worker-budget-exhausted advisory path, the outer `settle_subtask` contract (never escalates to `failed`/`blocked` even on `FileNotFoundError`), and `_infer_build_lint_test` across the supported package-manager families. `test_run_final_conformance.py` additionally covers the staging-worktree skip path, the working_branch-absent skip path, the resume-idempotence short-circuit, the `_final_conformance_payload` PR-writer surfacing helper, and a coupling test that the call site lives between `phase_execute` and `phase_finalize` in `_run_phases` |
+| `test_discover_rules_files.py`, `test_validate_conformance_result.py`, `test_run_conformance_phase.py`, `test_run_final_conformance.py`, `test_infer_build_lint_test.py` | the post-work conformance phase (DESIGN §9) and the post-integration whole-tree conformance pass (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph): rule-file discovery against the fixed capped allowlist, schema cross-field invariants including path-traversal rejection, the orchestrator-level loop covering clean / malformed / crashed / rolled-back / cap-exhausted paths, the commit-prefix observability check, the dirty-state warning before rollback, the worker-budget-exhausted advisory path, the outer `settle_subtask` contract (never escalates to `failed`/`blocked` even on `FileNotFoundError`), and `_infer_build_lint_test` across the supported package-manager families (Node/JS, Python, Rust, Go, Ruby/Rails including rubocop detection, `bin/rails test` inference, and the `_is_rails_repo` two-file guard against Sinatra/Grape false positives). `test_run_final_conformance.py` additionally covers the staging-worktree skip path, the working_branch-absent skip path, the resume-idempotence short-circuit, the `_final_conformance_payload` PR-writer surfacing helper, and a coupling test that the call site lives between `phase_execute` and `phase_finalize` in `_run_phases` |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |
