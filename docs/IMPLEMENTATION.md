@@ -2207,12 +2207,19 @@ families (checked in this order; first match wins per axis via
 - **Python** (`pyproject.toml` / `pytest.ini` / `setup.cfg`) → `pytest` (test)
 - **Rust** (`Cargo.toml`) → `cargo build` (build), `cargo test` (test)
 - **Go** (`go.mod`) → `go build ./...` (build), `go test ./...` (test)
+- **Maven** (`pom.xml`) → `mvn package` (build), `mvn test` (test)
+- **Gradle** (`build.gradle` / `build.gradle.kts`) → `./gradlew build` /
+  `./gradlew test` when `gradlew` exists, else `gradle build` / `gradle test`
 - **ESLint** (`.eslintrc.*`) → `npx eslint .` (lint)
 - **Ruff** (`.ruff.toml` / `ruff.toml`) → `ruff check .` (lint)
-- **Ruby/Rails** (`.rubocop.yml` / `.rubocop.yaml`) → `bundle exec rubocop` (lint);
-  `_is_rails_repo(repo_root)` (requires both `Gemfile.lock` and `bin/rails` —
-  the two-file check distinguishes Rails from Sinatra/Grape/etc.) →
-  `bin/rails test` (test)
+- **RuboCop** (`.rubocop.yml` / `.rubocop.yaml`) → `bundle exec rubocop` (lint)
+- **C#/.NET** (`*.sln` at root, or `*.csproj` at root as fallback) →
+  `dotnet build` (build), `dotnet test` (test)
+- **PHP** (`phpunit.xml` / `phpunit.xml.dist`) → `vendor/bin/phpunit` (test);
+  (`phpstan.neon` / `phpstan.neon.dist`) → `vendor/bin/phpstan analyse` (lint)
+- **Rails** — `_is_rails_repo(repo_root)` (requires both `Gemfile.lock` and
+  `bin/rails` — the two-file check distinguishes Rails from
+  Sinatra/Grape/etc.) → `bin/rails test` (test)
 
 The short-circuit semantics mean earlier families take precedence: in a
 polyglot Node+Rails repo, `npm test` wins the test axis while
@@ -2976,12 +2983,15 @@ not first-wins).
 | `go.mod` + `go.sum` | `go mod download` | |
 | `Cargo.lock` | `cargo fetch` | |
 | `Gemfile.lock` | `bundle install` | |
+| `composer.lock` | `composer install --no-interaction` | |
+| `packages.lock.json` | `dotnet restore` | NuGet lockfile |
 | anything else | (no entry — caller falls back to LLM worker) | bare `requirements.txt`, bare `pyproject.toml`, Maven (`pom.xml`), Gradle, polyglot Makefile |
 
 `validate_provision_recipe(recipe) -> None` enforces (raises `ValueError`
 on violation):
 - `command[0]` is in the argv allowlist `{pnpm, npm, yarn, pip, pip3,
-  uv, poetry, go, cargo, bundle, gem, mvn, gradle, gradlew, make}`.
+  uv, poetry, go, cargo, bundle, gem, mvn, gradle, gradlew, make,
+  composer, dotnet}`.
 - No `sudo` anywhere in the argv.
 - No shell metacharacters (`|`, `&`, `;`, `$`, backticks, `>`, `<`, `\n`)
   in any argv element.
@@ -4478,6 +4488,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / plan_overlap_judge / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). Resolved from `--skip-overlap-judge` / `LEERIE_SKIP_OVERLAP_JUDGE` / `leerie.toml` / default `False`. The cheap-skip on single-planner / <2-subtask runs is automatic and not gated by this field — this flag only affects runs where the worker would otherwise fire. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `skip_budget_check` | bool | whether `check_budget_feasibility()` (DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*) is suppressed. Resolved from `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml` / default `False`. The runtime backstop in `State.bump_workers()` is independent of this field — it always fires when the counter actually exceeds `max_total_workers`; this flag only suppresses the *early* die() that catches mathematically-unwinnable runs at the plan/execute boundary. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state. On `--resume` the preflight is moot regardless — the resume path enters past `schedule()` so the check has nothing to gate |
+| `strict_conformer` | bool | whether the conformer phase is blocking instead of advisory (DESIGN §9 *Post-work conformance*, "Opt-in strict mode" paragraph). Resolved from `--strict-conformer` / `LEERIE_STRICT_CONFORMER` / `leerie.toml` / default `False`. When True, conformer residuals (failed build/lint/test axes or unresolved rule violations) cause the subtask to return `blocked` instead of `complete`; the final-tree pass also blocks the run if residuals remain. The user fixes the residuals and runs `--resume`. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `verbosity` | str | resolved verbosity level (`quiet` / `normal` / `stream` / `debug`); re-resolved fresh on every run, including `--resume`, so the user can dial up or down without editing state |
 | `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) via `--add-dir`. Resolved from `--inspect-dir` / `LEERIE_INSPECT_DIRS` / `inspect_dirs` in `leerie.toml`; re-resolved fresh on every run, including `--resume`, so the user can add or remove paths without editing state. Empty list when nothing is configured |
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
@@ -4789,7 +4800,7 @@ enforcement functions:
 | `test_inspect_tools.py` | `INSPECT_TOOLS` composition and the inspect-callsite wirings (classifier, planner, reconciler, plan_overlap_judge, provision) — pins that the inspect bucket grants `Bash(<verb>:*)` patterns but never `Write`/`Edit` or bare `Bash`, the same DESIGN §12 enforcement applied to workers that don't get `--dangerously-skip-permissions` |
 | `test_resolve_inspect_dirs.py` | `resolve_inspect_dirs()` precedence (CLI → env → TOML → `[]`), `~` expansion, dedup, and `STATE_FIELDS` membership |
 | `test_resolve_prompt.py` | `resolve_prompt()` — every `WORKER_TYPES` member returns a `("file", content, "prompts/<call_type>.md")` triple; parity/coupling test; unknown call_type raises |
-| `test_discover_rules_files.py`, `test_validate_conformance_result.py`, `test_run_conformance_phase.py`, `test_run_final_conformance.py`, `test_infer_build_lint_test.py` | the post-work conformance phase (DESIGN §9) and the post-integration whole-tree conformance pass (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph): rule-file discovery against the fixed capped allowlist, schema cross-field invariants including path-traversal rejection, the orchestrator-level loop covering clean / malformed / crashed / rolled-back / cap-exhausted paths, the commit-prefix observability check, the dirty-state warning before rollback, the worker-budget-exhausted advisory path, the outer `settle_subtask` contract (never escalates to `failed`/`blocked` even on `FileNotFoundError`), and `_infer_build_lint_test` across the supported package-manager families (Node/JS, Python, Rust, Go, Ruby/Rails including rubocop detection, `bin/rails test` inference, and the `_is_rails_repo` two-file guard against Sinatra/Grape false positives). `test_run_final_conformance.py` additionally covers the staging-worktree skip path, the working_branch-absent skip path, the resume-idempotence short-circuit, the `_final_conformance_payload` PR-writer surfacing helper, and a coupling test that the call site lives between `phase_execute` and `phase_finalize` in `_run_phases` |
+| `test_discover_rules_files.py`, `test_validate_conformance_result.py`, `test_run_conformance_phase.py`, `test_run_final_conformance.py`, `test_infer_build_lint_test.py` | the post-work conformance phase (DESIGN §9) and the post-integration whole-tree conformance pass (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph): rule-file discovery against the fixed capped allowlist, schema cross-field invariants including path-traversal rejection, the orchestrator-level loop covering clean / malformed / crashed / rolled-back / cap-exhausted paths, the commit-prefix observability check, the dirty-state warning before rollback, the worker-budget-exhausted advisory path, the outer `settle_subtask` contract (never escalates to `failed`/`blocked` even on `FileNotFoundError`, unless `--strict-conformer` is on), and `_infer_build_lint_test` across the supported package-manager families (Node/JS, Python, Rust, Go, Java/Maven, Gradle, C#/.NET, PHP, Ruby/Rails including rubocop detection, `bin/rails test` inference, and the `_is_rails_repo` two-file guard against Sinatra/Grape false positives). `test_run_final_conformance.py` additionally covers the staging-worktree skip path, the working_branch-absent skip path, the resume-idempotence short-circuit, the `_final_conformance_payload` PR-writer surfacing helper, and a coupling test that the call site lives between `phase_execute` and `phase_finalize` in `_run_phases` |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |

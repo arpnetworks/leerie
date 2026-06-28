@@ -75,6 +75,7 @@ def test_provision_argv0_allowlist_intersects_documented_managers(leerie):
     documented = {
         "pnpm", "npm", "yarn", "pip", "pip3", "uv", "poetry", "pipenv",
         "go", "cargo", "bundle", "gem", "mvn", "gradle", "gradlew", "make",
+        "composer", "dotnet",
     }
     assert leerie._PROVISION_ARGV0_ALLOW == documented
 

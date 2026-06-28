@@ -139,3 +139,81 @@ def test_polyglot_node_rails_picks_npm_test_and_rails_test_not_overridden(leerie
     (tmp_path / "bin" / "rails").write_text("#!/usr/bin/env ruby\n")
     blt = _infer(leerie, tmp_path)
     assert blt["test"] == "npm test"
+
+
+# --- Java / Maven ---
+
+def test_pom_xml_infers_maven(leerie, tmp_path):
+    (tmp_path / "pom.xml").write_text("<project/>")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "mvn package"
+    assert blt["test"] == "mvn test"
+
+
+# --- Java / Kotlin / Gradle ---
+
+def test_build_gradle_infers_gradle(leerie, tmp_path):
+    (tmp_path / "build.gradle").write_text("apply plugin: 'java'\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "gradle build"
+    assert blt["test"] == "gradle test"
+
+
+def test_build_gradle_kts_infers_gradle(leerie, tmp_path):
+    (tmp_path / "build.gradle.kts").write_text("plugins { java }\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "gradle build"
+    assert blt["test"] == "gradle test"
+
+
+def test_gradlew_prefers_wrapper(leerie, tmp_path):
+    (tmp_path / "build.gradle").write_text("apply plugin: 'java'\n")
+    (tmp_path / "gradlew").write_text("#!/bin/sh\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "./gradlew build"
+    assert blt["test"] == "./gradlew test"
+
+
+def test_pom_and_gradle_maven_wins(leerie, tmp_path):
+    """Polyglot: Maven checked first, so pom.xml takes precedence."""
+    (tmp_path / "pom.xml").write_text("<project/>")
+    (tmp_path / "build.gradle").write_text("apply plugin: 'java'\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "mvn package"
+    assert blt["test"] == "mvn test"
+
+
+# --- C# / .NET ---
+
+def test_sln_infers_dotnet(leerie, tmp_path):
+    (tmp_path / "Foo.sln").write_text("")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "dotnet build"
+    assert blt["test"] == "dotnet test"
+
+
+def test_csproj_infers_dotnet(leerie, tmp_path):
+    (tmp_path / "Foo.csproj").write_text("<Project/>")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "dotnet build"
+    assert blt["test"] == "dotnet test"
+
+
+# --- PHP ---
+
+def test_phpunit_xml_infers_phpunit(leerie, tmp_path):
+    (tmp_path / "phpunit.xml").write_text("<phpunit/>")
+    blt = _infer(leerie, tmp_path)
+    assert blt["test"] == "vendor/bin/phpunit"
+
+
+def test_phpunit_xml_dist_infers_phpunit(leerie, tmp_path):
+    (tmp_path / "phpunit.xml.dist").write_text("<phpunit/>")
+    blt = _infer(leerie, tmp_path)
+    assert blt["test"] == "vendor/bin/phpunit"
+
+
+def test_phpstan_neon_infers_phpstan(leerie, tmp_path):
+    (tmp_path / "phpstan.neon").write_text("parameters:\n  level: max\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["lint"] == "vendor/bin/phpstan analyse"

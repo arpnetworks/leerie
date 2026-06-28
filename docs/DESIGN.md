@@ -2121,6 +2121,19 @@ catching every documentation drift) is not promoted to a hard guarantee by
 prompt; what *can* be guaranteed (protected paths stayed untouched, the
 worker's structured output is well-formed) is enforced in code.
 
+**Opt-in strict mode.** `--strict-conformer` (also `LEERIE_STRICT_CONFORMER`
+env var, `strict_conformer` in `leerie.toml`) replaces the advisory framing
+with a blocking one: when conformer residuals remain after the round cap is
+exhausted, the subtask returns `blocked` instead of `complete`. The user
+fixes the residuals manually and runs `--resume`. The same check applies to
+the final-tree pass — if residuals remain, the run pauses before the PR
+opens. This is an explicit trade-off: the operator accepts the risk described
+above (that the conformer may weaken work to clear the bar, or that
+pre-existing environmental failures will block unrelated subtasks) in exchange
+for the guarantee that no subtask passes with known conformance failures.
+Off by default; the advisory framing remains the recommended default for
+most repos.
+
 Within a round, the conformer is expected to invoke each build/lint/test axis
 **exactly once** (with a targeted-falsifier exception when verifying a single
 file's behavior). The orchestrator distinguishes two patterns: (a) running

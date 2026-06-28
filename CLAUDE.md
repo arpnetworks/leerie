@@ -265,6 +265,12 @@ export LEERIE_MAX_PARALLEL=6
 # per-subtask ratio will come in under the default 2.5 estimate:
 ./leerie "task" --skip-budget-check
 
+# Make the conformer phase blocking instead of advisory.
+# Residuals cause subtasks to return 'blocked' (fix + --resume).
+# Also LEERIE_STRICT_CONFORMER=1 or `strict_conformer = true` in
+# leerie.toml:
+./leerie "task" --strict-conformer
+
 # Waive §12 mechanical read-only enforcement on judgment workers
 # (use on repos where the planner needs pnpm/tsc/vitest visibility —
 # also LEERIE_DANGEROUSLY_SKIP_PERMISSIONS=1 or

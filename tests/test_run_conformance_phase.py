@@ -174,7 +174,7 @@ def test_clean_result_exits_after_one_round(env, monkeypatch):
     c = env["leerie"]
     state = _stub_run_conformer(c, [_clean_result()])
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -192,7 +192,7 @@ def test_malformed_result_breaks_loop_with_warning(env):
                                                    "why_not_fixed": "y"}])
     state = _stub_run_conformer(c, [bad])
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -207,7 +207,7 @@ def test_worker_crash_surfaces_as_warning(env):
     c = env["leerie"]
     state = _stub_run_conformer(c, [None])
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -234,7 +234,7 @@ def test_protected_path_commit_is_rolled_back(env):
         ["git", "rev-parse", "HEAD"], cwd=env["worktree"],
         capture_output=True, text=True).stdout.strip()
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -263,7 +263,7 @@ def test_rounds_cap_respected_with_residuals(env):
     )
     state = _stub_run_conformer(c, [failing, failing, failing, failing])
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -282,7 +282,7 @@ def test_phase_never_returns_failed_status(env):
     # Mix of crash, malformed, bad commits, residuals — none of these are
     # supposed to fail the subtask.
     state = _stub_run_conformer(c, [None])
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
     # Returned shape: 2-tuple, second element is a list.
@@ -311,7 +311,7 @@ def test_unprefixed_conformer_commits_surface_as_warnings(env):
         ["git", "rev-parse", "HEAD"], cwd=env["worktree"],
         capture_output=True, text=True).stdout.strip()
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -339,7 +339,7 @@ def test_prefixed_conformer_commits_do_not_warn(env):
     state = _stub_run_conformer(c, [_clean_result()],
                                 commits={0: _good_commit})
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -379,7 +379,7 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
     # Now exercise the full phase loop to confirm the warning surfaces.
     env["st"].data["worker_count"] = 100
     env["st"].save()
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res is None
@@ -523,7 +523,7 @@ def test_protected_path_rollback_warns_about_discarded_uncommitted(env):
     _stub_run_conformer(c, [_clean_result()],
                         commits={0: _bad_with_uncommitted})
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -559,7 +559,7 @@ def test_pattern_b_bg_retry_injects_feedback_into_next_round(env):
         _result_event("a2", "build passed"),
     ])
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -590,7 +590,7 @@ def test_pattern_a_multi_invocation_does_not_inject_feedback(env):
         _result_event("a2", "42 tests passed"),
     ])
 
-    res, warnings = asyncio.run(c._run_conformance_phase(
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
 
@@ -598,3 +598,55 @@ def test_pattern_a_multi_invocation_does_not_inject_feedback(env):
     assert state["feedbacks"][0] is None
     assert state["feedbacks"][1] is None, \
         "Pattern A (progressive testing) should NOT inject feedback"
+
+
+# --- strict-conformer mode -------------------------------------------------
+
+def test_strict_conformer_blocks_on_residuals(env):
+    """When caps["strict_conformer"] is True and residuals remain,
+    blocked_reason must be a non-None string."""
+    c = env["leerie"]
+    failing = _clean_result(
+        rule_violations_residual=[{"rule": "r", "why_not_fixed": "bad"}],
+    )
+    _stub_run_conformer(c, [failing, failing, failing])
+    caps = dict(env["caps"])
+    caps["strict_conformer"] = True
+
+    _res, _warnings, blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        caps, env["st"], env["models"], env["efforts"]))
+
+    assert blocked is not None
+    assert "strict-conformer" in blocked
+
+
+def test_strict_conformer_none_when_clean(env):
+    """When strict mode is on but the result is clean, blocked_reason
+    must be None."""
+    c = env["leerie"]
+    _stub_run_conformer(c, [_clean_result()])
+    caps = dict(env["caps"])
+    caps["strict_conformer"] = True
+
+    _res, _warnings, blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        caps, env["st"], env["models"], env["efforts"]))
+
+    assert blocked is None
+
+
+def test_advisory_mode_never_blocks(env):
+    """When strict_conformer is off (default), blocked_reason is always
+    None regardless of residuals."""
+    c = env["leerie"]
+    failing = _clean_result(
+        rule_violations_residual=[{"rule": "r", "why_not_fixed": "bad"}],
+    )
+    _stub_run_conformer(c, [failing, failing, failing])
+
+    _res, _warnings, blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert blocked is None
