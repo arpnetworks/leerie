@@ -67,6 +67,131 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
+# Chromium + matching chromedriver, baked at image build time so workers that
+# need a real browser (system/integration tests, visual assertions, CSP checks,
+# Selenium/Capybara/Playwright/Puppeteer scenarios, etc.) have one available
+# without any runtime apt-get. Installing from Debian's own repos guarantees
+# the browser and driver versions are always in sync — no Selenium Manager
+# download needed at runtime. X11/GL/NSS/NSPR/GBM are pulled in automatically
+# as Chromium deps. fonts-liberation prevents glyph-fallback rendering
+# artifacts in screenshot-based assertions.
+#
+# libc6 is listed explicitly to force an upgrade if the debian:13-slim base
+# image snapshot lags the current trixie repos. Without it, the chromium binary
+# (compiled against the current trixie glibc) fails at load time with:
+#   undefined symbol: localtime64_r (fatal)
+# ld.so aborts before Chrome executes a single instruction, producing a
+# SIGTRAP/core-dump that looks like a sandbox crash but is actually a glibc
+# ABI mismatch. Listing libc6 here makes apt upgrade it in the same
+# transaction as chromium, keeping the versions in sync.
+#
+# The required container flags (--no-sandbox, --disable-setuid-sandbox,
+# --disable-dev-shm-usage) are baked into /etc/chromium.d/leerie-container-flags
+# below so callers need no Chrome-specific configuration. See
+# docs/IMPLEMENTATION.md §0.5 "Browser-based testing" for details.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      libc6 \
+      chromium \
+      chromium-driver \
+      fonts-liberation \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bake container-appropriate Chrome flags into /etc/chromium.d/ so every
+# Chromium invocation from this image works correctly without callers needing
+# to know about rootless-container specifics.
+#
+# --no-sandbox:              disable Chrome's user-namespace sandbox (not
+#                            available in unprivileged containers).
+# --disable-setuid-sandbox:  suppress the SUID sandbox-helper lookup.
+# --disable-dev-shm-usage:   redirect shared-memory to /tmp; /dev/shm is
+#                            typically 64 MB in containers and Chrome's
+#                            renderer can exceed that under load.
+RUN echo 'CHROMIUM_FLAGS="$CHROMIUM_FLAGS --no-sandbox --disable-setuid-sandbox --disable-dev-shm-usage"' \
+    > /etc/chromium.d/leerie-container-flags
+
+# Replace the Debian chrome_crashpad_handler with a protocol-compatible stub.
+#
+# Root cause: in this container environment Chrome spawns the crashpad handler
+# with --initial-client-fd=<fd> but WITHOUT --database (Debian's packaging
+# changed the invocation flow). The real handler exits immediately with
+# "database is required", Chrome detects the handler died before completing the
+# IPC handshake, and calls __builtin_trap() → SIGTRAP → exit 133.
+#
+# The handshake protocol (discovered by instrumenting the socket):
+#   1. Chrome sends a 40-byte hello through --initial-client-fd
+#   2. Handler must respond with 8 bytes + a server-socket FD via SCM_RIGHTS
+#   3. Chrome unblocks and continues startup; the server socket receives crash
+#      notifications for the lifetime of the browser process
+#
+# The stub below implements this protocol, stays alive as a monitor, and
+# silently discards crash reports (we have no crash database in-container).
+RUN cat > /usr/lib/chromium/chrome_crashpad_handler << 'STUB'
+#!/usr/bin/env python3
+"""
+Crashpad IPC stub for Debian Chromium in rootless containers.
+Chrome expects: read 40-byte hello → reply 8 bytes + server socket FD via
+SCM_RIGHTS. Without this handshake Chrome SIGTRAPs on startup.
+"""
+import sys, os, socket, struct, time
+
+def main():
+    fd = None
+    for arg in sys.argv[1:]:
+        if arg.startswith('--initial-client-fd='):
+            fd = int(arg.split('=', 1)[1])
+            break
+
+    if fd is None:
+        # Called as an exception handler (post-crash) without a client FD —
+        # just sleep so we don't loop-crash Chrome's crash-reporting path.
+        time.sleep(86400)
+        return
+
+    try:
+        os.read(fd, 4096)   # consume Chrome's 40-byte hello
+    except OSError:
+        time.sleep(86400)
+        return
+
+    # Create the Unix-domain server socket that Chrome will send crashes to.
+    sock_path = f'/tmp/.cpstub_{os.getpid()}.sock'
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        if os.path.exists(sock_path):
+            os.unlink(sock_path)
+        srv.bind(sock_path)
+        srv.listen(10)
+
+        # Send 8-byte ack + server FD back to Chrome via SCM_RIGHTS.
+        client = socket.fromfd(fd, socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            anc = [(socket.SOL_SOCKET, socket.SCM_RIGHTS,
+                    struct.pack('i', srv.fileno()))]
+            client.sendmsg([b'\x00' * 8], anc)
+        finally:
+            client.detach()
+
+        # Stay alive as the crash monitor; discard crash reports.
+        srv.settimeout(1.0)
+        while True:
+            try:
+                conn, _ = srv.accept()
+                conn.close()
+            except socket.timeout:
+                pass
+            except Exception:
+                break
+            time.sleep(0.1)
+    finally:
+        try: srv.close()
+        except: pass
+        try: os.unlink(sock_path)
+        except: pass
+
+main()
+STUB
+RUN chmod +x /usr/lib/chromium/chrome_crashpad_handler
+
 # mise — polyglot version manager (formerly rtx). Owns the per-repo
 # runtime version selection (DESIGN §6½). Reads .tool-versions natively
 # and .nvmrc / .python-version / .ruby-version / rust-toolchain.toml
@@ -179,6 +304,7 @@ RUN mkdir -p /home/leerie/.local/share/mise \
              /home/leerie/.cache/leerie/pip \
              /home/leerie/.cache/leerie/go-mod \
              /home/leerie/.cache/leerie/cargo \
+             /home/leerie/.cache/selenium \
              /home/leerie/.gnupg \
     && chown leerie:"${HOST_GID}" /home/leerie \
     && chown -R leerie:"${HOST_GID}" /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg \

@@ -184,6 +184,22 @@ Base layers (top-down):
   dev headers cover native-extension compilation: `node-gyp` (sharp,
   bcrypt), Ruby C gems (`nokogiri`, `pg`, `sqlite3`, `mysql2`, `ffi`), and
   Python C extensions.
+- `libc6` + `chromium` + `chromium-driver` + `fonts-liberation` — headless
+  Chrome for browser-based testing (Selenium, Capybara, Playwright, Puppeteer,
+  or any tool that drives a real browser). Installed from Debian's own repos at
+  image build time so the browser and chromedriver versions are always in sync;
+  Selenium Manager has nothing to download at runtime.
+  `libc6` is listed explicitly so apt upgrades it in the same transaction as
+  chromium: the `debian:13-slim` base image snapshot can lag the current trixie
+  glibc, causing chromium to fail at load time with
+  `undefined symbol: localtime64_r (fatal)` — a glibc ABI mismatch that
+  produces a SIGTRAP before Chrome executes a single instruction.
+  `/home/leerie/.cache/selenium` is pre-created and chowned to `leerie` so
+  Selenium Manager cache writes don't fail even if a download is attempted.
+  Workers run as the non-root `leerie` user — Chrome's SUID sandbox won't work
+  in this container configuration; the required flags are baked in via
+  `/etc/chromium.d/leerie-container-flags` (see *Browser-based testing* note
+  below).
 - Node.js LTS, arch-aware via `TARGETARCH` / `dpkg --print-architecture`
   → `arm64` → `linux-arm64` tarball, `amd64` → `linux-x64`. Pinned via
   `ARG NODE_VERSION` so the version is reproducible across builds.
@@ -523,6 +539,36 @@ normalizes filenames NFC → NFD (libarchive); rsync preserves filename
 bytes verbatim. Bundles sidestep the problem entirely — filenames
 travel as pack-format binary objects, materialized natively by the
 receiving git.
+
+### Browser-based testing
+
+Chromium and its matching chromedriver are baked into the image (see *Image
+build* above), so workers that need a real browser have one available without
+any runtime installation. The Selenium cache directory
+(`/home/leerie/.cache/selenium`) is pre-created and chowned to `leerie` so
+Selenium Manager cache writes succeed if it ever runs.
+
+**Container flags — baked in, no project changes required.** Three flags are
+needed to run Chromium in a rootless container:
+
+- `--no-sandbox` — disables Chrome's user-namespace sandbox, which is
+  unavailable in unprivileged containers.
+- `--disable-setuid-sandbox` — suppresses the SUID sandbox-helper lookup.
+  Without this, Chrome finds `/usr/lib/chromium/chrome-sandbox` and tries to
+  exec it; SUID is stripped in rootless containers, so the exec fails and
+  Chrome crashes with `SIGTRAP` before fully initializing — *even when
+  `--no-sandbox` is present*. This is the most common silent failure mode.
+- `--disable-dev-shm-usage` — redirects shared-memory to `/tmp`; `/dev/shm`
+  is typically 64 MB in containers and Chrome's renderer can exceed it.
+
+These are written to `/etc/chromium.d/leerie-container-flags` at image build
+time, so the `/usr/bin/chromium` wrapper picks them up automatically on every
+invocation. **No project-level Chrome flag configuration is required** — the
+image handles it.
+
+Projects that construct a `ChromeOptions` / `Options` object and add these
+flags explicitly are fine; the flags are idempotent. Projects that don't touch
+Chrome options at all also work, because the wrapper sets them globally.
 
 ### macOS-specific: Colima auto-share scope
 
