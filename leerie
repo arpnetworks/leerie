@@ -3129,6 +3129,7 @@ mkdir -p "$HOME/.cache/leerie/mise-data" \
          "$HOME/.cache/leerie/pip" \
          "$HOME/.cache/leerie/go-mod" \
          "$HOME/.cache/leerie/cargo" \
+         "$HOME/.cache/leerie/corepack" \
          "$LEERIE_STATE_HOST_DIR"
 
 CACHE_MOUNTS=(
@@ -3137,6 +3138,7 @@ CACHE_MOUNTS=(
   -v "$HOME/.cache/leerie/pip:/home/leerie/.cache/leerie/pip"
   -v "$HOME/.cache/leerie/go-mod:/home/leerie/.cache/leerie/go-mod"
   -v "$HOME/.cache/leerie/cargo:/home/leerie/.cache/leerie/cargo"
+  -v "$HOME/.cache/leerie/corepack:/home/leerie/.cache/leerie/corepack"
   # pnpm reads its store path from `npm_config_store_dir` (or `store-dir`
   # in .npmrc, or `--store-dir` CLI). There is no `PNPM_STORE_PATH`; a
   # prior version of this file set that and pnpm silently ignored it,
@@ -3146,6 +3148,7 @@ CACHE_MOUNTS=(
   -e "PIP_CACHE_DIR=/home/leerie/.cache/leerie/pip"
   -e "GOMODCACHE=/home/leerie/.cache/leerie/go-mod"
   -e "CARGO_HOME=/home/leerie/.cache/leerie/cargo"
+  -e "COREPACK_HOME=/home/leerie/.cache/leerie/corepack"
 )
 # MISE_DATA_DIR / MISE_SYSTEM_DATA_DIR are baked into the image as ENV
 # (Dockerfile) so the resolver and mount target are stable across
@@ -3850,14 +3853,22 @@ else
   # container so container-entry.sh can inject --run-id <container-id>.
   # nerdctl writes the cidfile before PID 1 starts.
 
-  # Probe whether the container runtime's namespace has /sys/fs/cgroup
-  # as shared (required for rshared bind-propagation). Rootless
-  # containerd (rootlesskit --propagation=rslave) demotes it to
-  # master (slave), making the bind-mount fail. When skipped, the
-  # orchestrator's _cgroup_probe detects the missing mount and falls
-  # back to uncapped workers with one warn line.
+  # On macOS (Darwin), unconditionally set the cgroup bind-mount —
+  # Colima's VM always has cgroup v2 with shared propagation, but the
+  # host has no /sys/fs/cgroup to probe. On Linux, probe whether the
+  # container runtime's namespace has /sys/fs/cgroup as shared (required
+  # for rshared bind-propagation). Rootless containerd (rootlesskit
+  # --propagation=rslave) demotes it to master (slave), making the
+  # bind-mount fail. When skipped, the orchestrator's _cgroup_probe
+  # detects the missing mount and falls back to uncapped workers with
+  # one warn line.
   CGROUP_MOUNT_ARG=()
-  if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+  if [ "$(uname -s)" = "Darwin" ]; then
+    # macOS has no /sys/fs/cgroup — the host-side probe below always
+    # fails. But Colima's Linux VM runs rootful containerd with cgroup
+    # v2 and shared propagation, so the bind-mount works inside the VM.
+    CGROUP_MOUNT_ARG=(--mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared")
+  elif [ -f /sys/fs/cgroup/cgroup.controllers ]; then
     _cg_shared=true
     _rl_child="/run/user/$(id -u)/containerd-rootless/child_pid"
     if [ -f "$_rl_child" ]; then

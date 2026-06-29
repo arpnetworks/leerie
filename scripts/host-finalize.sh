@@ -193,12 +193,25 @@ EOF
   fi
 
   echo "[leerie] finalize: opening PR against $working_branch" >&2
-  local pr_output
-  if ! pr_output="$(echo "$pr_body" | gh pr create \
-                    --base "$working_branch" \
-                    --head "$run_branch" \
-                    --title "$pr_title" \
-                    --body-file - 2>&1)"; then
+  local pr_output pr_ok=false
+  # GitHub's API may not have indexed the freshly-pushed refs yet;
+  # retry with backoff to ride out the race (symptom: "Head sha
+  # can't be blank" / "No commits between" immediately after push).
+  for _pr_delay in 0 3 8; do
+    [ "$_pr_delay" -gt 0 ] && {
+      echo "[leerie] finalize: gh pr create failed; retrying in ${_pr_delay}s…" >&2
+      sleep "$_pr_delay"
+    }
+    if pr_output="$(echo "$pr_body" | gh pr create \
+                      --base "$working_branch" \
+                      --head "$run_branch" \
+                      --title "$pr_title" \
+                      --body-file - 2>&1)"; then
+      pr_ok=true
+      break
+    fi
+  done
+  if [ "$pr_ok" != "true" ]; then
     # PR-creation failure is NON-fatal — push succeeded.
     _host_finalize_update_run_json "$run_json" \
       "pr_url=" "pr_error=${pr_output:-gh pr create failed}"

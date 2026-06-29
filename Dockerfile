@@ -321,6 +321,7 @@ RUN mkdir -p /home/leerie/.local/share/mise \
              /home/leerie/.cache/leerie/pip \
              /home/leerie/.cache/leerie/go-mod \
              /home/leerie/.cache/leerie/cargo \
+             /home/leerie/.cache/leerie/corepack \
              /home/leerie/.cache/rubocop_cache \
              /home/leerie/.cache/selenium \
              /home/leerie/.gnupg \

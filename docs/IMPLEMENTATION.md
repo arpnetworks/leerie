@@ -372,8 +372,11 @@ line → `ROOTLESS=true`). When rootless:
   skipped — container "root" IS the host user, so privilege drop would
   break bind-mount access and chown would reassign to the subuid range.
 - The cgroup delegation chowns (`|| true`) harmlessly fail.
-- The launcher probes whether `/sys/fs/cgroup` is `shared` before
-  adding the `rshared` bind-mount; rootless containerd with
+- On macOS (Darwin), the launcher unconditionally sets the `rshared`
+  bind-mount — Colima's VM always runs rootful containerd with cgroup
+  v2 and shared propagation, but the host has no `/sys/fs/cgroup` to
+  probe. On Linux, the launcher probes whether `/sys/fs/cgroup` is
+  `shared` before adding the mount; rootless containerd with
   `rootlesskit --propagation=rslave` causes this probe to fail, so
   the mount is omitted and `_cgroup_probe` falls back to uncapped.
 
@@ -429,6 +432,7 @@ forwarding is not available" note is gone for the same reason.
 | `~/.cache/leerie/pip` | `/home/leerie/.cache/leerie/pip` | rw | pip HTTP + wheels cache. Each worker that needs Python deps runs `pip install` / `uv sync` itself in its own worktree against this shared cache; after the first install of a package the cache is warm and subsequent workers' installs are fast. Wheel-build race pypa/pip#9034 is still a theoretical concern but in practice rare given leerie's small worker concurrency (DESIGN §6½). |
 | `~/.cache/leerie/go-mod` | `/home/leerie/.cache/leerie/go-mod` | rw | `GOMODCACHE`. Concurrent-safe via per-module-version `flock` in `cmd/go/internal/modfetch`. |
 | `~/.cache/leerie/cargo` | `/home/leerie/.cache/leerie/cargo` | rw | Whole `CARGO_HOME` (registry + bin + config.lock). Mounting only `registry/` breaks `config.lock` (cargo#11376). Concurrent-safe via cargo's documented flock semantics. |
+| `~/.cache/leerie/corepack` | `/home/leerie/.cache/leerie/corepack` | rw | `COREPACK_HOME`. Without this, corepack inherits `XDG_CACHE_HOME=/tmp/.cache` and tries to mkdir `/tmp/.cache/node/corepack/v1`, which fails under rootless UID remapping. Concurrent-safe: corepack downloads tarballs via atomic rename; the cache is read-mostly after first install. |
 | Each `--inspect-dir` path (translated) | `/inspect/<basename>` | ro | See below. |
 
 ### `--inspect-dir` path translation

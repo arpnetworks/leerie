@@ -1208,8 +1208,11 @@ sentinel, not on `id -u`, so macOS/Colima runs are unaffected).
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
 bind-propagation=rshared` in the bash launcher's nerdctl invocation —
-so the in-container entrypoint can see the host VM's cgroupfs. The
-launcher probes whether `/sys/fs/cgroup` is shared before adding this
+so the in-container entrypoint can see the host VM's cgroupfs.
+On macOS (Darwin) the launcher sets the mount unconditionally —
+Colima's VM always runs rootful containerd with cgroup v2 and shared
+propagation, but the macOS host has no `/sys/fs/cgroup` to probe.
+On Linux the launcher probes whether `/sys/fs/cgroup` is shared before adding this
 mount; rootless containerd with `rootlesskit --propagation=rslave`
 demotes it to slave, making `rshared` fail. When the probe detects
 this, the mount is omitted and the orchestrator's `_cgroup_probe` falls
