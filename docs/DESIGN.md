@@ -1174,7 +1174,8 @@ required so the entrypoint's chown can succeed before privilege drop).
 The entrypoint creates `/sys/fs/cgroup/leerie.slice/`, enables
 `+memory +pids` in its `cgroup.subtree_control` (so child cgroups
 get the controller files), and chowns it (plus `cgroup.procs` and
-`cgroup.subtree_control`) to the leerie user. The entrypoint then drops to the leerie user via
+`cgroup.subtree_control`) to the leerie user. The entrypoint then
+drops to the leerie user via
 `runuser -u leerie --` before exec'ing the orchestrator (local
 nerdctl) or sleeping as PID 1 (Fly, where the orchestrator is started
 out-of-band by the launcher's ssh-console wrapper that explicitly
