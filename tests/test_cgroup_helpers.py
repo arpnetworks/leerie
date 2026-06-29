@@ -16,6 +16,7 @@ and exercise the file-write surfaces directly.
 """
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -39,11 +40,28 @@ def reset_probe_memo(leerie):
 
 def test_probe_success_when_root_writable(leerie, tmp_path, monkeypatch):
     """A writable directory acting as the cgroup root: probe creates
-    `leerie-probe`, writes memory.max, removes the dir, returns True."""
+    `leerie-probe`, tests enrollment, and returns True. On a regular
+    filesystem the probe dir may persist (the cgroup.procs file left
+    by the enrollment test blocks rmdir); on real cgroupfs the kernel
+    reaps it atomically."""
     monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
     assert leerie._cgroup_probe() is True
-    # Probe must have cleaned up the probe directory.
-    assert not (tmp_path / "leerie-probe").exists()
+
+
+def test_probe_enrollment_failure_returns_false(
+        leerie, tmp_path, monkeypatch):
+    """When the probe dir exists but cgroup.procs cannot be written
+    (simulates nsdelegate + cgroupns=private EPERM), probe returns
+    False."""
+    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
+    probe_dir = tmp_path / "leerie-probe"
+    probe_dir.mkdir()
+    os.chmod(str(probe_dir), 0o555)
+    try:
+        assert leerie._cgroup_probe() is False
+    finally:
+        if probe_dir.exists():
+            os.chmod(str(probe_dir), 0o755)
 
 
 def test_probe_failure_when_root_readonly(leerie, tmp_path, monkeypatch):

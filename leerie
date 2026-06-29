@@ -3857,6 +3857,10 @@ else
   # per-worker memory.max / pids.max containment (DESIGN §6 "Worker
   # subtree termination — Memory containment"). cgroup v2 delegation
   # is file-permission based; no --privileged or --cap-add needed.
+  # --cgroupns=host is required alongside the bind-mount: nerdctl's
+  # default --cgroupns=private + nsdelegate on the cgroupfs mount
+  # blocks non-root process migration to cgroup.procs (the kernel
+  # treats the namespace boundary as a delegation boundary).
   # If the host doesn't have cgroup v2 (kernel <5.x or unified hier
   # disabled) the bind-mount no-ops cleanly and the orchestrator's
   # _cgroup_probe returns False, falling back to the pre-fix
@@ -3917,6 +3921,7 @@ else
     -e LEERIE_INSPECT_DIRS= \
     -e LEERIE_STATE_DIR=/leerie-state \
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"} \
+    --cgroupns=host \
     ${ROOTLESS_SECOPT[@]+"${ROOTLESS_SECOPT[@]}"} \
     -v "$USER_REPO:/work" \
     -v "$LEERIE_REPO:/opt/leerie-image:ro" \

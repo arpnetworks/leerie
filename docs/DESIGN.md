@@ -1211,6 +1211,18 @@ Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
 bind-propagation=rshared` in the bash launcher's nerdctl invocation —
 so the in-container entrypoint can see the host VM's cgroupfs.
+The launcher also passes `--cgroupns=host` so the container shares the
+host VM's cgroup namespace. Without this, nerdctl's default private
+cgroup namespace (`--cgroupns=private`) combined with `nsdelegate` on
+the cgroupfs mount blocks non-root process migration to `cgroup.procs`
+— the kernel treats the namespace boundary as a delegation boundary,
+causing every `_cgroup_enroll` call to fail with EPERM regardless of
+file ownership. With `--cgroupns=host`, the container sees its real
+cgroup path (e.g., `/system.slice/nerdctl-<id>.scope`) and the
+orchestrator can enroll worker PIDs into `leerie.slice/` children
+normally. Fly's Firecracker microVM boots its own kernel with no
+cgroup namespace boundary, so this flag only affects the local nerdctl
+path.
 On macOS (Darwin) the launcher sets the mount unconditionally —
 Colima's VM always runs rootful containerd with cgroup v2 and shared
 propagation, but the macOS host has no `/sys/fs/cgroup` to probe.
@@ -1223,11 +1235,14 @@ exposes cgroupfs directly with no launcher flag required.
 
 The orchestrator's `_detect_cgroup_root` prefers
 `/sys/fs/cgroup/leerie.slice` and falls back to `/sys/fs/cgroup`.
-`_cgroup_probe` verifies write access at the detected root and
-degrades to uncapped behavior with one warn line (naming the attempted
-root) if delegation isn't available — older kernel, missing cgroup-v2
-controllers, or an entrypoint that didn't actually run as root for
-some reason. The teardown path uses `cgroup.kill` (kernel ≥ 5.14) as
+`_cgroup_probe` runs a two-phase check: (1) create and remove a child
+cgroup directory to verify write access, then (2) spawn a short-lived
+subprocess and write its PID to `cgroup.procs` to verify that process
+migration actually works. Phase 2 catches the `nsdelegate` +
+`--cgroupns=private` failure that directory creation alone cannot
+detect. If either phase fails, the probe degrades to uncapped behavior
+with one warn line naming the attempted root and the likely cause.
+The teardown path uses `cgroup.kill` (kernel ≥ 5.14) as
 an atomic kill of any worker-subtree process that survived the
 existing `_terminate_proc_tree` proc-walk — a backstop, not the
 primary cleanup. See IMPLEMENTATION.md §"Caps" for the resolution

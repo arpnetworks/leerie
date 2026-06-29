@@ -5825,51 +5825,79 @@ def _detect_cgroup_root() -> Path:
 
 
 def _cgroup_probe() -> bool:
-    """Once-per-run probe: can we create cgroups under the detected
-    cgroup root (see `_detect_cgroup_root`)?
+    """Once-per-run probe: can we create cgroups AND enroll PIDs under
+    the detected cgroup root (see `_detect_cgroup_root`)?
 
-    Memoized in `_CGROUP_PROBE_RESULT`. Returns True on success, False
-    on any failure (RO mount, missing dir, missing controllers, etc.).
-    A failure logs one warn-once line so the user sees that the
-    containment is degraded; subsequent worker spawns silently skip the
-    cgroup work.
+    Two-phase check, memoized in `_CGROUP_PROBE_RESULT`:
 
-    The probe creates a child dir and immediately rmdir's it. On real
-    cgroupfs, rmdir of a cgroup dir succeeds even though it appears
-    "non-empty" — the kernel removes the cgroup atomically. On a
-    regular filesystem (test environment), the child dir IS empty
-    after mkdir so rmdir also succeeds. We deliberately do NOT touch
-    memory.max during the probe: writing a kernel-controller file
-    would leave files in the dir on a non-cgroupfs path, breaking
-    rmdir cleanup."""
+    Phase 1 — create a child cgroup directory (mkdir + rmdir). Catches
+    RO mounts, missing dirs, failed delegation chowns.
+
+    Phase 2 — spawn a short-lived subprocess and write its PID to
+    `cgroup.procs`. Catches the nsdelegate + --cgroupns=private failure
+    where directory creation succeeds but the kernel blocks non-root
+    process migration across the cgroup namespace boundary. On a
+    regular filesystem (test environment) the write trivially creates
+    a regular file — phase 2 never false-negatives outside real
+    cgroupfs.
+
+    On real cgroupfs, rmdir of a cgroup dir succeeds even with kernel
+    interface files (the kernel removes the cgroup atomically). On a
+    regular filesystem, the cgroup.procs file left by phase 2 blocks
+    rmdir — swallowed by suppress(OSError); exist_ok=True on mkdir
+    makes subsequent runs idempotent."""
     global _CGROUP_PROBE_RESULT
     if _CGROUP_PROBE_RESULT is not None:
         return _CGROUP_PROBE_RESULT
     root = _detect_cgroup_root()
     probe_dir = root / "leerie-probe"
+
+    # Phase 1: can we create a child cgroup directory?
     try:
         probe_dir.mkdir(exist_ok=True)
-        probe_dir.rmdir()
-        _CGROUP_PROBE_RESULT = True
     except OSError as e:
-        # Mention which root we attempted so the operator can tell
-        # whether scripts/container-entry.sh's delegation step ran:
-        # root == leerie.slice means delegation worked but caps still
-        # failed (probably a missing cgroup-v2 controller on the host);
-        # root == /sys/fs/cgroup means delegation never ran (likely
-        # because the entrypoint isn't executing as root — check that
-        # the Dockerfile has no USER directive, the launcher's nerdctl
-        # invocation doesn't pass --user, and the host kernel supports
-        # cgroup v2 + the writable /sys/fs/cgroup bind-mount).
         log(f"  cgroup probe failed at {root} ({e.strerror or e}); "
             f"worker memory containment is OFF for this run. Check "
             f"that scripts/container-entry.sh's cgroup-v2 delegation "
-            f"block ran (chown of /sys/fs/cgroup/leerie.slice succeeded "
-            f"at PID 1 as root).")
+            f"block ran (chown of /sys/fs/cgroup/leerie.slice "
+            f"succeeded at PID 1 as root).")
+        _CGROUP_PROBE_RESULT = False
+        return False
+
+    # Phase 2: can we enroll a PID into cgroup.procs?
+    # nsdelegate + --cgroupns=private blocks non-root migration;
+    # directory creation alone cannot detect this.
+    child: subprocess.Popen | None = None
+    try:
+        child = subprocess.Popen(["sleep", "60"],
+                                 start_new_session=True)
+        (probe_dir / "cgroup.procs").write_text(str(child.pid))
+    except OSError as e:
+        log(f"  cgroup enrollment probe failed at {root} "
+            f"({e.strerror or e}); worker memory containment is OFF "
+            f"for this run. Check that the launcher passes "
+            f"--cgroupns=host to nerdctl (required alongside the "
+            f"/sys/fs/cgroup bind-mount to avoid nsdelegate blocking "
+            f"process migration).")
+        _CGROUP_PROBE_RESULT = False
+        if child is not None:
+            with contextlib.suppress(OSError):
+                child.kill()
+                child.wait()
         with contextlib.suppress(OSError):
             probe_dir.rmdir()
-        _CGROUP_PROBE_RESULT = False
-    return _CGROUP_PROBE_RESULT
+        return False
+    finally:
+        if child is not None:
+            with contextlib.suppress(OSError):
+                child.kill()
+            with contextlib.suppress(OSError):
+                child.wait(timeout=5)
+
+    with contextlib.suppress(OSError):
+        probe_dir.rmdir()
+    _CGROUP_PROBE_RESULT = True
+    return True
 
 
 def _cgroup_create(sid: str, memory_max_bytes: int,
