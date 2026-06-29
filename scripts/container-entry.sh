@@ -55,6 +55,10 @@ if [ -d /sys/fs/cgroup ] && [ ! -d /sys/fs/cgroup/leerie.slice ]; then
   mkdir -p /sys/fs/cgroup/leerie.slice 2>/dev/null || true
 fi
 if [ -d /sys/fs/cgroup/leerie.slice ]; then
+  # Enable memory + pids controllers so child cgroups (per-worker) get
+  # the controller files (memory.max, pids.max). Must happen as root
+  # BEFORE the chown — the leerie user can then write cap values.
+  echo "+memory +pids" > /sys/fs/cgroup/leerie.slice/cgroup.subtree_control 2>/dev/null || true
   chown leerie: /sys/fs/cgroup/leerie.slice 2>/dev/null || true
   chown leerie /sys/fs/cgroup/leerie.slice/cgroup.procs 2>/dev/null || true
   chown leerie /sys/fs/cgroup/leerie.slice/cgroup.subtree_control 2>/dev/null || true
