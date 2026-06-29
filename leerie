@@ -2667,7 +2667,12 @@ prev_was_inspect=false
 _prev_was_resume=false
 _prev_was_chain_id=false
 _prev_was_fly_app_rewrite=false
+_prev_was_state_dir_rewrite=false
 for arg in "$@"; do
+  if [ "$_prev_was_state_dir_rewrite" = "true" ]; then
+    _prev_was_state_dir_rewrite=false
+    continue
+  fi
   if [ "$_prev_was_fly_app_rewrite" = "true" ]; then
     _prev_was_fly_app_rewrite=false
     continue
@@ -2712,6 +2717,13 @@ for arg in "$@"; do
       ;;
     --no-auto-publish)
       # Launcher-only flag; consumed by ensure_image() in the remote path.
+      ;;
+    --state-dir)
+      # Launcher-only flag; consumed by the state-dir resolver above.
+      _prev_was_state_dir_rewrite=true
+      ;;
+    --state-dir=*)
+      # Launcher-only flag (=form); consumed above.
       ;;
     --fly-app)
       # Launcher-only flag; consumed by the LEERIE_FLY_APP resolver above.

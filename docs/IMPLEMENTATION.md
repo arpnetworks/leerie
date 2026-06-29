@@ -1245,8 +1245,10 @@ Resolution order (lowest → highest priority):
 3. **`LEERIE_STATE_DIR`** environment variable. Overrides the default and
    any toml value; bare `~` and `~/`-prefixed values are expanded.
 
-4. **`--state-dir PATH`** CLI flag. Highest priority; overrides everything.
-   Bare `~` and `~/`-prefixed values are expanded.
+4. **`--state-dir PATH`** / `--state-dir=PATH` CLI flag. Highest priority;
+   overrides everything. Launcher-only (stripped from `REWRITTEN_ARGS`;
+   the orchestrator never sees it). Bare `~` and `~/`-prefixed values
+   are expanded.
 
 After resolution and before the verb dispatch, the launcher runs
 `_validate_state_ownership` against the resolved path:
@@ -1301,8 +1303,10 @@ Resolution order (lowest → highest priority):
    expanded (`~/` → `$HOME/`) and used verbatim. Set once in your shell
    profile to keep all repos under a common directory.
 
-4. **`--state-dir PATH`** CLI flag. Highest priority; overrides everything.
-   Bare `~` and `~/`-prefixed values are expanded.
+4. **`--state-dir PATH`** / `--state-dir=PATH` CLI flag. Highest priority;
+   overrides everything. Launcher-only (stripped from `REWRITTEN_ARGS`;
+   the orchestrator never sees it). Bare `~` and `~/`-prefixed values
+   are expanded.
 
 Code counterpart: `resolve_leerie_root(repo_root)` in `leerie.py`;
 constant `STATE_DIR_ENV = "LEERIE_STATE_DIR"`. All three `leerie_root`
