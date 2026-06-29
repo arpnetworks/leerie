@@ -171,9 +171,39 @@ done
 # DRY_RUN and NERDCTL_VERSION are already set above; runtime-install.sh
 # inherits them. The helper defines underscore-prefixed log/err/run
 # functions so they don't shadow this installer's own helpers.
-INSTALL_DIR="$(cd "$(dirname "$0")" && pwd)"
-# shellcheck disable=SC1091
-. "$INSTALL_DIR/runtime-install.sh"
+#
+# Three-tier resolution so `curl | bash` works (where $0 is "bash", not a
+# file path): (1) adjacent to this script (local checkout / direct exec),
+# (2) already-cloned repo at $PREFIX, (3) download from GitHub.
+_source_runtime_helpers() {
+  # Tier 1: script is a real file on disk (local checkout / direct exec).
+  local script_dir
+  script_dir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || script_dir=""
+  if [ -n "$script_dir" ] && [ -f "$script_dir/runtime-install.sh" ]; then
+    # shellcheck disable=SC1091
+    . "$script_dir/runtime-install.sh"
+    return 0
+  fi
+  # Tier 2: repo already cloned at $PREFIX (re-run / update).
+  if [ -f "$PREFIX/scripts/runtime-install.sh" ]; then
+    . "$PREFIX/scripts/runtime-install.sh"
+    return 0
+  fi
+  # Tier 3: download from GitHub (first-time curl|bash).
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/leerie-runtime-install.XXXXXX")"
+  # Use a fixed path in the trap so it works after the local goes out of scope.
+  # shellcheck disable=SC2064
+  trap "rm -f '$tmp'" EXIT
+  local raw_url="https://raw.githubusercontent.com/enricai/leerie/${REF}/scripts/runtime-install.sh"
+  if curl -fsSL "$raw_url" -o "$tmp"; then
+    . "$tmp"
+    return 0
+  fi
+  err "cannot locate runtime-install.sh (tried script dir, $PREFIX, and GitHub download)"
+  return 1
+}
+_source_runtime_helpers || exit 1
 
 # --- 1. preflight: git + claude + curl -----------------------------------
 # curl is required to download the repo (and for the runtime preflight's
