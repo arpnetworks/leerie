@@ -358,7 +358,7 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 ./leerie --status   <chain-id>        # render per-run states from run.json
 ./leerie --attach   <chain-id>        # poll run.json files every 5s
 ./leerie --stop     <chain-id>        # pause every running chain run
-./leerie --kill     <chain-id>        # destroy every chain run's machine
+./leerie --kill     <chain-id>        # destroy every chain run
 ./leerie --resume   <chain-id>        # resume every paused chain run
 ./leerie --finalize <chain-id>        # push + open PR for every unpushed run
 ./leerie --list --chains              # group runs by chain_id

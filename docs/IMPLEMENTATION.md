@@ -4236,32 +4236,39 @@ destructive and pause actions need explicit verbs.
 Two new launcher flags, routed at the top of `leerie` alongside
 `--resume` (line ~63):
 
-- **`leerie --stop <run-id>`** — clean pause. Reads `fly_machine_id`
-  from `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json`, sources
-  `provision.sh`, exports `LEERIE_MACHINE_ID` and `FLY_APP`, calls
-  `stop_machine()`. Then calls `update_run_json` from `lib.sh` to set
-  `paused_at = <iso_now>` and `pause_reason = "user-requested"` on
-  the sidecar. The run is resumable via the existing
-  `leerie --resume <id>` path (runtime auto-detected from
-  `fly-machine.json`). Errors with an actionable message if the
-  sidecar is missing or `fly_machine_id` is null.
-- **`leerie --kill <run-id> [--force]`** — destroy. Same sidecar
-  resolution. Prompts the user to type the run-id to confirm (unless
-  `--force` / `LEERIE_FORCE_KILL=1`), then calls `destroy_machine()`.
-  Sets `killed_at = <iso_now>` on the sidecar. The run is no longer
-  resumable.
+- **`leerie --stop <run-id>`** — clean pause. Runtime detection:
+  (1) `_auto_detect_fly_runtime` checks for `fly-machine.json` →
+  Fly path; (2) `_is_local_container` probes `nerdctl inspect
+  <run-id>` → local path; (3) neither → error.
+  - **Fly path:** sources `provision.sh`, exports `LEERIE_MACHINE_ID`
+    and `FLY_APP`, calls `stop_machine()`.
+  - **Local path:** sources `lib.sh`, calls `nerdctl stop <run-id>`
+    (SIGTERM first — the orchestrator's `InterruptedBySignal` handler
+    saves state before exit — then SIGKILL after grace period; `--rm`
+    on the original `nerdctl run` auto-removes the container).
+  - Both paths call `update_run_json` to set `paused_at = <iso_now>`
+    and `pause_reason = "user-requested"` on the sidecar. The run is
+    resumable via `leerie --resume <id>`.
+- **`leerie --kill <run-id> [--force]`** — destroy. Same runtime
+  detection as `--stop`. Prompts the user to type the run-id to
+  confirm (unless `--force` / `LEERIE_FORCE_KILL=1`).
+  - **Fly path:** calls `destroy_machine()`, sets `killed_at` and
+    `fly_machine_id` on the sidecar.
+  - **Local path:** calls `nerdctl kill <run-id>` (immediate SIGKILL),
+    sets `killed_at` on the sidecar.
+  - The run is no longer resumable.
 
   Recovery path for the orphan case: `leerie --kill --machine-id <id>
   --app <app>` allows destruction by machine-id directly when the
   sidecar is missing or unreadable (e.g., `.leerie/` was deleted but
-  the machine is still running on Fly).
+  the machine is still running on Fly). This path is Fly-only.
 
-Both verbs route before any runtime preflight (fast-path dispatch),
-call `require_flyctl` from `lib.sh`, and exit without ever sourcing
-`seed-auth.sh` / `seed-repo.sh`. They are read-only
-with respect to the local repo (except for the sidecar update) and
-do not require `--no-runtime-install` handling — `require_flyctl`
-respects it.
+Both verbs route before any runtime preflight (fast-path dispatch)
+and exit without ever sourcing `seed-auth.sh` / `seed-repo.sh`. The
+Fly path calls `require_flyctl` from `lib.sh`; the local path only
+sources `lib.sh` (for `update_run_json` / `iso_now`). Both are
+read-only with respect to the local repo (except for the sidecar
+update).
 
 The `killed_at` field is added to `RUN_STATUSES` in `orchestrator/leerie.py`
 as a new terminal state (`killed`); `_derive_run_status` reads it
@@ -4316,10 +4323,15 @@ Changes:
   `--list` (no `--runtime fly`) is unchanged.
 
 Verbs `--stop`, `--kill`, `--finalize` accept an optional
-`--runtime <local|fly>` flag for forward-compatibility. Today only
-`fly` is meaningful; `--runtime local` errors with "no local-runtime
-equivalent yet." Without the flag, the verbs infer the runtime from
-the sidecar (`fly_machine_id` presence) — existing behavior preserved.
+`--runtime <local|fly>` flag. `--stop` and `--kill` support both
+runtimes: Fly runs route to `flyctl machine stop`/`flyctl machine
+destroy`; local runs route to `nerdctl stop`/`nerdctl kill` via the
+`_is_local_container` probe (`nerdctl inspect <run-id>`). `--stop`
+uses `nerdctl stop` (SIGTERM first, allowing graceful state save);
+`--kill` uses `nerdctl kill` (immediate SIGKILL). `--finalize
+--runtime local` still errors — local finalization is inline. Without
+the flag, the verbs infer the runtime from the sidecar
+(`fly-machine.json` presence for Fly, `nerdctl inspect` for local).
 `--resume` accepts `--runtime` directly (the smart router branches by
 runtime: fly takes the smart-attach path, local takes the inline
 re-exec path).

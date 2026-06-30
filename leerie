@@ -358,6 +358,15 @@ _auto_detect_fly_runtime() {
   return 1
 }
 
+# --- _is_local_container --------------------------------------------------
+# Returns 0 when the given run-id is a live nerdctl container on this host.
+# Used by --stop/--kill to distinguish local runs from Fly runs when no
+# fly-machine.json sidecar exists.
+_is_local_container() {
+  local run_id="$1"
+  [ -n "$run_id" ] && nerdctl inspect "$run_id" >/dev/null 2>&1
+}
+
 # --- host-side per-repo state directory ----------------------------------
 # Resolves LEERIE_STATE_HOST_DIR: the host path for this repo's leerie run
 # state (runs/, worktrees/, etc.). Lives under $HOME so Colima auto-shares
@@ -902,9 +911,9 @@ PY
     exit $?
     ;;
   --stop)
-    # Fast-path: explicit pause of a remote run (DESIGN §6 *The user-
-    # visible verb surface*). Reads fly_machine_id from the run sidecar
-    # and calls stop_machine. Resumable via --resume.
+    # Fast-path: explicit pause of a run (DESIGN §6 *The user-visible
+    # verb surface*). For Fly runs, calls stop_machine; for local runs,
+    # calls nerdctl stop. Resumable via --resume.
     #
     # Chain-id dispatch: if the positional id is a UUID (8-4-4-4-12),
     # iterate $LEERIE_STATE_HOST_DIR/runs/*/run.json filtered by
@@ -949,18 +958,16 @@ PY
       remote_log "--stop: --runtime must be 'local' or 'fly' (got '$_stop_runtime')"
       exit 1
     fi
-    if [ "$_stop_runtime" = "local" ]; then
-      remote_log "--stop --runtime local: no local-runtime equivalent yet (local runs run synchronously)."
-      exit 1
-    fi
     if [ -z "$_stop_run_id" ]; then
       remote_log "--stop requires a <run-id>"
-      echo "  Usage: leerie --stop <run-id> [--runtime fly]" >&2
+      echo "  Usage: leerie --stop <run-id> [--runtime fly|local]" >&2
       exit 1
     fi
     if _auto_detect_fly_runtime "$_stop_run_id" "$_stop_runtime"; then
       remote_log "--stop: auto-detected Fly run; promoting --runtime to fly"
       _stop_runtime="fly"
+    elif [ "$_stop_runtime" != "fly" ] && _is_local_container "$_stop_run_id"; then
+      _stop_runtime="local"
     fi
     _stop_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_stop_run_id"
     if [ ! -d "$_stop_run_dir" ]; then
@@ -968,23 +975,42 @@ PY
       echo "  Check 'leerie --list' for active runs." >&2
       exit 1
     fi
-    if [ "$_stop_runtime" = "fly" ] && [ -z "${LEERIE_FLY_APP:-}" ]; then
+    export LEERIE_RUN_ID="$_stop_run_id"
+    _stop_sidecar="$_stop_run_dir/run.json"
+    if [ "$_stop_runtime" = "local" ]; then
+      # Local container: nerdctl stop sends SIGTERM (orchestrator saves
+      # state via InterruptedBySignal handler) then SIGKILL after grace.
+      # --rm on the original nerdctl run auto-removes the container.
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/lib.sh"
+      remote_log "--stop: stopping local container $LEERIE_RUN_ID..."
+      nerdctl stop "$_stop_run_id" >/dev/null 2>&1 || true
+      _ensure_run_json "$_stop_run_dir" || true
+      update_run_json "$_stop_sidecar" \
+        paused_at "$(iso_now)" \
+        pause_reason "user-requested" || true
+      remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
+      exit 0
+    fi
+    if [ "$_stop_runtime" != "fly" ]; then
+      remote_log "--stop: run $LEERIE_RUN_ID is not a live Fly machine or local container"
+      echo "  If the container already exited, there is nothing to stop." >&2
+      echo "  Check 'leerie --list' for active runs." >&2
+      exit 1
+    fi
+    if [ -z "${LEERIE_FLY_APP:-}" ]; then
       remote_log "--stop: LEERIE_FLY_APP is required. Set it: export LEERIE_FLY_APP=my-app"
       exit 1
     fi
     FLY_APP="${LEERIE_FLY_APP:-}"
     export FLY_APP
-    export LEERIE_RUN_ID="$_stop_run_id"
     # shellcheck disable=SC1091
     . "$LEERIE_REPO/scripts/remote/provision.sh"
     require_flyctl || exit 1
     # run_id IS the machine ID (DESIGN §6).
     LEERIE_MACHINE_ID="$_stop_run_id"
     export LEERIE_MACHINE_ID
-    # Bootstrap a minimal run.json if only fly-machine.json exists, so
-    # update_run_json has a file to merge paused_at into.
     _ensure_run_json "$_stop_run_dir" || true
-    _stop_sidecar="$_stop_run_dir/run.json"
     remote_log "--stop: pausing machine $LEERIE_MACHINE_ID (run $LEERIE_RUN_ID)"
     stop_machine
     update_run_json "$_stop_sidecar" \
@@ -995,8 +1021,9 @@ PY
     exit 0
     ;;
   --kill)
-    # Fast-path: explicit destroy of a remote run's machine (DESIGN §6
-    # *The user-visible verb surface*). Confirmation prompt unless --force.
+    # Fast-path: explicit destroy of a run (DESIGN §6 *The user-visible
+    # verb surface*). For Fly runs, calls destroy_machine; for local
+    # runs, calls nerdctl kill. Confirmation prompt unless --force.
     # NOT resumable afterwards — sets killed_at on the sidecar.
     #
     # Chain-id dispatch: if the positional id is a UUID (8-4-4-4-12),
@@ -1052,21 +1079,13 @@ PY
       remote_log "--kill: --runtime must be 'local' or 'fly' (got '$_kill_runtime')"
       exit 1
     fi
-    if [ "$_kill_runtime" = "local" ]; then
-      remote_log "--kill --runtime local: no local-runtime equivalent yet (local runs are not persistently running)."
-      exit 1
-    fi
     if _auto_detect_fly_runtime "$_kill_run_id" "$_kill_runtime"; then
       remote_log "--kill: auto-detected Fly run; promoting --runtime to fly"
       _kill_runtime="fly"
+    elif [ "$_kill_runtime" != "fly" ] && [ -n "$_kill_run_id" ] && _is_local_container "$_kill_run_id"; then
+      _kill_runtime="local"
     fi
     [ -n "${LEERIE_FORCE_KILL:-}" ] && _kill_force=1
-    if [ "$_kill_runtime" = "fly" ] && [ -z "${_kill_app:-}" ] && [ -z "${LEERIE_FLY_APP:-}" ]; then
-      remote_log "--kill: LEERIE_FLY_APP is required (or pass --app <name>). Set it: export LEERIE_FLY_APP=my-app"
-      exit 1
-    fi
-    FLY_APP="${_kill_app:-${LEERIE_FLY_APP:-}}"
-    export FLY_APP
     _kill_run_dir=""
     _kill_sidecar=""
     if [ -n "$_kill_run_id" ]; then
@@ -1081,16 +1100,50 @@ PY
         _kill_machine_id="$_kill_run_id"
       fi
     fi
+    # --- local container kill path ---
+    if [ "$_kill_runtime" = "local" ]; then
+      if [ -z "$_kill_run_id" ]; then
+        remote_log "--kill: no run-id for local container"
+        exit 1
+      fi
+      if [ "$_kill_force" != "1" ]; then
+        printf "This will destroy local container %s. Type the run-id to confirm: " \
+          "$_kill_run_id" >&2
+        read -r _kill_confirm
+        if [ "$_kill_confirm" != "$_kill_run_id" ]; then
+          remote_log "--kill: confirmation mismatch; aborted."
+          exit 1
+        fi
+      fi
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/lib.sh"
+      remote_log "--kill: destroying local container $_kill_run_id"
+      nerdctl kill "$_kill_run_id" >/dev/null 2>&1 || true
+      if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
+        _ensure_run_json "$_kill_run_dir" || true
+        _kill_sidecar="$_kill_run_dir/run.json"
+        if [ -f "$_kill_sidecar" ]; then
+          update_run_json "$_kill_sidecar" \
+            killed_at "$(iso_now)" || true
+        fi
+      fi
+      remote_log "--kill: destroyed. Run is no longer resumable."
+      exit 0
+    fi
+    # --- Fly machine kill path ---
     if [ -z "$_kill_machine_id" ]; then
-      remote_log "--kill: no fly_machine_id found."
+      remote_log "--kill: run ${_kill_run_id:-unknown} is not a live Fly machine or local container"
       echo "  Usage: leerie --kill <run-id> [--force]" >&2
       echo "  Orphan: leerie --kill --machine-id <id> [--app <app>]" >&2
       exit 1
     fi
+    if [ "$_kill_runtime" != "fly" ] && [ -z "${_kill_app:-}" ] && [ -z "${LEERIE_FLY_APP:-}" ]; then
+      remote_log "--kill: LEERIE_FLY_APP is required (or pass --app <name>). Set it: export LEERIE_FLY_APP=my-app"
+      exit 1
+    fi
+    FLY_APP="${_kill_app:-${LEERIE_FLY_APP:-}}"
+    export FLY_APP
     if [ "$_kill_force" != "1" ]; then
-      # D3: context-aware confirmation label. When the user invoked the
-      # orphan path (machine-id only, no run-id), asking for the run-id
-      # is confusing — they have no run-id, only a machine-id.
       if [ -n "$_kill_run_id" ]; then
         _kill_prompt_target="$_kill_run_id"
         _kill_prompt_label="run-id"
@@ -1113,17 +1166,12 @@ PY
     require_flyctl || exit 1
     LEERIE_MACHINE_ID="$_kill_machine_id"
     export LEERIE_MACHINE_ID
-    # If the run was provisioned with FLY_VM_DISK_GB, look up its volume
-    # so destroy_machine reaps the volume too. Empty when the run used
-    # Fly's default ephemeral rootfs.
     if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
       LEERIE_VOLUME_ID="$(_resolve_volume_id_from_run_dir "$_kill_run_dir")"
       export LEERIE_VOLUME_ID
     fi
     remote_log "--kill: destroying machine $LEERIE_MACHINE_ID"
     destroy_machine
-    # Ensure run.json exists so killed_at + fly_machine_id are recorded
-    # host-side for forensics.
     if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
       _ensure_run_json "$_kill_run_dir" || true
       _kill_sidecar="$_kill_run_dir/run.json"

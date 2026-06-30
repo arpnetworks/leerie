@@ -1564,13 +1564,15 @@ this terminal-side activity") and destruction needs its own verb.
 `--stop`, `--kill`, or `--finalize` targets a run whose state
 directory contains a `fly-machine.json` sidecar and no explicit
 `--runtime` was given, the launcher auto-promotes to `fly` via the
-shared `_auto_detect_fly_runtime` helper. Without this, the default
-`local` runtime either starts a container with an empty host-side
-`state.json` (`--resume`) or rejects the command with "no
-local-runtime equivalent" (`--stop`/`--kill`/`--finalize`). If the
-user explicitly sets `--runtime local` on a Fly-originated run,
-`--resume` warns but respects the choice; the fast-path verbs reject
-it as before.
+shared `_auto_detect_fly_runtime` helper. When no `fly-machine.json`
+exists, `--stop` and `--kill` probe for a live local nerdctl container
+via `_is_local_container` (`nerdctl inspect <run-id>`). `--stop` uses
+`nerdctl stop` (SIGTERM → grace → SIGKILL) so the orchestrator's
+signal handler can save state before exit; `--kill` uses `nerdctl kill`
+(immediate SIGKILL) since the run is terminal. `--finalize` on a local
+run is inline (no separate verb needed). If the user explicitly sets
+`--runtime local` on a Fly-originated run, `--resume` warns but
+respects the choice.
 
 **Smart resume in remote mode.** `--resume` is the single verb for
 re-engaging with a remote run, regardless of the run's current state.
