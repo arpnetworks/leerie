@@ -33,6 +33,16 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
+# A bare branch named 'leerie' blocks creation of leerie/runs/* and
+# leerie/subtasks/* (git's loose ref store cannot hold a file and a
+# directory at the same path). Defense-in-depth: preflight() checks
+# this too, but --resume skips preflight.
+if git show-ref --verify --quiet refs/heads/leerie; then
+  echo "error: branch 'leerie' conflicts with leerie's internal namespace (leerie/runs/*, leerie/subtasks/*)." >&2
+  echo "Rename it: git branch -m leerie leerie-old" >&2
+  exit 1
+fi
+
 mkdir -p "${RUN_DIR}/worktrees" "${RUN_DIR}/subtasks" "${RUN_DIR}/criteria" "${RUN_DIR}/checkpoints" "${RUN_DIR}/artifacts"
 
 # Record the working branch only on first setup. On a resume the file already

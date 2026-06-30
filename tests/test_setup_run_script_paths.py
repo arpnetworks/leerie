@@ -76,6 +76,18 @@ def test_setup_run_no_git_exclude():
     assert '".leerie/"' not in src
 
 
+def test_setup_run_checks_external_leerie_branch():
+    """setup-run.sh must check for a pre-existing 'leerie' branch.
+    This is defense-in-depth for the --resume path, which skips
+    preflight(). Without it, a user branch named 'leerie' crashes
+    `git branch leerie/runs/<id>` with 'cannot lock ref'."""
+    src = _script("setup-run.sh")
+    assert "refs/heads/leerie" in src, (
+        "setup-run.sh must check for a pre-existing 'leerie' branch "
+        "before creating leerie/runs/<id>."
+    )
+
+
 # --- new-worktree.sh ------------------------------------------------------
 
 def test_new_worktree_takes_run_id_arg():

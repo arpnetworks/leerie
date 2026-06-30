@@ -3585,13 +3585,19 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         die(f"working tree has {len(dirty)} modified/staged file(s). "
             "Commit or stash before running leerie.")
 
-    # 3. (removed in per-run refactor) The global leerie/* branch and
-    #    .leerie/worktrees/* checks used to fail a second concurrent
-    #    run; they no longer apply now that each run namespaces its
-    #    branches as leerie/runs/<run-id> (and subtask branches as
-    #    leerie/subtasks/<run-id>/<sid>) and its worktrees under the
-    #    per-run dir. A run_id collision is detected during setup-run.sh
-    #    (git side). See DESIGN.md §6 and §14 ("single-clone parallelism").
+    # 3. external 'leerie' branch — a bare branch named 'leerie' occupies
+    #    the ref path that leerie's namespaced branches (leerie/runs/*,
+    #    leerie/subtasks/*) need as a directory in git's loose ref store.
+    r = await run_proc(["git", "show-ref", "--verify", "--quiet",
+                        "refs/heads/leerie"])
+    if r.returncode == 0:
+        die("a branch named 'leerie' exists in this repository. "
+            "This conflicts with leerie's internal branch namespace "
+            "(leerie/runs/*, leerie/subtasks/*) — git cannot create "
+            "branches under 'leerie/' while 'leerie' exists as a branch.\n"
+            "Rename or delete it:\n"
+            "  git branch -m leerie leerie-old    # rename (preserves commits)\n"
+            "  git branch -D leerie               # delete (if fully merged)")
 
     # 4. claude CLI version is recent enough for `--json-schema` in -p mode.
     #    Runs even when --skip-smoke is set: --skip-smoke is for skipping the

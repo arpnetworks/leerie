@@ -573,6 +573,14 @@ simultaneously — `leerie/<run-id>` as a leaf ref and
 `git worktree add`. Sibling prefixes make the collision structurally
 impossible.
 
+**External collision hazard.** The same loose-ref-store constraint
+applies externally: a pre-existing user branch named exactly `leerie`
+(without any `/` suffix) occupies the path that `leerie/runs/…` and
+`leerie/subtasks/…` need as a directory. The orchestrator's `preflight()`
+checks for this and `die()`s with an actionable rename suggestion;
+`setup-run.sh` repeats the check as defense-in-depth for the `--resume`
+path, which skips `preflight()`.
+
 Integration is **incremental, one wave at a time**. Each wave's results are
 merged into the run branch and the merged result is validated before the
 next wave starts. Conflicts surface one wave at a time, close to the work
