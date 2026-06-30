@@ -339,6 +339,12 @@ _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
 # --dangerously-skip-permissions to every worker, including the inspect
 # bucket; the allowlist still names what the worker can call without
 # prompting, but the gate that rejects everything else is lifted.
+#
+# Tool restriction is two-layered:
+#   --allowedTools  (soft) — pre-approves tools for auto-execution;
+#       bypassed entirely by --dangerously-skip-permissions.
+#   --disallowedTools (hard, DISALLOWED_TOOLS) — removes tools from the
+#       model's context; survives --dangerously-skip-permissions.
 INSPECT_TOOLS = (
     f"{_READ_BASE},"
     "Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),"
@@ -348,6 +354,20 @@ INSPECT_TOOLS = (
     "Bash(git status),Bash(git branch:*),Bash(git ls-files:*)"
 )
 ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit"
+
+# DISALLOWED_TOOLS is the hard-deny list passed via --disallowedTools to
+# every worker.  Unlike --allowedTools (permission-tier only, bypassed by
+# --dangerously-skip-permissions), --disallowedTools with bare tool names
+# removes tools from the model's context entirely — the model cannot see
+# or call them regardless of permission mode.  This prevents workers from
+# spawning subagents, setting timers, or sending messages that the
+# orchestrator cannot track.
+DISALLOWED_TOOLS = (
+    "Agent,SendMessage,"
+    "ScheduleWakeup,"
+    "CronCreate,CronDelete,CronList,"
+    "RemoteTrigger,PushNotification"
+)
 
 # --inspect-dir preference: extra directories to grant the inspect-bucket
 # workers (classifier, planner, reconciler, plan_overlap_judge, provision) read access to via the
@@ -6525,6 +6545,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             "--verbose",
             "--json-schema", schema,
             "--allowedTools", allowed_tools,
+            "--disallowedTools", DISALLOWED_TOOLS,
             "--max-turns", str(max_turns),
             "--model", model,
         ]
