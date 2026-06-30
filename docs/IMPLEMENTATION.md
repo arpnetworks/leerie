@@ -228,6 +228,28 @@ Base layers (top-down):
   privilege via `runuser -u leerie -- ...` to invoke the orchestrator.
   See DESIGN §6 *Memory containment* for the full mechanism.
 
+### Per-repo derived image (local nerdctl)
+
+After the base image is confirmed present, the launcher checks for a
+`.leerie/Dockerfile` in the user's repo (or auto-generates one from
+`setup_packages` — see DESIGN §6½ *Per-repo container image*). The
+relevant bash surface:
+
+| Function / variable | Location in `leerie` | Purpose |
+|---|---|---|
+| `_leerie_sha256 <file>` | after base-build block | Portable sha256 of a file — uses `sha256sum` (Linux) or `shasum -a 256` (macOS) |
+| `_leerie_repo_id` | after base-build block | Sanitized repo identifier from `git remote get-url origin` (or `basename $USER_REPO` fallback); lowercase, `[a-z0-9._-]` only, `/` → `-` |
+| `resolve_repo_image_tag()` | after base-build block | Returns `leerie-repo/<repo-id>:<LEERIE_VERSION>` when a Dockerfile is present (real or to-be-auto-generated), empty string otherwise |
+| `build_repo_image <tag>` | after base-build block | Runs `nerdctl build --build-arg BASE_IMAGE=<IMAGE_TAG> --build-arg HOST_UID/GID -t <tag> -f .leerie/Dockerfile <USER_REPO>`; exits 1 on failure |
+| `REPO_IMAGE_TAG` | after base-build block | Set to `resolve_repo_image_tag()` output when a Dockerfile exists; empty string otherwise |
+| `$LEERIE_STATE_HOST_DIR/.dockerfile-hash` | after base-build block | Stores `<LEERIE_VERSION>:<sha256>` of the last-built Dockerfile; rebuild fires on mismatch or image absence |
+
+**Rebuild triggers** (checked in order): (1) `nerdctl image inspect "$REPO_IMAGE_TAG"` fails, OR (2) `<LEERIE_VERSION>:<sha256>` of the current Dockerfile differs from the stored hash. Second run with unchanged Dockerfile hits the skip path ("per-repo image up-to-date; skipping build").
+
+**Auto-generation from `setup_packages`**: when `.leerie/config.toml` declares `setup_packages` and no `.leerie/Dockerfile` exists, the launcher generates an apt-install Dockerfile at `.leerie/Dockerfile` (atomic write via temp file + `mv`) before the build-decision block. A committed Dockerfile always takes precedence — `setup_packages` is ignored when both exist.
+
+**`nerdctl run` image arg**: `"${REPO_IMAGE_TAG:-$IMAGE_TAG}"` — falls back to the base image transparently when no repo Dockerfile is present.
+
 ### Registry publish path (fly.io / remote Machines)
 
 Fly.io Machines pull an image from a registry rather than using a
@@ -266,9 +288,15 @@ Internally, the remote-builder path runs:
 flyctl deploy --build-only --push --remote-only \
   --app <fly-app-name> \
   --config <tmp-fly.toml> \
-  --dockerfile Dockerfile \
+  --dockerfile <DOCKERFILE> \
+  [--build-arg KEY=VAL ...] \
   --image-label <VERSION>
 ```
+
+`<DOCKERFILE>` defaults to `$LEERIE_REPO/Dockerfile`; pass `--dockerfile
+<path>` to override (used by `ensure_image()` for per-repo images). Pass
+`--build-arg KEY=VAL` one or more times to forward build arguments to
+flyctl; this flag is repeatable and accumulated before forwarding.
 
 The `<tmp-fly.toml>` is a copy of the repo's `fly.toml` with the
 `[build] image = "..."` line stripped. That line is correct for
@@ -295,7 +323,9 @@ and again after every version bump — otherwise `flyctl machine run`
 fails at provision time with an unfriendly "manifest unknown" error.
 
 The launcher closes that gap with `ensure_image()` in the `RUNTIME=fly`
-branch, run before `provision_machine`:
+branch, run before `provision_machine`. Two variants:
+
+**Base image path** (no `.leerie/Dockerfile`):
 
 1. Cache check: if `$XDG_CACHE_HOME/leerie/published-tags.txt` already
    has `$FLY_IMAGE_TAG`, skip everything.
@@ -308,6 +338,38 @@ branch, run before `provision_machine`:
    `--local-build` CLI flag or `LEERIE_LOCAL_BUILD=1` env var).
    build-push.sh handles the actual remote-vs-local mode dispatch.
 4. On success, append the tag to the positive cache.
+
+**Per-repo derived image path** (`.leerie/Dockerfile` present):
+
+The relevant bash surface:
+
+| Function / variable | Location in `leerie` | Purpose |
+|---|---|---|
+| `_set_fly_per_repo_image()` | before `resolve_fly_image_tag()` call in the `RUNTIME=fly` block | Detects `.leerie/Dockerfile`, computes tag, sets `LEERIE_FLY_IMAGE` + context vars; no-op when absent |
+| `_FLY_PER_REPO_DOCKERFILE` | module-level (set by `_set_fly_per_repo_image`) | Absolute path to `.leerie/Dockerfile`; empty string when no per-repo Dockerfile |
+| `_FLY_BASE_TAG` | module-level (set by `_set_fly_per_repo_image`) | Base Fly tag (`registry.fly.io/$APP:$VERSION`) passed as `BASE_IMAGE` build-arg |
+
+Before `resolve_fly_image_tag()` is called, `_set_fly_per_repo_image()`
+detects `.leerie/Dockerfile`, computes a 12-character hex hash of its
+content, and sets `LEERIE_FLY_IMAGE=registry.fly.io/$APP:$VERSION-$HASH`.
+`resolve_fly_image_tag()` returns that value (via the existing
+`LEERIE_FLY_IMAGE` override hook). `ensure_image()` then:
+
+1. Cache check on the per-repo tag — skip if already in
+   `published-tags.txt`.
+2. Ensure the base image is published: check the cache for the base tag
+   (`registry.fly.io/$APP:$VERSION`); on miss, invoke build-push.sh for
+   the base image first and cache the result.
+3. Build and push the per-repo image: invoke build-push.sh with
+   `--dockerfile $USER_REPO/.leerie/Dockerfile --build-arg
+   BASE_IMAGE=registry.fly.io/$APP:$VERSION --tag <per-repo-tag>`.
+4. Append the per-repo tag to the positive cache.
+
+The per-repo tag format is `registry.fly.io/$APP:$VERSION-$HASH` where
+`$HASH` is the first 12 hex characters of `sha256($LEERIE_DOCKERFILE)`.
+A rebuild fires automatically when the Dockerfile content or the leerie
+version changes — the hash changes, a cache miss occurs, and
+ensure_image re-runs build-push.sh.
 
 Results are cached at `$XDG_CACHE_HOME/leerie/published-tags.txt` (default
 `~/.cache/leerie/published-tags.txt`), one line per `<tag>` known to be
@@ -433,6 +495,7 @@ forwarding is not available" note is gone for the same reason.
 | `~/.cache/leerie/go-mod` | `/home/leerie/.cache/leerie/go-mod` | rw | `GOMODCACHE`. Concurrent-safe via per-module-version `flock` in `cmd/go/internal/modfetch`. |
 | `~/.cache/leerie/cargo` | `/home/leerie/.cache/leerie/cargo` | rw | Whole `CARGO_HOME` (registry + bin + config.lock). Mounting only `registry/` breaks `config.lock` (cargo#11376). Concurrent-safe via cargo's documented flock semantics. |
 | `~/.cache/leerie/corepack` | `/home/leerie/.cache/leerie/corepack` | rw | `COREPACK_HOME`. Without this, corepack inherits `XDG_CACHE_HOME=/tmp/.cache` and tries to mkdir `/tmp/.cache/node/corepack/v1`, which fails under rootless UID remapping. Concurrent-safe: corepack downloads tarballs via atomic rename; the cache is read-mostly after first install. |
+| `~/.cache/leerie/bundle` | `/home/leerie/.cache/leerie/bundle` | rw | `BUNDLE_PATH` for Bundler (Ruby gems). `BUNDLE_CACHE_ALL=1` instructs Bundler to cache all gems (including git-sourced ones) so each `bundle install` reuses downloaded gems across worktrees and runs. |
 | Each `--inspect-dir` path (translated) | `/inspect/<basename>` | ro | See below. |
 
 ### `--inspect-dir` path translation
@@ -2234,6 +2297,39 @@ polyglot Node+Rails repo, `npm test` wins the test axis while
 `bundle exec rubocop` still fills the lint axis if no ESLint/Ruff config
 exists.
 
+**Declared BLT commands (`.leerie/config.toml`).** A repo may commit
+`.leerie/config.toml` with explicit `build`, `lint`, and/or `test` keys
+that override the corresponding axis from inference. Missing keys fall
+through to `_infer_build_lint_test()`. An empty-string value means "not
+applicable" — same convention as inference — and is preserved rather than
+replaced by inference. The file also accepts a `setup_packages` key
+(comma-separated apt package names) stored for future Dockerfile generation
+but not consumed by BLT resolution.
+
+Resolution is implemented by two functions:
+
+- **`_load_blt_config(repo_root: Path) -> dict[str, str] | None`** — reads
+  `.leerie/config.toml` via `_read_toml_key()` for each of `build`, `lint`,
+  `test`, `setup_packages`. Returns `None` when the file is absent; returns a
+  dict containing only the keys present in the file (no defaults for absent
+  keys).
+
+- **`resolve_blt(repo_root: Path) -> dict[str, str]`** — calls
+  `_load_blt_config()`; for each axis, uses the declared value if present
+  (including empty string), otherwise falls through to
+  `_infer_build_lint_test()`. Logs which axes came from config vs inference.
+  This is the function called by both `_run_conformance_phase` and
+  `run_final_conformance` — neither calls `_infer_build_lint_test` directly.
+
+`.leerie/config.toml` format (flat key = value, same parser as `leerie.toml`):
+
+```toml
+build = "make build"
+lint  = "ruff check ."
+test  = "pytest -x"
+# setup_packages = "libvips-dev fonts-noto"
+```
+
 `plan.json` carries `{task, waves, subtasks, preconditions}`. The
 `preconditions` array is the deduped list of `extent: external` `requires`
 entries collected during phase 2½ (see DESIGN §5 `requires.extent`); each
@@ -3111,7 +3207,7 @@ branch, after the `_write_run_json(...)` block and before
 
 ### Caches
 
-Five host caches mounted into the container, all `rw`. Listed in §0.5
+Six host caches mounted into the container, all `rw`. Listed in §0.5
 "Bind-mount table." Concurrency-safety verdicts:
 
 - **mise installs** — Safe. Version dirs are immutable once installed;
@@ -3130,8 +3226,11 @@ Five host caches mounted into the container, all `rw`. Listed in §0.5
   once via pip's own retry, and a persistent failure surfaces as a
   conformer warning (DESIGN §9), not a silent corruption.
 
-Bundler is **not** mounted as a shared cache (open `unlink` races,
-rubygems/bundler#4519). Ruby repos route through `.leerie-setup.sh`.
+- **Bundler** — Mounted. `BUNDLE_PATH` and `BUNDLE_CACHE_ALL=1` are set
+  so `bundle install` reuses cached gems across worktrees and runs.
+  The historic `unlink` race (rubygems/bundler#4519) was fixed in
+  Bundler 2.2+; all supported Ruby versions ship a sufficiently recent
+  Bundler.
 
 ### Worker-driven install (replaces per-worktree replay)
 
@@ -3807,8 +3906,9 @@ normalization decision ever happens.
 dirty set from `git status --porcelain` on the host:
 - Modified-but-uncommitted tracked files
 - Untracked-not-ignored files
-- Defensive filter drops `.git/*`, `.leerie/*`, and worktree paths
-  (`.leerie/runs/*/worktrees/*`) before handing the list to rsync
+- Defensive filter drops `.git/*`, non-whitelisted `.leerie/*` paths, and worktree paths
+  (`.leerie/runs/*/worktrees/*`) before handing the list to rsync; exception: `.leerie/config.toml`,
+  `.leerie/Dockerfile`, `.leerie/.leerie-setup.sh` pass through
 - Forced-in `.claude/` (workers need it, often gitignored) —
   enumerated via `find .claude -type f` host-side and appended to
   the dirty list before the defensive filter
@@ -4064,7 +4164,7 @@ Three operations in `re_seed`, in order:
    --porcelain` dirty set, append every file under the repo-local
    `.claude/` directory (force-included even when gitignored — workers
    need its hooks/agents/skills/commands), filter the combined list
-   (drop `.git/*`, `.leerie/*`, and `.leerie/runs/*/worktrees/*` defensive
+   (drop `.git/*`, non-whitelisted `.leerie/*` paths, and `.leerie/runs/*/worktrees/*` defensive
    entries), then rsync the result to `/work` on the machine via
    `fly_rsync_wrapper` from `lib.sh` (transports `rsync --server` over
    `flyctl ssh console -C`). The full-history clone on the machine is
@@ -4809,6 +4909,11 @@ enforcement functions:
 | `test_resolve_inspect_dirs.py` | `resolve_inspect_dirs()` precedence (CLI → env → TOML → `[]`), `~` expansion, dedup, and `STATE_FIELDS` membership |
 | `test_resolve_prompt.py` | `resolve_prompt()` — every `WORKER_TYPES` member returns a `("file", content, "prompts/<call_type>.md")` triple; parity/coupling test; unknown call_type raises |
 | `test_discover_rules_files.py`, `test_validate_conformance_result.py`, `test_run_conformance_phase.py`, `test_run_final_conformance.py`, `test_infer_build_lint_test.py` | the post-work conformance phase (DESIGN §9) and the post-integration whole-tree conformance pass (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph): rule-file discovery against the fixed capped allowlist, schema cross-field invariants including path-traversal rejection, the orchestrator-level loop covering clean / malformed / crashed / rolled-back / cap-exhausted paths, the commit-prefix observability check, the dirty-state warning before rollback, the worker-budget-exhausted advisory path, the outer `settle_subtask` contract (never escalates to `failed`/`blocked` even on `FileNotFoundError`, unless `--strict-conformer` is on), and `_infer_build_lint_test` across the supported package-manager families (Node/JS, Python, Rust, Go, Java/Maven, Gradle, C#/.NET, PHP, Ruby/Rails including rubocop detection, `bin/rails test` inference, and the `_is_rails_repo` two-file guard against Sinatra/Grape false positives). `test_run_final_conformance.py` additionally covers the staging-worktree skip path, the working_branch-absent skip path, the resume-idempotence short-circuit, the `_final_conformance_payload` PR-writer surfacing helper, and a coupling test that the call site lives between `phase_execute` and `phase_finalize` in `_run_phases` |
+| `test_resolve_blt.py` | `_load_blt_config()` and `resolve_blt()`: no config → full inference fallthrough; all-3-keys → declared values used; partial config → declared key wins others inferred; empty-string value treated as "not applicable" not a fallthrough; config overrides inference even when inference would return a value; `_load_blt_config` returns None when file absent and dict of only-present keys otherwise, including `setup_packages` |
+| `test_resolve_repo_image_tag.py` | `resolve_repo_image_tag()` and `_leerie_repo_id()` — embedded-harness bash tests: no Dockerfile + no setup_packages → empty string; Dockerfile present → tag `leerie-repo/<repo-id>:<version>`; repo-id from HTTPS/SSH remote or basename fallback; uppercase sanitized; rebuild matrix (image absent, hash mismatch, base version changed, all-match no rebuild); coupling test that sentinel lines co-occur in harness and live launcher |
+| `test_launcher_per_repo_image.py` | Per-repo derived image bash-harness tests: `resolve_repo_image_tag()` with/without Dockerfile and with setup_packages only; `_leerie_repo_id()` from HTTPS/SSH remote and basename fallback; `build_repo_image` success/failure/error-message sentinel; rebuild-skip when image present and hash matches; rebuild fires on hash mismatch or image absence |
+| `test_dockerfile_autogen.py` | Auto-generation of `.leerie/Dockerfile` from `setup_packages`: generated content contains ARG BASE_IMAGE, FROM \$BASE_IMAGE, USER root, apt-get install, declared packages, and trailing USER leerie in order; log message emitted during auto-gen; existing Dockerfile preserved verbatim and suppresses auto-gen; no setup_packages + no Dockerfile → REPO_IMAGE_TAG empty, no build fires; coupling tests that sentinel strings exist verbatim in launcher source |
+| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that guard the real launcher's `config)` arm once config-010 integrates |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |

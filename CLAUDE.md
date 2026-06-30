@@ -361,13 +361,17 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
 `resolve_runtime`, `gather_answers` validation gate, `_retryable_failure`,
 `check_merge_committed`, `validate_result`, `validate_plan`,
-`_validate_run_json`, `_derive_run_status`)
+`_validate_run_json`, `_derive_run_status`, `_load_blt_config`,
+`resolve_blt`)
 including a coupling test that the
 retry-policy markers match the live check-function strings. The
 remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 `stop_machine`, `decide_teardown`, `resume_machine`, and `lib.sh`'s
 `update_run_json` — is tested via bash-harness subprocess tests with
-stubbed `flyctl`. No coverage target is set — the suite was
+stubbed `flyctl`. The local per-repo image surface —
+`resolve_repo_image_tag`, `_leerie_repo_id`, `build_repo_image` — is
+tested via bash-harness subprocess tests with stubbed `git` and
+`nerdctl`. No coverage target is set — the suite was
 introduced from scratch and a number now would be arbitrary.
 
 The worker invocation path (`claude_p`) is not unit-tested; meaningful

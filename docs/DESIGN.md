@@ -1661,10 +1661,13 @@ laptop state" = host commits plus host dirty edits):
 The dirty set is computed on the host where worktree paths
 (`.leerie/runs/<run-id>/worktrees/...`) structurally cannot appear,
 because worktrees live only on the machine. A defensive filter
-excludes `.git/*`, `.leerie/*`, and `.leerie/runs/*/worktrees/*` paths
-before handing the file list to rsync's `--files-from=-` — protects
-against a future change that lets host-side paths name worktree files
-or surfaces host-side `.leerie/` run state to the machine.
+excludes `.git/*` and non-whitelisted `.leerie/*` paths before handing
+the file list to rsync's `--files-from=-` — protects against a future
+change that lets host-side paths name worktree files or surfaces
+host-side `.leerie/` run state to the machine. Exception: the three
+committed config files (`.leerie/config.toml`, `.leerie/Dockerfile`,
+`.leerie/.leerie-setup.sh`) are repo-owned declarations that workers
+need on the machine and pass through the filter.
 
 The repo-local `.claude/` directory is force-included in the dirty
 set even when `.gitignore` excludes it (the common case). Workers
@@ -1773,8 +1776,9 @@ classification and planning, layered top-to-bottom by determinism:
    the tests" subtask does), then runs the command itself from
    its own worktree via its Bash tool. The package-manager
    caches (pnpm store, pip wheel cache, go module cache, cargo
-   registry) are shared across worktrees and across runs, so
-   re-running the install command in worktree N is fast.
+   registry, Bundler gem cache) are shared across worktrees and
+   across runs, so re-running the install command in worktree N
+   is fast.
 
    This shape has three benefits over an orchestrator-driven
    install: (a) the host's checked-out source tree and tracked
@@ -1841,6 +1845,64 @@ prior exit's launcher child) can race and destroy the machine.
 The `die()` handler also sets `finished_at` (for `fetch_branch`
 discovery) but leaves `current_phase` at whatever phase died — those
 runs ARE resumable and fall through normally. (See *§12*.)
+
+### Declared BLT commands
+
+A repo may commit `.leerie/config.toml` with explicit `build`, `lint`,
+and/or `test` keys. When present, these override the corresponding axis
+from `_infer_build_lint_test()`. Missing keys fall through to inference.
+An empty-string value means "not applicable" — same convention as
+today's inference — and is preserved rather than replaced by inference.
+This is the "CI yaml" analog: the repo author tells leerie exactly how
+to build, lint, and test, the same way they tell GitHub Actions.
+
+The file also accepts a `setup_packages` key (comma-separated apt
+package names) that triggers per-repo image auto-generation (see below);
+it is not consumed by BLT resolution.
+
+Resolution is handled by `resolve_blt(repo_root)` (calls
+`_load_blt_config()` first, then fills missing axes from inference),
+which is what both `_run_conformance_phase` and `run_final_conformance`
+call — neither calls `_infer_build_lint_test` directly any longer.
+
+### Per-repo container image
+
+System packages requiring root (C libraries for native gems, fonts,
+specialized tooling) cannot be installed by `.leerie-setup.sh` — that
+hook runs as the unprivileged `leerie` user. A repo that needs such
+packages commits `.leerie/Dockerfile` that extends the base image with
+`ARG BASE_IMAGE` / `FROM $BASE_IMAGE`. The launcher builds a derived
+image tagged `leerie-repo/<repo-id>:<version>` (where `<repo-id>` is
+derived from the git remote URL, sanitized to tag chars) and uses it for
+all subsequent `nerdctl run` invocations. When no `.leerie/Dockerfile`
+exists but `.leerie/config.toml` declares `setup_packages`, the launcher
+auto-generates an apt-install Dockerfile and proceeds through the same
+build path. A committed Dockerfile always takes precedence — `setup_packages`
+is ignored when both are present.
+
+Rebuild is triggered by any of: the derived image is absent, the sha256
+of the Dockerfile changed (stored as `<base_version>:<sha256>` at
+`$LEERIE_STATE_HOST_DIR/.dockerfile-hash`), or the base version changed.
+A second run with an unchanged Dockerfile skips the build entirely.
+
+The `nerdctl run` image argument uses `${REPO_IMAGE_TAG:-$IMAGE_TAG}`,
+so the base image is used transparently when no repo Dockerfile is
+present.
+
+**Fly runtime variant.** On `--runtime fly` the same `.leerie/Dockerfile`
+triggers a derived image at `registry.fly.io/$APP:$VERSION-$HASH` where
+`$HASH` is the first 12 hex characters of the Dockerfile's sha256. Before
+`resolve_fly_image_tag()` is called, `_set_fly_per_repo_image()` detects the
+Dockerfile, computes the hash, and sets `LEERIE_FLY_IMAGE` to the per-repo
+tag — the existing override hook in `resolve_fly_image_tag()` picks it up
+transparently. `ensure_image()` then first guarantees the base image is
+published (checking `published-tags.txt`; building and pushing if absent),
+then calls `build-push.sh --dockerfile $USER_REPO/.leerie/Dockerfile
+--build-arg BASE_IMAGE=$base_tag --tag $per_repo_tag` to build and push
+the derived image. Both the base tag and the per-repo tag are recorded in
+`published-tags.txt` so subsequent runs skip the build entirely. Without
+`.leerie/Dockerfile` the Fly path is unchanged — the base tag resolves and
+`ensure_image` proceeds as before.
 
 ---
 
