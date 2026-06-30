@@ -3116,7 +3116,7 @@ fi
 
 # Best-effort host cleanup. Container is --rm; its writes inside the
 # mounts vanish with the container. This removes the host scratch.
-trap 'rm -rf "$STAGE"' EXIT
+trap 'rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
 
 # --- finalize-phase auth is host-side now -------------------------------
 # Previous versions of leerie bind-mounted ~/.config/gh, ~/.git-credentials,
@@ -3931,7 +3931,6 @@ else
     ${INSPECT_MOUNTS[@]+"${INSPECT_MOUNTS[@]}"} \
     -w /work \
     "$IMAGE_TAG" ${REWRITTEN_ARGS[@]+"${REWRITTEN_ARGS[@]}"} || container_rc=$?
-  rm -f "$_cidfile" 2>/dev/null
 fi
 
 # --- host-side finalize (push + PR) -------------------------------------
@@ -3957,6 +3956,9 @@ fi
 #   - the structured-exit code (EXIT_NEEDS_ANSWERS=10) — the launcher's
 #     plugin re-runs leerie with --answers after the user responds.
 if [ "$container_rc" -ne 0 ] || [ "$NO_PUSH" = "true" ]; then
+  if [ "$container_rc" -ne 0 ]; then
+    echo "[leerie] finalize: skipped — container exited with code $container_rc" >&2
+  fi
   exit "$container_rc"
 fi
 
@@ -3996,7 +3998,7 @@ if [ "$RUNTIME" != "fly" ]; then
   fi
 
   if [ -z "$LATEST_RUN_DIR" ]; then
-    # No run finished this invocation — nothing to push.
+    echo "[leerie] finalize: no unpushed finished run found under $LEERIE_STATE_HOST_DIR/runs/" >&2
     exit 0
   fi
 
