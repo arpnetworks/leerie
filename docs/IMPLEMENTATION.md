@@ -27,7 +27,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `.claude-plugin/marketplace.json` | Single-plugin marketplace manifest. Makes the repo itself discoverable via `/plugin marketplace add enricai/leerie` from inside Claude Code. Points at `.` so Claude Code reads the sibling `.claude-plugin/plugin.json`. |
 | `.claude-plugin/plugin.json` | Existing plugin manifest (commands, skills, metadata). The `version` field is the single source of truth for `leerie --version`. |
 | `scripts/install.sh` | The `curl \| bash` shell installer. Preflight (git/claude/curl) → runtime preflight (colima on macOS, nerdctl+containerd on Linux) → clone → symlink → verify. Self-contained bash; deps: `bash`, `curl`, `git`. |
-| `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Passes `--cgroupns=host` so the container shares the host VM's cgroup namespace — required for cgroup v2 process enrollment (nerdctl's default `--cgroupns=private` + `nsdelegate` blocks non-root `cgroup.procs` writes; see DESIGN §6 *Memory containment*). Fast paths for `--version` skip container startup. |
+| `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Passes `--cgroupns=host` so the container shares the host VM's cgroup namespace — required for cgroup v2 process enrollment (nerdctl's default `--cgroupns=private` + `nsdelegate` blocks non-root `cgroup.procs` writes; see DESIGN §6 *Memory containment*). Fast paths for `--version` and `config` skip container startup. |
 | `Dockerfile` | Image recipe (Debian 13 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. Runs as **root** (the Dockerfile intentionally omits `USER leerie` so the entrypoint can perform cgroup-v2 delegation — `mkdir /sys/fs/cgroup/leerie.slice`, enable `+memory +pids` in its `cgroup.subtree_control`, then `chown` to the leerie user — before privilege drop; see DESIGN §6 *Memory containment*). `ulimit -c 0`, the cgroup delegation block, `cd /work`, and the `chown leerie: /work` step all run as root. The final exec drops to leerie via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...`: if invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately, which also drops via `Popen(user="leerie")`), the runuser exec wraps `sleep infinity` to keep the namespace alive; otherwise it wraps `python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). The explicit `env` form is used instead of `runuser --login` because the login form would chdir to `/home/leerie` and override the `cd /work` invariant. |
 | `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
@@ -132,6 +132,37 @@ Maps to `DESIGN.md`: §2 (no plugin-spawned subagents — the launcher is
 plain process exec, not in-session orchestration). §6 *Worker subtree
 termination* and §0.5 of this document describe what runs inside the
 container the launcher starts.
+
+---
+
+### `config`
+
+Launcher bash case arm: `config)`. `leerie config` is a host-only fast
+path — it exits before `nerdctl run` and never starts a container. It is
+listed alongside `--version` in the ownership-guard skip-list so it never
+claims a state directory. Three sub-modes:
+
+- **bare (`leerie config`)**: prints effective build/lint/test config for
+  `$USER_REPO` with `[config]` / `[inference]` provenance per axis (reads
+  `.leerie/config.toml` if present, otherwise infers). Also prints any
+  non-comment `key = value` lines from `leerie.toml` when that file exists.
+- **`leerie config --init`**: creates `.leerie/` and writes
+  `.leerie/config.toml` with auto-detected BLT values (uncommented) and a
+  commented `setup_packages` example. Refuses with exit 1 if `config.toml`
+  already exists. Prints the path and suggests `git add .leerie/`.
+- **`leerie config --chat`**: execs interactive `claude` (NOT `claude -p`)
+  with `--system-prompt-file $LEERIE_REPO/prompts/config_chat.md` and
+  `--add-dir $USER_REPO`. No container started. Exits 1 if
+  `prompts/config_chat.md` is missing.
+
+All three sub-modes share an inline BLT inferrer (`_config_read_key`,
+`_infer_axis`, `_axis_source`) implemented directly in the launcher bash
+so the verb requires no container and no orchestrator import. The logic
+mirrors the harness in `tests/test_config_verb.py`.
+
+Maps to `DESIGN.md`: §6½ *Declared BLT commands* (the `.leerie/config.toml`
+format and resolution); §6½ *Per-repo container image* (`setup_packages`,
+`prompts/config_chat.md` for the interactive session).
 
 ---
 
@@ -1331,8 +1362,8 @@ After resolution and before the verb dispatch, the launcher runs
 - **Dir exists, no `.owner`, no recognizable markers (empty or
   unrelated):** claim it by writing `.owner`.
 
-The check is skipped for `--version` and the `--chain-*` verbs (those
-talk to the chain Fly app and don't touch local state).
+The check is skipped for `--version`, `config`, and the `--chain-*` verbs (those
+talk to the chain Fly app or are host-only fast paths that don't touch local state).
 
 Resolution and ownership validation live entirely in the launcher (bash);
 no Python counterpart — the path is passed to `nerdctl run` as a
@@ -4923,9 +4954,10 @@ enforcement functions:
 | `test_discover_rules_files.py`, `test_validate_conformance_result.py`, `test_run_conformance_phase.py`, `test_run_final_conformance.py`, `test_infer_build_lint_test.py` | the post-work conformance phase (DESIGN §9) and the post-integration whole-tree conformance pass (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph): rule-file discovery against the fixed capped allowlist, schema cross-field invariants including path-traversal rejection, the orchestrator-level loop covering clean / malformed / crashed / rolled-back / cap-exhausted paths, the commit-prefix observability check, the dirty-state warning before rollback, the worker-budget-exhausted advisory path, the outer `settle_subtask` contract (never escalates to `failed`/`blocked` even on `FileNotFoundError`, unless `--strict-conformer` is on), and `_infer_build_lint_test` across the supported package-manager families (Node/JS, Python, Rust, Go, Java/Maven, Gradle, C#/.NET, PHP, Ruby/Rails including rubocop detection, `bin/rails test` inference, and the `_is_rails_repo` two-file guard against Sinatra/Grape false positives). `test_run_final_conformance.py` additionally covers the staging-worktree skip path, the working_branch-absent skip path, the resume-idempotence short-circuit, the `_final_conformance_payload` PR-writer surfacing helper, and a coupling test that the call site lives between `phase_execute` and `phase_finalize` in `_run_phases` |
 | `test_resolve_blt.py` | `_load_blt_config()` and `resolve_blt()`: no config → full inference fallthrough; all-3-keys → declared values used; partial config → declared key wins others inferred; empty-string value treated as "not applicable" not a fallthrough; config overrides inference even when inference would return a value; `_load_blt_config` returns None when file absent and dict of only-present keys otherwise, including `setup_packages` |
 | `test_resolve_repo_image_tag.py` | `resolve_repo_image_tag()` and `_leerie_repo_id()` — embedded-harness bash tests: no Dockerfile + no setup_packages → empty string; Dockerfile present → tag `leerie-repo/<repo-id>:<version>`; repo-id from HTTPS/SSH remote or basename fallback; uppercase sanitized; rebuild matrix (image absent, hash mismatch, base version changed, all-match no rebuild); coupling test that sentinel lines co-occur in harness and live launcher |
+| `test_launcher_cache_mounts.py` | Coupling test for the Ruby bundle cache in `CACHE_MOUNTS`: asserts `-v ...:/home/leerie/.cache/leerie/bundle` volume mount and `-e BUNDLE_PATH=.../bundle` env entry appear inside the `CACHE_MOUNTS=(...)` array; companion assertion confirms `$HOME/.cache/leerie/bundle` is `mkdir -p`'d before the array. Reads launcher source text directly — no subprocess — so a future refactor that drops the bundle lines causes immediate test failure (guards the regression where every `bundle install` recompiles gems from scratch). |
 | `test_launcher_per_repo_image.py` | Per-repo derived image bash-harness tests: `resolve_repo_image_tag()` with/without Dockerfile and with setup_packages only; `_leerie_repo_id()` from HTTPS/SSH remote and basename fallback; `build_repo_image` success/failure/error-message sentinel; rebuild-skip when image present and hash matches; rebuild fires on hash mismatch or image absence |
 | `test_dockerfile_autogen.py` | Auto-generation of `.leerie/Dockerfile` from `setup_packages`: generated content contains ARG BASE_IMAGE, FROM \$BASE_IMAGE, USER root, apt-get install, declared packages, and trailing USER leerie in order; log message emitted during auto-gen; existing Dockerfile preserved verbatim and suppresses auto-gen; no setup_packages + no Dockerfile → REPO_IMAGE_TAG empty, no build fires; coupling tests that sentinel strings exist verbatim in launcher source |
-| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that guard the real launcher's `config)` arm once config-010 integrates |
+| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run` |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |
