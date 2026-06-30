@@ -2875,6 +2875,16 @@ DESIGN.md §8 for the distinction).
 
 No-op when the task doesn't reference files.
 
+### Phantom-path check
+
+`PHANTOM_PATH` fires when a `files_likely_touched` entry does not exist
+and no ancestor directory between the file and `repo_root` exists
+either.  This catches hallucinated paths (e.g.
+`src/totally/invented/dir/file.ts` when `src/totally/` does not exist)
+while tolerating greenfield features that create new subdirectories
+under an existing parent (e.g. `src/components/features/social/post.tsx`
+when `src/components/features/` already exists).
+
 ### Migration-surface check
 
 `check_planner_output` includes an `UNCOVERED_MIGRATION_SURFACE` check

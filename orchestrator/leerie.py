@@ -3776,10 +3776,18 @@ def check_planner_output(
         for f in s.get("files_likely_touched", []):
             full = repo_root / f
             if not full.exists() and not full.parent.exists():
-                issues.append(
-                    f"PHANTOM_PATH: {sid} lists {f!r} in "
-                    "files_likely_touched but neither it nor its "
-                    "parent directory exists")
+                has_ancestor = False
+                ancestor = full.parent.parent
+                while ancestor != repo_root and ancestor != ancestor.parent:
+                    if ancestor.exists():
+                        has_ancestor = True
+                        break
+                    ancestor = ancestor.parent
+                if not has_ancestor:
+                    issues.append(
+                        f"PHANTOM_PATH: {sid} lists {f!r} in "
+                        "files_likely_touched but no ancestor "
+                        "directory exists under the repo root")
 
     all_ids = {s["id"] for s in subtasks}
     for s in subtasks:
@@ -8663,6 +8671,8 @@ async def phase_plan(task: str, st: State, caps: dict,
                 make_feedback_prompt=_on_feedback,
             )
             if result is None:
+                for w in gate_warnings:
+                    log(f"  planner-{category}: {w}")
                 if n_samples > 1:
                     log(f"  planner-{category}: crashed and produced "
                         "no result")
