@@ -39,9 +39,16 @@ def test_other_extension_treated_as_literal(leerie, tmp_path):
     assert leerie.resolve_task_argument(str(f)) == str(f)
 
 
-def test_path_like_string_but_missing_file(leerie, tmp_path):
+def test_missing_md_file_dies(leerie, tmp_path):
     missing = tmp_path / "nope.md"
-    assert leerie.resolve_task_argument(str(missing)) == str(missing)
+    with pytest.raises(SystemExit):
+        leerie.resolve_task_argument(str(missing))
+
+
+def test_missing_txt_file_dies(leerie, tmp_path):
+    missing = tmp_path / "prompt.txt"
+    with pytest.raises(SystemExit):
+        leerie.resolve_task_argument(str(missing))
 
 
 def test_very_long_literal_string_treated_as_literal(leerie, tmp_path,
@@ -52,6 +59,15 @@ def test_very_long_literal_string_treated_as_literal(leerie, tmp_path,
     # literal task, not crash.
     monkeypatch.chdir(tmp_path)
     long_task = "Rebrand the site " + ("x" * 300)
+    assert leerie.resolve_task_argument(long_task) == long_task
+
+
+def test_very_long_string_ending_in_suffix_treated_as_literal(leerie, tmp_path,
+                                                              monkeypatch):
+    # OSError from ENAMETOOLONG must suppress the missing-file die()
+    # even when the string ends with a task-file suffix.
+    monkeypatch.chdir(tmp_path)
+    long_task = "x" * 300 + ".txt"
     assert leerie.resolve_task_argument(long_task) == long_task
 
 

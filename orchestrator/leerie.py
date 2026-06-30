@@ -2507,28 +2507,30 @@ def resolve_task_argument(raw: str) -> str:
     """Resolve the positional `task` argument to the task string.
 
     If `raw` points at an existing .txt or .md file, return its contents
-    (stripped). Otherwise return `raw` unchanged.
-
-    Suffix is restricted (rather than reading any existing file) so a
-    literal task string that happens to match a filename in cwd is not
-    silently swallowed.
+    (stripped). If `raw` has a .txt/.md suffix but the file doesn't exist,
+    die — the user meant to reference a file. Otherwise return `raw`
+    unchanged.
     """
     p = Path(raw)
     # A long literal task is one path component over NAME_MAX (255 bytes
     # on macOS/Linux), which makes stat() raise ENAMETOOLONG instead of
     # returning a "not found" result that is_file() would surface as
     # False. Any stat failure means we cannot confirm a file, so treat
-    # `raw` as the literal task — same outcome as the missing-file path.
+    # `raw` as the literal task.
+    stat_ok = True
     try:
         is_task_file = (p.is_file()
                         and p.suffix.lower() in TASK_FILE_SUFFIXES)
     except OSError:
         is_task_file = False
+        stat_ok = False
     if is_task_file:
         contents = p.read_text().strip()
         if not contents:
             die(f"task file {raw!r} is empty")
         return contents
+    if stat_ok and p.suffix.lower() in TASK_FILE_SUFFIXES:
+        die(f"task file not found: {raw}")
     return raw
 
 

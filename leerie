@@ -2243,6 +2243,17 @@ for arg in "$@"; do
 done
 export LEERIE_TASK_ARG
 
+# --- fail fast on missing task file ---------------------------------------
+# Matches the eager validation --chain already does for prompt files (l.1722).
+case "$LEERIE_TASK_ARG" in
+  *.txt|*.md|*.TXT|*.MD)
+    if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$LEERIE_TASK_ARG" ]; then
+      remote_log "task file not found: $LEERIE_TASK_ARG"
+      exit 1
+    fi
+    ;;
+esac
+
 # --- runtime-mode knob ---------------------------------------------------
 # Resolves RUNTIME=local|fly. Precedence: CLI --runtime > LEERIE_RUNTIME env
 # > leerie.toml `runtime` key > default `local`. Mirrors the orchestrator's
