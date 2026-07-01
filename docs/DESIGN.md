@@ -251,6 +251,22 @@ It is reconciled by the orchestrator with three mechanisms:
   the unresolved set mechanically, runs Tarjan's SCC on the post-mutation
   graph, and applies the worker's output mechanically.
 
+  **Dead-subtask elimination (code-enforced).** A planner can emit
+  `requires: {tag, extent: in_plan}` for a capability it expects another
+  domain to produce. If that domain returns 0 subtasks, the requires is
+  unresolvable. The reconciler correctly surfaces this — but a subtask
+  whose *every* `in_plan` requires is unresolvable is fully speculative:
+  it tests or guards work that no domain will perform. Before `die()`,
+  the orchestrator prunes such subtasks mechanically. This mirrors dead
+  code elimination after constant folding in compilers: a domain
+  returning 0 subtasks is a constant fold; subtasks depending solely on
+  it are dead code. The prune fires only when at least one domain has 0
+  subtasks — it does not weaken the reconciler's `unresolvable` verdict
+  in the general case. After pruning, surviving subtasks with no
+  unresolvable requires proceed normally. If all domains end up empty,
+  `detect_no_work` fires. If unresolvable entries remain after pruning,
+  the run dies as before.
+
   Acyclicity is a first-class output property — the reconciler's job is to
   produce an acyclic merged plan, not just to resolve unresolved capability
   tags. If the worker's first attempt closes a cycle (each rename can be
@@ -2067,7 +2083,9 @@ domain's `confidence.basis` quoted, writes `finished_at`, skips phases
 3–6, and exits 0. The run renders as `done` in `leerie --list` (no
 push, no PR — there is no commit to propose). A mixed outcome (some
 ready+empty, some ready+nonempty) proceeds normally; the empty domains
-simply contribute nothing. The all-blocked case still dies — a blocker
+simply contribute nothing (dead-subtask elimination can also produce a
+mixed outcome by pruning fully-speculative subtasks from a non-empty
+domain — see §5 *Dead-subtask elimination*). The all-blocked case still dies — a blocker
 is a gate failure that the user must see.
 
 The structural contract of these disciplines is mechanically enforced — the

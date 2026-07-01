@@ -239,6 +239,11 @@ STATE_FIELDS = (
     # field from `dropped_subtasks` (off-tree soft drops, phase 3) so the
     # two causes stay separately auditable.
     "conditional_drops",
+    # speculative_collapse_drops: subtask sids mechanically pruned by
+    # dead-subtask elimination (DESIGN §5) — fully-speculative subtasks
+    # whose every in_plan requires was unresolvable because the provider
+    # domain returned 0 subtasks. List of sid strings.
+    "speculative_collapse_drops",
     # plan_overlap_judge / plan_overlap_applied: set by phase_overlap_judge
     # (DESIGN §5 *Cross-domain surface overlap*). plan_overlap_judge stores
     # the full judge worker output (list of collisions with a_sid/b_sid/
@@ -8858,6 +8863,64 @@ def _compute_unresolved_requires(plans: list[dict]) -> list[dict]:
     return unresolved
 
 
+def _prune_dead_subtasks(
+    plans: list[dict],
+    unresolvable_entries: list[dict],
+) -> list[str]:
+    """Dead-subtask elimination: remove subtasks whose EVERY in_plan
+    requires tag is in the reconciler's unresolvable set (DESIGN §5).
+
+    Fires only when at least one plan has 0 subtasks (the "constant
+    fold" that makes the dead subtasks detectable). Mirrors the
+    conditional_drops cleanup pattern: prunes depends_on references
+    from surviving subtasks.
+
+    Returns sorted list of pruned sids (empty if nothing pruned).
+    Mutates `plans` in place."""
+    if not any(not p.get("subtasks") for p in plans):
+        return []
+
+    unresolvable_pairs: set[tuple[str, str]] = {
+        (u["sid"], u["tag"]) for u in unresolvable_entries
+    }
+    unresolvable_sids: set[str] = {u["sid"] for u in unresolvable_entries}
+
+    dead_sids: set[str] = set()
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            sid = s.get("id", "")
+            if sid not in unresolvable_sids:
+                continue
+            in_plan_tags = [
+                e.get("tag", "")
+                for e in (s.get("requires") or [])
+                if isinstance(e, dict) and e.get("extent") == "in_plan"
+                and e.get("tag")
+            ]
+            if not in_plan_tags:
+                continue
+            if all((sid, tag) in unresolvable_pairs for tag in in_plan_tags):
+                dead_sids.add(sid)
+
+    if not dead_sids:
+        return []
+
+    for plan in plans:
+        plan["subtasks"] = [
+            s for s in plan.get("subtasks", [])
+            if s.get("id") not in dead_sids
+        ]
+
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            deps = s.get("depends_on") or []
+            pruned_deps = [d for d in deps if d not in dead_sids]
+            if len(pruned_deps) != len(deps):
+                s["depends_on"] = pruned_deps
+
+    return sorted(dead_sids)
+
+
 def _find_oversized_added_subtasks(plans: list[dict]) -> list[dict]:
     """Pure-Python lookup: every reconciler-added subtask (carrying
     `_added_by_reconciler: true`, stamped by `_apply_reconciler_output`)
@@ -9524,6 +9587,25 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         die("reconciler crashed and produced no result")
     for w in recon_warnings:
         log(f"  reconciler: {w}")
+    # Dead-subtask elimination (DESIGN §5): prune fully-speculative
+    # subtasks before _check_unresolvable can die(). A subtask is
+    # fully speculative when every one of its in_plan requires tags
+    # is in the reconciler's unresolvable set AND at least one domain
+    # has 0 subtasks (the "constant fold" that makes the dead subtasks
+    # detectable).
+    _unresolvable_entries = output.get("unresolvable", []) or []
+    if _unresolvable_entries:
+        _pruned = _prune_dead_subtasks(plans, _unresolvable_entries)
+        if _pruned:
+            log(f"phase 2½: dead-subtask elimination — pruned "
+                f"{len(_pruned)} fully-speculative subtask(s): "
+                f"{', '.join(_pruned)}")
+            st.data["speculative_collapse_drops"] = _pruned
+            st.save()
+            output["unresolvable"] = [
+                u for u in _unresolvable_entries
+                if u["sid"] not in set(_pruned)
+            ]
     _check_unresolvable(output)
     _apply_reconciler_output(plans, output)
     _record_conditional_drops(output)
