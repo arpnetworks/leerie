@@ -17,7 +17,7 @@ primary_region = "iad"
 # Image built and pushed by scripts/remote/build-push.sh.
 # The version tag is updated to match .claude-plugin/plugin.json on each release.
 [build]
-  image = "registry.fly.io/leerie:0.9.20"
+  image = "registry.fly.io/leerie:0.9.21"
 
 # VM sizing matches the local Colima auto-size guidance in docs/INSTALL.md:
 # half-of-host CPU/RAM, clamped to 2–8 cpus / 4–16 GB.
