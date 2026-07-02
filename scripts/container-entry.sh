@@ -84,6 +84,12 @@ cd /work
 # (DESIGN §6 *Remote disk policy*; IMPLEMENTATION §0.5 *Container shape*.)
 if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   chown leerie: /work 2>/dev/null || true
+  # The Dockerfile's `mise install --system` creates /tmp/.cache/mise/
+  # as root (XDG_CACHE_HOME=/tmp/.cache). On local nerdctl /tmp is an
+  # ephemeral overlay so this is never seen; on Fly the rootfs preserves
+  # root ownership and `mise install` fails with EACCES when a repo pins
+  # a runtime version not pre-baked in the image.
+  chown -R leerie: /tmp/.cache 2>/dev/null || true
 fi
 
 # Fly path: idle as PID 1 so the machine stays up. The orchestrator is

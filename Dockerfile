@@ -254,6 +254,12 @@ ENV MISE_STATE_DIR=/tmp/.mise-state
 # At runtime mise's resolver falls through to these from the user
 # dir if a repo declares no version. ~150-200 MB image cost.
 RUN mise install --system node@lts python@3.12
+# mise install --system runs as root and creates /tmp/.cache/mise/
+# (via XDG_CACHE_HOME=/tmp/.cache above) owned by root:root. On Fly
+# Machines the rootfs preserves this ownership; the leerie user then
+# gets EACCES when `mise install` tries to write its download cache.
+# On local nerdctl runs /tmp is an ephemeral overlay so this is never seen.
+RUN chown -R leerie: /tmp/.cache
 
 # Stable PATH symlink for the LTS Node bin. `mise install --system
 # node@lts` resolves to a concrete version directory under
