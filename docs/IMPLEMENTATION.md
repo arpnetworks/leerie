@@ -4103,19 +4103,29 @@ of state. The launcher routes by observation:
 |---|---|---|
 | Stopped (paused) | n/a | Wake via `resume_machine` → re-seed → launch orchestrator → tail |
 | Running | Dead | (Re-)seed if needed → launch orchestrator → tail |
-| Running | Alive | Skip launch → attach: tail orchestrator.log (default) or open bash shell (`--shell`) |
+| Running | Alive | Skip seed + launch → attach: tail orchestrator.log (default) or open bash shell (`--shell`) |
 
-The "alive orchestrator" case is detected by the rc=75 signal from
-the launcher's in-machine Python launch wrapper — the wrapper's
-fast-path flock probe (DESIGN §6 *Single owner per run dir*) exits 75
-when the run-directory lock is held. Because `flyctl ssh console` does
-not forward remote exit codes (see §Single-owner-per-run-dir
-enforcement, *flyctl exit-code workaround*), the launcher parses the
-real code from stderr via `_extract_flyctl_remote_rc`. The launcher's
-rc=75 branch then
-pivots: it does NOT spawn a duplicate orchestrator; instead it invokes
+The "alive orchestrator" case is detected by a two-layered flock probe.
+**Early probe (resume path only):** on the `_resumed=true` path, the
+launcher runs a lightweight Python flock snippet via `flyctl ssh console`
+immediately after `resume_machine` — before `seed_auth`. If the probe
+returns rc=75 (lock held), the launcher skips `seed_auth`, `re_seed`,
+and the launch wrapper entirely, pivoting straight to
+`_attach_to_live_orchestrator` (lib.sh). SSH readiness is not a concern:
+when the orchestrator is alive, the machine was never stopped and
+hallpass is already warm; if the probe fails for any non-75 reason, the
+launcher falls through to `seed_auth`. **Launch-time probe
+(belt-and-suspenders):** the launcher's in-machine Python launch
+wrapper takes a fast-path flock probe (DESIGN §6 *Single owner per run
+dir*) and exits 75 when the run-directory lock is held. This covers
+fresh provisions and any race the early probe missed. Because `flyctl
+ssh console` does not forward remote exit codes (see
+§Single-owner-per-run-dir enforcement, *flyctl exit-code workaround*),
+the launcher parses the real code from stderr via
+`_extract_flyctl_remote_rc`. Both probes pivot via
+`_attach_to_live_orchestrator` (lib.sh): it invokes
 `tail_with_optional_autofinalize()` (default) or a `flyctl ssh console`
-bash payload (`--shell`) against the live machine, and exits with
+bash payload (`--shell`) against the live machine, and sets
 `container_rc=130` so `decide_teardown` leaves the machine alone. The
 attach transport is `flyctl ssh console` proxied through Fly's
 hallpass + WireGuard mesh — no sshd in the image, no key management,

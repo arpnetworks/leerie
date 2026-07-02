@@ -1598,21 +1598,34 @@ The launcher reads observed state and routes to the right behavior:
 |---|---|---|
 | Stopped (paused) | n/a | Wake machine → re-seed → launch orchestrator → tail |
 | Running | Dead | (Re-)seed if needed → launch orchestrator → tail |
-| Running | Alive | Skip launch → tail orchestrator.log |
+| Running | Alive | Skip seed + launch → tail orchestrator.log |
 
 The "machine running, orchestrator alive" branch is the §6 isolation
 boundary's terminal-side surface — not a new privileged channel.
-Detection: the launcher pipes a launch wrapper through `flyctl ssh
-console -C "python3 -"`; the wrapper takes a fast-path flock probe on
-the run directory (DESIGN §6 *Single owner per run dir*) and exits 75
-if the lock is held. **flyctl exit-code limitation:** `flyctl ssh
-console` does not forward the remote process's exit code — it returns
-1 for any non-zero remote exit. The actual code appears only in
-stderr (`Error: ssh shell: Process exited with status <N>`). The
-launcher captures stderr and parses the real remote code via
-`_extract_flyctl_remote_rc` (lib.sh) so the rc=75 pivot fires
-correctly. The launcher's rc=75 branch pivots to attach
-behavior instead of launching a duplicate. The attach channel itself
+Detection is two-layered. **Early flock probe (resume path only):**
+on the `_resumed=true` path, the launcher runs a lightweight flock
+probe via `flyctl ssh console` immediately after `resume_machine`
+succeeds and *before* `seed_auth`. If the probe detects a held lock
+(rc=75), the launcher skips `seed_auth`, `re_seed`, and the launch
+wrapper entirely, going straight to the attach path — avoiding ~60 s
+of wasted seeding. SSH readiness is not a concern: when the
+orchestrator is alive, the machine was never stopped and hallpass is
+already warm. If the probe fails for any reason other than rc=75
+(SSH not ready, run directory absent), the launcher falls through
+silently to `seed_auth`. **Launch-time flock probe
+(belt-and-suspenders):** the launcher pipes a launch wrapper through
+`flyctl ssh console -C "python3 -"`; the wrapper takes a fast-path
+flock probe on the run directory (§6 *Single owner per run dir*)
+and exits 75 if the lock is held. This second probe covers fresh
+provisions and any race the early probe missed. **flyctl exit-code
+limitation:** `flyctl ssh console` does not forward the remote
+process's exit code — it returns 1 for any non-zero remote exit.
+The actual code appears only in stderr (`Error: ssh shell: Process
+exited with status <N>`). The launcher captures stderr and parses
+the real remote code via `_extract_flyctl_remote_rc` (lib.sh) so the
+rc=75 pivot fires correctly. Both probes pivot to attach behavior
+via `_attach_to_live_orchestrator` (lib.sh) instead of launching a
+duplicate. The attach channel itself
 is `flyctl ssh console` against the run's Fly Machine, proxied
 through Fly's hallpass + WireGuard mesh, giving the user a real PTY
 at `/work`. Default behavior runs `tail -F` of the orchestrator log

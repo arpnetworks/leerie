@@ -361,21 +361,22 @@ def test_launcher_contains_auto_discovery_block():
 
 
 def test_launcher_contains_rc75_pivot():
-    """The rc=75 pivot must invoke tail_with_optional_autofinalize OR
-    the shell payload; container_rc=130 must be set so decide_teardown
-    routes through the detach-banner arm rather than killing the live
-    machine (DESIGN §6 *Single owner per run dir*, contagion fix)."""
+    """The rc=75 pivot must invoke _attach_to_live_orchestrator;
+    container_rc=130 must be set so decide_teardown routes through the
+    detach-banner arm rather than killing the live machine (DESIGN §6
+    *Single owner per run dir*, contagion fix)."""
     launcher = LEERIE.read_text()
     assert 'if [ "$_launch_rc" = "75" ]; then' in launcher, (
         "The rc=75 branch must exist."
     )
-    assert "tail_with_optional_autofinalize" in launcher, (
-        "rc=75 default branch must invoke the shared tail helper."
+    assert "_attach_to_live_orchestrator" in launcher, (
+        "rc=75 default branch must invoke _attach_to_live_orchestrator."
     )
-    # Container_rc=130 is the critical routing decision — see DESIGN §6.
-    assert "container_rc=130" in launcher, (
-        "rc=75 pivot must set container_rc=130 so decide_teardown "
-        "leaves the live machine alone."
+    # container_rc=130 is set inside _attach_to_live_orchestrator (lib.sh).
+    libsh = LIB_SH.read_text()
+    assert "container_rc=130" in libsh, (
+        "_attach_to_live_orchestrator must set container_rc=130 so "
+        "decide_teardown leaves the live machine alone."
     )
 
 
@@ -532,3 +533,207 @@ def test_lib_sh_helper_returns_does_not_exit():
             f"Helper uses `exit` (terminates launcher) instead of "
             f"`return` (returns to caller). Offending line:\n  {line!r}"
         )
+
+
+# =========================================================================
+# Early flock probe: detect live orchestrator before seed_auth
+# =========================================================================
+
+def test_launcher_contains_early_flock_probe():
+    """The early probe must exist inside the _resumed=true guard and
+    must call _attach_to_live_orchestrator on rc=75."""
+    launcher = LEERIE.read_text()
+    assert "_early_probe_rc" in launcher, (
+        "Early flock probe variable missing from launcher."
+    )
+    assert '_early_probe_rc" = "75"' in launcher, (
+        "Early probe must check for rc=75."
+    )
+    assert "_skip_seed_launch" in launcher, (
+        "Early probe must set _skip_seed_launch to gate seed/launch."
+    )
+
+
+def test_lib_sh_exports_attach_to_live_orchestrator():
+    """_attach_to_live_orchestrator() must be defined in lib.sh."""
+    libsh = LIB_SH.read_text()
+    assert "_attach_to_live_orchestrator()" in libsh, (
+        "_attach_to_live_orchestrator() not defined in lib.sh"
+    )
+    assert "container_rc=130" in libsh, (
+        "_attach_to_live_orchestrator must set container_rc=130"
+    )
+
+
+def _stub_flyctl_with_stderr(
+    tmp_path: Path,
+    ssh_console_rc: int = 0,
+    stderr_msg: str = "",
+) -> Path:
+    """flyctl stub that returns a configurable rc for ssh-console and
+    writes stderr_msg to stderr (for _extract_flyctl_remote_rc parsing)."""
+    log = tmp_path / "flyctl.log"
+    fake = tmp_path / "flyctl"
+    fake.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$@" >> "{log}"\n'
+        "if [ \"$1 $2\" = 'ssh console' ]; then\n"
+        f'  cat - >> "{log}.stdin"\n'
+        + (f'  echo "{stderr_msg}" >&2\n' if stderr_msg else "")
+        + f"  exit {ssh_console_rc}\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    fake.chmod(0o755)
+    return fake
+
+
+# Harness mirrors the early-probe block from the launcher. Runs the
+# probe, then reports whether seed_auth would have been called.
+_EARLY_PROBE_HARNESS = f"""
+set -uo pipefail
+
+remote_log() {{ echo "[leerie] $*" >&2; }}
+
+. {LIB_SH}
+
+# Simulate caller-scope variables the attach function reads.
+RESUME_SHELL="${{RESUME_SHELL:-false}}"
+RESUME_AUTO_FINALIZE="${{RESUME_AUTO_FINALIZE:-false}}"
+LEERIE_RUN_ID="$1"
+LEERIE_MACHINE_ID="$2"
+FLY_APP="$3"
+_resumed="$4"
+container_rc=0
+
+_skip_seed_launch=false
+if [ "$_resumed" = "true" ]; then
+  _early_probe_script='
+import fcntl, os, sys
+run_dir = "/work/.leerie/runs/" + sys.argv[1]
+try:
+    fd = os.open(run_dir, os.O_RDONLY)
+except OSError:
+    sys.exit(0)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+except BlockingIOError:
+    sys.exit(75)
+finally:
+    os.close(fd)
+'
+  _early_probe_rc=0
+  _early_probe_stderr="$(mktemp)"
+  printf '%s' "$_early_probe_script" \\
+    | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \\
+        --pty=false -C "python3 - '$LEERIE_RUN_ID'" \\
+        2>"$_early_probe_stderr" \\
+    || _early_probe_rc=$?
+  if [ "$_early_probe_rc" != "0" ]; then
+    _early_probe_rc="$(_extract_flyctl_remote_rc "$_early_probe_stderr" "$_early_probe_rc")"
+  fi
+  rm -f "$_early_probe_stderr"
+
+  if [ "$_early_probe_rc" = "75" ]; then
+    remote_log "--resume: early probe detected live orchestrator — skipping seed"
+    _attach_to_live_orchestrator
+    _skip_seed_launch=true
+  fi
+fi
+
+if [ "$_skip_seed_launch" = "false" ]; then
+  echo "SEED_AUTH_CALLED=true"
+else
+  echo "SEED_AUTH_CALLED=false"
+fi
+echo "CONTAINER_RC=$container_rc"
+"""
+
+
+def test_early_probe_detects_live_orchestrator(tmp_path: Path):
+    """rc=75 from the flock probe → seed_auth skipped, container_rc=130."""
+    fake = _stub_flyctl_with_stderr(
+        tmp_path,
+        ssh_console_rc=1,
+        stderr_msg="Error: ssh shell: Process exited with status 75",
+    )
+    r = subprocess.run(
+        ["bash", "-c", _EARLY_PROBE_HARNESS, "_",
+         "test-run-aaa", "mach-001", "leerie", "true"],
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "RESUME_SHELL": "false",
+            "RESUME_AUTO_FINALIZE": "false",
+        },
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "SEED_AUTH_CALLED=false" in r.stdout, r.stdout
+    assert "CONTAINER_RC=130" in r.stdout, r.stdout
+    assert "early probe detected live orchestrator" in r.stderr, r.stderr
+
+
+def test_early_probe_falls_through_on_ssh_failure(tmp_path: Path):
+    """Non-75 SSH failure → fall through to seed_auth normally."""
+    fake = _stub_flyctl_with_stderr(
+        tmp_path,
+        ssh_console_rc=1,
+        stderr_msg="Error: ssh shell: connect failed",
+    )
+    r = subprocess.run(
+        ["bash", "-c", _EARLY_PROBE_HARNESS, "_",
+         "test-run-bbb", "mach-002", "leerie", "true"],
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "RESUME_SHELL": "false",
+            "RESUME_AUTO_FINALIZE": "false",
+        },
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "SEED_AUTH_CALLED=true" in r.stdout, r.stdout
+    assert "CONTAINER_RC=0" in r.stdout, r.stdout
+
+
+def test_early_probe_skipped_on_fresh_provision(tmp_path: Path):
+    """_resumed=false → no probe, seed_auth runs normally."""
+    fake = _stub_flyctl_with_stderr(tmp_path, ssh_console_rc=1,
+                                     stderr_msg="should not matter")
+    r = subprocess.run(
+        ["bash", "-c", _EARLY_PROBE_HARNESS, "_",
+         "test-run-ccc", "mach-003", "leerie", "false"],
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "RESUME_SHELL": "false",
+            "RESUME_AUTO_FINALIZE": "false",
+        },
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "SEED_AUTH_CALLED=true" in r.stdout, r.stdout
+    assert "CONTAINER_RC=0" in r.stdout, r.stdout
+    # flyctl should not have been called at all.
+    log_file = tmp_path / "flyctl.log"
+    if log_file.exists():
+        assert "ssh console" not in log_file.read_text(), (
+            "flyctl ssh console should not be called when _resumed=false"
+        )
+
+
+def test_early_probe_falls_through_when_no_lock(tmp_path: Path):
+    """Probe returns 0 (no lock held) → seed_auth runs normally."""
+    fake = _stub_flyctl_with_stderr(tmp_path, ssh_console_rc=0)
+    r = subprocess.run(
+        ["bash", "-c", _EARLY_PROBE_HARNESS, "_",
+         "test-run-ddd", "mach-004", "leerie", "true"],
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "RESUME_SHELL": "false",
+            "RESUME_AUTO_FINALIZE": "false",
+        },
+        capture_output=True, text=True,
+    )
+    assert r.returncode == 0, r.stderr
+    assert "SEED_AUTH_CALLED=true" in r.stdout, r.stdout
+    assert "CONTAINER_RC=0" in r.stdout, r.stdout

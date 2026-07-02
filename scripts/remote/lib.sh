@@ -332,9 +332,9 @@ TAIL_SH
 #
 # Call sites today:
 #   - The launcher's fresh-launch tail (after starting the orchestrator).
-#   - The launcher's `--resume` smart router rc=75 pivot (when the
-#     orchestrator is already alive and we're attaching to the live
-#     log stream rather than spawning a duplicate).
+#   - `_attach_to_live_orchestrator` (this file) — invoked by both the
+#     early flock probe and the launch-wrapper rc=75 pivot when the
+#     orchestrator is already alive.
 #
 # Both code paths use this helper to avoid two divergent copies of the
 # token-grep-and-exec dance; the helper is the load-bearing surface
@@ -408,6 +408,46 @@ $_tail_script"
     printf '%s' "$_tail_invocation" \
       | flyctl ssh console --app "$_app" --machine "$_machine_id" --pty=false -C "sh -s"
   fi
+}
+
+# --- _attach_to_live_orchestrator -----------------------------------------
+# Attach to an already-running orchestrator — either open a bash shell
+# at /work (RESUME_SHELL=true) or tail the live log stream via
+# render_tail_wrapper + tail_with_optional_autofinalize.
+#
+# Call sites:
+#   - The early flock probe (resume path, before seed_auth).
+#   - The launch-wrapper rc=75 pivot (after seed_auth, belt-and-suspenders).
+#
+# Reads from caller's scope:
+#   RESUME_SHELL, LEERIE_RUN_ID, LEERIE_MACHINE_ID, FLY_APP,
+#   RESUME_AUTO_FINALIZE
+#
+# Side-effect: sets container_rc=130 in the caller's scope so
+# decide_teardown leaves the machine alone (DESIGN §6 *Smart resume
+# in remote mode*).
+_attach_to_live_orchestrator() {
+  if [ "$RESUME_SHELL" = "true" ]; then
+    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
+    local _shell_payload="cd /work && PS1='leerie@$LEERIE_RUN_ID:\\w\\$ ' exec bash --noprofile --norc -i"
+    local _shell_payload_q
+    _shell_payload_q="$(printf %s "$_shell_payload" | sed "s/'/'\\\\''/g")"
+    flyctl ssh console \
+      --app "$FLY_APP" \
+      --machine "$LEERIE_MACHINE_ID" \
+      --command "bash -lc '$_shell_payload_q'" || true
+  else
+    remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
+    local _tail_script
+    _tail_script="$(render_tail_wrapper)"
+    tail_with_optional_autofinalize \
+      "$_tail_script" \
+      "$LEERIE_RUN_ID" \
+      "$LEERIE_MACHINE_ID" \
+      "$FLY_APP" \
+      "$RESUME_AUTO_FINALIZE" || true
+  fi
+  container_rc=130
 }
 
 # --- require_flyctl ------------------------------------------------------

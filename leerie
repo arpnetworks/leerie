@@ -3968,6 +3968,60 @@ except Exception:
     fi
 
     if [ "$_provisioned" = "true" ]; then
+      # --- Early flock probe (resume-only optimization) ---
+      # On a resumed machine, probe whether the orchestrator is still
+      # alive BEFORE spending ~60s on seed_auth + re_seed. If the run
+      # directory's flock is held (rc=75), skip seeding entirely and
+      # attach to the live log stream. This is an optimization — the
+      # launch-time flock probe (~100 lines below) is the
+      # belt-and-suspenders enforcement and is NOT removed.
+      #
+      # Fresh provisions (_resumed=false) skip this: no prior
+      # orchestrator can be running on a freshly created machine.
+      #
+      # SSH readiness: when the orchestrator IS alive, the machine was
+      # never stopped — hallpass is already warm. When the machine was
+      # genuinely paused, the orchestrator is dead (died with the
+      # machine); if SSH isn't ready yet the probe fails with a non-75
+      # rc and falls through to seed_auth's wait_for_fly_ssh_ready.
+      _skip_seed_launch=false
+      if [ "$_resumed" = "true" ]; then
+        _early_probe_script="$(cat <<'EARLY_PROBE_PY'
+import fcntl, os, sys
+run_dir = "/work/.leerie/runs/" + sys.argv[1]
+try:
+    fd = os.open(run_dir, os.O_RDONLY)
+except OSError:
+    sys.exit(0)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+except BlockingIOError:
+    sys.exit(75)
+finally:
+    os.close(fd)
+EARLY_PROBE_PY
+)"
+        _early_probe_rc=0
+        _early_probe_stderr="$(mktemp)"
+        printf '%s' "$_early_probe_script" \
+          | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+              --pty=false -C "python3 - '$LEERIE_RUN_ID'" \
+              2>"$_early_probe_stderr" \
+          || _early_probe_rc=$?
+        if [ "$_early_probe_rc" != "0" ]; then
+          _early_probe_rc="$(_extract_flyctl_remote_rc "$_early_probe_stderr" "$_early_probe_rc")"
+        fi
+        rm -f "$_early_probe_stderr"
+
+        if [ "$_early_probe_rc" = "75" ]; then
+          remote_log "--resume: early probe detected live orchestrator — skipping seed"
+          _attach_to_live_orchestrator
+          _skip_seed_launch=true
+        fi
+      fi
+
+      if [ "$_skip_seed_launch" = "false" ]; then
       # Machine is running and reachable. Seed Claude config + git identity
       # so `claude -p` workers can authenticate and commit, then seed the
       # working tree (git clone + rsync uncommitted delta).  Then run the
@@ -4206,25 +4260,7 @@ PY
           #     alone (decide_teardown at scripts/remote/provision.sh:401).
           #     Exactly what we want when the original orchestrator is
           #     still alive.
-          if [ "$RESUME_SHELL" = "true" ]; then
-            remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; opening shell at /work"
-            _shell_payload="cd /work && PS1='leerie@$LEERIE_RUN_ID:\\w\\$ ' exec bash --noprofile --norc -i"
-            _shell_payload_q="$(printf %s "$_shell_payload" | sed "s/'/'\\\\''/g")"
-            flyctl ssh console \
-              --app "$FLY_APP" \
-              --machine "$LEERIE_MACHINE_ID" \
-              --command "bash -lc '$_shell_payload_q'" || true
-          else
-            remote_log "--resume: orchestrator already running for $LEERIE_RUN_ID; attaching to live log stream (Ctrl-C to detach — orchestrator keeps running)"
-            _tail_script="$(render_tail_wrapper)"
-            tail_with_optional_autofinalize \
-              "$_tail_script" \
-              "$LEERIE_RUN_ID" \
-              "$LEERIE_MACHINE_ID" \
-              "$FLY_APP" \
-              "$RESUME_AUTO_FINALIZE" || true
-          fi
-          container_rc=130
+          _attach_to_live_orchestrator
         elif [ "$_launch_rc" != "0" ]; then
           remote_log "error: failed to start detached orchestrator on machine $LEERIE_MACHINE_ID (rc=$_launch_rc)"
           container_rc=1
@@ -4265,6 +4301,7 @@ $_tail_script"
           container_rc=$orch_rc
         fi
       fi
+      fi  # _skip_seed_launch
     else
       # Reached when neither resume_machine nor provision_machine
       # produced a running machine (or --resume strict-fail set
