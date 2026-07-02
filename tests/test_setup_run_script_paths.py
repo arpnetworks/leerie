@@ -131,6 +131,18 @@ def test_new_worktree_idempotency_check_uses_fixed_string():
     assert 'grep -q "worktree .*/' not in src
 
 
+def test_new_worktree_canonicalizes_wt_to_absolute():
+    """$WT must be resolved to an absolute path before the reuse grep.
+
+    git worktree list --porcelain outputs absolute, symlink-resolved paths.
+    When LEERIE_STATE_DIR is unset (Fly runtime), $WT is relative and the
+    grep never matches, crashing continuation retries with
+    "fatal: '...' already exists"."""
+    src = _script("new-worktree.sh")
+    assert 'case "$WT" in' in src
+    assert 'WT="$(pwd -P)/$WT"' in src
+
+
 # --- integrate.sh ---------------------------------------------------------
 
 def test_integrate_takes_run_id_arg():

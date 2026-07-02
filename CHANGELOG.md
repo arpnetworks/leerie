@@ -5,6 +5,19 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.22]
+
+### Fixed
+
+- **`new-worktree.sh` idempotency broken on Fly runtime.** The worktree
+  reuse check compared a relative path (`$WT`) against the absolute
+  paths from `git worktree list --porcelain`, so the match never fired
+  when `LEERIE_STATE_DIR` was unset (the default on Fly machines). On
+  continuation retries (confidence gate, mechanical check), the script
+  crashed with `fatal: '...' already exists`, making the run
+  unrecoverable even after `--resume`. Fixed by canonicalizing `$WT`
+  to an absolute path via `pwd -P` before the comparison.
+
 ## [0.9.14]
 
 ### Fixed

@@ -17,6 +17,14 @@ ID="${1:?usage: new-worktree.sh <subtask-id> <run-id>}"
 RUN_ID="${2:?usage: new-worktree.sh <subtask-id> <run-id>}"
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
 WT="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/${ID}"
+# git worktree list --porcelain outputs absolute, symlink-resolved paths.
+# When LEERIE_STATE_DIR is unset (Fly runtime), $WT is relative and the
+# reuse grep below never matches, crashing continuation retries with
+# "fatal: '...' already exists". pwd -P resolves symlinks to match git.
+case "$WT" in
+  /*) ;;
+  *)  WT="$(pwd -P)/$WT" ;;
+esac
 BRANCH="leerie/subtasks/${RUN_ID}/${ID}"
 PARENT_BRANCH="leerie/runs/${RUN_ID}"
 
