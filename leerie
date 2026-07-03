@@ -550,6 +550,9 @@ case "${1:-}" in
   *) _validate_state_ownership ;;
 esac
 
+# COUPLING: every verb arm below that `exit`s must also have a guard in
+# the REWRITTEN_ARGS filter loop (~line 3097) so a misplaced verb errors
+# clearly instead of leaking to the orchestrator.
 case "${1:-}" in
   --version)
     echo "leerie $LEERIE_VERSION"
@@ -3149,6 +3152,16 @@ for arg in "$@"; do
       # Launcher-only flag; triggers `leerie --finalize` on clean exit via
       # tail_with_optional_autofinalize. The orchestrator's argparse
       # doesn't know it.
+      ;;
+    --finalize|--stop|--kill|--re-seed|--attach|--chain|--chain-submit|--chain-status|--list-chains|--chain-kill|--chain-attach|config)
+      # Launcher-only verbs — normally dispatched at the top-level case
+      # (line ~553) when they appear as $1. If one appears here it was
+      # in a non-$1 position (e.g. `leerie <id> --finalize --runtime fly`
+      # instead of `leerie --finalize <id> --runtime fly`). Error instead
+      # of leaking to the orchestrator's argparse.
+      remote_log "error: '$arg' is a verb and must be the first argument."
+      remote_log "  Run: leerie $arg [args...]"
+      exit 1
       ;;
     --resume)
       # Forward --resume to the orchestrator and mark that the next
