@@ -598,8 +598,18 @@ case "${1:-}" in
         build="make"
       fi
       if [ -f "$_user_repo/package.json" ]; then
-        [ -n "$build" ] || build="npm run build"
-        [ -n "$test" ] || test="npm test"
+        # Lockfile-aware PM detection — mirrors orchestrator's
+        # _infer_build_lint_test() (pnpm > yarn > bun > npm).
+        local _pm="npm"
+        if [ -f "$_user_repo/pnpm-lock.yaml" ]; then
+          _pm="pnpm"
+        elif [ -f "$_user_repo/yarn.lock" ]; then
+          _pm="yarn"
+        elif [ -f "$_user_repo/bun.lockb" ] || [ -f "$_user_repo/bun.lock" ]; then
+          _pm="bun"
+        fi
+        [ -n "$build" ] || build="$_pm run build"
+        [ -n "$test" ] || test="$_pm run test"
       fi
       if [ -f "$_user_repo/pyproject.toml" ] || [ -f "$_user_repo/pytest.ini" ] || \
          [ -f "$_user_repo/setup.cfg" ]; then
@@ -922,6 +932,223 @@ PY
     else
       set -- "${_list_rest[@]}"
     fi
+    ;;
+  --accept-blocked)
+    # Mark a blocked/failed subtask as complete so --resume skips it.
+    # Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local]
+    #
+    # For local runs: modifies $LEERIE_STATE_HOST_DIR/runs/<id>/state.json
+    # directly (bind-mounted into the container).
+    # For Fly runs: starts the paused machine, SSH-modifies state.json on
+    # the volume, then stops it again.
+    shift
+    USER_REPO="${USER_REPO:-$PWD}"
+    export USER_REPO
+    _ab_run_id=""
+    _ab_sid=""
+    _ab_runtime=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --runtime) _ab_runtime="${2:-}"; shift 2 ;;
+        --runtime=*) _ab_runtime="${1#--runtime=}"; shift ;;
+        --*) remote_log "unknown --accept-blocked flag: $1"; exit 1 ;;
+        *)
+          if [ -z "$_ab_run_id" ]; then _ab_run_id="$1"; shift
+          elif [ -z "$_ab_sid" ]; then _ab_sid="$1"; shift
+          else remote_log "unexpected --accept-blocked arg: $1"; exit 1
+          fi
+          ;;
+      esac
+    done
+    if [ -z "$_ab_run_id" ] || [ -z "$_ab_sid" ]; then
+      remote_log "--accept-blocked requires <run-id> <subtask-id>"
+      echo "  Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local]" >&2
+      exit 1
+    fi
+    # Validate both positional args against a strict allowlist BEFORE they
+    # reach any filesystem path or remote shell. run_id is interpolated into
+    # $_ab_state_dir (a state-mutating write path — traversal risk) and, on
+    # the Fly path, into the `flyctl ssh console -C` string alongside sid
+    # (remote-shell double-parse — command-injection risk; SECURITY.md
+    # "Command injection"). The allowlist accepts real run-ids (hex Fly
+    # machine ids, UUIDs) and subtask-ids (planner slugs) while rejecting
+    # quotes, `;`, `/`, `..`, and whitespace. "code enforces" (DESIGN §12).
+    case "$_ab_run_id" in
+      *[!A-Za-z0-9._-]*)
+        remote_log "--accept-blocked: invalid run-id '$_ab_run_id' (allowed chars: A-Za-z0-9._-)"
+        exit 1 ;;
+    esac
+    case "$_ab_sid" in
+      *[!A-Za-z0-9._-]*)
+        remote_log "--accept-blocked: invalid subtask-id '$_ab_sid' (allowed chars: A-Za-z0-9._-)"
+        exit 1 ;;
+    esac
+    if [ -n "$_ab_runtime" ] && [ "$_ab_runtime" != "fly" ] && [ "$_ab_runtime" != "local" ]; then
+      remote_log "--accept-blocked: --runtime must be 'local' or 'fly' (got '$_ab_runtime')"
+      exit 1
+    fi
+    if _auto_detect_fly_runtime "$_ab_run_id" "$_ab_runtime"; then
+      _ab_runtime="fly"
+    elif [ "$_ab_runtime" != "fly" ]; then
+      _ab_runtime="local"
+    fi
+    _ab_state_dir="$LEERIE_STATE_HOST_DIR/runs/$_ab_run_id"
+    if [ ! -d "$_ab_state_dir" ]; then
+      remote_log "--accept-blocked: no run dir at $_ab_state_dir"
+      exit 1
+    fi
+    _ab_state_file="$_ab_state_dir/state.json"
+    # Python program that validates and atomically mutates state.json.
+    # Reads (state_path, sid) from argv. Prints exactly one sentinel line
+    # prefixed ACCEPTED: / NOOP: / ERROR: so callers (esp. the Fly path,
+    # which pipes this over `flyctl ssh console -C "python3 -"` and cannot
+    # rely on the process exit code surviving flyctl's rc-flattening) can
+    # grep the outcome. Exit code is still set for the local path.
+    _ab_mutate='
+import json, os, sys, tempfile
+path, sid = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        st = json.load(f)
+except FileNotFoundError:
+    print(f"ERROR: state.json not found at {path}", file=sys.stderr)
+    sys.exit(1)
+ss = st.get("subtask_status", {})
+cur = ss.get(sid)
+if cur is None:
+    print(f"ERROR: subtask {sid!r} not found in subtask_status", file=sys.stderr)
+    sys.exit(1)
+if cur == "complete":
+    print(f"NOOP: subtask {sid!r} is already complete")
+    sys.exit(0)
+if cur not in ("blocked", "failed"):
+    print(f"ERROR: subtask {sid!r} has status {cur!r} (expected blocked or failed)", file=sys.stderr)
+    sys.exit(1)
+ss[sid] = "complete"
+bl = st.get("blocked", {})
+if isinstance(bl, dict):
+    bl.pop(sid, None)
+    if not bl:
+        st.pop("blocked", None)
+with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=False, suffix=".tmp") as tmp:
+    json.dump(st, tmp, indent=2)
+    tmp.write("\n")
+    tmp_path = tmp.name
+os.replace(tmp_path, path)
+print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
+'
+    if [ "$_ab_runtime" = "fly" ]; then
+      if [ -z "${LEERIE_FLY_APP:-}" ]; then
+        remote_log "--accept-blocked: LEERIE_FLY_APP is required for Fly runs"
+        exit 1
+      fi
+      FLY_APP="${LEERIE_FLY_APP:-}"
+      export FLY_APP
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/provision.sh"
+      require_flyctl || exit 1
+      # run_id IS the machine ID (DESIGN §6). Export LEERIE_RUN_ID too so
+      # the decide_teardown trap that provision.sh registers on source has
+      # a valid run-id for sidecar resolution / resume hints.
+      LEERIE_MACHINE_ID="$_ab_run_id"
+      export LEERIE_MACHINE_ID
+      export LEERIE_RUN_ID="$_ab_run_id"
+      # Wake the machine only if it is stopped. If it is already running
+      # (accepting a block on a live run) we must NOT pause it afterward —
+      # track whether we started it so the teardown below is conditional.
+      # `flyctl machine status` has no --json; parse the text (same idiom
+      # as re-seed.sh).
+      _ab_started_machine=false
+      _ab_mstate="$(flyctl machine status "$LEERIE_MACHINE_ID" --app "$FLY_APP" 2>/dev/null \
+                    | sed 's/\x1b\[[0-9;]*m//g' \
+                    | awk -F': *' '/^State: / { print $2; exit }' \
+                    | tr -d '[:space:]' || true)"
+      case "$_ab_mstate" in
+        started|starting) : ;;
+        stopped)
+          remote_log "--accept-blocked: starting paused machine $LEERIE_MACHINE_ID..."
+          if ! flyctl machine start "$LEERIE_MACHINE_ID" --app "$FLY_APP" >/dev/null 2>&1; then
+            remote_log "--accept-blocked: flyctl machine start failed for $LEERIE_MACHINE_ID"
+            exit 1
+          fi
+          _ab_started_machine=true
+          wait_for_started "$LEERIE_MACHINE_ID" || {
+            remote_log "--accept-blocked: machine $LEERIE_MACHINE_ID never reached started state"
+            stop_machine
+            exit 1
+          }
+          ;;
+        destroyed|"")
+          remote_log "--accept-blocked: machine $LEERIE_MACHINE_ID is destroyed or missing — cannot modify state"
+          exit 1
+          ;;
+        *)
+          remote_log "--accept-blocked: machine $LEERIE_MACHINE_ID is in state '$_ab_mstate' — cannot modify state"
+          exit 1
+          ;;
+      esac
+      # Conditional teardown: only pause the machine if WE started it.
+      _ab_teardown() {
+        if [ "$_ab_started_machine" = true ]; then
+          stop_machine
+          _ensure_run_json "$_ab_state_dir" || true
+          update_run_json "$_ab_state_dir/run.json" \
+            paused_at "$(iso_now)" \
+            pause_reason "user-requested" \
+            fly_machine_id "$LEERIE_MACHINE_ID" || true
+        fi
+      }
+      # Prove hallpass (in-machine SSH) is actually up before the mutate
+      # SSH — a freshly-started machine takes 5-30 s. Correct arg order is
+      # (fly_app, machine_id); gate on the return.
+      if ! wait_for_fly_ssh_ready "$FLY_APP" "$LEERIE_MACHINE_ID"; then
+        remote_log "--accept-blocked: machine $LEERIE_MACHINE_ID never became SSH-ready"
+        _ab_teardown
+        exit 1
+      fi
+      _ab_remote_state="/work/.leerie/runs/$_ab_run_id/state.json"
+      # Pipe the python program via stdin to `python3 -` on the machine so
+      # the multi-line script body never round-trips through a shell quoter
+      # (established pattern — force-finalize.sh, lib.sh sh -s). The `-C`
+      # string IS parsed by a remote shell (see lib.sh:181), so the two
+      # positional args are single-quoted; $_ab_remote_state / $_ab_sid
+      # inside them are the allowlist-validated tokens from the top of this
+      # verb (no metacharacters can break out). sys.argv[1:] receives the
+      # two args. Grep the output for the sentinel prefix since flyctl
+      # flattens the remote exit code.
+      _ab_out="$(printf '%s' "$_ab_mutate" \
+        | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+            --pty=false -C "python3 - '$_ab_remote_state' '$_ab_sid'" 2>&1 || true)"
+      _ab_sentinel="$(printf '%s\n' "$_ab_out" | tr -d '\r' \
+                      | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
+      case "$_ab_sentinel" in
+        ACCEPTED:*|NOOP:*)
+          remote_log "--accept-blocked: $_ab_sentinel"
+          ;;
+        *)
+          remote_log "--accept-blocked: failed to modify state on machine"
+          [ -n "$_ab_out" ] && remote_log "  output: $_ab_out"
+          _ab_teardown
+          exit 1
+          ;;
+      esac
+      # Mirror the mutation onto the host copy so --list / audits stay
+      # consistent (best-effort; host copy is optional).
+      if [ -f "$_ab_state_file" ]; then
+        python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" >/dev/null 2>&1 || true
+      fi
+      _ab_teardown
+      remote_log "--accept-blocked: done. Resume via: leerie --resume $_ab_run_id"
+    else
+      # Local: state.json is on the host (bind-mounted into containers).
+      if [ ! -f "$_ab_state_file" ]; then
+        remote_log "--accept-blocked: no state.json at $_ab_state_file"
+        exit 1
+      fi
+      python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid"
+      remote_log "--accept-blocked: done. Resume via: leerie --resume $_ab_run_id"
+    fi
+    exit 0
     ;;
   --re-seed)
     # Fast-path: re-rsync the host's working tree into a paused/running
@@ -3153,7 +3380,7 @@ for arg in "$@"; do
       # tail_with_optional_autofinalize. The orchestrator's argparse
       # doesn't know it.
       ;;
-    --finalize|--stop|--kill|--re-seed|--attach|--chain|--chain-submit|--chain-status|--list-chains|--chain-kill|--chain-attach|config)
+    --finalize|--stop|--kill|--re-seed|--accept-blocked|--attach|--chain|--chain-submit|--chain-status|--list-chains|--chain-kill|--chain-attach|config)
       # Launcher-only verbs — normally dispatched at the top-level case
       # (line ~553) when they appear as $1. If one appears here it was
       # in a non-$1 position (e.g. `leerie <id> --finalize --runtime fly`

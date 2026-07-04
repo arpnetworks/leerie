@@ -12542,10 +12542,22 @@ def _infer_build_lint_test(repo_root: Path) -> dict[str, str]:
         # and picks. We just signal "a Makefile exists."
         out["build"] = "make"
     if (repo_root / "package.json").is_file():
-        # npm has both build and test conventions; lint varies. The
-        # conformer reads scripts and picks.
-        out["build"] = out["build"] or "npm run build"
-        out["test"] = out["test"] or "npm test"
+        # Lockfile-aware PM detection — precedence mirrors
+        # detect_recipe_from_lockfiles (pnpm > yarn > bun > npm).
+        # `<pm> run build` / `<pm> run test` uniformly: bun's bare
+        # `bun test` / `bun build` invoke built-in tools, not
+        # package.json scripts.
+        if (repo_root / "pnpm-lock.yaml").is_file():
+            pm = "pnpm"
+        elif (repo_root / "yarn.lock").is_file():
+            pm = "yarn"
+        elif (repo_root / "bun.lockb").is_file() or \
+             (repo_root / "bun.lock").is_file():
+            pm = "bun"
+        else:
+            pm = "npm"
+        out["build"] = out["build"] or f"{pm} run build"
+        out["test"] = out["test"] or f"{pm} run test"
     if (repo_root / "pyproject.toml").is_file() or \
        (repo_root / "pytest.ini").is_file() or \
        (repo_root / "setup.cfg").is_file():
@@ -12996,19 +13008,19 @@ def _conformance_clean(conf_res: dict) -> bool:
 # a fresh BLT command in response to an auto-backgrounded prior one
 # (the retry-instead-of-recover antipattern; see conformer.md §4).
 _BLT_AXIS_RES: dict[str, re.Pattern[str]] = {
-    "test":  re.compile(r"\b(?:pnpm|npm|yarn|npx)\s+(?:run\s+)?(?:test|vitest)\b"
+    "test":  re.compile(r"\b(?:pnpm|npm|yarn|bun|npx)\s+(?:run\s+)?(?:test|vitest)\b"
                         r"|\bvitest\s+run\b"
                         r"|\bbin/rails\s+test\b"
                         r"|\bmvn\s+test\b"
                         r"|\b\.?/?gradlew\s+test\b|\bgradle\s+test\b"
                         r"|\bdotnet\s+test\b"
                         r"|\bvendor/bin/phpunit\b"),
-    "build": re.compile(r"\b(?:pnpm|npm|yarn)\s+(?:run\s+)?build\b"
+    "build": re.compile(r"\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?build\b"
                         r"|\btsc(?:\s|$)|\bnext\s+build\b"
                         r"|\bmvn\s+(?:package|compile)\b"
                         r"|\b\.?/?gradlew\s+build\b|\bgradle\s+build\b"
                         r"|\bdotnet\s+build\b"),
-    "lint":  re.compile(r"\b(?:pnpm|npm|yarn)\s+(?:run\s+)?lint\b"
+    "lint":  re.compile(r"\b(?:pnpm|npm|yarn|bun)\s+(?:run\s+)?lint\b"
                         r"|\bbiome\s+check\b|\beslint(?:\s|$)"
                         r"|\brubocop\b"
                         r"|\bvendor/bin/phpstan\b|\bvendor/bin/phpcs\b"),

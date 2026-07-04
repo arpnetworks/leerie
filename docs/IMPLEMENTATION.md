@@ -2315,7 +2315,12 @@ families (checked in this order; first match wins per axis via
 `out[axis] = out[axis] or "..."`):
 
 - **Makefile** → `make` (build)
-- **Node/JS** (`package.json`) → `npm run build` (build), `npm test` (test)
+- **Node/JS** (`package.json`) → `<pm> run build` (build), `<pm> run test`
+  (test), where `<pm>` is detected from lockfiles: `pnpm-lock.yaml` → `pnpm`,
+  `yarn.lock` → `yarn`, `bun.lockb`/`bun.lock` → `bun`, else `npm`.
+  Precedence mirrors `detect_recipe_from_lockfiles()`. All PMs use the
+  `<pm> run <script>` form uniformly — bun's bare `bun test` / `bun build`
+  invoke built-in tools rather than package.json scripts
 - **Python** (`pyproject.toml` / `pytest.ini` / `setup.cfg`) → `pytest` (test)
 - **Rust** (`Cargo.toml`) → `cargo build` (build), `cargo test` (test)
 - **Go** (`go.mod`) → `go build ./...` (build), `go test ./...` (test)
@@ -2339,7 +2344,7 @@ families (checked in this order; first match wins per axis via
   Sinatra/Grape/etc.) → `bin/rails test` (test)
 
 The short-circuit semantics mean earlier families take precedence: in a
-polyglot Node+Rails repo, `npm test` wins the test axis while
+polyglot Node+Rails repo, `npm run test` wins the test axis while
 `bundle exec rubocop` still fills the lint axis if no ESLint/Ruff config
 exists.
 
@@ -2659,7 +2664,7 @@ Implements DESIGN §9 *Post-work conformance*.
 | Validate output | `validate_conformance_result()` | Cross-field invariants — `rule_violations_residual` non-empty requires `rules_files_read` non-empty; each `rule_violations_fixed` item must cite a non-empty `rule` string; each `docs_updates` / `tests_updates` item must cite a `path` that exists. On failure → warning, loop breaks. |
 | Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions used on the implementer, re-applied to any new commits the conformer added. A scope-protected-path violation triggers `rollback_conformer_commits()` (reset to `before_sha`) and is recorded as a warning, **not** as `failed` / `blocked`. |
 | Loop bound | `caps["conformance_rounds"]` (default 3) | Re-runs the conformer if its output is malformed or residuals remain. Exhausting the cap with residuals still present is a warning, not a failure. |
-| BLT-axis observability + feedback | `_emit_bash_axis_warnings()` | After each round, parses the per-worker JSONL log at `<state-root>/runs/<id>/logs/<sid>-conformer.log` (or `final-conformer-r<N>.log` for the final pass) and surfaces two types: (1) **multi-invocation** (advisory only) — `conformer round N: ran <AXIS>_CMD K times in one round` — legitimate progressive testing (targeted → full suite → grep) is the common cause; surfaced for observability. (2) **retry-after-backgrounded** (feedback-injected) — `conformer round N: <AXIS>_CMD auto-backgrounded (bash_id=<id>) and was followed by another <AXIS>_CMD invocation` — the "retry-instead-of-recover" pattern. These Pattern B warnings are collected after each round and, if non-empty, formatted via `_format_check_feedback()` and passed as `extra_feedback` to the next round's `run_conformer()` call so the conformer can correct the behavior. Helpers `_count_bash_axis_invocations()` and `_count_orphaned_bg_axis()` are pure log-parsing — never raise. `_BLT_AXIS_RES` is a `dict[str, re.Pattern[str]]` containing compiled regexes for the test, build, and lint axes: test matches `pnpm/npm/yarn/npx test` (and `vitest`), `vitest run`, `bin/rails test`; build matches `pnpm/npm/yarn build`, `tsc`, `next build`; lint matches `pnpm/npm/yarn lint`, `biome check`, `eslint`, `rubocop`. The `_count_orphaned_bg_axis` detection logic also accepts `BashOutput shell_id=<id>` polls as a valid recovery path — forward-compatible with future tool-surface changes. |
+| BLT-axis observability + feedback | `_emit_bash_axis_warnings()` | After each round, parses the per-worker JSONL log at `<state-root>/runs/<id>/logs/<sid>-conformer.log` (or `final-conformer-r<N>.log` for the final pass) and surfaces two types: (1) **multi-invocation** (advisory only) — `conformer round N: ran <AXIS>_CMD K times in one round` — legitimate progressive testing (targeted → full suite → grep) is the common cause; surfaced for observability. (2) **retry-after-backgrounded** (feedback-injected) — `conformer round N: <AXIS>_CMD auto-backgrounded (bash_id=<id>) and was followed by another <AXIS>_CMD invocation` — the "retry-instead-of-recover" pattern. These Pattern B warnings are collected after each round and, if non-empty, formatted via `_format_check_feedback()` and passed as `extra_feedback` to the next round's `run_conformer()` call so the conformer can correct the behavior. Helpers `_count_bash_axis_invocations()` and `_count_orphaned_bg_axis()` are pure log-parsing — never raise. `_BLT_AXIS_RES` is a `dict[str, re.Pattern[str]]` containing compiled regexes for the test, build, and lint axes: test matches `pnpm/npm/yarn/bun/npx test` (and `vitest`), `vitest run`, `bin/rails test`; build matches `pnpm/npm/yarn/bun build`, `tsc`, `next build`; lint matches `pnpm/npm/yarn/bun lint`, `biome check`, `eslint`, `rubocop`. The `_count_orphaned_bg_axis` detection logic also accepts `BashOutput shell_id=<id>` polls as a valid recovery path — forward-compatible with future tool-surface changes. |
 | Attach result | — | `res["conformance"]` (worker output blob) and `res["conformance_warnings"]` (list of strings) are added to the implementer's result. The subtask still returns `complete`. |
 
 The phase is advisory: **no path through the conformance phase produces a
@@ -4300,6 +4305,60 @@ as a new terminal state (`killed`); `_derive_run_status` reads it
 before `paused_at`. `_validate_run_json` enforces that `paused_at`,
 `pushed_at`, and `killed_at` are mutually exclusive (same invariant
 pattern as today's `paused_at` vs `pushed_at`).
+
+#### Accept-blocked verb (`leerie --accept-blocked`)
+
+When a subtask returns `status: blocked` due to unsatisfied `extent:
+external` prerequisites (DESIGN §5), `--resume` retries it — which
+blocks again indefinitely. The `--accept-blocked` verb lets the
+operator acknowledge the external block so `--resume` skips that
+subtask.
+
+- **`leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local]`**
+  — sets `subtask_status[sid]` to `"complete"` in state.json and removes
+  the sid from the `blocked` dict (if present). On `--resume`,
+  `phase_execute`'s wave-skip filters subtasks whose `subtask_status` is
+  `"complete"`, so the accepted subtask never re-dispatches.
+  - **Input validation (both runtimes):** both positionals are checked
+    against `^[A-Za-z0-9._-]+$` immediately after parsing, before they
+    reach any filesystem path or remote shell. The run-id is interpolated
+    into the host state-dir path (traversal risk) and, on Fly, into the
+    `flyctl ssh console -C` string; the sid is interpolated into that same
+    `-C` string. Since `-C` is parsed by a **remote shell**, an unvalidated
+    metacharacter would be a command-injection vector (SECURITY.md); the
+    allowlist is the mechanical enforcement (DESIGN §12).
+  - **Local path:** runs the mutation program (`python3 -c "$_ab_mutate"`)
+    against `$LEERIE_STATE_HOST_DIR/runs/<id>/state.json` directly
+    (bind-mounted into containers).
+  - **Fly path:** inspects `flyctl machine status`; refuses on
+    `destroyed`/missing; if `stopped`, wakes the machine (`flyctl machine
+    start` + `wait_for_started`, fatal on failure) and records that it did
+    so. Waits for hallpass via `wait_for_fly_ssh_ready "$FLY_APP"
+    "$machine_id"` (gated on the return). Pipes the mutation program over
+    **stdin** to `python3 -` on the machine (`printf '%s' "$_ab_mutate" |
+    flyctl ssh console ... -C "python3 - '<remote-state>' '<sid>'"`) so the
+    multi-line script body never round-trips through a shell quoter (same
+    idiom as `force-finalize.sh`). The `-C` string itself IS parsed by a
+    remote shell, so the two positional args are single-quoted and the
+    run-id/sid inside them are the validated tokens above. The program
+    prints an `ACCEPTED:` / `NOOP:` / `ERROR:` sentinel that the launcher
+    greps (flyctl flattens the remote exit code). The host-side copy is
+    mirrored best-effort. Teardown is **conditional**: the machine is
+    paused again (with `paused_at`/`pause_reason`/`fly_machine_id`
+    re-written via `update_run_json`) only if this verb woke a stopped
+    machine — a machine that was already running is left running.
+  - The mutation program validates that the subtask's current status is
+    `"blocked"` or `"failed"` before mutating (atomic temp-file +
+    `os.replace`). No-ops with a `NOOP:` sentinel if already `"complete"`.
+  - **Test coverage:** `tests/test_accept_blocked.py` — local-path tests
+    (mutation, no-op, error paths, blocked-dict cleanup), Fly-path tests
+    with a stubbed `flyctl` that parses both `-C` positionals and routes
+    the stdin-piped `python3 -` to a local fixture, and injection-rejection
+    tests asserting a metacharacter-bearing run-id/sid is refused with a
+    nonzero exit and no mutation.
+
+Maps to `DESIGN.md`: §5 *`requires.extent` — in-graph vs. external
+prerequisites*, *Accepting external-blocked subtasks*.
 
 Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*, *The
 user-visible verb surface*.

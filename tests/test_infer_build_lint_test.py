@@ -28,7 +28,7 @@ def test_package_json_infers_npm_build_and_test(leerie, tmp_path):
     (tmp_path / "package.json").write_text('{"name":"x"}')
     blt = _infer(leerie, tmp_path)
     assert blt["build"] == "npm run build"
-    assert blt["test"] == "npm test"
+    assert blt["test"] == "npm run test"
 
 
 def test_cargo_infers_cargo_commands(leerie, tmp_path):
@@ -95,7 +95,7 @@ def test_polyglot_node_python_picks_npm_build(leerie, tmp_path):
     assert blt["build"] == "npm run build"
     # `out["test"] or "..."` short-circuits — npm test (from package.json,
     # checked first) wins over pytest.
-    assert blt["test"] == "npm test"
+    assert blt["test"] == "npm run test"
 
 
 def test_makefile_infers_make(leerie, tmp_path):
@@ -138,7 +138,7 @@ def test_polyglot_node_rails_picks_npm_test_and_rails_test_not_overridden(leerie
     (tmp_path / "bin").mkdir()
     (tmp_path / "bin" / "rails").write_text("#!/usr/bin/env ruby\n")
     blt = _infer(leerie, tmp_path)
-    assert blt["test"] == "npm test"
+    assert blt["test"] == "npm run test"
 
 
 # --- Java / Maven ---
@@ -243,3 +243,59 @@ def test_gradle_and_detekt_fills_build_test_and_lint(leerie, tmp_path):
     assert blt["build"] == "gradle build"
     assert blt["test"] == "gradle test"
     assert blt["lint"] == "detekt"
+
+
+# --- Node.js lockfile-aware PM detection ---
+
+def test_pnpm_lock_infers_pnpm_commands(leerie, tmp_path):
+    (tmp_path / "package.json").write_text('{"name":"x"}')
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "pnpm run build"
+    assert blt["test"] == "pnpm run test"
+
+
+def test_yarn_lock_infers_yarn_commands(leerie, tmp_path):
+    (tmp_path / "package.json").write_text('{"name":"x"}')
+    (tmp_path / "yarn.lock").write_text("# yarn lockfile v1\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "yarn run build"
+    assert blt["test"] == "yarn run test"
+
+
+def test_bun_lockb_infers_bun_commands(leerie, tmp_path):
+    """bun.lockb (binary lockfile) triggers bun detection."""
+    (tmp_path / "package.json").write_text('{"name":"x"}')
+    (tmp_path / "bun.lockb").write_bytes(b"\x00")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "bun run build"
+    assert blt["test"] == "bun run test"
+
+
+def test_bun_lock_infers_bun_commands(leerie, tmp_path):
+    """bun.lock (text lockfile, bun v1.2+) triggers bun detection."""
+    (tmp_path / "package.json").write_text('{"name":"x"}')
+    (tmp_path / "bun.lock").write_text("{}\n")
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "bun run build"
+    assert blt["test"] == "bun run test"
+
+
+def test_npm_lock_infers_npm_commands(leerie, tmp_path):
+    """Explicit package-lock.json still yields npm (the default)."""
+    (tmp_path / "package.json").write_text('{"name":"x"}')
+    (tmp_path / "package-lock.json").write_text('{"lockfileVersion":3}')
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "npm run build"
+    assert blt["test"] == "npm run test"
+
+
+def test_pnpm_wins_over_npm_lock(leerie, tmp_path):
+    """When both pnpm-lock.yaml and package-lock.json exist, pnpm wins —
+    the team chose pnpm even if package-lock.json was left behind."""
+    (tmp_path / "package.json").write_text('{"name":"x"}')
+    (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+    (tmp_path / "package-lock.json").write_text('{"lockfileVersion":3}')
+    blt = _infer(leerie, tmp_path)
+    assert blt["build"] == "pnpm run build"
+    assert blt["test"] == "pnpm run test"

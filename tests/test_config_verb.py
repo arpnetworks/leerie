@@ -133,8 +133,16 @@ _infer_axis() {
     build="make"
   fi
   if [ -f "$USER_REPO/package.json" ]; then
-    [ -n "$build" ] || build="npm run build"
-    [ -n "$test" ] || test="npm test"
+    local _pm="npm"
+    if [ -f "$USER_REPO/pnpm-lock.yaml" ]; then
+      _pm="pnpm"
+    elif [ -f "$USER_REPO/yarn.lock" ]; then
+      _pm="yarn"
+    elif [ -f "$USER_REPO/bun.lockb" ] || [ -f "$USER_REPO/bun.lock" ]; then
+      _pm="bun"
+    fi
+    [ -n "$build" ] || build="$_pm run build"
+    [ -n "$test" ] || test="$_pm run test"
   fi
   if [ -f "$USER_REPO/pyproject.toml" ] || [ -f "$USER_REPO/pytest.ini" ] || \
      [ -f "$USER_REPO/setup.cfg" ]; then

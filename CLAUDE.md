@@ -188,6 +188,10 @@ tests/                      pytest suite
 # Resume after an interruption:
 ./leerie --resume
 
+# Accept a blocked subtask so --resume skips it (e.g., E2E tests
+# that need external deps the container can't provide):
+./leerie --accept-blocked <run-id> <subtask-id>
+
 # Generate .leerie/config.toml with auto-detected BLT commands (host-only, no container):
 ./leerie config --init
 
