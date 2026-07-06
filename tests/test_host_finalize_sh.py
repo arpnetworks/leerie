@@ -151,7 +151,8 @@ def test_repushes_when_local_ahead_of_origin(tmp_path):
                     "categories": ["feature"], "waves": [[]],
                     "completed_waves": 1},
     )
-    # git stub: local tip 'bbbb…' != origin tip 'aaaa…' → local ahead →
+    # git stub: local tip 'bbbb…' != origin tip 'aaaa…', and origin IS a
+    # strict ancestor (merge-base --is-ancestor exits 0) → fast-forward
     # re-push. Track that `push` is invoked.
     git_body = '''
 if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then
@@ -162,6 +163,9 @@ if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
 fi
 if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
   printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/x\n'; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "merge-base" ]; then
+  exit 0   # origin is an ancestor of local → fast-forward
 fi
 exit 0
 '''
@@ -178,6 +182,52 @@ exit 0
     after = json.loads((run_dir / "run.json").read_text())
     assert after.get("pr_url") is not None
     assert after.get("pr_error") is None
+
+
+def test_diverged_origin_does_not_repush(tmp_path):
+    """When pushed_at is set and the local tip differs from origin but
+    origin has DIVERGED (not a strict ancestor of local — `merge-base
+    --is-ancestor` fails), host_finalize must NOT re-push: a plain push
+    could not fast-forward. It keeps the idempotent short-circuit instead
+    (DESIGN §6 *Finalization*)."""
+    run_dir = _make_run(
+        tmp_path, "feat-diverged-aa",
+        run_json={
+            "branch": "leerie/runs/feat-diverged-aa",
+            "working_branch": "main",
+            "pushed_at": "2026-05-29T16:00:00+00:00",
+            "finished_at": "2026-05-29T17:00:00+00:00",
+        },
+        state_json={"task": "x", "started_at": "2026-05-29T15:00:00+00:00",
+                    "categories": ["feature"], "waves": [[]],
+                    "completed_waves": 1},
+    )
+    # git stub: local 'bbbb…' != origin 'aaaa…', but merge-base
+    # --is-ancestor FAILS (exit 1) → diverged → must not re-push.
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then
+  exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  echo "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/x\n'; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "merge-base" ]; then
+  exit 1   # origin is NOT an ancestor → diverged
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 0, r.stderr
+    assert "diverged" in r.stderr
+    # No push — a diverged origin is left for manual resolution.
+    git_log = (tmp_path / "git.log").read_text()
+    push_invoked = any(
+        "push" in line.split() for line in git_log.splitlines()
+    )
+    assert not push_invoked, git_log
 
 
 def test_already_pushed_up_to_date_noops_even_with_incomplete_waves(tmp_path):

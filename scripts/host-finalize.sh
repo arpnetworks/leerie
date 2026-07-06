@@ -99,9 +99,20 @@ host_finalize() {
         echo "[leerie] finalize: run already pushed (origin up to date); nothing to do" >&2
         return 0
       fi
+      # Only fall through to re-push when the re-push would fast-forward —
+      # i.e. origin's tip is a strict ancestor of the local tip. A DIVERGED
+      # origin (has commits local lacks) is NOT a partial push we can
+      # safely fast-forward; short-circuit it here rather than letting the
+      # plain `git push` below reject it into the push_error path. Origin
+      # absent (`_ot` empty) is treated as behind → re-push creates the ref.
+      if [ -n "$_ot" ] && \
+         ! git -C "$USER_REPO" merge-base --is-ancestor "$_ot" "$_lt" 2>/dev/null; then
+        echo "[leerie] finalize: run already pushed; origin has diverged from the local run branch — not re-pushing (resolve manually)" >&2
+        return 0
+      fi
     fi
-    # pushed_at set but origin absent/behind → partial push. Fall through
-    # to the completion gate + re-push below.
+    # pushed_at set but origin strictly behind (or absent) → partial push
+    # we can fast-forward. Fall through to the completion gate + re-push.
   fi
 
   # Completion gate (DESIGN §6 *finished_at is a discovery sentinel, not a
@@ -161,12 +172,13 @@ host_finalize() {
   fi
 
   # Note the re-push (DESIGN §6 *Finalization*). If pushed_at is set and we
-  # reached here, the early short-circuit above already ruled out the
-  # equal-tips no-op — so origin is behind local (a prior finalize pushed a
-  # PARTIAL branch), and we have now PASSED the completion gate, so a
-  # re-push publishes a complete branch. Just log intent; the push below
-  # is a fast-forward. pushed_at stays set, so the chain wave-skip signal
-  # (which reads the field, not the tip) is unaffected.
+  # reached here, the early short-circuit above already ruled out both the
+  # equal-tips no-op AND the diverged-origin case — so origin is a strict
+  # ancestor of (or absent vs) local: a prior finalize pushed a PARTIAL
+  # branch. We have now PASSED the completion gate, so a re-push publishes
+  # a complete branch, and the push below is guaranteed to fast-forward.
+  # pushed_at stays set, so the chain wave-skip signal (which reads the
+  # field, not the tip) is unaffected.
   if [ -n "$(jq -r '.pushed_at // ""' "$run_json")" ]; then
     echo "[leerie] finalize: run marked pushed but origin is not up to date (partial prior push); re-pushing" >&2
   fi

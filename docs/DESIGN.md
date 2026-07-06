@@ -1102,10 +1102,15 @@ before the completion gate existed) can leave `pushed_at` set on a
 **partial** branch — and the completion gate only refuses the *first*
 premature push, not a later correct one. So the short-circuit compares the
 local run-branch tip against the pushed origin tip: **equal tips → no-op**
-(the common case, including every fully-pushed chain wave); **local tip
-strictly ahead of origin → fast-forward re-push + re-open the PR**, gated
-behind the same `completed_waves == len(waves)` completion check so only a
-now-complete run can re-push. This keeps a partial-push from permanently
+(the common case, including every fully-pushed chain wave); **origin a
+strict ancestor of the local tip (or origin absent) → fast-forward
+re-push + re-open the PR**, gated behind the same completion check
+(`completed_waves == len(waves)`, which itself *fails open* on a
+missing/unreadable `state.json` — see gate #3 above — so the re-push is
+gated only when that signal is available). A *diverged* origin (has
+commits the local branch lacks) is **not** treated as a partial push: it
+keeps the idempotent short-circuit rather than attempting a push that
+could not fast-forward. This keeps a partial-push from permanently
 wedging a run while preserving idempotency and the chain wave-skip signal
 (which reads the `pushed_at` field, still set, not the tip). It does not
 weaken the run.json invariants: a re-push keeps `pushed_at` set and, on

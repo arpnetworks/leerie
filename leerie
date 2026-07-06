@@ -1645,9 +1645,15 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           _fin_local_tip="$(git -C "$USER_REPO" rev-parse "refs/heads/$_fin_branch" 2>/dev/null || true)"
           _fin_origin_tip="$(git -C "$USER_REPO" ls-remote origin "refs/heads/$_fin_branch" 2>/dev/null | cut -f1 || true)"
           if [ "$_fin_local_tip" != "$_fin_origin_tip" ]; then
-            # Local branch present but origin behind/absent → partial
-            # prior push. Fall through so host_finalize re-pushes.
-            _fin_repush="true"
+            # Local branch present but origin behind/absent → partial prior
+            # push. Fall through so host_finalize re-pushes — but only when
+            # the re-push would fast-forward (origin absent, or a strict
+            # ancestor of local). A DIVERGED origin is left to the
+            # idempotent short-circuit; host_finalize would refuse it too.
+            if [ -z "$_fin_origin_tip" ] || \
+               git -C "$USER_REPO" merge-base --is-ancestor "$_fin_origin_tip" "$_fin_local_tip" 2>/dev/null; then
+              _fin_repush="true"
+            fi
           fi
         fi
         if [ "$_fin_repush" = "true" ]; then
