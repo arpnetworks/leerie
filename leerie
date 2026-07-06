@@ -2588,7 +2588,8 @@ _value_flags=" --run-id --answers --pr-template --max-workers \
 --source-of-truth --runtime --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --telemetry-dir --judge-dir \
---heal-dir --phase --host-no-push --status --chain-id "
+--heal-dir --phase --host-no-push --status --chain-id \
+--seed-depth --seed-shallow-threshold-mb "
 for arg in "$@"; do
   # Skip if this arg is the value of a previous value-taking flag.
   if [ -n "$_prev" ]; then
@@ -2820,6 +2821,72 @@ if [ "$RUNTIME" = "fly" ] && [ -z "${FLY_VM_DISK_GB:-}" ]; then
   FLY_VM_DISK_GB=8
   export FLY_VM_DISK_GB
 fi
+
+# --- Shallow-seed knobs (DESIGN §6 *Shallow seeding for heavy repos*) --------
+# Two operator knobs consumed by scripts/remote/seed-repo.sh on fresh remote
+# provisions. Resolution mirrors FLY_VM_DISK_GB above: CLI flag > env var >
+# leerie.toml flat key > default. Both are bash-only (the Python orchestrator
+# never reads them, unlike confidence_rounds).
+#
+#   LEERIE_SEED_DEPTH:  git clone --depth for the shallow path. Default 50.
+#                       0 = full history (disables shallow seeding entirely).
+#   LEERIE_SEED_SHALLOW_THRESHOLD_MB:  activate shallow only when the repo's
+#                       .git exceeds this many MB. Default 200.
+#
+# _resolve_seed_knob <cli-value> <env-var-name> <toml-key> <default> — prints
+# the resolved value. CLI wins; else env if set; else leerie.toml flat key;
+# else default. Same flat-key grep/sed as the FLY_VM_DISK_GB read above.
+_resolve_seed_knob() {
+  local _cli="$1" _envname="$2" _tomlkey="$3" _default="$4" _envval _tomlval
+  if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi
+  eval "_envval=\"\${$_envname:-}\""
+  if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi
+  if [ -f "$USER_REPO/leerie.toml" ]; then
+    _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" \
+                        "$USER_REPO/leerie.toml" 2>/dev/null \
+                      | head -1 \
+                      | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"
+    if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi
+  fi
+  printf '%s' "$_default"
+}
+_cli_seed_depth=""
+_cli_seed_threshold=""
+_prev_seed_arg=""
+for arg in "$@"; do
+  if [ -n "$_prev_seed_arg" ]; then
+    case "$_prev_seed_arg" in
+      depth)     _cli_seed_depth="$arg" ;;
+      threshold) _cli_seed_threshold="$arg" ;;
+    esac
+    _prev_seed_arg=""
+    continue
+  fi
+  case "$arg" in
+    --seed-depth=*)                  _cli_seed_depth="${arg#--seed-depth=}" ;;
+    --seed-depth)                    _prev_seed_arg="depth" ;;
+    --seed-shallow-threshold-mb=*)   _cli_seed_threshold="${arg#--seed-shallow-threshold-mb=}" ;;
+    --seed-shallow-threshold-mb)     _prev_seed_arg="threshold" ;;
+  esac
+done
+LEERIE_SEED_DEPTH="$(_resolve_seed_knob "$_cli_seed_depth" LEERIE_SEED_DEPTH seed_depth 50)"
+LEERIE_SEED_SHALLOW_THRESHOLD_MB="$(_resolve_seed_knob "$_cli_seed_threshold" LEERIE_SEED_SHALLOW_THRESHOLD_MB seed_shallow_threshold_mb 200)"
+unset _cli_seed_depth _cli_seed_threshold _prev_seed_arg
+# Validate. Depth: non-negative integer (0 = full/disable). Threshold: positive
+# integer. Reject garbage at startup rather than letting seed-repo.sh mishandle it.
+case "$LEERIE_SEED_DEPTH" in
+  ''|*[!0-9]*)
+    remote_log "LEERIE_SEED_DEPTH='$LEERIE_SEED_DEPTH' is not a non-negative integer (0 = full history)"
+    exit 1
+    ;;
+esac
+case "$LEERIE_SEED_SHALLOW_THRESHOLD_MB" in
+  ''|*[!0-9]*|0)
+    remote_log "LEERIE_SEED_SHALLOW_THRESHOLD_MB='$LEERIE_SEED_SHALLOW_THRESHOLD_MB' is not a positive integer (MB)"
+    exit 1
+    ;;
+esac
+export LEERIE_SEED_DEPTH LEERIE_SEED_SHALLOW_THRESHOLD_MB
 
 # DRY_RUN is referenced by scripts/runtime-install.sh; default to false
 # in the launcher (the launcher has no --dry-run flag — that's install.sh).
@@ -3347,6 +3414,7 @@ _prev_was_resume=false
 _prev_was_chain_id=false
 _prev_was_fly_app_rewrite=false
 _prev_was_state_dir_rewrite=false
+_prev_was_seed_knob=false
 for arg in "$@"; do
   if [ "$_prev_was_state_dir_rewrite" = "true" ]; then
     _prev_was_state_dir_rewrite=false
@@ -3354,6 +3422,11 @@ for arg in "$@"; do
   fi
   if [ "$_prev_was_fly_app_rewrite" = "true" ]; then
     _prev_was_fly_app_rewrite=false
+    continue
+  fi
+  if [ "$_prev_was_seed_knob" = "true" ]; then
+    # Consume the value of --seed-depth / --seed-shallow-threshold-mb.
+    _prev_was_seed_knob=false
     continue
   fi
   if $prev_was_inspect; then
@@ -3415,6 +3488,17 @@ for arg in "$@"; do
       # Launcher-only flag; consumed by ensure_image() to forward
       # --local-build to build-push.sh (legacy local nerdctl/docker
       # build instead of the default Fly remote builder).
+      ;;
+    --seed-depth|--seed-shallow-threshold-mb)
+      # Launcher-only flags (DESIGN §6 *Shallow seeding for heavy repos*);
+      # resolved into LEERIE_SEED_DEPTH / LEERIE_SEED_SHALLOW_THRESHOLD_MB
+      # above and consumed by seed-repo.sh. The orchestrator's argparse
+      # doesn't know them — strip both the flag and its value so they don't
+      # leak to parse_args() (which is strict, not parse_known_args).
+      _prev_was_seed_knob=true
+      ;;
+    --seed-depth=*|--seed-shallow-threshold-mb=*)
+      # =form; consumed above.
       ;;
     --no-re-seed)
       # Launcher-only flag (Phase 4); consumed by the auto-re-seed-on-resume
@@ -4327,9 +4411,53 @@ EARLY_PROBE_PY
         container_rc=1
         _seed_ok=false
       elif [ "$_resumed" = "true" ]; then
-        # Resume path: machine already has /work, just refresh the dirty
-        # delta unless --no-re-seed was passed. (Phase 4 auto-re-seed.)
-        if [ "$NO_RE_SEED" != "true" ]; then
+        # Resume path. Normally /work already holds a valid seeded repo,
+        # so we just refresh the dirty delta (re_seed). BUT if the
+        # *initial* seed died before completing (e.g. the full-bundle
+        # pipe timed out — DESIGN §6 *Shallow seeding for heavy repos*),
+        # /work is partial/absent and no run state was ever written; a
+        # dirty-only re_seed would rsync onto a non-repo and the
+        # orchestrator would then die with "run-id does not match any
+        # known run". Probe /work validity first and, if invalid, run
+        # the FULL seed_repo (which wipes+repopulates /work) to
+        # self-heal. All env seed_repo needs (LEERIE_MACHINE_ID from
+        # resume_machine, USER_REPO exported above, FLY_APP from
+        # provision.sh) is already set; re-export FLY_APP defensively.
+        export FLY_APP="${LEERIE_FLY_APP:-}"
+        # Token-based probe: the remote command ALWAYS exits 0 when SSH
+        # works and prints VALID / INVALID. This distinguishes a genuinely
+        # unseeded /work (INVALID → safe to wipe + self-heal) from an SSH
+        # transport failure (no token / non-zero flyctl rc). We NEVER run
+        # the destructive full seed_repo on an ambiguous probe — wiping a
+        # valid /work would obliterate the run branch + per-subtask
+        # branches. On probe failure we fall through to the ordinary
+        # re_seed path (whose own dirty-guard protects in-flight work).
+        # NB: capture rc via `|| _work_probe_rc=$?` on the SAME simple
+        # command — a bare `VAR=$(failing-cmd)` would trip `set -e` (active
+        # since leerie:17) and abort the launcher before we could inspect
+        # the rc, which is the exact SSH-failure case we must handle
+        # gracefully rather than crash on.
+        _work_probe_rc=0
+        _work_probe="$(flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+               --pty=false -C "sh -c 'if [ -d /work/.git ] && git -C /work rev-parse --verify HEAD >/dev/null 2>&1; then echo VALID; else echo INVALID; fi'" \
+               2>/dev/null)" || _work_probe_rc=$?
+        _work_probe="$(printf '%s' "$_work_probe" | tr -d '[:space:]')"
+        if [ "$_work_probe_rc" -eq 0 ] && [ "$_work_probe" = "INVALID" ]; then
+          # Confirmed round-trip + genuinely unseeded /work → self-heal.
+          remote_log "--resume: /work is not a valid seeded repo (initial seed never completed) — running full seed_repo to self-heal"
+          if ! seed_repo; then
+            remote_log "error: self-heal seed_repo failed — aborting remote run"
+            container_rc=1
+            _seed_ok=false
+          fi
+        elif [ "$NO_RE_SEED" != "true" ]; then
+          # Either /work is VALID, or the probe was ambiguous (SSH blip).
+          # Refresh the dirty delta only (NEVER re-clone over /work here —
+          # that would obliterate the run branch + per-subtask branches).
+          # Skipped when --no-re-seed was passed.
+          if [ "$_work_probe_rc" -ne 0 ] || [ "$_work_probe" != "VALID" ]; then
+            remote_log "--resume: /work validity probe was inconclusive (rc=$_work_probe_rc); proceeding with dirty re_seed (not wiping)"
+          fi
           # shellcheck disable=SC1091
           . "$LEERIE_REPO/scripts/remote/re-seed.sh"
           [ "$RE_SEED_FORCE" = "true" ] && export LEERIE_RE_SEED_FORCE=1

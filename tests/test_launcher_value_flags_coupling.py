@@ -122,6 +122,13 @@ _LAUNCHER_ONLY_BOOLEAN_FLAGS: frozenset[str] = frozenset({
     # records it via update_run_json after host_finalize. The
     # orchestrator never reads it.
     "--chain-id",
+    # --seed-depth / --seed-shallow-threshold-mb are value-taking but
+    # launcher-only: they resolve into LEERIE_SEED_DEPTH /
+    # LEERIE_SEED_SHALLOW_THRESHOLD_MB, consumed by seed-repo.sh on the
+    # host (DESIGN §6 *Shallow seeding for heavy repos*). The launcher
+    # strips them from REWRITTEN_ARGS; the orchestrator never reads them.
+    "--seed-depth",
+    "--seed-shallow-threshold-mb",
 })
 
 

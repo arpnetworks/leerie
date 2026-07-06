@@ -317,6 +317,20 @@ export LEERIE_VERBOSITY=normal  # override (default is stream)
 # path takes over — `./leerie --resume` recovers the run normally:
 export LEERIE_SEED_TIMEOUT_S=900
 
+# Shallow-seed heavy repos (--runtime fly). For a repo with deep
+# committed history, the fresh-provision `git bundle --all` can be
+# hundreds of MB and exceed the seed timeout. When the repo's .git
+# exceeds LEERIE_SEED_SHALLOW_THRESHOLD_MB (default 200), leerie ships a
+# `git clone --depth=N` of the working branch (as a .git tar) instead —
+# a fraction of the bytes. Workers on the machine then see only depth-N
+# history (git log/blame beyond N unavailable; the machine can't deepen).
+# Set depth to 0 to force the full-history bundle. CLI > env > leerie.toml
+# (seed_depth / seed_shallow_threshold_mb):
+export LEERIE_SEED_DEPTH=50                 # 0 = full history (disable shallow)
+export LEERIE_SEED_SHALLOW_THRESHOLD_MB=200
+./leerie "task" --runtime fly --seed-depth 100
+./leerie "task" --runtime fly --seed-depth 0   # force full bundle
+
 # Heartbeat cadence (default 10 s) for the "still streaming (Ns
 # elapsed)" line emitted during seed_auth/seed_repo bulk transfers. Set
 # to 0 to suppress entirely. The separate hallpass-wait heartbeat in

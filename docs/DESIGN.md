@@ -1772,6 +1772,83 @@ runs are synchronous foreground processes (`nerdctl run --rm` with no
 backgrounding), so there is no detached container to attach to —
 `--resume` just re-execs the orchestrator against `state.json`.
 
+**Shallow seeding for heavy repos.** The fresh-provision seed
+(`seed_repo_clone`) delivers the host's committed state as a
+`git bundle create - --all` piped to the machine over
+`flyctl ssh console`. `--all` packs the full history of every ref.
+For a repo with deep history and large committed blobs (vendored
+archives, seed-data dumps, media), that bundle can be hundreds of MB
+— a single serialized stream over the WireGuard tunnel that can
+exceed the `LEERIE_SEED_TIMEOUT_S` cap (default 600 s) and fail the
+whole run before any worker starts. The bloat is *history*, not the
+working tree: build artifacts and `node_modules` are already excluded
+(a bundle carries committed objects only), so the lever is the depth
+of committed history, not what's on disk.
+
+Above a size threshold (repo `.git` larger than a bounded default),
+the seed switches to a **shallow** transport: the host makes a
+throwaway `git clone --depth=N` of the working branch, tars *only its
+`.git` directory*, pipes that over the same channel, and the machine
+untars it and `git checkout`s the working tree. This ships a fraction
+of the bytes (a depth-50 clone of a 960 MB-history repo is ~140 MB
+vs. a 420 MB full bundle) while remaining correct on every downstream
+path:
+
+- **Why tar-of-`.git`, not a shallow bundle.** `git bundle` refuses a
+  shallow repository — a shallow clone's grafted commits have parents
+  the pack cannot reach, so `bundle create --all` produces an object
+  the receiver cannot clone. Tarring the shallow clone's `.git`
+  sidesteps this: it ships the pack (including the `.git/shallow`
+  graft boundary) verbatim, and the machine materializes a valid
+  shallow repo.
+- **Why it stays NFC-safe.** Tarring `.git` preserves the same
+  filename-normalization guarantee that motivated bundles: object
+  contents (tree entries by raw bytes) never serialize filenames
+  through the transport; the receiving Linux git creates working-tree
+  filenames natively on `checkout`. (Tarring the *working tree* would
+  reintroduce the macOS BSD-tar NFC→NFD bug — so the seed tars `.git`
+  only and reconstructs the tree with `checkout`.)
+- **Why fetch-back is unaffected.** When a worker commits a run branch
+  on the shallow machine repo, `fetch-branch.sh` bundles *that branch
+  by name* (not `--all`). The bundle cites the shallow boundary commit
+  as a prerequisite; the host — which always holds the full origin
+  ancestry — has that commit, so `bundle verify` + `fetch` reassemble
+  full history and the graft never leaks host-side.
+- **Why the PR diff stays correct.** A real `git clone --depth=N`
+  keeps the working branch's true tip hash, so `git merge-base` on the
+  host resolves the run branch against the working branch and the PR
+  "Files changed" view shows only the worker's changes. (A synthetic
+  re-rooting of history would be smaller still but would break the
+  merge-base — so the seed uses a genuine shallow clone, never a
+  re-root.)
+
+Submodules are orthogonal: a `--depth` clone of the superproject does
+not populate `.git/modules`, so the existing per-submodule bundle
+machinery (each submodule bundled separately, its URL rewired on the
+machine) carries over unchanged.
+
+The cost is that workers on the machine see only depth-N history
+(`git log`/`git blame` beyond N is unavailable, and the machine
+cannot deepen — it has no origin credentials, by the finalization
+model above). The default depth is chosen to preserve useful recent
+history rather than a bare depth-1 tip. Depth and the size threshold
+are operator-tunable; setting depth to full disables shallow seeding
+and restores the full-bundle path. Small repos are unaffected — they
+stay on the full bundle, which costs nothing to ship. The shallow path
+also falls back to the full bundle when the working branch is a
+detached HEAD or has a name outside a conservative shell-safe charset
+(the machine-side reconstruction interpolates the branch into a
+`git checkout` run over `sh -c`, and the full path — which never names
+the branch — is the safe default for the rare exotic branch).
+
+Because `seed_repo_clone` always wipes and repopulates `/work`, this
+switch is confined to fresh provisions. Mid-run re-seed (below) never
+re-clones and is unchanged. A corollary robustness fix: `--resume`
+now probes whether the initial seed actually produced a valid `/work`
+git repo; if a prior seed died before completing (leaving no run
+state on the machine), resume re-runs the full seed instead of
+dead-ending on a dirty-only re-seed against a repo that isn't there.
+
 **Mid-run re-seed (remote mode).** Once a remote run has started, the
 host's working tree keeps evolving — the user lands new commits,
 saves uncommitted edits, pulls in a new submodule. The remote machine

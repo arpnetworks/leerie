@@ -13,6 +13,24 @@
 #      (the protocol-flag is required by git 2.38+ for file://-style
 #      URLs, per CVE-2022-39253). Delivers committed state only.
 #
+#      Shallow parent transport (heavy repos, DESIGN §6 *Shallow
+#      seeding for heavy repos*): for a repo whose `.git` exceeds
+#      `LEERIE_SEED_SHALLOW_THRESHOLD_MB` (and with a non-zero
+#      `LEERIE_SEED_DEPTH`), the full `git bundle --all` for the
+#      *parent* is hundreds of MB of deep history — a single serialized
+#      pipe that can blow the seed timeout. Instead the laptop makes a
+#      throwaway `git clone --depth=N` of the working branch, tars ONLY
+#      its `.git`, pipes that over the SAME channel, and the machine
+#      untars + `git checkout`s. CRITICAL: this tars `.git` only, never
+#      the working tree — the NFC→NFD safety below depends on it (git
+#      recreates working-tree filenames natively on checkout).
+#      `git bundle` CANNOT ship a shallow repo (its grafted commits have
+#      unreachable parents), which is why the shallow path uses tar, not
+#      a shallow bundle. Submodules are UNCHANGED — a `--depth` parent
+#      clone doesn't populate `.git/modules`, so each submodule still
+#      ships as its own full bundle. See `_seed_use_shallow` /
+#      `_seed_shallow_parent`.
+#
 #   2. `seed_repo_dirty` — laptop rsync's the dirty/untracked delta
 #      (uncommitted edits, untracked-not-ignored files, forced-in
 #      `.claude/`) into /work via the existing `fly_rsync_wrapper`
@@ -116,19 +134,149 @@ _seed_repo_preflight() {
 }
 
 # ---------------------------------------------------------------------------
+# _seed_use_shallow
+#
+# Decide whether the parent repo should be shipped via the shallow
+# tar-of-.git path instead of the full `git bundle --all`. Returns 0
+# (shallow) when BOTH hold: LEERIE_SEED_DEPTH is a non-zero integer AND
+# the host repo's .git exceeds LEERIE_SEED_SHALLOW_THRESHOLD_MB. Returns
+# 1 (full bundle) otherwise — including on any probe failure, so the
+# safe default is always the proven full-bundle path.
+# (DESIGN §6 *Shallow seeding for heavy repos*.)
+# ---------------------------------------------------------------------------
+_seed_use_shallow() {
+  local _depth="${LEERIE_SEED_DEPTH:-0}" _thresh="${LEERIE_SEED_SHALLOW_THRESHOLD_MB:-200}" _git_kb
+  case "$_depth" in ''|*[!0-9]*|0) return 1 ;; esac
+  case "$_thresh" in ''|*[!0-9]*|0) return 1 ;; esac
+  # .git size in KB. --git-dir handles worktrees / .git-file layouts.
+  local _gitdir
+  _gitdir="$(git -C "$USER_REPO" rev-parse --git-dir 2>/dev/null)" || return 1
+  case "$_gitdir" in /*) : ;; *) _gitdir="$USER_REPO/$_gitdir" ;; esac
+  _git_kb="$(du -sk "$_gitdir" 2>/dev/null | awk '{print $1}')" || return 1
+  case "$_git_kb" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$_git_kb" -gt "$(( _thresh * 1024 ))" ]
+}
+
+# ---------------------------------------------------------------------------
+# _seed_branch_shallow_safe <branch>
+#
+# The shallow path injects the branch name into a `git checkout -f <branch>`
+# line inside the machine-side script, which is sent as `flyctl … -C
+# "sh -c '<script>'"`. A branch name is under user control and git permits
+# characters that would break that single-quoted wrapper or inject into the
+# remote shell — an apostrophe (`feat/it's-a-branch` is a valid ref) closes
+# the quote early; `$` / backtick could construct commands. Rather than
+# escape (fragile), we allow the shallow path ONLY for a conservative,
+# shell-safe charset (the overwhelming majority of real branches) and fall
+# back to the proven full-bundle path for anything else. Returns 0 (safe)
+# when the branch is non-empty and matches ^[A-Za-z0-9/._-]+$, 1 otherwise.
+#
+# Also reject the machine-script placeholder tokens: the branch is baked
+# into $_parent_materialize before the `${//__CLEANUP_TMP__/…}` pass, so a
+# branch literally named __CLEANUP_TMP__ / __PARENT_MATERIALIZE__ would be
+# mangled by that later substitution. Such branch names don't exist in
+# practice; rejecting them (→ full bundle) is free insurance.
+# ---------------------------------------------------------------------------
+_seed_branch_shallow_safe() {
+  case "$1" in
+    ''|*[!A-Za-z0-9/._-]*) return 1 ;;
+    *__PARENT_MATERIALIZE__*|*__CLEANUP_TMP__*) return 1 ;;
+    *) return 0 ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# _seed_shallow_parent
+#
+# The shallow parent-delivery path used by seed_repo_clone when
+# _seed_use_shallow says yes. Makes a throwaway `git clone --depth=N`
+# of the working branch on the host, tars ONLY its .git, pipes that
+# over the same $(_seed_timeout_prefix)-wrapped ssh-console channel the
+# full-bundle path uses, and has the machine untar + checkout.
+#
+# Tars .git-only (never the working tree) so the NFC→NFD filename bug
+# stays sidestepped exactly as with bundles: object contents carry
+# filenames as raw bytes; the Linux receiver materializes them natively
+# on `git checkout`. `git bundle` can't ship a shallow repo (grafted
+# parents), which is why this uses tar. Submodules are shipped by the
+# UNCHANGED per-submodule bundle path in seed_repo_clone (a --depth
+# clone of the parent does not populate .git/modules).
+#
+# Args: $1 = working branch to clone (resolved by the caller).
+# Reads USER_REPO, FLY_APP, LEERIE_MACHINE_ID, LEERIE_SEED_DEPTH.
+# Returns 0 on success, 1 on any failure (caller falls through to its
+# own PAUSED-on-failure path). The machine-side submodule wiring is
+# invoked by the caller after this returns, identically to the full path.
+# ---------------------------------------------------------------------------
+_seed_shallow_parent() {
+  local _branch="$1" _tmp_shallow _hb_pid _seed_to="" _rc=0
+  if [ -z "$_branch" ]; then
+    remote_log "seed_repo: _seed_shallow_parent called without a branch"
+    return 1
+  fi
+
+  # Throwaway shallow clone on the host. --no-local forces a real
+  # object transfer (not a hardlink farm), so the resulting .git is a
+  # self-contained shallow pack. Real tip hash is preserved (no
+  # re-rooting), which keeps the host-side PR merge-base correct.
+  _tmp_shallow="$(mktemp -d -t leerie-shallow.XXXXXX)" || return 1
+  # shellcheck disable=SC2064
+  trap "rm -rf '$_tmp_shallow'" RETURN
+  if ! git clone --quiet --depth="$LEERIE_SEED_DEPTH" --no-local \
+         --branch "$_branch" "file://$USER_REPO" "$_tmp_shallow/repo" 2>/dev/null; then
+    remote_log "seed_repo: shallow clone (depth=$LEERIE_SEED_DEPTH) of $_branch failed"
+    return 1
+  fi
+
+  if command -v _seed_timeout_prefix >/dev/null 2>&1; then
+    _seed_to="$(_seed_timeout_prefix)"
+  fi
+  _seed_progress_bg "seed_repo (shallow parent .git)" &
+  _hb_pid=$!
+  # Tar ONLY .git (relative to the clone root) and pipe to the machine.
+  # Same `sh -c 'cat > ...'` receiver + timeout wrapper as the bundle pipe.
+  tar -C "$_tmp_shallow/repo" -cf - .git 2>/dev/null \
+        | $_seed_to flyctl ssh console --quiet --app "$FLY_APP" \
+            --machine "$LEERIE_MACHINE_ID" --pty=false \
+            -C "sh -c 'cat > /tmp/leerie-seed-git.tar'" >/dev/null 2>&1
+  _rc=${PIPESTATUS[1]}
+  kill "$_hb_pid" 2>/dev/null || true
+  wait "$_hb_pid" 2>/dev/null || true
+  if [ "$_rc" -ne 0 ]; then
+    if [ "$_rc" -eq 124 ] || [ "$_rc" -eq 137 ]; then
+      remote_log "seed_repo: shallow .git pipe did not return within ${LEERIE_SEED_TIMEOUT_S:-600}s (rc=$_rc) — flyctl ssh console likely stalled"
+    fi
+    remote_log "seed_repo: failed to pipe shallow .git tar to machine"
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
 # seed_repo_clone
 #
-# Bundle the host's committed state (parent + every submodule), pipe
-# each bundle to the machine via ssh-console, and have the machine
-# clone from those bundle files on its local disk. Always wipes /work
-# first — call this only on a fresh provision, never on resume.
+# Ship the host's committed state to /work on the machine. Two parent-
+# delivery transports:
 #
-# Why bundles instead of tar or rsync: the bundle file is pack-format
-# binary; tree entries are stored as raw bytes; the receiving Linux
-# git materializes filenames natively from those objects. macOS BSD
-# tar's NFC→NFD filename normalization (the bug that triggered this
-# whole rewrite) doesn't apply because filenames don't transit the
-# wire as strings — only commit-hash refs and packed objects do.
+#   - Full (default): `git bundle create - --all` for the parent piped
+#     to the machine, which `git clone`s from the bundle file. Delivers
+#     full history. The proven path for normal repos.
+#   - Shallow (heavy repos, DESIGN §6 *Shallow seeding for heavy repos*):
+#     when _seed_use_shallow says yes, a throwaway `git clone --depth=N`
+#     is tarred (.git only) and piped, and the machine untars + checks
+#     out. Ships a fraction of the bytes for deep-history repos.
+#
+# In BOTH cases the per-submodule bundle machinery is identical (a
+# --depth parent clone does not populate .git/modules). Always wipes
+# /work first — call this only on a fresh provision, never on resume.
+#
+# Why bundles/.git-tar instead of a working-tree tar or rsync: pack
+# objects store tree entries as raw bytes; the receiving Linux git
+# materializes filenames natively from those objects. macOS BSD tar's
+# NFC→NFD filename normalization (the bug that triggered this whole
+# rewrite) doesn't apply because filenames don't transit the wire as
+# strings — only commit-hash refs and packed objects do. The shallow
+# path preserves this by tarring .git ONLY (never the working tree).
 # ---------------------------------------------------------------------------
 seed_repo_clone() {
   _seed_repo_preflight || return 1
@@ -148,7 +296,32 @@ seed_repo_clone() {
     fi
   fi
 
-  remote_log "remote: seeding — bundling $USER_REPO (parent + submodules) to /work ..."
+  # Decide parent transport once, up front, so the log line and both the
+  # host-side pipe and the machine-side reconstruction agree. When shallow,
+  # resolve the working branch here (the machine-side `git checkout` needs
+  # it, and _seed_shallow_parent clones it).
+  local _shallow=false _branch=""
+  if _seed_use_shallow; then
+    _branch="$(git -C "$USER_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null)"
+    if [ -z "$_branch" ] || [ "$_branch" = "HEAD" ]; then
+      # Detached HEAD (or unresolvable) — fall back to the full-bundle path,
+      # which ships all refs and doesn't need a named branch to check out.
+      remote_log "seed_repo: detached/unresolvable HEAD; using full bundle (shallow needs a named branch)"
+    elif ! _seed_branch_shallow_safe "$_branch"; then
+      # Branch name contains a character that isn't shell-safe for the
+      # machine-side `sh -c '…'` wrapper. Fall back to the full-bundle path
+      # (which never interpolates the branch name) rather than risk a broken
+      # or injected remote command.
+      remote_log "seed_repo: branch '$_branch' has non-shell-safe characters; using full bundle instead of shallow"
+    else
+      _shallow=true
+    fi
+  fi
+  if [ "$_shallow" = "true" ]; then
+    remote_log "remote: seeding — shallow-cloning $USER_REPO ($_branch, .git > ${LEERIE_SEED_SHALLOW_THRESHOLD_MB}MB, depth=$LEERIE_SEED_DEPTH) + submodules to /work ..."
+  else
+    remote_log "remote: seeding — bundling $USER_REPO (parent + submodules) to /work ..."
+  fi
 
   # Empty /work's CONTENTS but preserve the directory inode. A bare
   # `rm -rf /work && mkdir -p /work` replaces the inode, which leaves
@@ -158,44 +331,49 @@ seed_repo_clone() {
   # error retrieving current directory` from sub-shells, and claude
   # --version timing out (its node runtime tries to stat ".").
   #
-  # Also reset the bundle staging dirs in case a prior paused run
+  # Also reset the bundle/tar staging paths in case a prior paused run
   # left them behind.
   if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-         --pty=false -C "sh -c 'find /work -mindepth 1 -maxdepth 1 -exec rm -rf {} + && chown leerie: /work && rm -rf /tmp/leerie-seed.bundle /tmp/leerie-subs && mkdir -p /tmp/leerie-subs'" >/dev/null 2>&1; then
+         --pty=false -C "sh -c 'find /work -mindepth 1 -maxdepth 1 -exec rm -rf {} + && chown leerie: /work && rm -rf /tmp/leerie-seed.bundle /tmp/leerie-seed-git.tar /tmp/leerie-subs && mkdir -p /tmp/leerie-subs'" >/dev/null 2>&1; then
     remote_log "seed_repo: failed to reset /work on machine $LEERIE_MACHINE_ID"
     return 1
   fi
 
-  # 1. Bundle the parent repo and pipe it to /tmp/leerie-seed.bundle on
-  #    the machine. `git bundle create - --all` packs every ref into a
-  #    single pack-format binary stream on stdout.
+  # 1. Deliver the parent repo's committed state to the machine.
+  #    Shallow: tar-of-.git piped to /tmp/leerie-seed-git.tar (see
+  #    _seed_shallow_parent). Full: `git bundle create - --all` piped
+  #    to /tmp/leerie-seed.bundle.
   #
   #    The receiver MUST be wrapped in `sh -c '...'`; without it, the
   #    remote treats `>` as an argument to `cat` rather than a shell
   #    redirect and fails with `cat: invalid option -- 'c'`.
-  local _hb_pid_parent _seed_to="" _parent_rc=0
-  # Symmetry with seed-auth.sh: defensive `command -v` so a standalone
-  # sourcing path that hasn't loaded lib.sh still works (today
-  # seed-repo.sh always sources lib.sh, but the guard keeps the two
-  # bulk-pipe call sites uniform).
-  if command -v _seed_timeout_prefix >/dev/null 2>&1; then
-    _seed_to="$(_seed_timeout_prefix)"
-  fi
-  _seed_progress_bg "seed_repo (parent bundle)" &
-  _hb_pid_parent=$!
-  git -C "$USER_REPO" bundle create - --all 2>/dev/null \
-        | $_seed_to flyctl ssh console --quiet --app "$FLY_APP" \
-            --machine "$LEERIE_MACHINE_ID" --pty=false \
-            -C "sh -c 'cat > /tmp/leerie-seed.bundle'" >/dev/null 2>&1
-  _parent_rc=${PIPESTATUS[1]}
-  kill "$_hb_pid_parent" 2>/dev/null || true
-  wait "$_hb_pid_parent" 2>/dev/null || true
-  if [ "$_parent_rc" -ne 0 ]; then
-    if [ "$_parent_rc" -eq 124 ] || [ "$_parent_rc" -eq 137 ]; then
-      remote_log "seed_repo: parent-bundle pipe did not return within ${LEERIE_SEED_TIMEOUT_S:-600}s (rc=$_parent_rc) — flyctl ssh console likely stalled"
+  if [ "$_shallow" = "true" ]; then
+    _seed_shallow_parent "$_branch" || return 1
+  else
+    local _hb_pid_parent _seed_to="" _parent_rc=0
+    # Symmetry with seed-auth.sh: defensive `command -v` so a standalone
+    # sourcing path that hasn't loaded lib.sh still works (today
+    # seed-repo.sh always sources lib.sh, but the guard keeps the two
+    # bulk-pipe call sites uniform).
+    if command -v _seed_timeout_prefix >/dev/null 2>&1; then
+      _seed_to="$(_seed_timeout_prefix)"
     fi
-    remote_log "seed_repo: failed to pipe parent bundle to machine"
-    return 1
+    _seed_progress_bg "seed_repo (parent bundle)" &
+    _hb_pid_parent=$!
+    git -C "$USER_REPO" bundle create - --all 2>/dev/null \
+          | $_seed_to flyctl ssh console --quiet --app "$FLY_APP" \
+              --machine "$LEERIE_MACHINE_ID" --pty=false \
+              -C "sh -c 'cat > /tmp/leerie-seed.bundle'" >/dev/null 2>&1
+    _parent_rc=${PIPESTATUS[1]}
+    kill "$_hb_pid_parent" 2>/dev/null || true
+    wait "$_hb_pid_parent" 2>/dev/null || true
+    if [ "$_parent_rc" -ne 0 ]; then
+      if [ "$_parent_rc" -eq 124 ] || [ "$_parent_rc" -eq 137 ]; then
+        remote_log "seed_repo: parent-bundle pipe did not return within ${LEERIE_SEED_TIMEOUT_S:-600}s (rc=$_parent_rc) — flyctl ssh console likely stalled"
+      fi
+      remote_log "seed_repo: failed to pipe parent bundle to machine"
+      return 1
+    fi
   fi
 
   # 2. Bundle each submodule recursively, pipe each into
@@ -235,23 +413,52 @@ seed_repo_clone() {
     wait "$_hb_pid_subs" 2>/dev/null || true
   fi
 
-  # 3. Machine-side: clone from /tmp/leerie-seed.bundle into /work, wire
-  #    each submodule's URL to its bundle file (in `.git/config`, NOT
-  #    `.gitmodules` — we never modify the committed file), then
-  #    submodule update. Finally chown -R leerie: /work so the
-  #    orchestrator (which runs as leerie) owns its working tree.
+  # 3. Machine-side: materialize /work, wire each submodule's URL to its
+  #    bundle file (in `.git/config`, NOT `.gitmodules` — we never modify
+  #    the committed file), then submodule update. Finally chown -R
+  #    leerie: /work so the orchestrator (which runs as leerie) owns its
+  #    working tree.
   #
-  #    `git clone` against a bundle file path Just Works — git
-  #    recognizes the bundle header and treats the file like a remote.
-  if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
-         --pty=false -C 'sh -c '"'"'
+  #    The parent-materialization PREFIX differs by transport; the
+  #    submodule wiring + chown + cleanup are identical. We build the
+  #    script with placeholder substitution (heredoc, quoted delimiter)
+  #    to avoid the `'"'"'` quoting acrobatics — same pattern as
+  #    _seed_one_inspect_dir_clone.
+  #
+  #    Full:    `git clone` from the bundle file (git recognizes the
+  #             bundle header and treats the file like a remote).
+  #    Shallow: untar .git into /work (inode-preserving; /work already
+  #             emptied above), `git checkout -f` the branch to
+  #             materialize the tree natively, drop the stale file://
+  #             origin (inert on the machine, but removed so no worker
+  #             attempts a dead fetch). `git checkout` recreates
+  #             filenames natively → NFC-safe.
+  local _parent_materialize _cleanup_tmp
+  if [ "$_shallow" = "true" ]; then
+    # $_branch is injected directly (not via a placeholder) — it passed
+    # _seed_branch_shallow_safe above, so it contains only shell-safe
+    # characters and cannot break the `sh -c '…'` wrapper or collide with a
+    # placeholder token.
+    _parent_materialize="find /work -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+tar -C /work -xf /tmp/leerie-seed-git.tar
+cd /work
+git checkout -f $_branch
+git remote remove origin 2>/dev/null || true"
+    _cleanup_tmp='/tmp/leerie-seed-git.tar /tmp/leerie-subs'
+  else
+    _parent_materialize='git clone /tmp/leerie-seed.bundle /work
+cd /work'
+    _cleanup_tmp='/tmp/leerie-seed.bundle /tmp/leerie-subs'
+  fi
+
+  local _machine_script
+  _machine_script="$(cat <<'MACHINE_SCRIPT'
 set -e
 # `protocol.file.allow=always` is required for submodule update to
 # accept file://-style local paths (bundle files on disk). Git 2.38+
 # blocks `file` by default per CVE-2022-39253. We trust local paths
 # because we just put them there.
-git clone /tmp/leerie-seed.bundle /work
-cd /work
+__PARENT_MATERIALIZE__
 if [ -f .gitmodules ]; then
   git submodule init
   git submodule status | awk "{print \$2}" | while read sm; do
@@ -263,10 +470,22 @@ if [ -f .gitmodules ]; then
   git -c protocol.file.allow=always submodule update --recursive
 fi
 chown -R leerie: /work
-# Clean up the bundle tmpfiles — they served their purpose.
-rm -rf /tmp/leerie-seed.bundle /tmp/leerie-subs
-'"'" >/dev/null 2>&1; then
-    remote_log "seed_repo: machine-side clone from bundle failed"
+# Clean up the tmpfiles — they served their purpose.
+rm -rf __CLEANUP_TMP__
+MACHINE_SCRIPT
+)"
+  # Substitute the placeholders. None of the values contain `|`, so the
+  # bash `${var//from/to}` replacement is unambiguous. The branch name is
+  # already baked into $_parent_materialize (shell-safe by the gate above),
+  # so there is no branch-derived placeholder to collide with these tokens.
+  _machine_script="${_machine_script//__PARENT_MATERIALIZE__/$_parent_materialize}"
+  _machine_script="${_machine_script//__CLEANUP_TMP__/$_cleanup_tmp}"
+
+  local _mode="clone-from-bundle"
+  [ "$_shallow" = "true" ] && _mode="shallow-untar"
+  if ! flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
+         --pty=false -C "sh -c '$_machine_script'" >/dev/null 2>&1; then
+    remote_log "seed_repo: machine-side reconstruction of /work failed ($_mode)"
     return 1
   fi
 
