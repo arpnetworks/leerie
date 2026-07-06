@@ -198,6 +198,23 @@ decomposition quality is therefore the load-bearing assumption of the whole
 system — if planners under-decompose, implementers degrade before they hand
 off. It is the first place to look when a run goes wrong.
 
+**Conceptual dominance is a planner-judgment axis, deliberately not a
+mechanical gate.** A related sizing failure is *dilution*: one subtask that is
+so much more conceptually involved than its siblings that batching it with them
+degrades the plan for everything else — the case where the right move is to
+isolate it into its own subtask cluster rather than split it or leave it. The
+planner prompt asks for exactly this judgment (§2). It is **not** backed by a
+code check, and that is a considered decision, not an omission: file count — and
+every other mechanical proxy tested against the real plan corpus (planner
+text-length, `requires`/`provides` fan-out, text-per-file density, across a full
+threshold sweep) — cannot separate a genuinely dilutive subtask from a
+legitimately batched migration sweep. The best achievable signal still
+misclassifies a large fraction of legitimate batched sweeps as dilution. Per §12, a signal that cannot
+be checked mechanically without misfiring belongs in the prompt, not in code, so
+no `validate_plan` reject or `DEFAULT_CAPS` threshold is added for it. (Contrast
+`UNCOVERED_MIGRATION_SURFACE`, which *is* a code check because migration coverage
+*is* mechanically countable.)
+
 ### Cross-domain dependencies
 
 Planners run in parallel and cannot see each other's output. Yet dependencies
@@ -2496,6 +2513,20 @@ finds nothing, the phase still runs — the conformer focuses on whether the
 diff touched a surface the README or a `docs/` file describes, and whether
 tests for the touched code were updated — and silently skips the
 rule-conformance axis. A repo with no docs and no tests gets a near-no-op.
+
+The same discovered set is surfaced to the *implementer* at write time, not
+only to the conformer post-hoc. Convention drift is cheaper to prevent than to
+catch: a component written against the repo's design-system doc matches on the
+first try, where a conformer that only *reads* the diff afterward can flag a
+rule violation but cannot re-derive an unwritten visual convention. So the
+implementer's prompt names the discovered convention docs as paths (it reads
+the ones relevant to its subtask; it already has the full worktree checkout),
+and its evidence gate asks it to reconcile the pattern it followed against
+them. This is advisory — matching an existing design is judgment, not a
+mechanically checkable invariant — but the *discovery* is code, so the doc
+list itself cannot silently drift. The discovery allowlist therefore includes
+the repo's design-system doc (e.g. `docs/DESIGN-SYSTEM.md`), which specifies
+component/color/banner conventions a UI subtask must follow.
 
 Two further disciplines apply, and they sit at the §12 axis:
 

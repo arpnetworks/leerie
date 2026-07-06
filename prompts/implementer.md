@@ -121,7 +121,12 @@ measurement, a research source — not an assertion.
   fix is explained mechanistically.
 - **Feature-implementation:** acceptance criteria enumerated; integration points
   identified with file:line; edge cases listed; the pattern to follow
-  (existing or researched) identified and cited.
+  (existing or researched) identified and cited. When `CONVENTION_DOCS` are
+  provided, reconcile that pattern against them — a new **UI / visual**
+  component (banner, dialog, card, button, form control, layout) with no cited
+  sibling and no cited design-system rule has not cleared this gate: find the
+  matching component or the design-system convention *before* writing it, so it
+  matches the repo's design rather than drifting.
 - **Refactoring:** behavior-preservation defined via characterization tests or
   an explicit equivalence argument; the full blast radius mapped.
 - **Performance-optimization:** a baseline measured; the bottleneck identified
@@ -203,10 +208,11 @@ API key, an unreachable external service).
 
 ### 4. Implement
 
-Make the change in your worktree. Follow the conventions in the criteria file
-and the subtask's `investigation_notes`. Commit your work to the branch with a
-clear message. Commit only code and project files — never the `.leerie/`
-directory.
+Make the change in your worktree. Follow the conventions in the criteria file,
+the subtask's `investigation_notes`, and the `CONVENTION_DOCS` named in your
+prompt (the repo's authoritative design-system / component / style docs — read
+the ones relevant to your subtask). Commit your work to the branch with a clear
+message. Commit only code and project files — never the `.leerie/` directory.
 
 **Environmental issues are out of scope.** If `lint` / `typecheck` /
 `test` failures exist in files **outside your subtask's

@@ -82,3 +82,58 @@ def test_nonexistent_repo_root_returns_empty(leerie, tmp_path):
     contract is "never raises."""
     out = leerie.discover_rules_files(tmp_path / "does-not-exist")
     assert out == []
+
+
+def test_design_system_doc_is_a_candidate(leerie):
+    """Guard the load-bearing addition (DESIGN §9): the repo's design-system
+    doc must remain in the discovery allowlist so its component/banner
+    conventions reach both the conformer and the implementer. A future
+    refactor that silently drops it should fail this test."""
+    assert "docs/DESIGN-SYSTEM.md" in leerie._RULES_FILE_CANDIDATES
+    # spelling variants also covered
+    assert "docs/DESIGN_SYSTEM.md" in leerie._RULES_FILE_CANDIDATES
+    assert "docs/UI.md" in leerie._RULES_FILE_CANDIDATES
+
+
+def test_finds_design_system_doc(leerie, tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "DESIGN-SYSTEM.md").write_text("# banners use bg-destructive\n")
+    out = leerie.discover_rules_files(tmp_path)
+    rels = [p.relative_to(tmp_path).as_posix() for p in out]
+    assert "docs/DESIGN-SYSTEM.md" in rels
+
+
+def test_format_rules_paths_empty_is_none_sentinel(leerie, tmp_path):
+    """The shared formatter renders `(none)` for an empty list — the same
+    sentinel the conformer's RULES_FILES line uses."""
+    assert leerie._format_rules_paths([], tmp_path) == "(none)"
+
+
+def test_format_rules_paths_renders_relative(leerie, tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    p = docs / "DESIGN-SYSTEM.md"
+    p.write_text("x\n")
+    out = leerie._format_rules_paths([p], tmp_path)
+    assert out == "docs/DESIGN-SYSTEM.md"
+
+
+def test_convention_docs_section_none_when_no_docs(leerie, tmp_path):
+    """No discoverable docs → no CONVENTION_DOCS block injected (so the
+    implementer prompt gets no empty section)."""
+    assert leerie._format_convention_docs_section(tmp_path) is None
+
+
+def test_convention_docs_section_lists_discovered_paths(leerie, tmp_path):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "DESIGN-SYSTEM.md").write_text("x\n")
+    (tmp_path / "CLAUDE.md").write_text("y\n")
+    section = leerie._format_convention_docs_section(tmp_path)
+    assert section is not None
+    assert section.startswith("CONVENTION_DOCS")
+    # both discovered docs named, in allowlist priority order (CLAUDE.md first)
+    assert "CLAUDE.md" in section
+    assert "docs/DESIGN-SYSTEM.md" in section
+    assert section.index("CLAUDE.md") < section.index("docs/DESIGN-SYSTEM.md")

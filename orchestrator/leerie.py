@@ -12433,6 +12433,13 @@ async def run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     artifacts_section = _format_upstream_artifacts_for_sid(leerie_dir, sid)
     if artifacts_section is not None:
         up.append(artifacts_section)
+    # DESIGN §9: surface the repo's authoritative convention docs to the
+    # implementer at write time (not only to the post-hoc conformer), so a
+    # new component matches the repo's design conventions on the first try.
+    # st.repo_root is populated at State construction — already in scope.
+    convention_docs_section = _format_convention_docs_section(st.repo_root)
+    if convention_docs_section is not None:
+        up.append(convention_docs_section)
     if continuation:
         up.append(f"This is a CONTINUATION. Read the checkpoint at "
                   f"{leerie_dir}/checkpoints/{sid}.md, validate it against the "
@@ -12550,6 +12557,12 @@ _RULES_FILE_CANDIDATES = (
     ".cursorrules", ".windsurfrules",
     "docs/CLAUDE.md", "docs/AGENTS.md",
     "docs/CONVENTIONS.md", "docs/STYLE.md",
+    # Design-system docs: a repo's component/color/banner conventions live
+    # here, not in CLAUDE.md. Discovering them lets the conformer enforce
+    # them and (DESIGN §9) the implementer follow them at write time, so a
+    # new UI component matches the design on the first try instead of
+    # drifting and relying on a post-hoc catch.
+    "docs/DESIGN-SYSTEM.md", "docs/DESIGN_SYSTEM.md", "docs/UI.md",
     "README.md", "CONTRIBUTING.md",
     "docs/DESIGN.md", "docs/IMPLEMENTATION.md",
 )
@@ -12568,6 +12581,33 @@ def discover_rules_files(repo_root: Path) -> list[Path]:
         except OSError:
             continue
     return out
+
+
+def _format_rules_paths(rules_files: list[Path], repo_root: Path) -> str:
+    """Render discovered rule/convention paths relative to `repo_root` for
+    prompt injection. Shared by the conformer's `RULES_FILES:` line and the
+    implementer's `CONVENTION_DOCS:` line so the two formats never diverge.
+    Returns `(none)` for an empty list."""
+    return ", ".join(
+        str(p.relative_to(repo_root)) if str(p).startswith(str(repo_root))
+        else str(p)
+        for p in rules_files
+    ) or "(none)"
+
+
+def _format_convention_docs_section(repo_root: Path) -> str | None:
+    """Build the implementer's `CONVENTION_DOCS:` prompt block from the same
+    discovery the conformer uses (DESIGN §9). Returns None when the repo has
+    no discoverable convention docs, so no empty block is injected. Paths
+    only — the implementer opens the ones its subtask needs from its own
+    worktree checkout, avoiding inlining a large design-system doc."""
+    rules_files = discover_rules_files(repo_root)
+    if not rules_files:
+        return None
+    return ("CONVENTION_DOCS (authoritative repo conventions — read the ones "
+            "relevant to your subtask and follow their patterns, especially "
+            "design-system / component conventions for any UI work): "
+            f"{_format_rules_paths(rules_files, repo_root)}")
 
 
 def _is_rails_repo(repo_root: Path) -> bool:
@@ -12871,11 +12911,7 @@ async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
     advisory)."""
     sys_prompt = load_prompt("conformer")
     repo_root = st.repo_root
-    rules_paths_str = ", ".join(
-        str(p.relative_to(repo_root)) if str(p).startswith(str(repo_root))
-        else str(p)
-        for p in rules_files
-    ) or "(none)"
+    rules_paths_str = _format_rules_paths(rules_files, repo_root)
     up = [f"Run the post-work conformance phase for subtask `{sid}`.",
           f"LEERIE_DIR is {leerie_dir} (absolute). Your subtask spec "
           f"is at {leerie_dir}/subtasks/{sid}.json and the implementer's "
@@ -13404,11 +13440,7 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     blt_feedback: str | None = None
 
     sys_prompt = load_prompt("conformer")
-    rules_paths_str = ", ".join(
-        str(p.relative_to(repo_root)) if str(p).startswith(str(repo_root))
-        else str(p)
-        for p in rules_files
-    ) or "(none)"
+    rules_paths_str = _format_rules_paths(rules_files, repo_root)
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))

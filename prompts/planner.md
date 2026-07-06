@@ -53,6 +53,24 @@ The orchestrator gives you, in your prompt:
    Do not over-decompose past the verifiable-unit boundary. A subtask that
    cannot be independently verified is too small — merge it with its sibling.
 
+   **Isolate a conceptually-dominant subtask.** When one unit of work is *far
+   more conceptually involved* than its siblings — dense, load-bearing logic
+   that will need most of a worker's attention and reasoning — give it its own
+   subtask (and, when the domains allow, its own cluster) rather than batching
+   it with lighter work. Co-scheduling a heavyweight unit alongside several
+   light ones *dilutes* the plan: the heavy one crowds out attention the others
+   need, and the light ones add noise the heavy one does not. Isolating it is
+   the "do it in a separate prompt" move — it keeps each worker's focus matched
+   to its subtask. Note the dominance and the reason in that subtask's
+   `investigation_notes`.
+
+   This is about *conceptual* involvement, **not** file count. A migration or
+   sweep that touches many files but does one mechanical thing is **not**
+   dominant — it is correctly one batched subtask (see *Migration sweep*
+   below); do **not** split it to reduce its file count. The signal is "how
+   much thinking this unit demands," not "how many files it edits." A single
+   dense file can be dominant; a 20-file rename is not.
+
    **Migration sweep.** When a subtask introduces a new pattern replacing
    an old one (a new accessor, a new seam, a new abstraction), quantify
    the migration surface:

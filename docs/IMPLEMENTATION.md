@@ -2753,7 +2753,7 @@ Implements DESIGN §9 *Post-work conformance*.
 
 | Step | Function | Behavior |
 |------|----------|----------|
-| Discover rules files | `discover_rules_files(repo_root)` | Returns existing paths from a fixed, capped allowlist (`CLAUDE.md`, `AGENTS.md`, `.agent.md`, `.cursorrules`, `.windsurfrules`, `docs/CLAUDE.md`, `docs/AGENTS.md`, `docs/CONVENTIONS.md`, `docs/STYLE.md`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`), deterministic order, never raises. Empty list when nothing matches. |
+| Discover rules files | `discover_rules_files(repo_root)` | Returns existing paths from a fixed, capped allowlist (`CLAUDE.md`, `AGENTS.md`, `.agent.md`, `.cursorrules`, `.windsurfrules`, `docs/CLAUDE.md`, `docs/AGENTS.md`, `docs/CONVENTIONS.md`, `docs/STYLE.md`, `docs/DESIGN-SYSTEM.md`, `docs/DESIGN_SYSTEM.md`, `docs/UI.md`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`), deterministic order, never raises. Empty list when nothing matches. The design-system candidates (`docs/DESIGN-SYSTEM.md` and spelling variants) exist so a repo's component/color/banner conventions reach both the conformer and the implementer (DESIGN §9). |
 | Run conformer | `run_conformer()` | One `claude -p` invocation with `ACT_TOOLS`, `--dangerously-skip-permissions`, `SCHEMAS["conformer"]`. Accepts optional `extra_feedback: str \| None` — when non-None, appended to the user prompt (used for Pattern B backgrounding-retry feedback from prior round). Catches `WorkerError` and returns `None` (surfaced as a warning). |
 | Validate output | `validate_conformance_result()` | Cross-field invariants — `rule_violations_residual` non-empty requires `rules_files_read` non-empty; each `rule_violations_fixed` item must cite a non-empty `rule` string; each `docs_updates` / `tests_updates` item must cite a `path` that exists. On failure → warning, loop breaks. |
 | Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions used on the implementer, re-applied to any new commits the conformer added. A scope-protected-path violation triggers `rollback_conformer_commits()` (reset to `before_sha`) and is recorded as a warning, **not** as `failed` / `blocked`. |
@@ -3443,6 +3443,23 @@ sibling) is exported to `os.environ` once in `phase_provision` (and
 re-exported from persisted state on `--resume`); worker subprocesses
 inherit it without any per-worker plumbing because `_invoke` does
 not pass an explicit `env=` to `create_subprocess_exec`.
+
+**Convention-doc injection (`CONVENTION_DOCS:` block).** Alongside the
+recipe, `run_implementer` injects the repo's authoritative convention
+docs so the implementer writes UI to the repo's design conventions on
+the first try rather than drifting and relying on a post-hoc conformer
+catch (DESIGN §9). It calls `discover_rules_files(st.repo_root)` — the
+same discovery the conformer uses — and renders the surviving paths
+(relative to `repo_root`) as a `CONVENTION_DOCS:` line in the user
+prompt, using the same relative-path formatting as `run_conformer`'s
+`RULES_FILES:` line. Paths only, not contents: the implementer runs in
+a full worktree checkout and opens the docs relevant to its subtask, so
+inlining a large design-system doc into every prompt is avoided. When
+discovery returns nothing, no block is injected. `st.repo_root` is
+already in scope in `run_implementer` (set at `State` construction), so
+this needs no new parameter or call-site change. The `prompts/implementer.md`
+§3 evidence gate and §4 Implement step name this block so the worker
+reconciles the pattern it followed against the discovered conventions.
 
 ---
 
