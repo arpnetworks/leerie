@@ -23,15 +23,18 @@ import pytest
 
 
 WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
-           "provision", "implementer", "integrator", "conformer")
+           "satisfied_probe", "provision", "implementer", "integrator",
+           "conformer")
 
 # The expected default per worker, with no overrides. Judgment workers
-# get "high"; acting workers (implementer, conformer) resolve to None.
+# get "high"; acting workers (implementer, conformer) and the per-subtask
+# satisfied_probe resolve to None.
 DEFAULTS: dict[str, str | None] = {
     "classifier": "high",
     "planner":    "high",
     "reconciler": "high",
     "plan_overlap_judge": "high",
+    "satisfied_probe": None,
     "provision":  "high",
     "integrator": "high",
     "implementer": None,

@@ -146,3 +146,45 @@ def test_overlap_judge_call_site_uses_inspect_tools():
     )
     assert "allowed_tools=ACT_TOOLS" not in body
     assert "allowed_tools=RUN_TOOLS" not in body
+
+
+def test_satisfied_probe_call_site_uses_satisfied_probe_tools():
+    """The satisfied_probe worker (DESIGN §8 *Already-satisfied subtask
+    elimination*) must pass allowed_tools=SATISFIED_PROBE_TOOLS — the
+    base-tree-only bucket. A regression to INSPECT_TOOLS would re-grant
+    history-spanning git (`git log --all`, non-HEAD `git show <ref>:`),
+    which lets the probe find a deliverable on some OTHER branch and
+    report satisfied=true — silently deleting real work (calibration
+    measured 12/12 false-positives with full INSPECT_TOOLS latitude).
+    ACT_TOOLS/RUN_TOOLS would grant Write/Edit. No other test guards this
+    call site: the behavioral stub in test_filter_satisfied_subtasks.py
+    swallows allowed_tools via **_kw, and test_resolve_skip_satisfied_check
+    checks the CONSTANT's content but not that the call site uses it.
+
+    Boundary note: unlike the sibling call-site tests above (which slice to
+    the next `async def`), filter_satisfied_subtasks is followed by a large
+    NON-async block (the provisioning helpers), so the next-`async def`
+    bound would span ~40KB of unrelated code and make the negative asserts
+    scoped far too broadly. Slice to the next top-level `def `/`async def`
+    instead — just this function's body.
+    """
+    import re
+    src = LEERIE_PY.read_text()
+    start = src.index("async def filter_satisfied_subtasks(")
+    m = re.search(r"\n(?:async def |def )", src[start + 10:])
+    end = start + 10 + m.start() if m else len(src)
+    body = src[start:end]
+    # Guard: the slice must actually contain the worker invocation, so a
+    # future refactor that moves the claude_p call out of this function
+    # can't make the tool-scope asserts vacuously pass.
+    assert "claude_p(" in body, (
+        "filter_satisfied_subtasks body no longer contains the claude_p "
+        "call — this test's boundary or the worker wiring changed"
+    )
+    assert "allowed_tools=SATISFIED_PROBE_TOOLS" in body, (
+        "filter_satisfied_subtasks must pass "
+        "allowed_tools=SATISFIED_PROBE_TOOLS to claude_p"
+    )
+    assert "allowed_tools=INSPECT_TOOLS" not in body
+    assert "allowed_tools=ACT_TOOLS" not in body
+    assert "allowed_tools=RUN_TOOLS" not in body

@@ -208,6 +208,7 @@ STATE_FIELDS = (
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
     "skip_overlap_judge",
+    "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
     "verbosity", "inspect_dirs",
@@ -360,6 +361,25 @@ INSPECT_TOOLS = (
 )
 ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit"
 
+# SATISFIED_PROBE_TOOLS — a deliberately narrow, BASE-TREE-ONLY subset of
+# INSPECT_TOOLS for the phase-3 satisfied-probe (DESIGN §8 *Already-
+# satisfied subtask elimination*). It must NOT include history-spanning
+# git verbs (`git log:*`, `git show:*` with an arbitrary ref, `git
+# branch`): a git worktree shares the main repo's full ref/object DB, so
+# a probe that can reach other branches / later commits will "find" a
+# deliverable that exists only on some OTHER branch and false-positive —
+# silently dropping real work. Calibration measured 12/12 false-positives
+# with full INSPECT_TOOLS latitude and 0 when scoped to the base tree.
+# Only `git show HEAD:<path>`, `git diff`, and `git status` on the current
+# checkout are allowed; the prompt reinforces the same rule (§12: the code
+# constraint is the guarantee, the prompt is documentation).
+SATISFIED_PROBE_TOOLS = (
+    f"{_READ_BASE},"
+    "Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(wc:*),Bash(grep:*),"
+    "Bash(rg:*),Bash(file:*),Bash(stat:*),Bash(pwd),Bash(echo:*),"
+    "Bash(git show HEAD:*),Bash(git diff:*),Bash(git status)"
+)
+
 # DISALLOWED_TOOLS is the hard-deny list passed via --disallowedTools to
 # every worker.  Unlike --allowedTools (permission-tier only, bypassed by
 # --dangerously-skip-permissions), --disallowedTools with bare tool names
@@ -511,6 +531,18 @@ SKIP_BUDGET_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 STRICT_CONFORMER_ENV = "LEERIE_STRICT_CONFORMER"
 STRICT_CONFORMER_FILE = SOURCE_OF_TRUTH_FILE
 
+# --skip-satisfied-check bypass (DESIGN §8 *Already-satisfied subtask
+# elimination*). Suppresses the phase-3 `filter_satisfied_subtasks()`
+# gate that spawns a per-subtask `satisfied_probe` worker to drop
+# subtasks already met on the base tree. When set, every subtask
+# proceeds to schedule(); the mechanical `check_branch_has_commits`
+# backstop still catches an already-satisfied subtask post-execution
+# (as a retryable no-op). Resolution order: --skip-satisfied-check CLI
+# flag → LEERIE_SKIP_SATISFIED_CHECK env → skip_satisfied_check in
+# leerie.toml → False.
+SKIP_SATISFIED_CHECK_ENV = "LEERIE_SKIP_SATISFIED_CHECK"
+SKIP_SATISFIED_CHECK_FILE = SOURCE_OF_TRUTH_FILE
+
 # --pr-template selector. When the target repo has multiple PR templates
 # in a PULL_REQUEST_TEMPLATE/ directory, pick this one by name (the
 # basename, with or without .md). When unset, the alphabetically first
@@ -556,6 +588,11 @@ MODEL_DEFAULT_PER_WORKER = {
     "judge": "sonnet",
     "heal": "sonnet",
     "pr_writer": "sonnet",
+    # satisfied_probe runs once per subtask (DESIGN §8 *Already-satisfied
+    # subtask elimination*); throughput/cost dominates. Its correctness
+    # rests on the base-tree-only tool scope + conservative default, not
+    # the model tier.
+    "satisfied_probe": "sonnet",
 }
 MODEL_ENV = "LEERIE_MODEL"
 MODEL_FILE = "leerie.toml"
@@ -579,7 +616,8 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
 }
 EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
-                "provision", "implementer", "integrator", "conformer")
+                "satisfied_probe", "provision", "implementer", "integrator",
+                "conformer")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -1318,6 +1356,35 @@ SCHEMAS: dict[str, dict] = {
                         "merge_feasibility": {"type": "string"},
                     },
                 },
+            },
+        },
+    },
+    "satisfied_probe": {
+        # Output of the per-subtask satisfied-probe worker (DESIGN §8
+        # *Already-satisfied subtask elimination*). Spawned once per
+        # surviving subtask by `filter_satisfied_subtasks` in phase 3.
+        # The worker inspects ONLY the base tree (working tree + `git
+        # show HEAD:` — never other refs) and decides whether the
+        # subtask's success criteria are already fully met, such that an
+        # implementer would have nothing to commit.
+        #
+        # `satisfied` is the load-bearing field: True → the subtask is
+        # soft-dropped before scheduling. The prompt instructs the
+        # worker to default to False on any uncertainty — a false "already
+        # done" silently deletes real work, which is strictly worse than
+        # a false "still needed" (the latter only costs one implementer
+        # round the mechanical no-commits backstop already tolerates).
+        # No confidence block: this is an advisory prune subordinate to
+        # `check_branch_has_commits` (§12), not a run-gating judgment.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["satisfied", "evidence"],
+        "properties": {
+            "satisfied": {"type": "boolean"},
+            "evidence": {"type": "string"},
+            "checked": {
+                "type": "array",
+                "items": {"type": "string"},
             },
         },
     },
@@ -3066,6 +3133,28 @@ def resolve_skip_budget_check(repo_root: Path, cli_value: bool) -> bool:
         file_name=SKIP_BUDGET_CHECK_FILE)
 
 
+def resolve_skip_satisfied_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-satisfied-check preference. Order:
+    --skip-satisfied-check CLI flag (action='store_true') →
+    LEERIE_SKIP_SATISFIED_CHECK env var →
+    skip_satisfied_check in leerie.toml → False.
+
+    When True, `filter_satisfied_subtasks()` (DESIGN §8 *Already-
+    satisfied subtask elimination*) is suppressed: no `satisfied_probe`
+    worker spawns and every subtask proceeds to `schedule()`. The
+    mechanical `check_branch_has_commits` backstop still catches an
+    already-satisfied subtask post-execution (as a retryable no-op), so
+    this flag trades the cheap plan-time skip for the more expensive
+    post-execution one. Off by default; use when the operator knows the
+    base tree contains no already-merged overlap and wants to save the
+    per-subtask probe cost."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_SATISFIED_CHECK_ENV,
+        file_key="skip_satisfied_check",
+        file_name=SKIP_SATISFIED_CHECK_FILE)
+
+
 def resolve_strict_conformer(repo_root: Path, cli_value: bool) -> bool:
     """Resolve the --strict-conformer preference. Order:
     --strict-conformer CLI flag (action='store_true') →
@@ -4505,6 +4594,157 @@ def filter_offtree_subtasks(plans: list[dict], repo_root: Path,
             log(f"     {sid}: {r}")
     st.data.setdefault("dropped_subtasks", {}).update(dropped)
     st.save()
+
+
+async def filter_satisfied_subtasks(
+    plans: list[dict], repo_root: Path, st: "State", caps: dict,
+    models: dict[str, str], efforts: dict[str, str | None],
+) -> dict[str, str] | None:
+    """Mutate `plans` in place: drop any subtask whose success criteria
+    are already met on the base tree (DESIGN §8 *Already-satisfied
+    subtask elimination*). Spawns one read-only `satisfied_probe` worker
+    per surviving subtask (bounded by `max_parallel`), each judging that
+    subtask's `success_criteria_seed` against the current checkout, and
+    soft-drops the ones the probe marks `satisfied`. Recorded in
+    `st.data["dropped_subtasks"]` with `reason: "already_satisfied"` plus
+    the probe's evidence — the same audit shape as
+    `filter_offtree_subtasks`.
+
+    Returns a `no_work_map` (`domain → basis`) IFF the drop empties every
+    `status == "ready"` plan (so the caller routes to
+    `_finish_no_work_run`, the same terminal state as the native
+    cleared-but-empty case, DESIGN §8). Returns None otherwise — the run
+    proceeds to `schedule()` with the surviving subtasks. A `status ==
+    "blocked"` plan with zero subtasks does NOT trigger the no-work route
+    (it must still fall to `schedule()`'s all-blocked `die`), mirroring
+    `detect_no_work`'s ready-only guard.
+
+    Soft drop, not `die()`: same resume-safety reasoning as
+    `filter_offtree_subtasks` — the drop happens on the plan→schedule
+    path that `--resume` does not re-run, and `state.json["waves"]` is
+    only written by `write_plan` after `schedule()`, so a surviving-only
+    plan is what gets persisted. The gate is advisory and subordinate to
+    the mechanical `check_branch_has_commits` backstop (§12): a
+    false-negative (probe says "still needed" when it was done) costs one
+    implementer round the backstop already tolerates; the probe is tuned
+    to prefer that over a false-positive that would silently delete real
+    work. The probe runs with `SATISFIED_PROBE_TOOLS` (a base-tree-only
+    subset of INSPECT_TOOLS — no history-spanning git, see that
+    constant's rationale)."""
+    if st.data.get("skip_satisfied_check"):
+        log("phase 3: satisfied-check skipped (--skip-satisfied-check / "
+            "LEERIE_SKIP_SATISFIED_CHECK / skip_satisfied_check=true)")
+        return None
+
+    # Flatten to (plan, subtask) pairs so the probe results can be applied
+    # back to the owning plan. Only subtasks carrying a non-empty success
+    # criterion are probeable — without a criterion there is nothing to
+    # judge "already met" against, so such a subtask always survives.
+    probeable: list[dict] = []
+    total = 0
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            total += 1
+            if (s.get("success_criteria_seed") or "").strip():
+                probeable.append(s)
+    if not probeable:
+        return None
+
+    log(f"phase 3: satisfied-probe over {len(probeable)} subtask(s) "
+        f"(base-tree already-satisfied check, DESIGN §8)")
+    st.data["current_phase"] = "phase 3: satisfied-probe"
+    st.save()
+
+    sys_prompt = load_prompt("satisfied_probe")
+    sem = asyncio.Semaphore(caps["max_parallel"])
+    # sid → drop record; only satisfied subtasks land here.
+    dropped: dict[str, dict] = {}
+
+    async def probe_one(s: dict) -> None:
+        sid = s.get("id", "?")
+        payload = {
+            "id": sid,
+            "title": s.get("title", ""),
+            "intent": s.get("intent", ""),
+            "success_criteria_seed": s.get("success_criteria_seed", ""),
+            "files_likely_touched": list(
+                s.get("files_likely_touched", []) or []),
+        }
+        user_prompt = (
+            "SUBTASK:\n" + json.dumps(payload, indent=2) +
+            "\n\nReturn only the JSON object per your schema. Judge the "
+            "CURRENT working tree / HEAD only — never other branches or "
+            "history. Default satisfied=false on any uncertainty."
+        )
+        async with sem:
+            # bump_workers is OUTSIDE the try: its WorkerError signals
+            # budget exhaustion (worker_count > max_total_workers), which
+            # is the hard backstop — it must propagate so gather_or_cancel
+            # aborts the run, not be swallowed into a silent subtask-keep.
+            # Only a claude_p failure is caught below as the fail-safe.
+            st.bump_workers(caps)
+            try:
+                out = await claude_p(
+                    user_prompt=user_prompt, system_prompt=sys_prompt,
+                    schema_key="satisfied_probe", cwd=str(repo_root),
+                    allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=20,
+                    autonomous=False, caps=caps, st=st,
+                    model=models["satisfied_probe"],
+                    effort=efforts["satisfied_probe"],
+                    sid=f"satisfied_probe-{sid}",
+                )
+            except WorkerError as e:
+                # A probe crash (e.g. claude_p schema failure twice) must
+                # NOT drop the subtask — fail safe toward keeping the work.
+                # Log and let the subtask survive.
+                log(f"  satisfied-probe {sid}: crashed ({e}); keeping "
+                    "subtask (fail-safe — no drop on probe failure)")
+                return
+        if out.get("satisfied") is True:
+            dropped[sid] = {
+                "reason": "already_satisfied",
+                "evidence": out.get("evidence", ""),
+                "checked": list(out.get("checked", []) or []),
+            }
+
+    await gather_or_cancel(*(probe_one(s) for s in probeable))
+
+    if not dropped:
+        return None
+
+    # Apply the drops: rewrite each plan's subtasks to survivors only.
+    for plan in plans:
+        plan["subtasks"] = [
+            s for s in (plan.get("subtasks", []) or [])
+            if s.get("id") not in dropped
+        ]
+
+    log(f"phase 3: satisfied-probe dropped {len(dropped)}/{total} "
+        "already-satisfied subtask(s):")
+    for sid, info in sorted(dropped.items()):
+        log(f"     {sid}: {info['evidence'][:160]}")
+    st.data.setdefault("dropped_subtasks", {}).update(dropped)
+    st.save()
+
+    # If every ready plan is now empty, this is the per-subtask analogue
+    # of the cleared-but-empty terminal state. Build a no_work_map from
+    # the drop evidence (NOT from plan confidence.basis, which is the
+    # planner's original "I found work" rationale — misleading here) and
+    # signal the caller to route to _finish_no_work_run. A blocked plan
+    # with 0 subtasks must still fall through to schedule()'s all-blocked
+    # die, so guard on ready-only exactly like detect_no_work.
+    for plan in plans:
+        if plan.get("status") != "ready":
+            return None
+        if plan.get("subtasks"):
+            return None
+    no_work_map: dict[str, str] = {}
+    for plan in plans:
+        domain = plan.get("domain") or "<unknown>"
+        no_work_map[domain] = (
+            "all subtasks already satisfied on HEAD "
+            "(satisfied-probe, DESIGN §8)")
+    return no_work_map
 
 
 # --- per-repo dependency provisioning ----------------------------------------
@@ -14698,6 +14938,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["dangerously_skip_permissions"] = bool(
             args.dangerously_skip_permissions)
         st.data["skip_overlap_judge"] = bool(args.skip_overlap_judge)
+        st.data["skip_satisfied_check"] = bool(
+            getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
         st.data["strict_conformer"] = bool(args.strict_conformer)
         st.data["leerie_version"] = _read_version()
@@ -14729,6 +14971,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "dangerously_skip_permissions": bool(
                        args.dangerously_skip_permissions),
                    "skip_overlap_judge": bool(args.skip_overlap_judge),
+                   "skip_satisfied_check": bool(
+                       getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
                    "strict_conformer": bool(args.strict_conformer),
                    "leerie_version": _read_version()}
@@ -14810,6 +15054,18 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # schedule() so the resulting waves do not reference dropped sids.
         filter_offtree_subtasks(plans, Path(os.getcwd()),
                                 st.data.get("inspect_dirs") or [], st)
+        # Already-satisfied subtask elimination (DESIGN §8). Per-subtask
+        # probe of the base tree; drops subtasks already met (e.g. a
+        # sibling run merged the deliverable to the base). Soft drop,
+        # recorded in state.data["dropped_subtasks"]. If it empties every
+        # ready plan, route to the same cleared-but-empty terminal state
+        # as detect_no_work — using the drop-derived no_work_map, not the
+        # planner's original confidence.basis. Must run BEFORE schedule().
+        satisfied_no_work = await filter_satisfied_subtasks(
+            plans, Path(os.getcwd()), st, caps, models, efforts)
+        if satisfied_no_work is not None:
+            _finish_no_work_run(st, satisfied_no_work)
+            return
         st.data["current_phase"] = "phase 3: scheduling"
         st.save()
         subtasks, waves = schedule(plans)
@@ -14997,6 +15253,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "affects runs where the worker would otherwise fire. "
                          f"Also {SKIP_OVERLAP_JUDGE_ENV} env or "
                          "skip_overlap_judge in leerie.toml. Default: off.")
+    ap.add_argument("--skip-satisfied-check", action="store_true",
+                    help="skip the phase 3 per-subtask satisfied-probe that "
+                         "drops subtasks already met on the base tree (DESIGN "
+                         "§8 Already-satisfied subtask elimination). When set, "
+                         "every subtask proceeds to scheduling; the mechanical "
+                         "no-commits backstop still catches already-satisfied "
+                         "work post-execution (as a retryable no-op). "
+                         f"Also {SKIP_SATISFIED_CHECK_ENV} env or "
+                         "skip_satisfied_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-budget-check", action="store_true",
                     help="skip the post-schedule budget-feasibility preflight "
                          "(DESIGN §13 Budget feasibility — fail fast at the "
@@ -15299,6 +15564,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # key; phase_overlap_judge reads it from there on entry.
     args.skip_overlap_judge = resolve_skip_overlap_judge(
         repo_root, args.skip_overlap_judge)
+
+    # Resolve --skip-satisfied-check (DESIGN §8 *Already-satisfied subtask
+    # elimination*). Same precedence shape as the other skip flags.
+    # orchestrate() folds it into state.json under "skip_satisfied_check";
+    # filter_satisfied_subtasks reads it from there on entry.
+    args.skip_satisfied_check = resolve_skip_satisfied_check(
+        repo_root, args.skip_satisfied_check)
 
     # Resolve --skip-budget-check (DESIGN §13 *Budget feasibility — fail
     # fast at the cheapest moment*). Same precedence shape as the other

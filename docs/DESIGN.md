@@ -2364,6 +2364,41 @@ mixed outcome by pruning fully-speculative subtasks from a non-empty
 domain — see §5 *Dead-subtask elimination*). The all-blocked case still dies — a blocker
 is a gate failure that the user must see.
 
+**Already-satisfied subtask elimination (the per-subtask sibling).** The
+cleared-but-empty state above is *whole-run*: it fires only when every planner
+natively returned zero subtasks. But a planner does not always know that a
+deliverable already exists — it is given the task and the codebase, not a
+manifest of what a *sibling run* merged to the base branch an hour ago. So a
+planner can, in good faith, emit a subtask whose success criteria are already
+met on the seeded base (e.g. two runs derive from the same request; the first
+merges its PR; the second is seeded from a base that now contains that work).
+Left alone, such a subtask reaches an implementer, which correctly reports
+`complete` while committing nothing — and the mechanical no-commits backstop
+(the `check_branch_has_commits` gate, §5 *Artifact passing between subtasks*)
+then fails it as a retryable no-op, burning the retry budget and pausing the
+run. The honest answer ("already done upstream") is exactly the one the
+backstop cannot represent.
+
+The fix is the per-subtask analogue of the cleared-but-empty check: before
+scheduling, a read-only **satisfied-probe** evaluates each subtask's
+`success_criteria_seed` against the base tree and soft-drops the ones already
+met — the same pre-schedule per-subtask soft-drop shape as dead-subtask
+elimination (§5) and the off-tree `files_likely_touched` filter, recorded in
+the same `dropped_subtasks` audit. If all subtasks drop, the run routes to the same
+`no_work_required` terminal state as the native cleared-but-empty case. This
+is a *soft, advisory* prune: it is subordinate to the mechanical no-commits
+backstop, which stays as the last line of defense for anything the probe
+misses (per §12, the code check is the guarantee; the LLM probe only reduces
+how often it fires on already-done work). Two disciplines are load-bearing and
+were established by calibration, not assumption: (1) the probe must judge the
+**base tree only** — never `git log --all` or another branch/ref, because a
+worktree shares the repo's full object DB and a history-spanning probe will
+"find" the deliverable on an unrelated branch and false-positive; (2) the
+probe defaults to *not satisfied* on any uncertainty, because a false "already
+done" silently deletes real work — a strictly worse failure than a false
+"still needed" (which merely costs one implementer round the backstop already
+tolerates).
+
 The structural contract of these disciplines is mechanically enforced — the
 worker's output schema requires the falsification, reconciliation, and gap
 fields to be present, so a worker that skipped them fails its own JSON gate
@@ -3021,9 +3056,9 @@ matches the same precedence chain as `--skip-smoke` and
 
 ## 14. Telemetry, judging, and self-healing
 
-Every LLM call in Leerie passes through one of the eight worker types in
+Every LLM call in Leerie passes through one of the nine worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
-`provision`, `implementer`, `integrator`, or `conformer`. Each worker type is a distinct **call type** — a
+`satisfied_probe`, `provision`, `implementer`, `integrator`, or `conformer`. Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
 worker role, no overlap, no gap.
