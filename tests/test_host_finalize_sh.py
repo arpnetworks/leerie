@@ -51,8 +51,21 @@ def _run_host_finalize(tmp_path: Path, run_dir: Path,
     host_finalize <run_dir>. Returns the CompletedProcess."""
     _make_stub_bin(tmp_path, "git", git_body)
     _make_stub_bin(tmp_path, "gh", gh_body)
+    # No-op `sleep` so the gh-pr-create retry loop's backoff
+    # (0/5/10/20/30s) is exercised WITHOUT real wall-clock delay — a
+    # PR-failure test would otherwise spend ~68s sleeping. The retry
+    # logic is still verified (the loop iterates and re-invokes `gh`,
+    # visible in gh.log); only the delay is removed.
+    _make_stub_bin(tmp_path, "sleep", "exit 0")
     user_repo = run_dir.parent.parent.parent  # .leerie/runs/<id>/.. → .leerie → repo
-    script = f". {HOST_FINALIZE_SH}; host_finalize {run_dir}"
+    # Run under `set -euo pipefail` to match production faithfully:
+    # host-finalize.sh is always sourced INTO the launcher, which sets
+    # `set -euo pipefail` (leerie:17). Without this, a failing command
+    # substitution inside host_finalize (e.g. `ls-remote` on an absent
+    # origin → pipefail rc 128) would be silently swallowed by the test
+    # but abort finalize in production. Matching shell options here is
+    # what makes those `|| true` guards actually verified.
+    script = f"set -euo pipefail; . {HOST_FINALIZE_SH}; host_finalize {run_dir}"
     return subprocess.run(
         ["bash", "-c", script],
         env={
@@ -82,17 +95,135 @@ def test_skips_when_no_push_true(tmp_path):
     assert not (tmp_path / "git.log").exists() or (tmp_path / "git.log").read_text() == ""
 
 
-def test_skips_when_already_pushed(tmp_path):
-    """run.json has pushed_at set → idempotent re-invocation; return 0."""
+def test_skips_when_already_pushed_and_origin_up_to_date(tmp_path):
+    """run.json has pushed_at set AND origin already matches the local
+    run-branch tip → idempotent re-invocation; return 0 without a second
+    push. The idempotency gate is tip-aware (DESIGN §6 *Finalization*):
+    pushed_at alone is not enough — origin must match."""
     run_dir = _make_run(tmp_path, "feat-y-aaaaaa", run_json={
         "branch": "leerie/runs/feat-y-aaaaaa",
         "working_branch": "main",
         "pushed_at": "2026-05-29T16:00:00+00:00",
         "finished_at": "2026-05-29T15:00:00+00:00",
     })
-    r = _run_host_finalize(tmp_path, run_dir)
+    # git stub: rev-parse (local tip) and ls-remote (origin tip) both
+    # return the SAME sha → tips equal → no-op.
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then
+  exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  echo "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/x\n'; exit 0
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
     assert r.returncode == 0, r.stderr
     assert "already pushed" in r.stderr
+    assert "origin up to date" in r.stderr
+    # No `git push` was invoked (only rev-parse / ls-remote). Match the
+    # push subcommand token, not the substring — the tmp path contains
+    # "pushed".
+    git_log = (tmp_path / "git.log").read_text()
+    push_invoked = any(
+        "push" in line.split() for line in git_log.splitlines()
+    )
+    assert not push_invoked, git_log
+
+
+def test_repushes_when_local_ahead_of_origin(tmp_path):
+    """run.json has pushed_at set but the local run-branch tip is AHEAD of
+    origin (a prior finalize pushed a PARTIAL branch — the PR-#22 wedge).
+    The run is complete (completed_waves == len(waves)), so host_finalize
+    falls through to a fast-forward re-push + PR instead of no-op'ing."""
+    run_dir = _make_run(
+        tmp_path, "feat-ahead-aaaa",
+        run_json={
+            "branch": "leerie/runs/feat-ahead-aaaa",
+            "working_branch": "main",
+            "pushed_at": "2026-05-29T16:00:00+00:00",
+            "finished_at": "2026-05-29T17:00:00+00:00",
+        },
+        state_json={"task": "x", "started_at": "2026-05-29T15:00:00+00:00",
+                    "categories": ["feature"], "waves": [[]],
+                    "completed_waves": 1},
+    )
+    # git stub: local tip 'bbbb…' != origin tip 'aaaa…' → local ahead →
+    # re-push. Track that `push` is invoked.
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then
+  exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  echo "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
+  printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\trefs/heads/x\n'; exit 0
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 0, r.stderr
+    assert "re-pushing" in r.stderr
+    # A `git push` DID happen (match the subcommand token, not the tmp
+    # path substring), and a PR was opened.
+    git_log = (tmp_path / "git.log").read_text()
+    push_invoked = any(
+        "push" in line.split() for line in git_log.splitlines()
+    )
+    assert push_invoked, git_log
+    after = json.loads((run_dir / "run.json").read_text())
+    assert after.get("pr_url") is not None
+    assert after.get("pr_error") is None
+
+
+def test_already_pushed_up_to_date_noops_even_with_incomplete_waves(tmp_path):
+    """Regression guard: an already-pushed run whose origin matches the
+    local tip must no-op (return 0) EVEN IF state.json shows
+    completed_waves < len(waves) — a resume artifact, or a run pushed under
+    old semantics then re-finalized. The tip-aware idempotency short-circuit
+    runs BEFORE the completion gate, so a genuinely-pushed run is never
+    refused with 'refusing to finalize' (DESIGN §6 *Finalization*: only the
+    re-push is gated on completeness, not the equal-tips no-op)."""
+    run_dir = _make_run(
+        tmp_path, "feat-done-aaaa",
+        run_json={
+            "branch": "leerie/runs/feat-done-aaaa",
+            "working_branch": "main",
+            "pushed_at": "2026-05-29T16:00:00+00:00",
+            "finished_at": "2026-05-29T15:00:00+00:00",
+        },
+        # Incomplete waves — would trip the completion gate if it ran first.
+        state_json={"task": "x", "started_at": "2026-05-29T15:00:00+00:00",
+                    "categories": ["feature"],
+                    "waves": [[1], [2], [3]], "completed_waves": 1},
+    )
+    # git stub: local tip == origin tip → already pushed, up to date.
+    git_body = '''
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ] && [ "$4" = "--verify" ]; then
+  exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "rev-parse" ]; then
+  echo "cccccccccccccccccccccccccccccccccccccccc"; exit 0
+fi
+if [ "$1" = "-C" ] && [ "$3" = "ls-remote" ]; then
+  printf 'cccccccccccccccccccccccccccccccccccccccc\trefs/heads/x\n'; exit 0
+fi
+exit 0
+'''
+    r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
+    assert r.returncode == 0, r.stderr
+    assert "origin up to date" in r.stderr
+    assert "refusing to finalize" not in r.stderr
+    # No push happened.
+    git_log = (tmp_path / "git.log").read_text()
+    push_invoked = any(
+        "push" in line.split() for line in git_log.splitlines()
+    )
+    assert not push_invoked, git_log
 
 
 def test_fails_when_branch_missing(tmp_path):

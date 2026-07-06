@@ -142,10 +142,13 @@ def test_finalize_no_work_run_exits_cleanly(tmp_path):
 
 
 def test_finalize_already_pushed_short_circuits(tmp_path):
-    """Sanity check: when pushed_at is already set, --finalize prints
-    the existing idempotent "already pushed" message regardless of
-    the branch state. Confirms Fix B didn't disturb the earlier
-    short-circuit at leerie:348-360."""
+    """When pushed_at is set and the run branch is ABSENT locally (a Fly
+    run not yet fetched, or a no-work run — nothing local to compare or
+    re-push), --finalize keeps the original idempotent "already pushed"
+    short-circuit (exit 0). The tip-aware gate (DESIGN §6 *Finalization*)
+    only falls through to re-finalize when the branch is present locally
+    AND origin is behind it; branch-absent must NOT regress into a
+    pointless re-fetch."""
     user_repo = _make_user_repo(tmp_path)
     state_dir = tmp_path / "leerie-state"
     run_id = "feat-already-pushed-abc123"
@@ -168,6 +171,46 @@ def test_finalize_already_pushed_short_circuits(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "already pushed" in result.stderr or "already pushed" in result.stdout
+
+
+def test_finalize_repushes_when_local_branch_ahead_of_origin(tmp_path):
+    """Partial-push recovery (DESIGN §6 *Finalization*, the PR-#22 wedge):
+    when pushed_at is set but the run branch is present locally and AHEAD
+    of origin (a prior finalize pushed a partial branch), --finalize must
+    NOT short-circuit — it falls through to re-finalize so host_finalize
+    can re-push the complete branch. Here origin has no such ref at all
+    (the partial push was rewound / never landed the full branch), which
+    is the exact shape of the incident run."""
+    user_repo = _make_user_repo(tmp_path)
+    # Create the run branch locally so rev-parse --verify succeeds and it
+    # is ahead of (absent) origin — origin has no matching ref.
+    run_id = "feat-partial-pushed-def456"
+    branch = f"leerie/runs/{run_id}"
+    subprocess.run(["git", "-C", str(user_repo), "branch", branch],
+                   check=True, capture_output=True)
+    state_dir = tmp_path / "leerie-state"
+    run_dir = state_dir / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({
+        "branch": branch,
+        "working_branch": "main",
+        "finished_at": "2026-06-02T19:00:00+00:00",
+        "pushed_at": "2026-06-02T19:05:00+00:00",
+    }))
+    (run_dir / "state.json").write_text("{}")
+
+    result = subprocess.run(
+        ["bash", str(LEERIE), "--finalize", run_id],
+        cwd=str(user_repo),
+        capture_output=True, text=True,
+        env={**os.environ, "PATH": os.environ.get("PATH", ""),
+             "LEERIE_STATE_DIR": str(state_dir)},
+    )
+    combined = result.stdout + result.stderr
+    # Must NOT take the idempotent short-circuit — it must announce the
+    # re-finalize instead.
+    assert "is already pushed; nothing to do" not in combined, combined
+    assert "origin is not up to date (partial prior push)" in combined, combined
 
 
 # --- Strict argparse: typos and extra positionals fail loudly --------------

@@ -1613,13 +1613,49 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       exit 1
     fi
     # Short-circuit if already finalized (only possible once run.json
-    # exists, i.e. after fetch_branch has run at least once).
+    # exists, i.e. after fetch_branch has run at least once). This is
+    # tip-aware to match host_finalize's deferred idempotency gate
+    # (DESIGN §6 *Finalization*): pushed_at records *that* a push
+    # happened, not *what* it pushed. Only short-circuit when the run
+    # branch is present locally AND origin already matches its tip — the
+    # ordinary idempotent case. If pushed_at is set but the local branch
+    # is ahead of origin (a prior finalize pushed a PARTIAL branch), or
+    # the branch isn't local yet (Fly run needing fetch first), fall
+    # through so host_finalize can re-push the complete branch.
     _fin_sidecar="$_fin_run_dir/run.json"
     if [ -f "$_fin_sidecar" ]; then
       _already="$(_json_get "$_fin_sidecar" "pushed_at")"
       if [ -n "$_already" ]; then
-        remote_log "--finalize: run $_fin_run_id is already pushed; nothing to do."
-        exit 0
+        # Tip-aware short-circuit (DESIGN §6 *Finalization*). pushed_at
+        # records *that* a push happened, not *what* it pushed. Only the
+        # one case where we can PROVE the push was partial — the run
+        # branch is present locally AND origin is behind it — falls
+        # through to re-finalize. Every other already-pushed shape keeps
+        # the original idempotent short-circuit: branch absent locally
+        # (a Fly run not yet fetched, or a no-work run — nothing local to
+        # compare or re-push), or branch present and origin already
+        # matching.
+        _fin_branch="$(_json_get "$_fin_sidecar" "branch")"
+        _fin_repush="false"
+        if [ -n "$_fin_branch" ] && \
+           git -C "$USER_REPO" rev-parse --verify "refs/heads/$_fin_branch" >/dev/null 2>&1; then
+          # `|| true`: under `set -euo pipefail`, a failing `ls-remote`
+          # (no origin remote, or origin lacks the ref) would otherwise
+          # abort the verb via pipefail before the comparison.
+          _fin_local_tip="$(git -C "$USER_REPO" rev-parse "refs/heads/$_fin_branch" 2>/dev/null || true)"
+          _fin_origin_tip="$(git -C "$USER_REPO" ls-remote origin "refs/heads/$_fin_branch" 2>/dev/null | cut -f1 || true)"
+          if [ "$_fin_local_tip" != "$_fin_origin_tip" ]; then
+            # Local branch present but origin behind/absent → partial
+            # prior push. Fall through so host_finalize re-pushes.
+            _fin_repush="true"
+          fi
+        fi
+        if [ "$_fin_repush" = "true" ]; then
+          remote_log "--finalize: run $_fin_run_id marked pushed but origin is not up to date (partial prior push); re-finalizing."
+        else
+          remote_log "--finalize: run $_fin_run_id is already pushed; nothing to do."
+          exit 0
+        fi
       fi
     fi
     if [ "$_fin_runtime" = "fly" ]; then

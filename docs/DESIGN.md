@@ -1092,6 +1092,25 @@ create` command to retry. The principle is that the user always knows
 exactly what state things are in and exactly which branch holds the work
 to be resolved.
 
+**`pushed_at` gates re-finalize by branch position, not by mere presence.**
+A re-invoked finalize (`leerie --finalize`, a second launcher pass, or
+Fly's `decide_teardown`) must be idempotent, so a run whose `pushed_at` is
+already set is normally a no-op. But `pushed_at` records *that* a push
+happened, not *what* it pushed: a finalize that fired while the run was
+still integrating (e.g. a mid-wave `die()` stamped `finished_at` early,
+before the completion gate existed) can leave `pushed_at` set on a
+**partial** branch — and the completion gate only refuses the *first*
+premature push, not a later correct one. So the short-circuit compares the
+local run-branch tip against the pushed origin tip: **equal tips → no-op**
+(the common case, including every fully-pushed chain wave); **local tip
+strictly ahead of origin → fast-forward re-push + re-open the PR**, gated
+behind the same `completed_waves == len(waves)` completion check so only a
+now-complete run can re-push. This keeps a partial-push from permanently
+wedging a run while preserving idempotency and the chain wave-skip signal
+(which reads the `pushed_at` field, still set, not the tip). It does not
+weaken the run.json invariants: a re-push keeps `pushed_at` set and, on
+success, sets `pr_url` — `pr_url ⇒ pushed_at` still holds.
+
 **Why push by default.** When leerie is invoked in CI or any unattended
 context, a successful run that leaves work only on a local branch is a
 silent failure mode — the work exists but the user has no signal that it

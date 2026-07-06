@@ -72,10 +72,36 @@ host_finalize() {
     return 0
   fi
 
-  # Honor already-pushed (idempotent re-invocation of --finalize).
+  # Early idempotency short-circuit (DESIGN §6 *Finalization*). `pushed_at`
+  # records *that* a push happened, not *what* it pushed — a finalize that
+  # fired mid-integration (a mid-wave die() stamped finished_at early) can
+  # leave pushed_at set on a PARTIAL branch. So this is tip-aware: only
+  # no-op when origin ALREADY matches the local run-branch tip (the
+  # genuinely-pushed case). Doing this *before* the completion gate
+  # preserves the invariant that re-finalizing an already-pushed run is
+  # always a safe no-op — even if state.json shows a stale/incomplete
+  # wave count (a resume artifact, or a run pushed under old semantics).
+  # If pushed_at is set but origin is BEHIND local (a partial prior push),
+  # we deliberately fall through to the completion gate below, so the
+  # re-push is still gated on completed_waves == len(waves). We resolve the
+  # branch here (duplicated with the block below) rather than reordering
+  # the whole function, keeping the change surgical.
   if [ -n "$(jq -r '.pushed_at // ""' "$run_json")" ]; then
-    echo "[leerie] finalize: run already pushed; nothing to do" >&2
-    return 0
+    local _rb _lt _ot
+    _rb="$(jq -r '.branch // ""' "$run_json")"
+    if [ -n "$_rb" ] && git -C "$USER_REPO" rev-parse --verify "refs/heads/$_rb" >/dev/null 2>&1; then
+      # `|| true`: under the launcher's `set -euo pipefail`, a failing
+      # `ls-remote` (no origin remote, or origin lacks the ref — the exact
+      # partial-push shape) would otherwise abort finalize via pipefail.
+      _lt="$(git -C "$USER_REPO" rev-parse "refs/heads/$_rb" 2>/dev/null || true)"
+      _ot="$(git -C "$USER_REPO" ls-remote origin "refs/heads/$_rb" 2>/dev/null | cut -f1 || true)"
+      if [ -n "$_ot" ] && [ "$_lt" = "$_ot" ]; then
+        echo "[leerie] finalize: run already pushed (origin up to date); nothing to do" >&2
+        return 0
+      fi
+    fi
+    # pushed_at set but origin absent/behind → partial push. Fall through
+    # to the completion gate + re-push below.
   fi
 
   # Completion gate (DESIGN §6 *finished_at is a discovery sentinel, not a
@@ -134,6 +160,17 @@ host_finalize() {
     return 0
   fi
 
+  # Note the re-push (DESIGN §6 *Finalization*). If pushed_at is set and we
+  # reached here, the early short-circuit above already ruled out the
+  # equal-tips no-op — so origin is behind local (a prior finalize pushed a
+  # PARTIAL branch), and we have now PASSED the completion gate, so a
+  # re-push publishes a complete branch. Just log intent; the push below
+  # is a fast-forward. pushed_at stays set, so the chain wave-skip signal
+  # (which reads the field, not the tip) is unaffected.
+  if [ -n "$(jq -r '.pushed_at // ""' "$run_json")" ]; then
+    echo "[leerie] finalize: run marked pushed but origin is not up to date (partial prior push); re-pushing" >&2
+  fi
+
   # --- step 1: push -----------------------------------------------------
   local push_args=(git -C "$USER_REPO" push -u origin "$run_branch")
   [ "${NO_VERIFY_PUSH:-false}" = "true" ] && push_args+=(--no-verify)
@@ -171,18 +208,23 @@ host_finalize() {
     pr_title="leerie: $pr_title_llm"
     pr_body="$pr_body_llm"
   else
-    # Deterministic fallback.
+    # Deterministic fallback. Every `jq` here reads $state_json, which may
+    # be ABSENT (the fail-open completion-gate case reaches here when the
+    # pr_writer worker didn't populate pr_title/pr_body). `2>/dev/null ||
+    # true` keeps each read from aborting finalize under the launcher's
+    # `set -euo pipefail` when the file is missing/unreadable; the empty
+    # result then degrades to "n/a" (via or_na_helper) or an empty section.
     local task first_cat source_of_truth started_at finished_at
     local wave_count subtask_count worker_count working_branch_display
     or_na_helper() { [ -n "$1" ] && [ "$1" != "null" ] && printf '%s' "$1" || printf 'n/a'; }
-    task="$(jq -r '.task // ""' "$state_json")"
-    first_cat="$(or_na_helper "$(jq -r '.categories[0] // ""' "$state_json")")"
-    source_of_truth="$(or_na_helper "$(jq -r '.answers.source_of_truth // ""' "$state_json")")"
-    started_at="$(or_na_helper "$(jq -r '.started_at // ""' "$state_json")")"
-    finished_at="$(or_na_helper "$(jq -r '.finished_at // ""' "$state_json")")"
-    wave_count="$(jq -r '.waves | length' "$state_json")"
-    subtask_count="$(jq -r '[.waves[] | length] | add // 0' "$state_json")"
-    worker_count="$(or_na_helper "$(jq -r '.worker_count // ""' "$state_json")")"
+    task="$(jq -r '.task // ""' "$state_json" 2>/dev/null || true)"
+    first_cat="$(or_na_helper "$(jq -r '.categories[0] // ""' "$state_json" 2>/dev/null || true)")"
+    source_of_truth="$(or_na_helper "$(jq -r '.answers.source_of_truth // ""' "$state_json" 2>/dev/null || true)")"
+    started_at="$(or_na_helper "$(jq -r '.started_at // ""' "$state_json" 2>/dev/null || true)")"
+    finished_at="$(or_na_helper "$(jq -r '.finished_at // ""' "$state_json" 2>/dev/null || true)")"
+    wave_count="$(jq -r '.waves | length' "$state_json" 2>/dev/null || true)"
+    subtask_count="$(jq -r '[.waves[] | length] | add // 0' "$state_json" 2>/dev/null || true)"
+    worker_count="$(or_na_helper "$(jq -r '.worker_count // ""' "$state_json" 2>/dev/null || true)")"
     working_branch_display="$(or_na_helper "$working_branch")"
 
     pr_title="leerie: $run_id"
@@ -230,7 +272,10 @@ EOF
   # GitHub's API may not have indexed the freshly-pushed refs yet;
   # retry with backoff to ride out the race (symptom: "Head sha
   # can't be blank" / "No commits between" immediately after push).
-  for _pr_delay in 0 3 8; do
+  # Indexing lag has been observed to exceed the original 11 s window
+  # (PR-#22 incident: a manual PR 8 min post-push was the first to
+  # succeed); 0/5/10/20/30 gives ~68 s of coverage.
+  for _pr_delay in 0 5 10 20 30; do
     [ "$_pr_delay" -gt 0 ] && {
       echo "[leerie] finalize: gh pr create failed; retrying in ${_pr_delay}s…" >&2
       sleep "$_pr_delay"
