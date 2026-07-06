@@ -78,6 +78,39 @@ host_finalize() {
     return 0
   fi
 
+  # Completion gate (DESIGN §6 *finished_at is a discovery sentinel, not a
+  # completion signal*). run.json's finished_at is stamped by the die-path
+  # SystemExit handler on ANY mid-wave abort (needed for run discovery), so
+  # it does NOT mean the run's waves all integrated. Pushing such a run
+  # opens a PR containing only the waves that finished before the crash
+  # (the PR-#22 incident). This is the single chokepoint every host-side
+  # push path funnels through (the auto-finalize block, the --finalize
+  # verb, and Fly decide_teardown all call host_finalize), so gating here
+  # covers them all. The signal lives in state.json (run.json never carries
+  # completed_waves/waves); this mirrors _derive_run_status case 6½.
+  # Fail-open: if state.json is absent or its wave fields are non-numeric,
+  # do NOT block — a legitimately complete run must never be refused over a
+  # missing/unreadable file. The cleared-but-empty terminal state
+  # (waves==[]) sets no_push=true and already returned above; even if it
+  # reached here, `0 < len([])` is false, so it is not blocked.
+  if [ -f "$state_json" ]; then
+    local _no_work _completed _wave_total
+    _no_work="$(jq -r '.no_work_required // false' "$state_json" 2>/dev/null)"
+    _completed="$(jq -r '.completed_waves // 0' "$state_json" 2>/dev/null)"
+    _wave_total="$(jq -r '.waves | length' "$state_json" 2>/dev/null)"
+    case "$_completed:$_wave_total" in
+      *[!0-9:]*) : ;;  # non-numeric (jq error / null) → fail-open, skip gate
+      *)
+        if [ "$_no_work" != "true" ] && [ "$_completed" -lt "$_wave_total" ]; then
+          echo "leerie: error — refusing to finalize run ${run_dir##*/}: only" \
+               "$_completed of $_wave_total waves integrated (run crashed" \
+               "mid-wave). Resume to finish: leerie --resume ${run_dir##*/}" >&2
+          return 1
+        fi
+        ;;
+    esac
+  fi
+
   local run_id run_branch working_branch
   run_id="$(basename "$run_dir")"
   run_branch="$(jq -r '.branch // ""' "$run_json")"

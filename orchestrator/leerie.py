@@ -2329,6 +2329,7 @@ RUN_STATUSES = (
     "seed-failed",
     "corrupt-sidecar",
     "in-progress",
+    "incomplete",
     "done",
     "done-pushed-no-pr",
     "done-pushed-pr",
@@ -2361,6 +2362,15 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
       6. sync_failed_at set        → `sync-failed` (machine still up, work
                                      not on host yet — recover via
                                      `leerie --finalize` then `--kill`).
+      6½. finished_at set but
+          completed_waves <
+          len(waves), and no
+          killed_at/paused_at      → `incomplete` (run died mid-wave; the
+                                     die-path handler stamped finished_at
+                                     for discovery but the waves are not
+                                     all integrated — resumable). See
+                                     DESIGN §6 *finished_at is a discovery
+                                     sentinel, not a completion signal*.
       7. finished_at set           → `done` (run completed, --no-push).
       8. killed_at set             → `killed` (explicit --kill).
       9. paused_at set             → `paused` (pause-on-failure or --stop).
@@ -2398,6 +2408,20 @@ def _derive_run_status(run_json: dict | None, state_json: dict | None) -> str:
         return "done-pushed-no-pr"
     if rj.get("sync_failed_at"):
         return "sync-failed"
+    # 6½. finished_at can be a *discovery* stamp written by the die-path
+    # SystemExit handler on a mid-wave abort, NOT a real completion (DESIGN
+    # §6 *finished_at is a discovery sentinel, not a completion signal*). A
+    # run whose waves are not all integrated is `incomplete`, not `done`,
+    # so --list doesn't mislabel it and finalize doesn't push a partial
+    # branch. killed_at/paused_at take precedence (an explicitly
+    # stopped/killed run is not "incomplete" in the resumable sense).
+    if rj.get("finished_at") and not rj.get("killed_at") and not rj.get("paused_at"):
+        sj = state_json or {}
+        waves = sj.get("waves")
+        if (isinstance(waves, list)
+                and not sj.get("no_work_required")
+                and sj.get("completed_waves", 0) < len(waves)):
+            return "incomplete"
     if rj.get("finished_at"):
         return "done"
     if rj.get("killed_at"):
@@ -14446,6 +14470,18 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     on both runtimes.
     """
     log("phase 6: finalizing")
+    # Completion gate (DESIGN §6 *finished_at is a discovery sentinel, not a
+    # completion signal*). The normal wave loop only reaches finalize after
+    # every wave integrates, but a stray finalize-only invocation (or a
+    # future control-flow bug) must never push a partial run branch or open
+    # a premature PR. Refuse if the waves are not all integrated. The
+    # cleared-but-empty terminal state routes through _finish_no_work_run,
+    # not here, so waves==[] never reaches this guard.
+    waves = st.data.get("waves", [])
+    completed = st.data.get("completed_waves", 0)
+    if isinstance(waves, list) and completed < len(waves):
+        die(f"refusing to finalize: only {completed} of {len(waves)} waves "
+            f"complete. Resume to finish: leerie --resume {st.run_id}")
     st.data["current_phase"] = "phase 6: finalize"
     st.save()
     proc = await run_script("finalize.sh", st.run_id)

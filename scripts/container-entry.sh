@@ -62,6 +62,43 @@ if [ -d /sys/fs/cgroup/leerie.slice ]; then
   chown leerie: /sys/fs/cgroup/leerie.slice 2>/dev/null || true
   chown leerie /sys/fs/cgroup/leerie.slice/cgroup.procs 2>/dev/null || true
   chown leerie /sys/fs/cgroup/leerie.slice/cgroup.subtree_control 2>/dev/null || true
+
+  # Aggregate memory cap on the slice itself (DESIGN §6 *container
+  # boundary's hidden precondition*; IMPLEMENTATION §0.5). The per-worker
+  # cgroups bound each worker; this bounds their SUM so the container as a
+  # whole cannot drive the VM to a *global* OOM (which kills unprotected
+  # host-session processes — the nerdctl client — orphaning the container
+  # and wedging the flock). Capping leerie.slice/memory.max makes an
+  # over-budget container trip a cgroup-scoped OOM (kills a worker inside
+  # the slice) instead. Derived from VM MemTotal read here, so it is
+  # portable across Colima and native Linux (the host launcher cannot read
+  # the VM's MemTotal on macOS). Reserve headroom for PID 1 + the VM's own
+  # daemons (sshd, lima-guestagent, containerd): cap = MemTotal - max(1GiB,
+  # 12.5%). Overridable via LEERIE_CONTAINER_MEMORY_MAX_BYTES (e.g. from a
+  # future launcher flag); "0"/"max" disables the cap. Best-effort: any
+  # failure leaves the slice uncapped (prior behavior).
+  # Sets memory.max (RAM) only, not memory.swap.max: a capped slice may
+  # swap before the cgroup OOM fires, but that still contains the pressure
+  # to the slice (no global OOM). Bounding total RAM+swap is a possible
+  # future refinement, not needed to prevent the host-cascade wedge.
+  _cap="${LEERIE_CONTAINER_MEMORY_MAX_BYTES:-}"
+  if [ "$_cap" = "0" ] || [ "$_cap" = "max" ]; then
+    _cap=""   # explicit opt-out
+  elif [ -z "$_cap" ] && [ -r /proc/meminfo ]; then
+    _memtotal_kb="$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo 2>/dev/null)"
+    if [ -n "$_memtotal_kb" ] && [ "$_memtotal_kb" -gt 0 ] 2>/dev/null; then
+      _total_bytes=$((_memtotal_kb * 1024))
+      _reserve=$((_total_bytes / 8))            # 12.5%
+      _min_reserve=$((1024 * 1024 * 1024))      # 1 GiB floor
+      [ "$_reserve" -lt "$_min_reserve" ] && _reserve="$_min_reserve"
+      if [ "$_total_bytes" -gt "$_reserve" ]; then
+        _cap=$((_total_bytes - _reserve))
+      fi
+    fi
+  fi
+  if [ -n "$_cap" ] && [ "$_cap" -gt 0 ] 2>/dev/null; then
+    echo "$_cap" > /sys/fs/cgroup/leerie.slice/memory.max 2>/dev/null || true
+  fi
 fi
 
 cd /work

@@ -7,8 +7,13 @@ Status table (in priority order):
   3. pr_error set              → `pr-failed`
   4. pr_url set                → `done-pushed-pr`
   5. pushed_at set             → `done-pushed-no-pr`
-  6. finished_at set           → `done`
-  7. otherwise                 → `in-progress`
+  6. sync_failed_at set        → `sync-failed`
+  6½. finished_at set but waves
+      not all integrated        → `incomplete`
+  7. finished_at set           → `done`
+  8. killed_at set             → `killed`
+  9. paused_at set             → `paused`
+ 10. otherwise                 → `in-progress`
 """
 from __future__ import annotations
 
@@ -178,13 +183,74 @@ def test_status_table_lists_every_value_used(leerie):
     can return — drift guard."""
     expected = {
         "seed-failed",
-        "corrupt-sidecar", "in-progress", "done",
+        "corrupt-sidecar", "in-progress", "incomplete", "done",
         "done-pushed-no-pr", "done-pushed-pr",
         "push-failed", "pr-failed",
         "paused", "killed",
         "sync-failed",
     }
     assert set(leerie.RUN_STATUSES) == expected
+
+
+# --- completion gate (DESIGN §6 *finished_at is a discovery sentinel*) ----
+
+def test_status_incomplete_finished_at_but_waves_unintegrated(leerie):
+    """A run whose die-path handler stamped finished_at mid-wave
+    (completed_waves < len(waves)) reads as `incomplete`, NOT `done` — so
+    --list doesn't mislabel it and finalize doesn't push a partial branch.
+    This is the exact run A / run B OOM-crash shape."""
+    rj = {"finished_at": "2026-07-05T23:25:46+00:00"}
+    sj = {"completed_waves": 1, "waves": [["a"], ["b"], ["c"], ["d"], ["e"]]}
+    assert leerie._derive_run_status(rj, sj) == "incomplete"
+
+
+def test_status_done_when_all_waves_integrated(leerie):
+    """finished_at + completed_waves == len(waves) → genuinely done."""
+    rj = {"finished_at": "2026-07-05T23:25:46+00:00"}
+    sj = {"completed_waves": 5, "waves": [["a"], ["b"], ["c"], ["d"], ["e"]]}
+    assert leerie._derive_run_status(rj, sj) == "done"
+
+
+def test_status_no_work_run_is_done_not_incomplete(leerie):
+    """Cleared-but-empty terminal state: waves == [] and completed == 0.
+    `0 < len([])` is False, so it stays `done`, not `incomplete`."""
+    rj = {"finished_at": "2026-07-05T23:25:46+00:00"}
+    sj = {"completed_waves": 0, "waves": [], "no_work_required": True}
+    assert leerie._derive_run_status(rj, sj) == "done"
+
+
+def test_status_incomplete_only_with_waves_state(leerie):
+    """Without a waves list in state_json (e.g. empty state), finished_at
+    still reads as done — the gate needs the waves signal to fire."""
+    rj = {"finished_at": "2026-07-05T23:25:46+00:00"}
+    assert leerie._derive_run_status(rj, {}) == "done"
+
+
+def test_status_incomplete_yields_to_pushed(leerie):
+    """If a partial run was somehow pushed, push/PR checks fire first —
+    the incomplete check is only for the unpushed finished_at case."""
+    rj = {
+        "finished_at": "2026-07-05T23:25:46+00:00",
+        "pushed_at": "2026-07-05T23:28:20+00:00",
+    }
+    sj = {"completed_waves": 1, "waves": [["a"], ["b"]]}
+    # pushed_at fires before the incomplete check (matches current
+    # precedence order — a push that happened is a fact worth surfacing).
+    assert leerie._derive_run_status(rj, sj) == "done-pushed-no-pr"
+
+
+def test_status_incomplete_guarded_by_killed_and_paused(leerie):
+    """The incomplete check itself is guarded by `not killed_at and not
+    paused_at` so an explicitly stopped partial run does not read as
+    `incomplete`. (Note: `finished_at`→`done` already precedes the
+    killed/paused checks in the taxonomy — pre-existing behavior — and
+    real sidecars are guarded against finished_at+killed_at by
+    _validate_run_json; this test pins only the incomplete-guard, using a
+    paused run with NO finished_at so the paused check is what fires.)"""
+    sj = {"completed_waves": 1, "waves": [["a"], ["b"]]}
+    rj_paused = {"paused_at": "2026-07-05T23:30:00+00:00",
+                 "fly_machine_id": "abc"}
+    assert leerie._derive_run_status(rj_paused, sj) == "paused"
 
 
 def test_orphan_marker_returns_seed_failed(leerie):

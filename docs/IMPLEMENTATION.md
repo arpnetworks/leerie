@@ -748,6 +748,39 @@ Common to both modes:
   filesystem survive for `--resume`.
 - `--name leerie-<ts>-<pid>` makes `nerdctl ps` legible and
   `nerdctl logs <name>` targetable for the rare diagnostic case.
+- `--label leerie.launcher_pid=<pid>` records the owning launcher's
+  PID (`$$`) on the container. The stale-container reaper (below) reads
+  it back via `nerdctl inspect` to test owner liveness without parsing
+  the `--name` suffix. `<pid>` is the same `$$` used in `--name`.
+- Aggregate memory cap: **not a `nerdctl run` flag.** `container-entry.sh`
+  (PID 1) writes `leerie.slice/memory.max` (the parent cgroup of every
+  per-worker cgroup), derived from VM `MemTotal` read from
+  `/proc/meminfo` (portable across Colima and native Linux; the host
+  launcher cannot read the VM's MemTotal on macOS, so a `nerdctl
+  --memory` flag is not used). This bounds the sum across all concurrent
+  workers, distinct from the per-worker cgroup caps in §6 (*Memory
+  containment*) which bound each worker individually. See DESIGN §6
+  *container boundary's hidden precondition* and the caps table in §6.
+
+**Abnormal-exit cleanup (traps + reaper).** The container boundary
+guarantees namespace teardown *when PID 1 exits*, but a host CLI that
+dies without forwarding a stop signal (OOM-killed `nerdctl` client,
+uncatchable SIGKILL) leaves the container orphaned and holding the
+run-dir flock — every later `--resume` then exits `EXIT_LOCKED=75`
+(DESIGN §6). Two launcher mechanisms close this:
+
+- **Kill-on-exit trap.** INT/TERM traps on the local run path
+  `nerdctl kill` the container (via its run-id, which equals the
+  container ID — see *Single-owner enforcement*) before the launcher
+  exits, and the EXIT trap performs the same kill *before* it removes
+  the cidfile. Reliable for Ctrl-C/SIGTERM; does NOT help under
+  SIGKILL/OOM (uncatchable) — that is the reaper's job.
+- **Stale-container reaper.** On the local `--resume` path, before the
+  `nerdctl run` spawn, the launcher looks up any container whose ID
+  equals the resume run-id (`nerdctl inspect`), and if it is still
+  running but its owning launcher (`leerie.launcher_pid` label) is dead
+  (`kill -0` fails), `nerdctl kill`s it first — making `--resume`
+  self-heal the orphaned-flock wedge instead of returning 75.
 
 The plugin mode flow above is exactly what `commands/leerie.md` already
 documents — it works through the container with zero new mechanism
@@ -3002,6 +3035,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | per-worker idle-event warning (`worker_idle_warn_sec`) | 300 s (5 min) | log a `no stdout events in <gap>s` warning naming the worker, its PID, and any stderr tail. Observation-only — the worker is NOT killed; `worker_timeout_sec` remains the only kill. Surfaces silent-hang failures (a worker that never emits its first `system/init` event) so the user is not left with zero feedback between phase start and the 90-min hard kill. |
 | per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived from `/proc/meminfo` (VM ram split across `max_parallel + 1` slots, clamped to ≤ 4 GiB), or `--worker-memory-max SIZE` / `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max` in `leerie.toml`. Suffixes K/M/G/T accepted | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services (sshd, lima-guestagent) are not eligible victims. Requires a writable cgroup root, picked by `_detect_cgroup_root()`: prefers `/sys/fs/cgroup/leerie.slice` (created and chowned to the leerie user by `scripts/container-entry.sh` at PID 1 / root — the Dockerfile intentionally omits `USER leerie` so the entrypoint can chown before dropping privilege via `runuser -u leerie -- ...`), falls back to `/sys/fs/cgroup`. Local nerdctl additionally needs the launcher's `--mount type=bind,source=/sys/fs/cgroup,...rshared` flag so the entrypoint can see the host VM's cgroupfs, and `--cgroupns=host` so the container shares the host VM's cgroup namespace (nerdctl's default `--cgroupns=private` + `nsdelegate` blocks non-root `cgroup.procs` writes); Fly's microVM exposes cgroupfs directly with no namespace boundary. The probe (`_cgroup_probe`) tests both directory creation and actual `cgroup.procs` enrollment (spawning a short-lived subprocess) so `nsdelegate`-related failures degrade cleanly at startup rather than failing per-worker. On incompatible hosts (older kernel, missing v2 controllers, or missing `--cgroupns=host`) the probe logs one warn line naming the attempted root and the likely cause, and the run continues uncapped. See DESIGN §6 *Memory containment*. |
 | per-worker cgroup PIDs cap (`worker_pids_max`) | 256 | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Catches runaway fork-bomb behavior in tool subtrees. |
+| aggregate container memory cap (`leerie.slice/memory.max`) | auto-derived in `scripts/container-entry.sh` (PID 1) from VM `MemTotal` in `/proc/meminfo`: `MemTotal - max(1 GiB, 12.5%)`, reserving headroom for PID 1 + VM daemons (sshd, lima-guestagent, containerd). Overridable via `LEERIE_CONTAINER_MEMORY_MAX_BYTES` (raw bytes); `0`/`max` opts out. **Intentional provenance deviation:** unlike the per-worker cap, there is *no* CLI flag / `leerie.toml` key / `DEFAULT_CAPS` entry — the cap is applied by the shell entrypoint *before* the Python orchestrator (and its resolver machinery) starts, so a Python-side resolver could not set it in time; the env var is the single override knob. Best-effort: any read/write failure leaves the slice uncapped (prior behavior). Sets `memory.max` (RAM) only, not `memory.swap.max` — a capped slice may swap before the cgroup OOM fires, which still contains the pressure to the slice (no global OOM); bounding total RAM+swap via `memory.swap.max` is a possible future refinement. | when the slice's aggregate RSS exceeds the cap the kernel triggers a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`) that kills a process *inside the container* (per-worker `-998` protection is only relative within the slice), instead of a VM-wide *global* OOM that would kill unprotected host-session processes — the `nerdctl` client especially — and orphan the container (wedging the run-dir flock). See DESIGN §6 *container boundary's hidden precondition*. |
 | auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap. See §3 *Auth/quota backoff*. |
 | mechanical-feedback rounds for judgment workers (`judgment_check_rounds`) | 3 | classifier, reconciler, provision, overlap judge, integrator. The orchestrator runs deterministic checks (file existence, graph cycles, lockfile consistency) on each worker's output and re-invokes with structured feedback if issues are found. On exhaustion, proceed with best result + warnings. CRITIC pattern (ICLR 2024). |
 | mechanical-feedback rounds for planner (`planner_check_rounds`) | 3 | Same CRITIC pattern, but higher default because the planner has richer checks (phantom paths, dangling deps, intra-domain cycles, protected paths, task-file coverage). |
@@ -4305,6 +4339,50 @@ as a new terminal state (`killed`); `_derive_run_status` reads it
 before `paused_at`. `_validate_run_json` enforces that `paused_at`,
 `pushed_at`, and `killed_at` are mutually exclusive (same invariant
 pattern as today's `paused_at` vs `pushed_at`).
+
+#### Completion gate (`incomplete` status + finalize refusal)
+
+DESIGN §6 *`finished_at` is a discovery sentinel, not a completion
+signal*. Because `main()`'s `except SystemExit` handler stamps
+`finished_at` on any post-setup `die()` (needed for `fetch_branch`
+discovery), `finished_at` does not by itself mean the run's waves all
+integrated. A run OOM-killed mid-wave can carry `finished_at` with
+`completed_waves < len(waves)`. Three code-surface elements gate on real
+completion, all reading the same signal from `state.json` (`run.json`
+never carries `completed_waves`/`waves`):
+
+- **`_derive_run_status`** takes `state_json` (already passed) and, when
+  `finished_at` is set but `completed_waves < len(state_json["waves"])`
+  and neither `killed_at` nor `paused_at` is set, returns the new status
+  `incomplete` instead of `done`/`done-pushed-*`. The check fires after
+  the push/PR-error checks (a real push/PR error still surfaces as
+  itself) but before the `finished_at`→`done` check. `incomplete` is
+  added to the derived-status set and is a valid `--list --status`
+  filter value. The cleared-but-empty terminal state
+  (`no_work_required`, `waves == []`) is exempt — `completed_waves (0)
+  < len([]) (0)` is false, so it still reads `done`. This gates only the
+  `--list` *display*, not the push.
+- **`phase_finalize`** guards its entry: if
+  `completed_waves < len(waves)`, it `die()`s with a "refusing to
+  finalize: N of M waves complete" message rather than writing the real
+  `finished_at`. Belt-and-suspenders — the normal wave loop only reaches
+  `phase_finalize` after all waves integrate (the no-work path returns
+  before it), but a stray finalize-only invocation is blocked here. Note
+  this is the *in-container* orchestrator; it does not itself push.
+- **`host_finalize`** (`scripts/host-finalize.sh`) is the **load-bearing
+  gate**, because the push+PR is host-side. After the `no_push` and
+  `pushed_at` early-returns, it reads `$run_dir/state.json` (already in
+  scope for the PR-body fallback) and `return 1`s with an actionable
+  resume hint when `no_work_required != true` and `completed_waves <
+  (.waves | length)`. All three host-side push entry points funnel
+  through `host_finalize` — the launcher's auto-finalize block
+  (`leerie`), the `leerie --finalize <id>` verb, and Fly's
+  `decide_teardown` (`scripts/remote/provision.sh`) — so this one gate
+  covers them all. Fail-open: absent/non-numeric wave fields skip the
+  gate so a legitimately complete run is never blocked over a missing
+  file. Without this gate, `_derive_run_status` and `phase_finalize`
+  alone would still let a stray `--finalize` push a partial branch (the
+  PR-#22 incident).
 
 #### Accept-blocked verb (`leerie --accept-blocked`)
 

@@ -911,6 +911,43 @@ subtasks") triggers the sync-failure banner. The value is idempotent
 on `--resume`: `phase_finalize` overwrites it with the real completion
 time if the run succeeds on retry.
 
+**`finished_at` is a discovery sentinel, not a completion signal.**
+Because the `except SystemExit` handler stamps `finished_at` on *any*
+post-setup `die()` — including a mid-wave "unresolved subtasks" abort
+with `completed_waves < len(waves)` — `finished_at` alone does not mean
+the run finished its work. A run whose container was OOM-killed mid-wave
+(the orphan case above) can end up with `finished_at` set and only 1 of
+5 waves integrated. Treating `finished_at` as "done" is what makes
+`leerie --list` render such a run `done` and lets a stray finalize push
+an incomplete run branch and open a premature PR. **The completion
+signal is `completed_waves == len(waves)`** (or the documented
+cleared-but-empty terminal state, which sets `waves = []`). `finished_at`
+is left overloaded (the die-path stamp is still needed for run
+discovery); instead, every consumer that would treat a run as *terminal*
+cross-checks wave completion against `state.json` (which alone carries
+`completed_waves`/`waves` — `run.json` never does). Three gates enforce
+this, all reading the same signal:
+
+1. `_derive_run_status` returns `incomplete` (not `done`) when
+   `finished_at` is set but `completed_waves < len(waves)` and the run is
+   neither killed nor paused — so `leerie --list` never mislabels a
+   crashed run.
+2. `phase_finalize`'s entry `die()`s rather than writing the real
+   `finished_at` when `completed_waves < len(waves)` — a defensive guard,
+   since the normal wave loop only reaches finalize after all waves
+   integrate.
+3. **`host_finalize` (the load-bearing gate) refuses the push+PR** when
+   `state.json` shows `completed_waves < len(waves)` and not
+   `no_work_required`. The push is host-side, and *all three* host-side
+   push paths — the launcher's auto-finalize block, the `leerie
+   --finalize <id>` verb, and Fly's `decide_teardown` — funnel through
+   `host_finalize`, so this single gate covers them all. It fails open
+   when `state.json` is absent so a legitimately complete run is never
+   blocked.
+
+A genuine completion is unaffected: by the time `phase_finalize` and
+`host_finalize` run on a real completion, `completed_waves == len(waves)`.
+
 **Recovery when the orchestrator dies before `finished_at`.** An
 uncontrolled exit — SIGKILL, OOM, power loss, or any crash that
 bypasses the `except SystemExit` handler — before `phase_finalize`
@@ -1144,6 +1181,57 @@ guarantee. If it half-finishes under Ctrl-C, or fails to escalate
 SIGTERM→SIGKILL before asyncio shutdown closes the event loop,
 that is no longer a leak — the container boundary catches every
 survivor when the orchestrator exits.
+
+**The container boundary's hidden precondition: the orchestrator
+must actually exit.** The kernel reaps the PID namespace *when PID 1
+dies* — but nothing guarantees PID 1 dies just because the host-side
+`nerdctl run` client did. On the local runtime the launcher relies on
+`nerdctl run -i` forwarding the host process's terminating signal to
+container PID 1; that link is not itself enforced by leerie. The
+failure mode observed in practice: a **VM-wide OOM** (two multi-worker
+runs sharing one 8 GB Colima VM exhausted all memory) invoked the
+kernel's *global* OOM-killer, which — because every in-container
+process carries `oom_score_adj:-998` (containerd's default) — spared
+the workers and the orchestrator and instead killed the *unprotected
+host-session processes*, including the `nerdctl run` clients. The
+host CLI died (terminal shows `exit status 255`, finalize is skipped),
+but container PID 1 kept running as an **orphan**. Because the
+orchestrator is alive, it still holds the run-dir flock (§6 *Single
+owner per run dir*), so every subsequent `--resume` correctly loses
+the flock race and exits `EXIT_LOCKED=75` — the run is wedged until
+the orphan is killed by hand. Three mechanisms close this gap, defense
+in depth:
+
+1. **Aggregate memory cap (prevention).** `container-entry.sh` (PID 1)
+   writes a container-level cap to the `leerie.slice` cgroup's
+   `memory.max` — the parent of every per-worker cgroup — derived from VM
+   `MemTotal` read from `/proc/meminfo` (so it is portable across Colima
+   and native Linux; the host launcher cannot read the VM's MemTotal on
+   macOS, which is why the derivation lives in-container rather than as a
+   `nerdctl run --memory` flag). A container that exceeds its cap triggers
+   a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`), which kills a process
+   *inside that container* — where the `-998` protection is only relative
+   — rather than a global OOM that reaches out to host-session processes.
+   This converts "kill the host client → orphan → wedge" into "kill a
+   worker in the guilty container → the orchestrator observes a clean
+   worker failure." It bounds the *aggregate*; the per-worker cgroup caps
+   (below, *Memory
+   containment*) bound each worker but not their sum.
+2. **Kill-on-exit trap (proactive cleanup).** The launcher installs
+   INT/TERM traps on the local run path that `nerdctl kill` the
+   container (via its run-id / cidfile) before the launcher exits, so a
+   Ctrl-C or SIGTERM to the host CLI tears the container down instead of
+   orphaning it. *Limitation, stated honestly:* OOM and SIGKILL deliver
+   an uncatchable signal — the trap never runs in exactly the OOM case
+   above — so the trap is a complement to, not a substitute for, the
+   reaper.
+3. **Stale-container reaper (recovery).** Before spawning on the local
+   `--resume` path, the launcher checks for an already-`Up` container
+   for this run whose owning launcher PID is dead (identified via a
+   `leerie.launcher_pid` label set at spawn) and `nerdctl kill`s it
+   first. This is the load-bearing fix for the OOM case: it makes
+   `--resume` self-heal the orphaned-flock wedge instead of returning
+   75, regardless of *how* the orphan was created.
 
 The container boundary holds across both invocation modes:
 

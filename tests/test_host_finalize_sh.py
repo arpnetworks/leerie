@@ -204,7 +204,11 @@ def test_pr_failure_is_non_fatal(tmp_path):
             "finished_at": "2026-05-29T16:00:00+00:00",
         },
         state_json={"task": "x", "started_at": "2026-05-29T15:00:00+00:00",
-                    "categories": ["feature"], "waves": [[]]},
+                    "categories": ["feature"], "waves": [[]],
+                    # A genuinely finalized run has completed_waves ==
+                    # len(waves); required so the completion gate treats
+                    # this as complete (not a mid-wave crash).
+                    "completed_waves": 1},
     )
     r = _run_host_finalize(tmp_path, run_dir,
                            gh_body='echo "fatal: simulated gh failure" >&2; exit 1')
@@ -215,3 +219,89 @@ def test_pr_failure_is_non_fatal(tmp_path):
     assert after.get("pr_url") is None
     assert after.get("pr_error") is not None
     assert "simulated gh failure" in after["pr_error"]
+
+
+# --- completion gate (DESIGN §6, the PR-#22 fix) --------------------------
+
+def test_gate_blocks_mid_wave_crashed_run(tmp_path):
+    """A run with finished_at (die-path discovery stamp) but
+    completed_waves < len(waves) is refused: no push, no PR, return 1 with
+    an actionable resume hint. This is the single chokepoint that prevents
+    the launcher / --finalize verb / Fly teardown from pushing a partial
+    run branch and opening a premature PR (the PR-#22 incident)."""
+    run_dir = _make_run(
+        tmp_path, "crash-run-aaaaaa",
+        run_json={
+            "branch": "leerie/runs/crash-run-aaaaaa",
+            "working_branch": "main",
+            "finished_at": "2026-07-05T23:25:46+00:00",
+        },
+        state_json={"completed_waves": 1, "waves": [[1], [2], [3], [4], [5]]},
+    )
+    r = _run_host_finalize(tmp_path, run_dir)
+    assert r.returncode == 1, r.stderr
+    assert "refusing to finalize" in r.stderr
+    assert "1 of 5 waves" in r.stderr
+    # No push, no PR, and no pushed_at written.
+    assert not (tmp_path / "git.log").exists() or \
+        "push" not in (tmp_path / "git.log").read_text()
+    after = json.loads((run_dir / "run.json").read_text())
+    assert after.get("pushed_at") is None
+
+
+def test_gate_allows_fully_integrated_run(tmp_path):
+    """completed_waves == len(waves) → the gate lets the run through to
+    the normal push path."""
+    run_dir = _make_run(
+        tmp_path, "done-run-aaaaaa",
+        run_json={
+            "branch": "leerie/runs/done-run-aaaaaa",
+            "working_branch": "main",
+            "finished_at": "2026-07-05T23:25:46+00:00",
+        },
+        state_json={"task": "x", "started_at": "2026-07-05T21:00:00+00:00",
+                    "categories": ["feature"],
+                    "completed_waves": 3, "waves": [[1], [2], [3]]},
+    )
+    r = _run_host_finalize(tmp_path, run_dir)
+    assert r.returncode == 0, r.stderr
+    assert "refusing to finalize" not in r.stderr
+    after = json.loads((run_dir / "run.json").read_text())
+    assert after.get("pushed_at") is not None
+
+
+def test_gate_allows_no_work_run(tmp_path):
+    """The cleared-but-empty terminal state (no_work_required, waves==[])
+    is not blocked. (It normally short-circuits on no_push=true earlier;
+    this pins the gate's own no-work exemption directly.)"""
+    run_dir = _make_run(
+        tmp_path, "nowork-run-aaaaaa",
+        run_json={
+            "branch": "leerie/runs/nowork-run-aaaaaa",
+            "working_branch": "main",
+            "finished_at": "2026-07-05T23:25:46+00:00",
+        },
+        state_json={"no_work_required": True, "completed_waves": 0, "waves": []},
+    )
+    r = _run_host_finalize(tmp_path, run_dir)
+    assert r.returncode == 0, r.stderr
+    assert "refusing to finalize" not in r.stderr
+
+
+def test_gate_fails_open_without_state_json(tmp_path):
+    """No state.json (state_json=None) → fail-open: the gate does not fire,
+    so a legitimately complete run is never blocked over a missing file."""
+    run_dir = _make_run(
+        tmp_path, "nostate-run-aaaaaa",
+        run_json={
+            "branch": "leerie/runs/nostate-run-aaaaaa",
+            "working_branch": "main",
+            "finished_at": "2026-07-05T23:25:46+00:00",
+        },
+        # no state_json
+    )
+    r = _run_host_finalize(tmp_path, run_dir)
+    assert r.returncode == 0, r.stderr
+    assert "refusing to finalize" not in r.stderr
+    after = json.loads((run_dir / "run.json").read_text())
+    assert after.get("pushed_at") is not None

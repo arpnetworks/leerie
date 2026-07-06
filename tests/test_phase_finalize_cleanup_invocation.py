@@ -44,3 +44,22 @@ def test_phase_finalize_does_not_use_bare_cleanup(leerie):
         "The no-arg mode is the operator-facing y/N path and aborts "
         "non-interactively."
     )
+
+
+def test_phase_finalize_has_completion_gate(leerie):
+    """Fix I / DESIGN §6: phase_finalize must refuse to finalize a run whose
+    waves are not all integrated (completed_waves < len(waves)), so a stray
+    finalize-only invocation never pushes a partial run branch or opens a
+    premature PR. The guard must precede the finalize.sh call."""
+    src = inspect.getsource(leerie.phase_finalize)
+    assert "completed_waves" in src and "refusing to finalize" in src, (
+        "phase_finalize must gate on completed_waves == len(waves) and "
+        "die() with a 'refusing to finalize' message on a partial run."
+    )
+    # The gate must come BEFORE the finalize.sh invocation (else a partial
+    # run would already have run finalize/cleanup before the check fires).
+    gate_pos = src.index("refusing to finalize")
+    finalize_pos = src.index('run_script("finalize.sh"')
+    assert gate_pos < finalize_pos, (
+        "the completion gate must fire before run_script('finalize.sh')"
+    )

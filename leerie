@@ -367,6 +367,50 @@ _is_local_container() {
   [ -n "$run_id" ] && nerdctl inspect "$run_id" >/dev/null 2>&1
 }
 
+# --- _reap_orphaned_container ---------------------------------------------
+# Fix E (DESIGN §6 *container boundary's hidden precondition*). Before a
+# local --resume spawns a fresh container, kill any container for this run
+# that is still "Up" but whose owning launcher process is dead — the
+# orphaned-orchestrator-holds-flock wedge (typically after an OOM-killed
+# nerdctl client). Without this, the still-alive orphan holds the run-dir
+# flock and the new orchestrator's State.__init__ loses the race and exits
+# EXIT_LOCKED=75, wedging the run until a manual `nerdctl kill`.
+#
+# Lookup: the run-id IS the container id for local runs (DESIGN §6), so
+# `nerdctl inspect <run-id>` targets it directly — no name/command parsing.
+# Owner liveness: the container carries a `leerie.launcher_pid` label set at
+# spawn; if that PID is gone (kill -0 fails), the container is orphaned.
+# Best-effort throughout: any probe failure leaves the container untouched
+# and the existing flock/EXIT_LOCKED path takes over.
+_reap_orphaned_container() {
+  local run_id="$1"
+  [ -n "$run_id" ] || return 0
+  # Only act on a container that exists AND is still running.
+  local status
+  status="$(nerdctl inspect -f '{{.State.Status}}' "$run_id" 2>/dev/null)" || return 0
+  [ "$status" = "running" ] || return 0
+  # Read the owning launcher PID from the label. Missing label (older
+  # container from before this change) → treat as unknown; do NOT reap, to
+  # avoid killing a genuinely live run.
+  local owner_pid
+  owner_pid="$(nerdctl inspect -f '{{index .Config.Labels "leerie.launcher_pid"}}' "$run_id" 2>/dev/null)"
+  case "$owner_pid" in
+    ''|'<no value>') return 0 ;;
+    *[!0-9]*) return 0 ;;
+  esac
+  # If the owning launcher is still alive, this is a genuine duplicate-resume
+  # attempt (another leerie is driving the run) — leave it; the orchestrator
+  # flock will correctly refuse the duplicate with EXIT_LOCKED.
+  if kill -0 "$owner_pid" 2>/dev/null; then
+    return 0
+  fi
+  remote_log "--resume: reaping orphaned container for run $run_id (owning launcher pid $owner_pid is dead)"
+  nerdctl kill "$run_id" >/dev/null 2>&1 || true
+  # nerdctl --rm removes it on kill; give the kernel a moment to release the
+  # run-dir flock before the fresh orchestrator tries to acquire it.
+  sleep 1
+}
+
 # --- host-side per-repo state directory ----------------------------------
 # Resolves LEERIE_STATE_HOST_DIR: the host path for this repo's leerie run
 # state (runs/, worktrees/, etc.). Lives under $HOME so Colima auto-shares
@@ -2669,6 +2713,15 @@ if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
   fi
 fi
 
+# Fix E: reap an orphaned still-Up container from a dead launcher before we
+# spawn a fresh one on the local resume path, so --resume self-heals the
+# OOM-orphan flock wedge instead of exiting EXIT_LOCKED=75. Runs only for
+# genuine local resumes (after Fly auto-detection above may have flipped
+# RUNTIME to fly).
+if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && [ -n "$LEERIE_RUN_ID" ]; then
+  _reap_orphaned_container "$LEERIE_RUN_ID"
+fi
+
 # --- LEERIE_FLY_APP (Fly.io app name) ------------------------------------
 # Fly.io app names are globally unique — the hardcoded default "leerie" is
 # already taken, so every user must set their own. Resolution:
@@ -4659,9 +4712,35 @@ else
 
   _cidfile="$LEERIE_STATE_HOST_DIR/.cidfile-$$"
   rm -f "$_cidfile"
+
+  # Fix D (DESIGN §6 *container boundary's hidden precondition*): kill the
+  # container if the launcher is interrupted, so a Ctrl-C / SIGTERM to this
+  # process tears the container down instead of orphaning it (an orphaned,
+  # still-Up container keeps holding the run-dir flock and wedges --resume).
+  # nerdctl run -i normally forwards the signal to PID 1, but this is the
+  # backstop for signals that don't get forwarded across the Colima VM
+  # boundary or that arrive before/after nerdctl owns the tty.
+  #   Limitation, by design: SIGKILL (signal 9, what OOM delivers) is
+  #   uncatchable — this trap never runs in the OOM case. The stale-container
+  #   reaper on the next --resume (Fix E) is the backstop for that.
+  # The EXIT arm reorders vs the outer host-scratch trap (set earlier) so the
+  # kill happens BEFORE the cidfile is removed; it then chains the original
+  # cleanup so $STAGE and the cidfile are still removed.
+  _kill_container_from_cidfile() {
+    if [ -f "${_cidfile:-}" ]; then
+      local _cid
+      _cid="$(cat "$_cidfile" 2>/dev/null)"
+      [ -n "$_cid" ] && nerdctl kill "$_cid" >/dev/null 2>&1 || true
+    fi
+  }
+  trap '_kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+  trap '_kill_container_from_cidfile; exit 130' INT
+  trap '_kill_container_from_cidfile; exit 143' TERM
+
   nerdctl run \
     --rm $TTY_FLAGS \
     --name "leerie-$(date +%s)-$$" \
+    --label "leerie.launcher_pid=$$" \
     --cidfile "$_cidfile" \
     -v "$_cidfile:/run/leerie-cidfile:ro" \
     -e LEERIE_INSPECT_DIRS= \
