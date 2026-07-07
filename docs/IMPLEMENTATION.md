@@ -2339,13 +2339,13 @@ single `$LEERIE_STATE_HOST_DIR` and cannot be reused directly.
 
 `group_id` is an optional string field in `run.json`. It is written
 at two points: (1) by the orchestrator at run-start when `--group-id`
-is supplied as a CLI arg (`orchestrator/leerie.py:15022`), so the
+is supplied as a CLI arg (`orchestrator/leerie.py:15061`), so the
 field appears in `run.json` immediately when the run begins; and (2)
 by the `--group` launcher arm after all members complete, via
 `update_run_json … group_id "$_group_id"` (the tag-back step in
 `leerie`). The `chain_id` field follows the same pattern.
 `_validate_run_json`
-(`orchestrator/leerie.py:1973`) does not add any invariant check on
+(`orchestrator/leerie.py:1994`) does not add any invariant check on
 `group_id` — it is informational and orthogonal to the push/pause/kill
 state machine. The field is accepted by the validator without error
 because validators only check fields they know about (unknown keys pass
@@ -2404,7 +2404,7 @@ state dir), so the discovery is:
 
 | Runtime | Discovery mechanism |
 |---------|---------------------|
-| **Local** | After `wait` on a member, scan `~/.leerie/<member-basename>/runs/*/run.json` for the newest file with `finished_at` set. This is the same discovery the local finalize already uses (`leerie:4967-4992`). No cidfile read, no `--rm` race — the `run.json` is durably on disk by the time `wait` returns. |
+| **Local** | After `wait` on a member, scan `~/.leerie/<member-basename>/runs/*/run.json` for the newest file with `finished_at` set (the `--group` arm's tag-back loop in `leerie`). No cidfile read, no `--rm` race — the `run.json` is durably on disk by the time `wait` returns. |
 | **Fly** | The existing `remote/<child-pid>.json` / `fly-machine.json` pointer path (`leerie:2263-2289`), applied per-member using the member's own state dir. The child's PID is `$!`; the member's state dir is resolved from its basename. |
 
 After discovering each member's `run.json`, the launcher calls
@@ -2454,19 +2454,19 @@ iterates `<state_dir_N>/runs/*/run.json` for each supplied directory.
 When a member's planner declares a cross-repo prerequisite as
 `requires.extent: external` (DESIGN.md §5), those entries accumulate
 in `State.data["external_preconditions"]` (written at plan time,
-`orchestrator/leerie.py:9700`). The entry shape is:
+`orchestrator/leerie.py:9727`). The entry shape is:
 `{tag, reasons:[{sid, reason}], originating_subtasks}`.
 
 The deploy-note plumbing threads `external_preconditions` from State
 into the finalize path at two points:
 
-1. **`_compose_pr_via_llm` payload** (`orchestrator/leerie.py:14686`):
+1. **`_compose_pr_via_llm` payload** (`orchestrator/leerie.py:14590`):
    `external_preconditions` is added as a field in the JSON payload
    passed to the `pr_writer` worker, alongside `task`, `commit_log`,
    etc. The pr_writer prompt instructs the worker to render a
    "⚠ Deploy-ordering" section when the field is non-empty.
 
-2. **`compose_pr_body` fallback** (`orchestrator/leerie.py:2098`):
+2. **`compose_pr_body` fallback** (`orchestrator/leerie.py:2119`):
    The deterministic fallback PR body is extended to render a
    "⚠ Deploy-ordering" section from `external_preconditions` when
    present in state. This ensures the deploy note appears even when

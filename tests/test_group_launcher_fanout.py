@@ -50,23 +50,28 @@ def _make_git_repo(path: Path) -> None:
 
 
 def _stub_recorder(tmp_path: Path) -> tuple[Path, Path]:
-    """Build a stub that records 'CWD:<pwd>\\nARGV:<$@>' to a log file.
+    """Build a stub that records 'CWD:<pwd>\\nARGV:<$@>' per invocation.
 
-    Each invocation appends a two-line block so multiple children in the
-    same fan-out accumulate in one log without racing (append is atomic for
-    short writes on local filesystems).
+    The `--group` launcher fans out its members concurrently
+    (``( cd <repo> && … ) &``), so N stub instances run in parallel. A
+    shared append log races: the two-line ``printf >>`` is not atomic
+    across both lines under concurrency, so blocks interleave and the
+    strict CWD-then-ARGV parser drops one. Instead each invocation writes
+    its own pid-suffixed file (``child.$$``) — one writer per file, no
+    interleave — and ``_run`` concatenates them.
 
-    Returns ``(stub_path, log_path)``.
+    Returns ``(stub_path, log_dir)``.
     """
-    log = tmp_path / "fanout.log"
+    log_dir = tmp_path / "fanout-logs"
+    log_dir.mkdir(exist_ok=True)
     stub = tmp_path / "fanout-stub"
     stub.write_text(textwrap.dedent(f"""\
         #!/usr/bin/env bash
-        printf 'CWD:%s\\nARGV:%s\\n' "$(pwd)" "$*" >> "{log}"
+        printf 'CWD:%s\\nARGV:%s\\n' "$(pwd)" "$*" > "{log_dir}/child.$$"
         exit 0
         """))
     stub.chmod(0o755)
-    return stub, log
+    return stub, log_dir
 
 
 def _run(
@@ -76,7 +81,12 @@ def _run(
     log: Path,
     env_extra: dict | None = None,
 ) -> subprocess.CompletedProcess:
-    """Invoke the launcher with *args* and the stub recorder active."""
+    """Invoke the launcher with *args* and the stub recorder active.
+
+    *log* is the per-child log directory from ``_stub_recorder``. After the
+    run, ``result.stub_log`` is the concatenation of every ``child.*`` file
+    each child wrote exactly once (no shared-append race).
+    """
     env = {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": str(tmp_path),
@@ -93,7 +103,9 @@ def _run(
         text=True,
         timeout=30,
     )
-    result.stub_log = log.read_text() if log.exists() else ""
+    result.stub_log = "".join(
+        p.read_text() for p in sorted(log.glob("child.*"))
+    ) if log.exists() else ""
     return result
 
 
@@ -120,6 +132,40 @@ def test_two_children_spawned(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     # Two "CWD:" lines → two child invocations.
     assert result.stub_log.count("CWD:") == 2
+
+
+def test_relative_launcher_path_resolves_after_member_cd() -> None:
+    """The fan-out re-invokes the launcher via an ABSOLUTE self-command.
+
+    Regression for the bug the live fly smoke caught: the member subshell
+    does `( cd <repo> && "$SELF" … )`. A relative `$0` (`./leerie`, the
+    quick-start form) would no longer resolve from the member's cwd
+    ("./leerie: No such file or directory"). The --group arm must resolve an
+    absolute self-command *before* the cd.
+
+    Driving a real relative-`$0` re-invocation without running the container
+    orchestrator is not hermetically reproducible in a unit test, so this is
+    a source-level guard (same style as the CLAUDE.md checklist greps): the
+    fan-out subshell must call `$_grp_self_cmd` — an absolutized value built
+    before the cd — and must NOT re-invoke via the raw relative `$0`.
+    """
+    src = LAUNCHER.read_text()
+    # The absolute self-command is computed before the cd from the launcher's
+    # own resolved directory, with LEERIE_SELF_CMD still taking precedence.
+    assert (
+        '_grp_self_cmd="${LEERIE_SELF_CMD:-$_grp_leerie_dir/$(basename "$0")}"'
+        in src
+    ), "the --group arm must build an absolute _grp_self_cmd before fan-out"
+    # Isolate the fan-out subshell (cd into the member repo, then re-invoke).
+    marker = 'cd "$_grp_member_repo_abs" || exit 1'
+    assert marker in src
+    fanout = src[src.index(marker):].split(") &", 1)[0]
+    assert '"$_grp_self_cmd"' in fanout, fanout
+    # The relative-`$0` fallback must not be used inside the fan-out subshell.
+    assert '"$0"' not in fanout, (
+        "fan-out must not re-invoke via a relative $0 after cd'ing into the "
+        "member repo"
+    )
 
 
 def test_each_child_cds_into_its_repo(tmp_path: Path) -> None:

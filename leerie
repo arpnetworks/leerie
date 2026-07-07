@@ -2864,6 +2864,13 @@ except SynthMergeConflict as exc:
     # shellcheck disable=SC1091
     . "$_grp_leerie_dir/scripts/remote/lib.sh"
 
+    # Absolute self-command for the fan-out. Each member subshell `cd`s into
+    # its own repo before re-invoking the launcher, so a relative `$0` (e.g.
+    # `./leerie`, the form documented in the quick-start) would no longer
+    # resolve from the member's cwd. Resolve it to an absolute path here,
+    # before any cd. `LEERIE_SELF_CMD` (used by the test harness) still wins.
+    _grp_self_cmd="${LEERIE_SELF_CMD:-$_grp_leerie_dir/$(basename "$0")}"
+
     # Signal handler: kill in-flight member children on Ctrl-C / SIGTERM.
     _grp_child_pids=()
     _grp_cleanup_done=0
@@ -2934,7 +2941,7 @@ ${_grp_member_prompt}"
 
       (
         cd "$_grp_member_repo_abs" || exit 1
-        "${LEERIE_SELF_CMD:-"$0"}" "$_grp_full_prompt" \
+        "$_grp_self_cmd" "$_grp_full_prompt" \
           "${_grp_inspect_args[@]}" \
           --group-id "$_grp_id" \
           "${_grp_passthrough[@]}"

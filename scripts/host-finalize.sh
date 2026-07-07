@@ -262,6 +262,29 @@ $task
 See \`.leerie/runs/$run_id/state.json\` for full run state.
 EOF
 )"
+    # Deploy-ordering note (DESIGN §20 run groups). Mirror the Python
+    # compose_pr_body renderer (orchestrator/leerie.py) so a run that falls
+    # all the way through to this LLM-less bash fallback still surfaces
+    # cross-repo prerequisites. Read external_preconditions straight from
+    # state.json — it lives in STATE_FIELDS, so no run.json persistence is
+    # needed. jq emits nothing when the key is absent/empty; `2>/dev/null ||
+    # true` keeps a missing/unreadable state.json from aborting finalize
+    # under `set -euo pipefail`.
+    local deploy_note
+    deploy_note="$(jq -r '
+      (.external_preconditions // [])
+      | select(length > 0)
+      | "\n## ⚠ Deploy-ordering\n\nOne or more cross-repo prerequisites were declared by the planner. Merge and deploy the following before merging this PR:\n\n"
+        + ([.[]
+            | "- **" + (.tag // "(unknown)") + "**"
+              + ( (([.reasons // [] | .[] | .reason // "" | select(. != "")]) | join("; "))
+                  | if . != "" then " — " + . else "" end )
+           ] | join("\n"))
+        + "\n"
+    ' "$state_json" 2>/dev/null || true)"
+    if [ -n "$deploy_note" ]; then
+      pr_body="$pr_body$deploy_note"
+    fi
   fi
 
   # The working_branch recorded at run start may no longer exist on

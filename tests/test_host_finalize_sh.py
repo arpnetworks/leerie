@@ -402,6 +402,119 @@ def test_pr_failure_is_non_fatal(tmp_path):
     assert "simulated gh failure" in after["pr_error"]
 
 
+# --- deploy-ordering note in the LLM-less fallback (DESIGN §20) -----------
+
+def _run_host_finalize_capturing_body(
+    tmp_path: Path, run_dir: Path
+) -> tuple[subprocess.CompletedProcess, str]:
+    """Run host_finalize with a `gh` stub that saves the piped `--body-file -`
+    stdin to gh-body.txt, so tests can assert on the composed PR body.
+
+    Returns ``(completed_process, pr_body_text)``.
+    """
+    _make_stub_bin(tmp_path, "git", "exit 0")
+    # gh reads the body from stdin (`--body-file -`); tee it out.
+    (tmp_path / "gh").write_text(
+        "#!/usr/bin/env bash\n"
+        f'cat > "{tmp_path}/gh-body.txt"\n'
+        "echo https://github.com/o/r/pull/1\n"
+    )
+    (tmp_path / "gh").chmod(0o755)
+    _make_stub_bin(tmp_path, "sleep", "exit 0")
+    user_repo = run_dir.parent.parent.parent
+    script = f"set -euo pipefail; . {HOST_FINALIZE_SH}; host_finalize {run_dir}"
+    proc = subprocess.run(
+        ["bash", "-c", script],
+        env={
+            "PATH": f"{tmp_path}:/usr/bin:/bin",
+            "USER_REPO": str(user_repo),
+            "HOME": str(tmp_path),
+        },
+        capture_output=True, text=True, check=False,
+    )
+    body_file = tmp_path / "gh-body.txt"
+    return proc, (body_file.read_text() if body_file.exists() else "")
+
+
+def _finalizable_run(tmp_path: Path, run_id: str, extra_state: dict) -> Path:
+    """A complete run (passes the completion gate) with NO pr_body in
+    run.json, so host_finalize composes the deterministic bash fallback."""
+    state = {
+        "task": "add storage volumes",
+        "started_at": "2026-07-06T15:00:00+00:00",
+        "categories": ["feature"],
+        "waves": [[]],
+        "completed_waves": 1,
+    }
+    state.update(extra_state)
+    return _make_run(
+        tmp_path, run_id,
+        run_json={
+            "branch": f"leerie/runs/{run_id}",
+            "working_branch": "main",
+            "finished_at": "2026-07-06T16:00:00+00:00",
+        },
+        state_json=state,
+    )
+
+
+def test_fallback_renders_deploy_note_from_state(tmp_path):
+    """external_preconditions in state.json → the LLM-less bash fallback
+    body carries the ⚠ Deploy-ordering section, mirroring the Python
+    compose_pr_body renderer (DESIGN §20 run groups)."""
+    run_dir = _finalizable_run(
+        tmp_path, "grp-web-aaaaaa",
+        extra_state={"external_preconditions": [
+            {"tag": "storage-volumes-api",
+             "reasons": [{"sid": "feat-001",
+                          "reason": "adds /volumes endpoint consumed here"}],
+             "originating_subtasks": ["feat-001"]},
+        ]},
+    )
+    proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
+    assert proc.returncode == 0, proc.stderr
+    assert "⚠ Deploy-ordering" in body, body
+    assert "storage-volumes-api" in body, body
+    assert "adds /volumes endpoint consumed here" in body, body
+
+
+def test_fallback_deploy_note_joins_multiple_reasons(tmp_path):
+    """Multiple reasons for one tag are joined with '; ', matching the
+    Python renderer."""
+    run_dir = _finalizable_run(
+        tmp_path, "grp-multi-aaaa",
+        extra_state={"external_preconditions": [
+            {"tag": "auth-svc",
+             "reasons": [{"sid": "a", "reason": "needs new scope"},
+                         {"sid": "b", "reason": "token refresh"}]},
+        ]},
+    )
+    proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
+    assert proc.returncode == 0, proc.stderr
+    assert "- **auth-svc** — needs new scope; token refresh" in body, body
+
+
+def test_fallback_no_deploy_note_when_preconditions_absent(tmp_path):
+    """No external_preconditions → no Deploy-ordering section (the common
+    single-repo / no-cross-repo case)."""
+    run_dir = _finalizable_run(tmp_path, "grp-none-aaaaa", extra_state={})
+    proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
+    assert proc.returncode == 0, proc.stderr
+    assert "Deploy-ordering" not in body, body
+
+
+def test_fallback_no_deploy_note_when_preconditions_empty(tmp_path):
+    """An empty external_preconditions list renders no section (guards the
+    `select(length > 0)` in the jq expression)."""
+    run_dir = _finalizable_run(
+        tmp_path, "grp-empty-aaaa",
+        extra_state={"external_preconditions": []},
+    )
+    proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
+    assert proc.returncode == 0, proc.stderr
+    assert "Deploy-ordering" not in body, body
+
+
 # --- completion gate (DESIGN §6, the PR-#22 fix) --------------------------
 
 def test_gate_blocks_mid_wave_crashed_run(tmp_path):
