@@ -1335,22 +1335,65 @@ in different cgroups are not eligible victims. `memory.swap.max=0`
 prevents the kernel from delaying an inevitable OOM by paging out
 worker memory to the Colima swap file.
 
-The mechanism is purely file-permission based on cgroup v2 — no
-`CAP_SYS_ADMIN`, no `--privileged`, no `systemd-run`. Both runtimes
-(Fly + local nerdctl) use the same delegation path:
+**The containment must be performed by root — it cannot be delegated to
+the non-root orchestrator.** This was established empirically after a
+run exhausted the VM thread table (a Bun `EAGAIN` panic) because worker
+containment was *silently off*. Two kernel facts make non-root
+self-enforcement impossible, both reproduced live inside a real leerie
+container and on a Fly Firecracker VM:
+
+1. **Cross-scope migration is denied.** Moving a task into a cgroup needs
+   write on `cgroup.procs` of the destination, the source, AND their
+   common ancestor. Workers are born in the root-owned container scope
+   (`/system.slice/nerdctl-<id>.scope` locally, the machine scope on Fly);
+   migrating them into `leerie.slice` crosses the root cgroup, which the
+   leerie user does not own → the enroll write fails with `EACCES`/`EIO`.
+2. **Controller limit files stay root-owned.** Even inside a properly
+   *delegated* subtree, the kernel keeps the controller interface files
+   (`pids.max`, `memory.max`) owned by root — a delegatee may organize
+   processes but not set controller limits.
+
+An earlier design chowned `leerie.slice` to the leerie user and had the
+orchestrator write the cgroupfs directly. It appeared to work but did
+not: the direct-write probe passed while the actual per-worker enroll
+silently failed on both runtimes, so every worker ran uncapped.
+
+The fix is a **root cgroup broker** (`scripts/cgroup-broker.py`).
 `scripts/container-entry.sh` is PID 1 and runs as root (the Dockerfile
-intentionally omits the `USER leerie` directive — root at PID 1 is
-required so the entrypoint's chown can succeed before privilege drop).
-The entrypoint creates `/sys/fs/cgroup/leerie.slice/`, enables
-`+memory +pids` in its `cgroup.subtree_control` (so child cgroups
-get the controller files), and chowns it (plus `cgroup.procs` and
-`cgroup.subtree_control`) to the leerie user. The entrypoint then
-drops to the leerie user via
-`runuser -u leerie --` before exec'ing the orchestrator (local
-nerdctl) or sleeping as PID 1 (Fly, where the orchestrator is started
-out-of-band by the launcher's ssh-console wrapper that explicitly
-drops via `Popen(user="leerie")`). Either way the orchestrator runs
-as leerie and operates inside the delegated slice.
+intentionally omits `USER leerie`); *before the privilege drop* it
+launches the broker, which listens on a Unix socket at
+`/run/leerie-cgroup.sock` (world-connectable; every request is
+validated). The broker performs `create` / `enroll` / `destroy` as root
+— the only privilege level where enrollment and limit-setting work — and
+detects the cgroup hierarchy: **v2** (Colima) uses the unified
+`leerie.slice/leerie-w-<sid>/{pids,memory}.max`; **v1/hybrid** (observed
+on Fly Firecracker VMs, whose unified mount exposes no controllers) uses
+the split hierarchies (`/sys/fs/cgroup/pids/leerie.slice/...`,
+`/sys/fs/cgroup/memory/leerie.slice/...`). The entrypoint then drops to
+the leerie user via `runuser -u leerie --` before exec'ing the
+orchestrator (local nerdctl) or sleeping as PID 1 (Fly, where the
+orchestrator is started out-of-band by the launcher's ssh-console wrapper
+that drops via `Popen(user="leerie")`). The orchestrator's `_cgroup_*`
+helpers are thin socket clients of the broker; it never writes cgroupfs
+directly.
+
+**Fail-closed gate.** Because a silently-uncapped run is what caused the
+crash, `enforce_and_record_cgroup_containment` runs once per run just
+before the first worker spawns — in `_run_phases`, *after* the resume
+short-circuits so an already-completed / no-work resume (which spawns
+zero workers — the "host launcher pushes + opens the PR" flow) is not
+gated and cannot `die()` spuriously on a containment-incapable host. It
+probes the broker end-to-end (a real create+enroll+destroy round-trip —
+the true test of the path workers use, unlike the old direct-write probe
+that false-passed) and records `{enforced, hierarchy}` in `state.json`
+(merged into the already-populated run state). If containment cannot be
+enabled (broker down, no usable cgroup hierarchy — neither a v2 unified
+mount nor v1 pids+memory controller mounts — or read-only cgroupfs), the
+run `die()`s with an actionable message —
+**unless** the operator passes `--dangerously-allow-uncapped`
+(`LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` / `leerie.toml`), which downgrades
+the fatal gate to a loud warning. Persisting the outcome is deliberate:
+the crash left no artifact of the silent failure; now it is visible.
 
 **Rootless exception.** Under rootless containerd (Linux), rootlesskit
 maps the host UID to container UID 0, so "root" inside the container IS
@@ -1358,9 +1401,15 @@ the unprivileged host user — no actual privilege escalation occurs. In
 this mode the entrypoint detects rootless via `/proc/self/uid_map`
 (non-zero host-start field) and skips both the privilege drop (`runuser`)
 and the `/work` chown (which would reassign ownership into the subuid
-range, breaking host-side access). The cgroup delegation chowns are
-best-effort (`|| true`) and harmlessly fail. The orchestrator runs as
-the mapped root user, which has the same access as the host user.
+range, breaking host-side access). The cgroup slice-setup writes are
+best-effort (`|| true`) and fail; the root broker cannot enforce
+containment either, because rootless "root" is the unprivileged host
+user without CAP_SYS_ADMIN over the host cgroup tree. The orchestrator
+runs as the mapped root user, which has the same access as the host user.
+**Consequently the fail-closed containment gate stops rootless runs by
+default** (a behavior change — such runs previously continued silently
+with uncapped workers); rootless users must pass
+`--dangerously-allow-uncapped` to proceed without containment.
 
 **User-namespace remap for `--dangerously-skip-permissions`.**
 Claude Code rejects `--dangerously-skip-permissions` when
@@ -1384,15 +1433,13 @@ so the in-container entrypoint can see the host VM's cgroupfs.
 The launcher also passes `--cgroupns=host` so the container shares the
 host VM's cgroup namespace. Without this, nerdctl's default private
 cgroup namespace (`--cgroupns=private`) combined with `nsdelegate` on
-the cgroupfs mount blocks non-root process migration to `cgroup.procs`
-— the kernel treats the namespace boundary as a delegation boundary,
-causing every `_cgroup_enroll` call to fail with EPERM regardless of
-file ownership. With `--cgroupns=host`, the container sees its real
-cgroup path (e.g., `/system.slice/nerdctl-<id>.scope`) and the
-orchestrator can enroll worker PIDs into `leerie.slice/` children
-normally. Fly's Firecracker microVM boots its own kernel with no
-cgroup namespace boundary, so this flag only affects the local nerdctl
-path.
+the cgroupfs mount blocks process migration to `cgroup.procs` even for
+the broker — the kernel treats the namespace boundary as a delegation
+boundary. With `--cgroupns=host`, the container sees its real cgroup
+path (e.g., `/system.slice/nerdctl-<id>.scope`) and the root broker can
+enroll worker PIDs into `leerie.slice/` children. Fly's Firecracker
+microVM boots its own kernel with no cgroup namespace boundary, so this
+flag only affects the local nerdctl path.
 On macOS (Darwin) the launcher sets the mount unconditionally —
 Colima's VM always runs rootful containerd with cgroup v2 and shared
 propagation, but the macOS host has no `/sys/fs/cgroup` to probe.
@@ -1400,24 +1447,21 @@ On Linux the launcher probes whether `/sys/fs/cgroup` is shared before adding th
 mount; rootless containerd with `rootlesskit --propagation=rslave`
 demotes it to slave, making `rshared` fail. When the probe detects
 this, the mount is omitted and the orchestrator's `_cgroup_probe` falls
-back to uncapped workers with one warn line. Fly's Firecracker microVM
-exposes cgroupfs directly with no launcher flag required.
+back to uncapped workers (and, absent `--dangerously-allow-uncapped`,
+the fail-closed gate stops the run). Fly's Firecracker microVM exposes
+cgroupfs directly with no launcher flag required.
 
-The orchestrator's `_detect_cgroup_root` prefers
-`/sys/fs/cgroup/leerie.slice` and falls back to `/sys/fs/cgroup`.
-`_cgroup_probe` runs a two-phase check: (1) create and remove a child
-cgroup directory to verify write access, then (2) spawn a short-lived
-subprocess and write its PID to `cgroup.procs` to verify that process
-migration actually works. Phase 2 catches the `nsdelegate` +
-`--cgroupns=private` failure that directory creation alone cannot
-detect. If either phase fails, the probe degrades to uncapped behavior
-with one warn line naming the attempted root and the likely cause.
-The teardown path uses `cgroup.kill` (kernel ≥ 5.14) as
-an atomic kill of any worker-subtree process that survived the
-existing `_terminate_proc_tree` proc-walk — a backstop, not the
-primary cleanup. See IMPLEMENTATION.md §"Caps" for the resolution
-surface and `_cgroup_*` / `_detect_cgroup_root` in
-`orchestrator/leerie.py` for the call sites.
+`_cgroup_probe` sends a `probe` request to the broker, which does a real
+create+enroll+destroy round-trip of a throwaway cgroup and returns the
+detected hierarchy (`v2`/`v1`). This is the true test of the path
+workers use — the earlier direct-write probe passed on hosts where the
+subsequent non-root enroll actually failed, which is how the containment
+silently disappeared. On v2 the broker's teardown uses `cgroup.kill`
+(kernel ≥ 5.14) as an atomic kill of any worker-subtree process that
+survived the existing `_terminate_proc_tree` proc-walk; on v1 it moves
+survivors to the parent then rmdirs. See IMPLEMENTATION.md §"Caps" for
+the resolution surface, `scripts/cgroup-broker.py` for the broker, and
+the `_cgroup_*` clients in `orchestrator/leerie.py` for the call sites.
 
 Earlier versions of leerie gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made

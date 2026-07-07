@@ -618,6 +618,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Removed stale docstring reference to deleted
   `test_launcher_remote_knob.py` in `test_launcher_no_push_skips.py`.
 
+- **Worker cgroup containment was silently OFF; a runaway subtree could
+  exhaust the VM thread/PID table (Bun `EAGAIN` crash).** Per-worker
+  memory/PID limits were never enforced: the non-root orchestrator cannot
+  enroll workers into cgroups or set controller limits (the kernel keeps
+  limit files root-owned in delegated subtrees, and cross-scope task
+  migration needs common-ancestor write the leerie user doesn't have —
+  both reproduced live on Colima **and** Fly). The old direct-write probe
+  passed while the actual per-worker enroll failed, so every worker ran
+  uncapped. A conformer re-running backgrounded `pytest tests/` then
+  accumulated threads until fork/thread-create failed for every worker.
+
+  Fixed with a **root cgroup broker** (`scripts/cgroup-broker.py`),
+  launched by `container-entry.sh` at PID 1 before the privilege drop; the
+  orchestrator's `_cgroup_*` helpers drive it over a Unix socket. The
+  broker performs create/enroll/destroy as root (the only level that
+  works) and handles cgroup **v2** (Colima) and **v1/hybrid** (some Fly
+  Firecracker VMs). A fail-closed gate
+  (`enforce_and_record_cgroup_containment`) runs in `_run_phases` just
+  before the first worker spawns — past the resume short-circuits, so an
+  already-completed / no-work `--resume` (which spawns no workers) is not
+  gated. It probes the broker end-to-end, records `{enforced, hierarchy}`
+  into `state.json` (merged into the already-loaded run state), and
+  `die()`s if containment can't be enabled — override with
+  `--dangerously-allow-uncapped` / `LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` /
+  `dangerously_allow_uncapped` in `leerie.toml`. This also restores the
+  per-worker memory (OOM) protection, which was off for the same reason.
+
+  **Behavior change (rootless containerd on Linux):** rootless "root" is the
+  unprivileged host user and cannot enforce cgroup containment, so rootless
+  runs now `die()` at the fail-closed gate by default — previously they
+  continued silently with uncapped workers. Pass `--dangerously-allow-uncapped`
+  (or set the env/`leerie.toml` key) to run rootless without containment.
+
 ## [0.2.6] - 2026-06-01
 
 This release fixes a hard failure on `--runtime fly` against any repo

@@ -30,6 +30,7 @@ import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -140,14 +141,11 @@ DEFAULT_CAPS = {
     # itself. Surfacing the knob is for tuning persistence, not for
     # promoting a prompt-governed limit to a code guarantee.
     "confidence_rounds": 8,
-    # Per-worker cgroup v2 memory cap (bytes). Each `claude -p` worker is
-    # enrolled in its own child cgroup at <cgroup-root>/leerie-w-<sid>/ where
-    # <cgroup-root> is /sys/fs/cgroup/leerie.slice on both runtimes (Fly +
-    # local nerdctl — scripts/container-entry.sh runs as PID 1/root and
-    # chowns the slice to the leerie user before privilege drop), with a
-    # generic fallback to /sys/fs/cgroup if the slice somehow wasn't
-    # delegated — see _detect_cgroup_root. The cgroup's memory.max is set
-    # to this value. When a worker's tool
+    # Per-worker cgroup memory cap (bytes). Each `claude -p` worker is
+    # enrolled (by the root cgroup broker — see scripts/cgroup-broker.py and
+    # DESIGN §6, because non-root enrollment cannot work) in its own child
+    # cgroup `leerie-w-<sid>` under leerie.slice on both runtimes, and the
+    # broker sets the cgroup's memory.max to this value. When a worker's tool
     # subtree (vitest, tsc, webpack workers, etc.) tries to allocate past
     # the cap, the kernel OOM-kills inside the cgroup — sshd / pid 1 /
     # other workers in the container are unaffected. This is the fix for
@@ -211,6 +209,14 @@ STATE_FIELDS = (
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
+    # cgroup_containment: recorded by the fail-closed gate
+    # (enforce_and_record_cgroup_containment, in _run_phases just before the
+    # first worker spawns) (DESIGN §6 *Memory containment*). {enforced: bool, hierarchy:
+    # "v2"|"v1"|null}. `enforced=false` means workers ran without memory/PID
+    # limits (only reachable via --dangerously-allow-uncapped). Persisted
+    # because the crash that motivated the broker left NO artifact of the
+    # silent containment failure — this makes it visible in state.json.
+    "cgroup_containment",
     "verbosity", "inspect_dirs",
     "integrator_warnings", "scope_warnings",
     "conformance",
@@ -504,6 +510,21 @@ CLARIFY_FILE = SOURCE_OF_TRUTH_FILE
 # flag → LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env → leerie.toml → False.
 DANGEROUS_SKIP_PERMS_ENV = "LEERIE_DANGEROUSLY_SKIP_PERMISSIONS"
 DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
+
+# --dangerously-allow-uncapped bypass (DESIGN §6 *Memory containment*).
+# By default, if the cgroup broker probe fails (broker down, no usable cgroup
+# hierarchy — neither a v2 unified mount nor v1 pids+memory controller mounts —
+# read-only cgroupfs, or rootless containerd which can't enforce containment),
+# leerie die()s before the first worker rather than run workers uncapped — a
+# silently-uncapped run is what
+# let a conformer's runaway subtree exhaust the VM thread table (the Bun
+# EAGAIN crash). This flag downgrades that fatal gate to a loud warning and
+# continues uncapped, for operators on hosts that genuinely cannot delegate.
+# Resolution order: --dangerously-allow-uncapped CLI flag →
+# LEERIE_DANGEROUSLY_ALLOW_UNCAPPED env → dangerously_allow_uncapped in
+# leerie.toml → False.
+DANGEROUS_ALLOW_UNCAPPED_ENV = "LEERIE_DANGEROUSLY_ALLOW_UNCAPPED"
+DANGEROUS_ALLOW_UNCAPPED_FILE = SOURCE_OF_TRUTH_FILE
 
 # --skip-overlap-judge bypass (DESIGN §5 *Cross-domain surface overlap*).
 # Skips the phase 2¾ `plan_overlap_judge` worker even on multi-planner
@@ -3104,6 +3125,24 @@ def resolve_dangerously_skip_permissions(
         env_var=DANGEROUS_SKIP_PERMS_ENV,
         file_key="dangerously_skip_permissions",
         file_name=DANGEROUS_SKIP_PERMS_FILE)
+
+
+def resolve_dangerously_allow_uncapped(
+        repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --dangerously-allow-uncapped preference. Order:
+    --dangerously-allow-uncapped CLI flag (action='store_true') →
+    LEERIE_DANGEROUSLY_ALLOW_UNCAPPED env var →
+    dangerously_allow_uncapped in leerie.toml → False.
+
+    When True, a failed cgroup broker probe (workers would run without
+    memory/PID containment) is a loud warning instead of a fatal error.
+    Off by default: silently-uncapped workers are what let a runaway
+    subtree exhaust the VM thread table (DESIGN §6 *Memory containment*)."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=DANGEROUS_ALLOW_UNCAPPED_ENV,
+        file_key="dangerously_allow_uncapped",
+        file_name=DANGEROUS_ALLOW_UNCAPPED_FILE)
 
 
 def resolve_skip_overlap_judge(repo_root: Path, cli_value: bool) -> bool:
@@ -6129,198 +6168,180 @@ def _get_progress(st: "State") -> tuple[int, int, int, int, int] | None:
     return running, in_conformer, done, completed + 1, len(waves)
 
 
-# --- cgroup v2 containment for worker subtrees ---------------------------
+# --- cgroup containment for worker subtrees (via the root broker) --------
 # Each `claude -p` worker (and every descendant it forks: bash children,
 # vitest pools, webpack workers, tsc, etc.) is enrolled in its own child
-# cgroup at <cgroup-root>/leerie-w-<sid>/. The cgroup's memory.max and
-# pids.max bound how much RAM / how many PIDs the worker subtree may
-# consume. When the worker subtree exceeds memory.max, the kernel OOM-
-# kills inside that cgroup — sshd / pid 1 / sibling workers are not
-# eligible victims. This is the fix for the cascade documented in
-# DESIGN §6 Worker subtree termination — Memory containment.
+# cgroup `leerie-w-<sid>`. The cgroup's memory.max and pids.max bound how
+# much RAM / how many PIDs the worker subtree may consume. When it exceeds
+# memory.max the kernel OOM-kills inside that cgroup; when it exceeds
+# pids.max further fork/clone in the subtree gets EAGAIN — sshd / pid 1 /
+# sibling workers are unaffected. This is the fix for the cascade in
+# DESIGN §6 Worker subtree termination, AND for the thread/PID-table
+# exhaustion crash (Bun EAGAIN) that motivated the broker.
 #
-# Delegation is purely file-permission based on cgroup v2; no
-# CAP_SYS_ADMIN required. The same delegation mechanism covers both
-# runtimes (Fly + local nerdctl): scripts/container-entry.sh is PID 1
-# and runs as root (the Dockerfile intentionally has no USER directive),
-# so it can mkdir /sys/fs/cgroup/leerie.slice and chown it (plus its
-# cgroup.procs and cgroup.subtree_control) to the leerie user. The
-# entrypoint then drops privilege to leerie via `runuser` before
-# exec'ing the orchestrator (local nerdctl) or sleeping as PID 1 (Fly,
-# where the orchestrator is started out-of-band by the launcher's
-# ssh-console wrapper that explicitly Popens with user="leerie").
-# Either way the orchestrator runs as leerie and operates inside the
-# delegated slice.
-#
-# Local nerdctl additionally needs the launcher's writable bind-mount
-# (`leerie` launcher: --mount type=bind,source=/sys/fs/cgroup,
-# target=/sys/fs/cgroup,bind-propagation=rshared) so the in-container
-# entrypoint can see the host VM's cgroupfs. Fly's Firecracker microVM
-# exposes cgroupfs directly.
-#
-# _detect_cgroup_root() prefers the delegated slice and falls back to
-# the cgroupfs root. If neither yields write access (older kernel,
-# missing cgroup-v2 controllers, entrypoint not running as root for
-# some reason), the probe degrades the path to no-op with a warn-once
-# log line — leerie must never die because the cap can't be applied.
+# THE BROKER, AND WHY (reproduced live — see DESIGN §6). The orchestrator
+# runs as non-root leerie, and cgroup enforcement CANNOT be done from
+# non-root code:
+#   1. Migrating a task into a cgroup needs write on `cgroup.procs` of the
+#      destination, the source, AND their common ancestor. Workers are born
+#      in the root-owned container scope; moving them into `leerie.slice`
+#      crosses the root cgroup, which leerie doesn't own → EACCES/EIO.
+#   2. Even inside a properly delegated subtree the kernel keeps controller
+#      limit files (`pids.max`, `memory.max`) root-owned.
+# So `scripts/cgroup-broker.py` runs as root (launched by container-entry.sh
+# at PID 1 before the privilege drop) and performs create/enroll/destroy on
+# the orchestrator's behalf over a Unix socket. It also handles cgroup v1
+# (Fly Firecracker VMs are v1/hybrid) vs v2 (Colima) transparently. The
+# functions below are thin socket clients; the public names/signatures are
+# unchanged so `_invoke`'s call sites are untouched, except `_cgroup_create`
+# now returns the sid (str) rather than a filesystem Path.
 
-_CGROUP_ROOT = Path("/sys/fs/cgroup")
-_CGROUP_DELEGATED_SLICE = Path("/sys/fs/cgroup/leerie.slice")
+_CGROUP_BROKER_SOCK = "/run/leerie-cgroup.sock"
 _CGROUP_PROBE_RESULT: bool | None = None
-_CGROUP_DETECTED_ROOT: Path | None = None
+_CGROUP_HIERARCHY: str | None = None  # "v2" / "v1" — set by a passing probe
 
 
-def _detect_cgroup_root() -> Path:
-    """Pick the cgroup root for worker subtrees. Prefer the delegated
-    `/sys/fs/cgroup/leerie.slice` if it exists — `scripts/container-
-    entry.sh` creates and chowns it to the leerie user at PID 1 (root)
-    on both runtimes (Fly + local nerdctl) before privilege drop, so
-    the orchestrator (running as non-root leerie) can write under it.
-    Fall back to `/sys/fs/cgroup` only if the slice somehow wasn't
-    delegated (older container image, custom entrypoint, kernel
-    without cgroup-v2). Memoized so the choice is stable across the
-    run."""
-    global _CGROUP_DETECTED_ROOT
-    if _CGROUP_DETECTED_ROOT is not None:
-        return _CGROUP_DETECTED_ROOT
-    if _CGROUP_DELEGATED_SLICE.is_dir():
-        _CGROUP_DETECTED_ROOT = _CGROUP_DELEGATED_SLICE
-    else:
-        _CGROUP_DETECTED_ROOT = _CGROUP_ROOT
-    return _CGROUP_DETECTED_ROOT
+def _cgroup_request(payload: str, timeout: float = 5.0) -> str:
+    """Send one request to the root broker and return its response line
+    (without trailing newline). Raises OSError if the broker is
+    unreachable or the round-trip fails."""
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(_CGROUP_BROKER_SOCK)
+        s.sendall((payload + "\n").encode())
+        return s.recv(4096).decode(errors="replace").strip()
 
 
 def _cgroup_probe() -> bool:
-    """Once-per-run probe: can we create cgroups AND enroll PIDs under
-    the detected cgroup root (see `_detect_cgroup_root`)?
-
-    Two-phase check, memoized in `_CGROUP_PROBE_RESULT`:
-
-    Phase 1 — create a child cgroup directory (mkdir + rmdir). Catches
-    RO mounts, missing dirs, failed delegation chowns.
-
-    Phase 2 — spawn a short-lived subprocess and write its PID to
-    `cgroup.procs`. Catches the nsdelegate + --cgroupns=private failure
-    where directory creation succeeds but the kernel blocks non-root
-    process migration across the cgroup namespace boundary. On a
-    regular filesystem (test environment) the write trivially creates
-    a regular file — phase 2 never false-negatives outside real
-    cgroupfs.
-
-    On real cgroupfs, rmdir of a cgroup dir succeeds even with kernel
-    interface files (the kernel removes the cgroup atomically). On a
-    regular filesystem, the cgroup.procs file left by phase 2 blocks
-    rmdir — swallowed by suppress(OSError); exist_ok=True on mkdir
-    makes subsequent runs idempotent."""
-    global _CGROUP_PROBE_RESULT
+    """Once-per-run probe, memoized in `_CGROUP_PROBE_RESULT`: does the
+    root broker exist AND can it round-trip a create+enroll+destroy of a
+    throwaway cgroup? This is the true test of the path workers use — the
+    old direct-write probe passed on hosts where non-root enrollment
+    actually fails (the bug this replaced). A passing probe records the
+    hierarchy (`v2`/`v1`) in `_CGROUP_HIERARCHY` for telemetry."""
+    global _CGROUP_PROBE_RESULT, _CGROUP_HIERARCHY
     if _CGROUP_PROBE_RESULT is not None:
         return _CGROUP_PROBE_RESULT
-    root = _detect_cgroup_root()
-    probe_dir = root / "leerie-probe"
-
-    # Phase 1: can we create a child cgroup directory?
     try:
-        probe_dir.mkdir(exist_ok=True)
+        resp = _cgroup_request("probe")
     except OSError as e:
-        log(f"  cgroup probe failed at {root} ({e.strerror or e}); "
-            f"worker memory containment is OFF for this run. Check "
-            f"that scripts/container-entry.sh's cgroup-v2 delegation "
-            f"block ran (chown of /sys/fs/cgroup/leerie.slice "
-            f"succeeded at PID 1 as root).")
+        log(f"  cgroup broker unreachable at {_CGROUP_BROKER_SOCK} "
+            f"({e.strerror or e}); worker containment is OFF for this "
+            f"run. Check that scripts/container-entry.sh launched "
+            f"scripts/cgroup-broker.py at PID 1.")
         _CGROUP_PROBE_RESULT = False
         return False
-
-    # Phase 2: can we enroll a PID into cgroup.procs?
-    # nsdelegate + --cgroupns=private blocks non-root migration;
-    # directory creation alone cannot detect this.
-    child: subprocess.Popen | None = None
-    try:
-        child = subprocess.Popen(["sleep", "60"],
-                                 start_new_session=True)
-        (probe_dir / "cgroup.procs").write_text(str(child.pid))
-    except OSError as e:
-        log(f"  cgroup enrollment probe failed at {root} "
-            f"({e.strerror or e}); worker memory containment is OFF "
-            f"for this run. Check that the launcher passes "
-            f"--cgroupns=host to nerdctl (required alongside the "
-            f"/sys/fs/cgroup bind-mount to avoid nsdelegate blocking "
-            f"process migration).")
-        _CGROUP_PROBE_RESULT = False
-        if child is not None:
-            with contextlib.suppress(OSError):
-                child.kill()
-                child.wait()
-        with contextlib.suppress(OSError):
-            probe_dir.rmdir()
-        return False
-    finally:
-        if child is not None:
-            with contextlib.suppress(OSError):
-                child.kill()
-            with contextlib.suppress(OSError):
-                child.wait(timeout=5)
-
-    with contextlib.suppress(OSError):
-        probe_dir.rmdir()
-    _CGROUP_PROBE_RESULT = True
-    return True
+    if resp.startswith("OK"):
+        parts = resp.split()
+        _CGROUP_HIERARCHY = parts[1] if len(parts) > 1 else "unknown"
+        _CGROUP_PROBE_RESULT = True
+        return True
+    log(f"  cgroup broker probe failed ({resp}); worker containment is "
+        f"OFF for this run. The broker found no usable cgroup hierarchy "
+        f"(no cgroup-v2 unified mount, no v1 pids+memory controller "
+        f"mounts, or a read-only cgroupfs).")
+    _CGROUP_PROBE_RESULT = False
+    return False
 
 
 def _cgroup_create(sid: str, memory_max_bytes: int,
-                   pids_max: int) -> Path | None:
-    """Create a child cgroup for a worker and set its caps. Returns the
-    cgroup path on success, None on any failure. Idempotent on the
-    mkdir — re-spawning a worker with the same sid (handoff,
-    continuation) reuses the existing cgroup. The caps are re-written
-    so a config change between spawns takes effect."""
+                   pids_max: int) -> str | None:
+    """Ask the broker to create a worker cgroup and set its caps. Returns
+    the sid on success (the handle passed to `_cgroup_enroll`/
+    `_cgroup_destroy`), None on any failure. Idempotent — re-spawning a
+    worker with the same sid re-writes the caps."""
     if not _cgroup_probe():
         return None
-    path = _detect_cgroup_root() / f"leerie-w-{sid}"
     try:
-        path.mkdir(exist_ok=True)
-        (path / "memory.max").write_text(str(memory_max_bytes))
-        (path / "pids.max").write_text(str(pids_max))
-        # memory.swap.max = 0 so the kernel doesn't swap-out the
-        # worker pages to delay an inevitable OOM. The Colima VM has
-        # 4 GB swap; letting workers eat it just means slow death
-        # instead of fast death.
-        with contextlib.suppress(OSError):
-            (path / "memory.swap.max").write_text("0")
+        resp = _cgroup_request(
+            f"create {sid} {memory_max_bytes} {pids_max}")
     except OSError as e:
         log(f"  [{sid}] cgroup create failed ({e.strerror or e}); "
             f"worker runs uncapped")
         return None
-    return path
+    if resp == "OK":
+        return sid
+    log(f"  [{sid}] cgroup create rejected by broker ({resp}); "
+        f"worker runs uncapped")
+    return None
 
 
-def _cgroup_enroll(cgroup_path: Path, pid: int) -> bool:
-    """Move `pid` into the cgroup. Called immediately after the worker
-    subprocess spawns. Returns True on success. Failure logs but does
-    not abort the worker — the worker will simply run in the parent
-    cgroup (uncapped) which is the pre-fix behavior."""
+def _cgroup_enroll(sid: str, pid: int) -> bool:
+    """Ask the broker to migrate `pid` into the worker cgroup. Called
+    immediately after the worker subprocess spawns. Returns True on
+    success. Failure logs but does not abort the worker — it simply runs
+    in the parent cgroup (uncapped)."""
     try:
-        (cgroup_path / "cgroup.procs").write_text(str(pid))
-        return True
+        resp = _cgroup_request(f"enroll {sid} {pid}")
     except OSError as e:
-        log(f"  cgroup enroll failed for pid={pid}: "
-            f"{e.strerror or e}")
+        log(f"  cgroup enroll failed for pid={pid}: {e.strerror or e}")
         return False
+    if resp == "OK":
+        return True
+    log(f"  cgroup enroll rejected by broker for pid={pid}: {resp}")
+    return False
 
 
-def _cgroup_destroy(cgroup_path: Path | None) -> None:
-    """Tear down the worker's cgroup. Best-effort:
-    - cgroup.kill (kernel ≥5.14) atomically kills all members of the
-      cgroup. Catches any lingering grandchild process the
-      _DescendantTracker / proc-walk may have missed.
-    - rmdir removes the empty cgroup.
-    Both are swallowed on ENOENT (already cleaned). Called from
+def _cgroup_destroy(sid: str | None) -> None:
+    """Ask the broker to tear down the worker cgroup (kill any survivors,
+    rmdir). Best-effort — broker/socket errors are swallowed. Called from
     `_invoke`'s cleanup path on every exit (success, timeout, abort)."""
-    if cgroup_path is None:
+    if sid is None:
         return
     with contextlib.suppress(OSError):
-        (cgroup_path / "cgroup.kill").write_text("1")
-    with contextlib.suppress(OSError):
-        cgroup_path.rmdir()
+        _cgroup_request(f"destroy {sid}")
+
+
+def enforce_and_record_cgroup_containment(st: "State",
+                                          allow_uncapped: bool) -> None:
+    """Fail-closed containment gate + state recording, run once per run
+    just before the first worker spawns (DESIGN §6 *Memory containment*).
+
+    Probes the root broker end-to-end (create+enroll+destroy round-trip),
+    records `{enforced, hierarchy}` into `st.data` (merges — `st.data` is
+    already loaded/seeded by the time this runs), then `die()`s if
+    containment can't be enabled — unless the operator explicitly waived
+    it with `--dangerously-allow-uncapped`, which downgrades to a loud
+    warning. A silently-uncapped run is what let a runaway conformer
+    subtree exhaust the VM thread table (the Bun EAGAIN crash), and the
+    direct-write probe this replaced gave false positives on exactly the
+    hosts where non-root enrollment fails.
+
+    **Why here and not in `main()`:** this must run only on paths that
+    actually spawn workers. `_run_phases`' resume branch short-circuits
+    (returns) before this on already-completed / no-work runs — those
+    spawn zero workers (the "host launcher pushes + opens the PR" flow),
+    so gating them would `die()` spuriously on a containment-incapable
+    host. Called at the two worker-guaranteed points (fresh + resumable
+    resume) after `st.data` is populated and before the first worker
+    (`phase_classify` on a fresh run, `phase_execute` on resume).
+
+    Recording the outcome is deliberate: the crash that motivated the
+    broker left NO artifact of the silent containment failure — persisting
+    it in state.json makes it visible for post-mortems."""
+    enforced = _cgroup_probe()
+    st.data["cgroup_containment"] = {
+        "enforced": enforced,
+        "hierarchy": _CGROUP_HIERARCHY,
+    }
+    st.save()
+    if enforced:
+        return
+    if allow_uncapped:
+        log("  ⚠  WARNING: worker cgroup containment is OFF "
+            "(--dangerously-allow-uncapped). Workers run without "
+            "memory/PID limits; a runaway subtree can exhaust the VM "
+            "thread/PID table. See DESIGN §6 Memory containment.")
+        return
+    die("worker cgroup containment could not be enabled — workers would "
+        "run uncapped and a runaway subtree can exhaust the VM thread/PID "
+        "table (the Bun EAGAIN crash). The root cgroup broker "
+        "(scripts/cgroup-broker.py, launched by container-entry.sh at "
+        "PID 1) is down, or this host has no usable cgroup hierarchy / "
+        "read-only cgroupfs (including rootless containerd, which cannot "
+        "enforce containment). See docs/INSTALL.md (cgroup delegation). "
+        "To run anyway without containment, pass --dangerously-allow-uncapped "
+        f"(or set {DANGEROUS_ALLOW_UNCAPPED_ENV}=1).")
 
 
 async def _invoke(cmd: list[str], cwd: str, timeout: int,
@@ -6402,20 +6423,26 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # operational chatter and stays gated.
     if verbosity != "quiet":
         log(f"  [{sid}] spawned (pid={proc.pid})")
-    # cgroup v2 containment: enroll the worker (and every descendant it
-    # forks — `set_new_session=True` above means the kernel propagates
-    # cgroup membership down the process tree by default on v2). On
-    # systems without writable cgroupfs the helpers return None / False
-    # silently and the worker runs uncapped. Failure modes from the
-    # cgroup path NEVER abort the worker — telemetry that crashes its
-    # host is worse than no telemetry (same principle as _memory_sampler).
-    cgroup_path: Path | None = None
+    # cgroup containment: ask the root broker to create the worker cgroup
+    # and enroll the worker (and every descendant it forks — the kernel
+    # propagates cgroup membership down the process tree). These are
+    # synchronous socket round-trips to the broker made directly in this
+    # coroutine (not via asyncio.to_thread): they briefly block the event
+    # loop, but the broker's replies are tiny/fast and bounded by
+    # `_cgroup_request`'s 5 s timeout, so the stall is negligible and no
+    # deadlock is possible (the broker never calls back into leerie).
+    # Containment enforcement itself was already gated at run start
+    # (enforce_and_record_cgroup_containment); here a per-worker failure
+    # returns None / False and the worker runs without its own sub-cgroup
+    # — the cgroup path NEVER aborts the worker (telemetry that crashes its
+    # host is worse than no telemetry, same principle as _memory_sampler).
+    cgroup_sid: str | None = None
     if (worker_memory_max_bytes is not None
             and worker_pids_max is not None):
-        cgroup_path = _cgroup_create(sid, worker_memory_max_bytes,
-                                     worker_pids_max)
-        if cgroup_path is not None:
-            _cgroup_enroll(cgroup_path, proc.pid)
+        cgroup_sid = _cgroup_create(sid, worker_memory_max_bytes,
+                                    worker_pids_max)
+        if cgroup_sid is not None:
+            _cgroup_enroll(cgroup_sid, proc.pid)
     # Track every descendant PID that ever appears under this worker. Claude
     # Code's Bash tool uses `run_in_background: true` to fire-and-forget
     # long-running commands (test runners, builds, dev servers); those
@@ -6632,14 +6659,14 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         watchdog_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await watchdog_task
-        # cgroup teardown. cgroup.kill (kernel ≥5.14) atomically reaps
-        # any worker-tree process that survived _terminate_proc_tree /
-        # descendant_tracker.stop_and_reap above — a backstop for the
-        # backgrounded grandchild class. Then rmdir the cgroup so we
-        # don't accumulate <cgroup-root>/leerie-w-* entries across a
-        # long-running orchestrator. Best-effort: ENOENT etc. are
+        # cgroup teardown via the broker. The broker's destroy atomically
+        # reaps any worker-tree process that survived _terminate_proc_tree /
+        # descendant_tracker.stop_and_reap above (cgroup.kill on v2, move-to-
+        # parent on v1) — a backstop for the backgrounded grandchild class —
+        # then rmdirs the cgroup so we don't accumulate leerie-w-* entries
+        # across a long-running orchestrator. Best-effort: socket errors are
         # swallowed inside _cgroup_destroy.
-        _cgroup_destroy(cgroup_path)
+        _cgroup_destroy(cgroup_sid)
     # Success path: reap any backgrounded subprocesses the worker left
     # behind. `claude -p` workers use Claude Code's Bash tool with
     # `run_in_background: true` for long-running tasks (test runners,
@@ -14962,6 +14989,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["strict_conformer"] = bool(args.strict_conformer)
         st.data["leerie_version"] = _read_version()
         st.save()
+        # Fail-closed containment gate + recording, now that st.data is
+        # loaded and this resume is past the completed/no-work short-
+        # circuits (i.e. it WILL spawn workers). Merges into the resumed
+        # state rather than clobbering it.
+        enforce_and_record_cgroup_containment(
+            st, args.dangerously_allow_uncapped)
         # Absorb --answers on resume too. The documented user flow for
         # a non-interactive deferred-question exit (Phase-1 or §11
         # mid-execution) is: get a pending-*.json, write an answers
@@ -14995,6 +15028,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "strict_conformer": bool(args.strict_conformer),
                    "leerie_version": _read_version()}
         st.save()
+        # Fail-closed containment gate + recording, before the first
+        # worker (phase_classify below). Must come after the
+        # `st.data = {...}` seed above, which would otherwise discard the
+        # recorded key.
+        enforce_and_record_cgroup_containment(
+            st, args.dangerously_allow_uncapped)
         await preflight(leerie_dir, verbosity=verbosity,
                         skip_smoke=args.skip_smoke,
                         no_push=getattr(args, "no_push", False))
@@ -15229,6 +15268,19 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "workers narrow-allowlisted). Also "
                          f"{DANGEROUS_SKIP_PERMS_ENV} env var or "
                          "dangerously_skip_permissions=true in leerie.toml.")
+    ap.add_argument("--dangerously-allow-uncapped", action="store_true",
+                    help="DANGEROUS: continue even if worker cgroup "
+                         "containment could not be enabled (cgroup broker "
+                         "down, no usable cgroup hierarchy — neither a v2 "
+                         "unified mount nor v1 pids+memory controller mounts "
+                         "— read-only cgroupfs, or rootless containerd, which "
+                         "cannot enforce containment). Default is to die() "
+                         "before the first worker — silently-uncapped workers "
+                         "can exhaust the VM thread/PID table (DESIGN §6 "
+                         "Memory containment). This downgrades that fatal gate "
+                         "to a loud warning and runs workers uncapped. Also "
+                         f"{DANGEROUS_ALLOW_UNCAPPED_ENV} env var or "
+                         "dangerously_allow_uncapped=true in leerie.toml.")
     ap.add_argument("--max-workers", type=_positive_int, metavar="N",
                     help=f"total worker-invocation budget "
                          f"(default {DEFAULT_CAPS['max_total_workers']}); "
@@ -15609,6 +15661,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     args.strict_conformer = resolve_strict_conformer(
         repo_root, args.strict_conformer)
 
+    args.dangerously_allow_uncapped = resolve_dangerously_allow_uncapped(
+        repo_root, args.dangerously_allow_uncapped)
+
     # Resolve --pr-template: free-form string (no enum). Re-attach to
     # args so phase_finalize sees the resolved value via
     # `args.pr_template`. None means "alphabetically first .md in
@@ -15637,6 +15692,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # --phase judge|heal: post-run skill phases. Short-circuit the normal
     # orchestrate() flow — just pick an existing run and run the skill.
     if args.phase:
+        # `--phase judge|heal` spawns claude -p workers (judge /
+        # patch_generator) but is deliberately NOT gated by the cgroup
+        # containment check: it is an opt-in post-run analysis tool
+        # operating on an already-finished run with read-only / patch
+        # workers, not the conformer-heavy main run that motivated the
+        # gate. Intentional non-coverage — do not "fix" as an oversight.
         phase_run_id = resolve_run_id(leerie_root, args.run_id)
         try:
             phase_st = State(leerie_root, phase_run_id, repo_root=repo_root)
@@ -15722,6 +15783,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                                        caps, phase_st, models, efforts,
                                        config=config))
         return
+
+    # The fail-closed cgroup containment gate (DESIGN §6 *Memory
+    # containment*) runs inside `_run_phases`, at the two points that are
+    # guaranteed to spawn workers (after the resume short-circuits for
+    # already-completed / no-work runs, which spawn none). Gating here in
+    # `main()` — before `orchestrate()` — would die() spuriously on those
+    # zero-worker resume paths on a containment-incapable host.
 
     # Signal handlers (DESIGN §6 / DESIGN §14): SIGTERM and SIGHUP raise
     # InterruptedBySignal so the same try/except machinery that catches

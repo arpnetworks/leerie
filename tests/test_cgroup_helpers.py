@@ -1,178 +1,232 @@
-"""Tests for the cgroup v2 containment helpers in leerie.py.
+"""Tests for the cgroup containment helpers in leerie.py.
 
-These helpers live in `orchestrator/leerie.py` (search for
-`_cgroup_probe`, `_cgroup_create`, `_cgroup_enroll`, `_cgroup_destroy`).
-They are best-effort: leerie MUST keep running when /sys/fs/cgroup is
-read-only or missing. The tests below pin three contracts:
+Since the containment fix, these helpers (`_cgroup_probe`,
+`_cgroup_create`, `_cgroup_enroll`, `_cgroup_destroy` in
+`orchestrator/leerie.py`) are thin clients of the root cgroup broker
+(`scripts/cgroup-broker.py`): they send a text request over a Unix
+socket and act on the response. The direct cgroupfs writes moved to the
+broker, which runs as root — the only privilege level where cgroup
+enrollment / limit-setting works (see DESIGN §6 *Memory containment* and
+the reproduced non-root delegation constraint).
 
-  1. Probe failure makes all subsequent helpers no-op cleanly.
-  2. Successful probe + create writes memory.max and pids.max files.
-  3. _cgroup_destroy is idempotent (swallow ENOENT and missing files).
+So these tests mock `_cgroup_request` (the socket round-trip) and pin the
+client contracts:
 
-We do NOT exercise real /sys/fs/cgroup on the test host because pytest
-typically runs on the developer's Mac (no cgroupfs) or in CI with
-varying cgroup setups. Instead we point `_CGROUP_ROOT` at a tmp_path
-and exercise the file-write surfaces directly.
+  1. Probe passes only when the broker answers `OK <hierarchy>`; a broker
+     `ERR ...` or an unreachable socket makes it False (and records the
+     hierarchy on success).
+  2. Probe failure makes `_cgroup_create` a no-op returning None.
+  3. create/enroll/destroy send the right payloads and treat any non-`OK`
+     response (or socket OSError) as failure without raising.
+
+The broker's own cgroupfs behavior (v1 vs v2 paths, sid validation) is
+covered separately by an in-container reproduction, not unit tests — it
+requires a real cgroup hierarchy the test host lacks.
 """
 from __future__ import annotations
-
-import os
-from pathlib import Path
 
 import pytest
 
 
 @pytest.fixture(autouse=True)
 def reset_probe_memo(leerie):
-    """Reset the module-level probe + detected-root memos before every
-    test. Without this, the first test that sets `_CGROUP_PROBE_RESULT`
-    or runs `_detect_cgroup_root()` would force the same value into
-    every subsequent test, defeating each test's `_CGROUP_ROOT`
-    monkeypatch.
-
-    Also neutralizes `_CGROUP_DELEGATED_SLICE` — in environments where
-    /sys/fs/cgroup/leerie.slice actually exists (e.g., inside a leerie
-    container), `_detect_cgroup_root()` would otherwise bypass the
-    `_CGROUP_ROOT` monkeypatch that each test sets up."""
-    orig_delegated = leerie._CGROUP_DELEGATED_SLICE
+    """Reset the module-level probe memo + hierarchy before every test so
+    one test's `_CGROUP_PROBE_RESULT` doesn't leak into the next."""
     leerie._CGROUP_PROBE_RESULT = None
-    leerie._CGROUP_DETECTED_ROOT = None
-    leerie._CGROUP_DELEGATED_SLICE = Path("/sys/fs/cgroup/leerie.slice-does-not-exist-in-tests")
+    leerie._CGROUP_HIERARCHY = None
     yield
     leerie._CGROUP_PROBE_RESULT = None
-    leerie._CGROUP_DETECTED_ROOT = None
-    leerie._CGROUP_DELEGATED_SLICE = orig_delegated
+    leerie._CGROUP_HIERARCHY = None
+
+
+def _stub_broker(leerie, monkeypatch, responses):
+    """Replace `_cgroup_request` with a stub that records every payload it
+    was sent and returns queued responses. `responses` is either a single
+    string (returned for every call) or a callable(payload) -> str. A
+    string starting with 'RAISE' makes the stub raise OSError."""
+    sent = []
+
+    def fake(payload, timeout=5.0):
+        sent.append(payload)
+        resp = responses(payload) if callable(responses) else responses
+        if resp.startswith("RAISE"):
+            raise OSError(resp[len("RAISE"):].strip() or "connection refused")
+        return resp
+
+    monkeypatch.setattr(leerie, "_cgroup_request", fake)
+    return sent
 
 
 # ---- probe ----------------------------------------------------------------
 
-def test_probe_success_when_root_writable(leerie, tmp_path, monkeypatch):
-    """A writable directory acting as the cgroup root: probe creates
-    `leerie-probe`, tests enrollment, and returns True. On a regular
-    filesystem the probe dir may persist (the cgroup.procs file left
-    by the enrollment test blocks rmdir); on real cgroupfs the kernel
-    reaps it atomically."""
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
+def test_probe_success_records_hierarchy(leerie, monkeypatch):
+    sent = _stub_broker(leerie, monkeypatch, "OK v2")
     assert leerie._cgroup_probe() is True
+    assert leerie._CGROUP_HIERARCHY == "v2"
+    assert sent == ["probe"]
 
 
-def test_probe_enrollment_failure_returns_false(
-        leerie, tmp_path, monkeypatch):
-    """When the probe dir exists but cgroup.procs cannot be written
-    (simulates nsdelegate + cgroupns=private EPERM), probe returns
-    False."""
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
-    probe_dir = tmp_path / "leerie-probe"
-    probe_dir.mkdir()
-    os.chmod(str(probe_dir), 0o555)
-    try:
-        assert leerie._cgroup_probe() is False
-    finally:
-        if probe_dir.exists():
-            os.chmod(str(probe_dir), 0o755)
+def test_probe_success_v1(leerie, monkeypatch):
+    _stub_broker(leerie, monkeypatch, "OK v1")
+    assert leerie._cgroup_probe() is True
+    assert leerie._CGROUP_HIERARCHY == "v1"
 
 
-def test_probe_failure_when_root_readonly(leerie, tmp_path, monkeypatch):
-    """When the root directory exists but mkdir fails, probe returns
-    False and degrades gracefully."""
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path / "missing-path")
+def test_probe_failure_on_broker_err(leerie, monkeypatch):
+    """Broker answers ERR (e.g. no usable hierarchy on a v1/hybrid host):
+    probe is False."""
+    _stub_broker(leerie, monkeypatch, "ERR no usable cgroup hierarchy")
     assert leerie._cgroup_probe() is False
 
 
-def test_probe_memoizes(leerie, tmp_path, monkeypatch):
-    """Once probe runs, the result is cached; the second call is a
-    pure read of `_CGROUP_PROBE_RESULT`. Verify by making the second
-    call use a path that would otherwise fail — if memoization works,
-    we still get the original result."""
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
+def test_probe_failure_when_broker_unreachable(leerie, monkeypatch):
+    """Socket connect raises (broker never launched): probe is False,
+    degrades gracefully."""
+    _stub_broker(leerie, monkeypatch, "RAISE no such file")
+    assert leerie._cgroup_probe() is False
+
+
+def test_probe_memoizes(leerie, monkeypatch):
+    """Once probe runs, the result is cached; a second call does not
+    re-hit the broker."""
+    sent = _stub_broker(leerie, monkeypatch, "OK v2")
     first = leerie._cgroup_probe()
-    # Swap the root to a non-writable location; memoized result should
-    # still be returned.
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT",
-                        Path("/sys/fs/cgroup-does-not-exist"))
     second = leerie._cgroup_probe()
-    assert first == second
+    assert first is second is True
+    assert sent == ["probe"]  # only one round-trip
 
 
 # ---- create ---------------------------------------------------------------
 
-def test_create_writes_caps(leerie, tmp_path, monkeypatch):
-    """A successful create makes the directory and writes memory.max
-    and pids.max with the given values."""
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
-    leerie._cgroup_probe()  # prime the memo
-    path = leerie._cgroup_create("test-sid", 256 * 1024**2, 64)
-    assert path is not None
-    assert (path / "memory.max").read_text() == str(256 * 1024**2)
-    assert (path / "pids.max").read_text() == "64"
+def test_create_sends_payload_and_returns_sid(leerie, monkeypatch):
+    sent = _stub_broker(
+        leerie, monkeypatch,
+        lambda p: "OK v2" if p == "probe" else "OK")
+    sid = leerie._cgroup_create("test-sid", 256 * 1024**2, 64)
+    assert sid == "test-sid"
+    assert f"create test-sid {256 * 1024**2} 64" in sent
 
 
 def test_create_returns_none_when_probe_failed(leerie, monkeypatch):
-    """If the probe says no, create is a no-op returning None — the
-    worker spawns uncapped."""
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT",
-                        Path("/sys/fs/cgroup-does-not-exist"))
-    leerie._cgroup_probe()
+    _stub_broker(leerie, monkeypatch, "RAISE unreachable")
     assert leerie._cgroup_create("sid", 1 << 30, 64) is None
 
 
-def test_create_idempotent(leerie, tmp_path, monkeypatch):
-    """Re-creating with the same sid (e.g., handoff continuation)
-    reuses the dir and rewrites the caps with the new values."""
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
-    leerie._cgroup_probe()
-    p1 = leerie._cgroup_create("sid-a", 1 << 28, 64)
-    p2 = leerie._cgroup_create("sid-a", 1 << 30, 128)
-    assert p1 == p2
-    assert (p2 / "memory.max").read_text() == str(1 << 30)
-    assert (p2 / "pids.max").read_text() == "128"
+def test_create_returns_none_on_broker_reject(leerie, monkeypatch):
+    """Probe passes but the create is rejected (e.g. bad sid): None, no
+    raise, worker runs uncapped."""
+    _stub_broker(
+        leerie, monkeypatch,
+        lambda p: "OK v2" if p == "probe" else "ERR bad sid")
+    assert leerie._cgroup_create("sid", 1 << 30, 64) is None
 
 
 # ---- enroll ---------------------------------------------------------------
 
-def test_enroll_writes_pid(leerie, tmp_path, monkeypatch):
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
-    leerie._cgroup_probe()
-    path = leerie._cgroup_create("sid-b", 1 << 30, 64)
-    assert leerie._cgroup_enroll(path, 12345) is True
-    assert (path / "cgroup.procs").read_text() == "12345"
+def test_enroll_sends_payload(leerie, monkeypatch):
+    sent = _stub_broker(leerie, monkeypatch, "OK")
+    assert leerie._cgroup_enroll("sid-b", 12345) is True
+    assert sent == ["enroll sid-b 12345"]
 
 
-def test_enroll_returns_false_on_failure(leerie, tmp_path):
-    """Enroll into a path that doesn't exist returns False (logs but
-    does not raise)."""
-    bogus = tmp_path / "nope"
-    assert leerie._cgroup_enroll(bogus, 1) is False
+def test_enroll_returns_false_on_broker_err(leerie, monkeypatch):
+    _stub_broker(leerie, monkeypatch, "ERR bad sid/pid")
+    assert leerie._cgroup_enroll("sid", 1) is False
+
+
+def test_enroll_returns_false_on_unreachable(leerie, monkeypatch):
+    _stub_broker(leerie, monkeypatch, "RAISE refused")
+    assert leerie._cgroup_enroll("sid", 1) is False
 
 
 # ---- destroy --------------------------------------------------------------
 
-def test_destroy_attempts_cgroup_kill_then_rmdir(leerie, tmp_path,
-                                                  monkeypatch):
-    """The destroy contract on a real cgroupfs: write '1' to
-    cgroup.kill (atomic kill of the cgroup, kernel ≥5.14), then
-    rmdir. On a regular filesystem (like this test), cgroup.kill is
-    just a stray file we write; rmdir then fails (dir non-empty) but
-    OSError is swallowed. The test verifies cgroup.kill IS written
-    and that no exception propagates."""
-    monkeypatch.setattr(leerie, "_CGROUP_ROOT", tmp_path)
-    leerie._cgroup_probe()
-    path = leerie._cgroup_create("sid-c", 1 << 30, 64)
-    leerie._cgroup_destroy(path)
-    # cgroup.kill was attempted (file exists on regular fs).
-    assert (path / "cgroup.kill").read_text() == "1"
-    # No exception propagated. Whether the dir survives depends on the
-    # filesystem; on real cgroupfs the kernel reaps it atomically, on
-    # regular fs the files prevent rmdir but the OSError is swallowed.
+def test_destroy_sends_payload(leerie, monkeypatch):
+    sent = _stub_broker(leerie, monkeypatch, "OK")
+    leerie._cgroup_destroy("sid-c")
+    assert sent == ["destroy sid-c"]
 
 
-def test_destroy_handles_none(leerie):
-    """None path (cgroup containment was off for this worker) is a
-    no-op, no exception."""
+def test_destroy_handles_none(leerie, monkeypatch):
+    """None sid (containment was off for this worker) is a no-op — the
+    broker must not even be contacted."""
+    sent = _stub_broker(leerie, monkeypatch, "OK")
     leerie._cgroup_destroy(None)
+    assert sent == []
 
 
-def test_destroy_handles_missing_path(leerie, tmp_path):
-    """Destroy on a path that doesn't exist swallows the ENOENT and
-    returns cleanly."""
-    leerie._cgroup_destroy(tmp_path / "never-existed")
+def test_destroy_swallows_unreachable(leerie, monkeypatch):
+    """A socket error during teardown is swallowed (best-effort)."""
+    _stub_broker(leerie, monkeypatch, "RAISE gone")
+    leerie._cgroup_destroy("sid-d")  # must not raise
+
+
+# ---- fail-closed gate + recording (unified) -------------------------------
+
+class _FakeState:
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+        self.saved = False
+
+    def save(self):
+        self.saved = True
+
+
+def test_gate_records_and_passes_when_enforced(leerie, monkeypatch):
+    """When containment is enforced, the outcome is recorded and the run
+    proceeds (no raise)."""
+    monkeypatch.setattr(leerie, "_cgroup_probe", lambda: True)
+    monkeypatch.setattr(leerie, "_CGROUP_HIERARCHY", "v2")
+    st = _FakeState({"task": "t"})
+    leerie.enforce_and_record_cgroup_containment(st, allow_uncapped=False)
+    assert st.data["cgroup_containment"] == {"enforced": True,
+                                             "hierarchy": "v2"}
+    assert st.saved
+
+
+def test_gate_dies_when_unenforced_and_not_waived(leerie, monkeypatch):
+    """The fix's core safety property: an unenforced run die()s by
+    default rather than running uncapped (what caused the crash). The
+    outcome is still recorded before the die()."""
+    monkeypatch.setattr(leerie, "_cgroup_probe", lambda: False)
+    st = _FakeState({"task": "t"})
+    with pytest.raises(SystemExit):
+        leerie.enforce_and_record_cgroup_containment(st, allow_uncapped=False)
+    assert st.data["cgroup_containment"]["enforced"] is False
+
+
+def test_gate_warns_and_continues_when_waived(leerie, monkeypatch):
+    """--dangerously-allow-uncapped downgrades the fatal gate to a
+    warning and lets the run proceed."""
+    monkeypatch.setattr(leerie, "_cgroup_probe", lambda: False)
+    st = _FakeState({"task": "t"})
+    leerie.enforce_and_record_cgroup_containment(st, allow_uncapped=True)
+    assert st.data["cgroup_containment"]["enforced"] is False
+
+
+def test_gate_merges_into_existing_state(leerie, monkeypatch):
+    """Regression for the resume-corruption bug: the gate must MERGE the
+    outcome into an already-populated st.data, never replace it. The
+    earlier design blind-saved an empty dict + one key in main() before
+    st was loaded, discarding task/waves/etc. and bricking --resume — so
+    the gate now runs in _run_phases after st.data is populated and merges."""
+    monkeypatch.setattr(leerie, "_cgroup_probe", lambda: True)
+    monkeypatch.setattr(leerie, "_CGROUP_HIERARCHY", "v2")
+    st = _FakeState({"task": "do a thing", "waves": [["a"]],
+                     "worker_count": 3})
+    leerie.enforce_and_record_cgroup_containment(st, allow_uncapped=False)
+    # Existing keys survive.
+    assert st.data["task"] == "do a thing"
+    assert st.data["waves"] == [["a"]]
+    assert st.data["worker_count"] == 3
+    # New key added.
+    assert st.data["cgroup_containment"] == {"enforced": True,
+                                             "hierarchy": "v2"}
+
+
+def test_gate_takes_state_and_flag(leerie):
+    """Pins the unified signature (st, allow_uncapped) — the gate now
+    lives with the state recording, not as a state-free main() call."""
+    import inspect
+    sig = inspect.signature(leerie.enforce_and_record_cgroup_containment)
+    assert list(sig.parameters) == ["st", "allow_uncapped"]

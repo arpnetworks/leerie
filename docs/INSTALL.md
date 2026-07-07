@@ -398,6 +398,35 @@ daemon was OOM-killed inside the VM (not your container's PID 1). Check
 to add 4 GB of swap via the YAML block in "Memory pressure: swap
 configuration" above.
 
+**"worker cgroup containment could not be enabled"** — leerie stops
+before running any worker when it cannot enforce per-worker memory/PID
+limits (DESIGN §6 *Memory containment*). Enforcement is done by a root
+broker (`scripts/cgroup-broker.py`) launched by the container entrypoint;
+the run dies if that broker can't operate. Common causes:
+- **no usable cgroup hierarchy** — the broker handles both a cgroup v2
+  unified mount (Colima) and cgroup v1/hybrid split `pids/` + `memory/`
+  controller mounts (some Fly.io Firecracker VMs), but fails if neither is
+  present — e.g. a host exposing only a partial/hybrid layout without both
+  controllers, or an unusual container cgroup setup.
+- **rootless containerd (Linux)** — rootless "root" is the unprivileged
+  host user and cannot enforce cgroup containment (no CAP_SYS_ADMIN over
+  the host cgroup tree; `--propagation=rslave` also omits the shared
+  bind-mount). Rootless runs therefore **always** hit this gate and must
+  pass `--dangerously-allow-uncapped` (below) to proceed. This is a change
+  from earlier versions, which ran rootless workers uncapped silently.
+- **read-only or missing `/sys/fs/cgroup`** — a read-only cgroupfs or an
+  absent mount leaves the broker unable to create cgroups.
+- **broker didn't start** — check the container log for a
+  `[cgroup-broker] listening` line; its absence means PID 1 couldn't
+  launch `python3 /opt/leerie-image/scripts/cgroup-broker.py`.
+
+To run anyway *without* containment (workers can then exhaust the VM's
+thread/PID table — the failure this gate prevents), pass
+`--dangerously-allow-uncapped` (or set `LEERIE_DANGEROUSLY_ALLOW_UNCAPPED=1`,
+or `dangerously_allow_uncapped = true` in `leerie.toml`). The
+`cgroup_containment` field in the run's `state.json` records whether
+containment was enforced and which hierarchy (`v2`/`v1`) was detected.
+
 **"$HOME/.claude not found"** — you haven't run `claude` yet on this
 machine. Run `claude --version` at least once so the directory is
 created.

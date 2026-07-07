@@ -354,13 +354,17 @@ RUN chown -R leerie:"${HOST_GID}" /opt/leerie-image
 RUN mkdir -p /work && chown leerie:"${HOST_GID}" /work
 
 # Intentionally NO `USER leerie` directive — ENTRYPOINT runs as root so
-# scripts/container-entry.sh can perform the cgroup-v2 delegation chown
-# of /sys/fs/cgroup/leerie.slice before dropping privilege via
-# `runuser -u leerie -- ...`. Without root at PID 1 the chown silently
-# fails (EPERM) and per-worker memory containment is off — DESIGN §6's
-# cascade protection. The orchestrator itself runs as leerie via that
-# runuser drop (local nerdctl) or via Popen(user="leerie") in the
-# launcher's ssh-console wrapper (Fly).
+# scripts/container-entry.sh can create /sys/fs/cgroup/leerie.slice and
+# launch the root cgroup broker (scripts/cgroup-broker.py) before dropping
+# privilege via `runuser -u leerie -- ...`. The broker does per-worker
+# cgroup enrollment/limit-setting, which non-root code cannot (DESIGN §6
+# *Memory containment*): the kernel keeps controller limit files root-owned
+# in delegated subtrees, and cross-scope task migration needs write on the
+# common-ancestor cgroup the leerie user doesn't own. Without root at PID 1
+# the broker can't run and per-worker memory/PID containment is off — the
+# orchestrator's fail-closed gate then stops the run. The orchestrator
+# itself runs as leerie via that runuser drop (local nerdctl) or via
+# Popen(user="leerie") in the launcher's ssh-console wrapper (Fly).
 WORKDIR /work
 
 ENTRYPOINT ["/opt/leerie-image/scripts/container-entry.sh"]

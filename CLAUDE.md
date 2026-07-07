@@ -290,6 +290,14 @@ export LEERIE_MAX_PARALLEL=6
 # `dangerously_skip_permissions = true` in leerie.toml):
 ./leerie "task" --dangerously-skip-permissions
 
+# Run workers WITHOUT cgroup containment when the host can't enforce it
+# (rootless containerd, or no usable cgroup hierarchy). DANGEROUS: workers
+# then run with no memory/PID limits, so a runaway subtree can exhaust the
+# VM thread/PID table (the failure the fail-closed gate prevents — DESIGN
+# §6 Memory containment). Also LEERIE_DANGEROUSLY_ALLOW_UNCAPPED=1 or
+# `dangerously_allow_uncapped = true` in leerie.toml:
+./leerie "task" --dangerously-allow-uncapped
+
 # Pick a PR template when the repo has multiple in PULL_REQUEST_TEMPLATE/.
 # Also LEERIE_PR_TEMPLATE or `pr_template` in leerie.toml.
 ./leerie "task" --pr-template feature
@@ -422,7 +430,14 @@ remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 stubbed `flyctl`. The local per-repo image surface —
 `resolve_repo_image_tag`, `_leerie_repo_id`, `build_repo_image` — is
 tested via bash-harness subprocess tests with stubbed `git` and
-`nerdctl`. The `leerie config` verb (all three sub-modes: `--init`,
+`nerdctl`. Worker cgroup containment (DESIGN §6 *Memory containment*) is
+tested in two files: `tests/test_cgroup_helpers.py` covers the
+orchestrator-side broker clients (`_cgroup_probe`/`_cgroup_create`/
+`_cgroup_enroll`/`_cgroup_destroy` via a stubbed socket round-trip) and
+the fail-closed `enforce_and_record_cgroup_containment`; `tests/test_cgroup_broker.py`
+covers the root broker (`scripts/cgroup-broker.py`) — protocol dispatch,
+sid validation, v1/v2 path selection, and the probe round-trip — against
+a fake cgroupfs. The `leerie config` verb (all three sub-modes: `--init`,
 bare, `--chat`) is tested in `tests/test_config_verb.py` via a
 self-contained bash harness with stubbed `nerdctl` and `claude`, plus
 a parity guard that extracts the real launcher `config)` case arm and
