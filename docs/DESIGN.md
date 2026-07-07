@@ -1482,8 +1482,9 @@ hit (delivered as assistant-text content in the verbatim format
 There is a second, subtler trigger: an **out-of-credits mid-stream
 kill**. When the account is overage-blocked (a `rate_limit_event`
 carrying `overageStatus:"rejected"` / `overageDisabledReason:
-"out_of_credits"` while `status` is still the benign `"allowed"`),
-the gateway lets in-flight requests finish but terminates the
+"out_of_credits"` — observed with `status:"allowed"`, though the latch
+keys only on those overage fields, not on `status`), the gateway lets
+in-flight requests finish but terminates the
 `claude -p` process the moment credits run out — often mid-turn,
 before a `result` event is emitted. On its own the overage event is
 *not* terminal (empirically, most workers that see it complete

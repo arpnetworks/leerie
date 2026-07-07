@@ -3210,7 +3210,19 @@ future terminal status strings (Anthropic's terminal value, e.g.
 matching everything-not-allowed avoids hardcoding a guess that could
 go stale). The protocol-level path parses `resetsAt` (a Unix timestamp
 in seconds) into a UTC `reset_at`; the text path parses the wall-clock
-time + IANA tz. Either source produces a `reset_at: datetime | None`
+time + IANA tz. A **third** raise site lives outside `_summarize_stream_event`: the
+`_invoke` no-result-envelope branch. When a worker stream truncates
+with no `result` event *and* the account was overage-blocked (a
+`rate_limit_event` seen mid-stream with `overageStatus == "rejected"`
+or `overageDisabledReason in {"out_of_credits", "out_of_overage"}`,
+latched into a `nonlocal overage_blocked`), `_invoke` raises
+`RateLimitedExit(reset_at=None, raw)` instead of a bare `WorkerError`
+— the out-of-credits-mid-stream-kill case described under §3 *Auth/quota
+backoff*. It is deliberately raised here, not in `_summarize_stream_event`,
+because the latch must survive to the post-stream no-envelope check even
+at quiet verbosity (where the summarizer returns `None`).
+
+Either source produces a `reset_at: datetime | None`
 (parse failure → `None`, never a wrong-time guess) and the raw
 message. `main()`'s `except RateLimitedExit` arm: when `reset_at` is
 set, run worktree cleanup, sleep until the moment + 30s margin, then
