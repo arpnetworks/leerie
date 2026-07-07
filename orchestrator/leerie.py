@@ -11887,6 +11887,39 @@ def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
     return into_id
 
 
+def _would_cycle_after(
+    plans: list[dict], apply_fn: Callable[[list[dict]], None]
+) -> bool:
+    """Return True iff applying `apply_fn` to `plans` would leave the
+    subtask dependency graph cyclic.
+
+    Side-effect-free: `apply_fn` runs against a deep copy, so the passed
+    `plans` is never mutated. Uses the same `_build_predecessor_graph` +
+    `_tarjan_sccs` pair as the phase 2½ acyclicity gate (`phase_reconcile`)
+    and the phase 2¾ post-merge backstop, so "cycle" means the same thing
+    at every site.
+
+    Used by `_apply_overlap_collisions` to tentatively test each `merge` /
+    `drop_*` resolution *before* applying it: a resolution whose
+    dependency-union would close a cycle is skipped rather than applied
+    (DESIGN §5 *Post-merge acyclicity* — per-resolution cycle avoidance).
+    The deep copy is the honest way to model the check: `_apply_overlap_merge`
+    / `_apply_overlap_drop` mutate in place across all plans (remove the
+    absorbed sid, rewrite downstream references), so re-deriving the union
+    semantics without them would risk drifting from the real apply."""
+    trial = copy.deepcopy(plans)
+    apply_fn(trial)
+    trial_subtasks = {
+        s["id"]: s for plan in trial for s in plan.get("subtasks", [])
+    }
+    preds, _provs, _esrc = _build_predecessor_graph(trial_subtasks)
+    succ: dict[str, set[str]] = {sid: set() for sid in trial_subtasks}
+    for tgt, src_set in preds.items():
+        for src in src_set:
+            succ[src].add(tgt)
+    return bool(_tarjan_sccs(set(trial_subtasks), succ))
+
+
 def _apply_overlap_collisions(plans: list[dict],
                               collisions: list[dict]) -> list[dict]:
     """Apply a validated list of overlap-judge collisions to `plans`
@@ -12002,6 +12035,33 @@ def _apply_overlap_collisions(plans: list[dict],
                 survivor_hint = a_sid
             elif b_sid in anchors and a_sid not in anchors:
                 survivor_hint = b_sid
+            # Per-resolution cycle avoidance (DESIGN §5 *Post-merge
+            # acyclicity*): a merge's dependency-union can close a
+            # transitive cycle through a third subtask absent from the
+            # merged pair. Test the merge against a copy first; if it
+            # would cycle, skip it and keep both subtasks separate for
+            # the integrator rather than die()ing the run. `survivor_of`
+            # is deliberately NOT updated — both endpoints stay live so a
+            # later collision referencing either resolves to a present sid.
+            if _would_cycle_after(
+                plans,
+                lambda tr, a=a_sid, b=b_sid, art=artifact, m=mf,
+                sh=survivor_hint: _apply_overlap_merge(
+                    tr, a, b, art, m or "<unset>", survivor_hint=sh),
+            ):
+                applied.append({
+                    "action": "skipped_would_cycle", "resolution": "merge",
+                    "artifact": artifact,
+                    "a_sid": a_sid, "b_sid": b_sid,
+                    "original_a_sid": raw_a, "original_b_sid": raw_b,
+                    "merge_feasibility": mf,
+                    "reason": c.get("reason", ""),
+                })
+                log(f"phase 2¾: merge {a_sid} ↔ {b_sid} would introduce a "
+                    f"dependency cycle (artifact: {artifact}) — "
+                    f"skipped_would_cycle; both subtasks kept separate for "
+                    f"the integrator to resolve at integration time")
+                continue
             surviving = _apply_overlap_merge(
                 plans, a_sid, b_sid, artifact, mf or "<unset>",
                 survivor_hint=survivor_hint)
@@ -12015,6 +12075,27 @@ def _apply_overlap_collisions(plans: list[dict],
             log(f"phase 2¾: merged {dropped} → {surviving} "
                 f"(artifact: {artifact})")
         elif resolution == "drop_a":
+            # Cycle avoidance (same rationale as `merge` above): a drop
+            # also unions the dropped subtask's `provides` into the
+            # survivor and rewrites downstream `depends_on`, so it can
+            # close a cycle too. Skip rather than die() if it would.
+            if _would_cycle_after(
+                plans,
+                lambda tr, d=a_sid, s=b_sid: _apply_overlap_drop(
+                    tr, dropped_sid=d, surviving_sid=s),
+            ):
+                applied.append({
+                    "action": "skipped_would_cycle", "resolution": "drop_a",
+                    "artifact": artifact,
+                    "a_sid": a_sid, "b_sid": b_sid,
+                    "original_a_sid": raw_a, "original_b_sid": raw_b,
+                    "reason": c.get("reason", ""),
+                })
+                log(f"phase 2¾: drop_a {a_sid} (keeping {b_sid}) would "
+                    f"introduce a dependency cycle (artifact: {artifact}) — "
+                    f"skipped_would_cycle; both subtasks kept separate for "
+                    f"the integrator to resolve at integration time")
+                continue
             _apply_overlap_drop(plans, dropped_sid=a_sid,
                                 surviving_sid=b_sid)
             survivor_of[a_sid] = b_sid
@@ -12026,6 +12107,23 @@ def _apply_overlap_collisions(plans: list[dict],
             log(f"phase 2¾: dropped {a_sid}, kept {b_sid} "
                 f"(artifact: {artifact})")
         elif resolution == "drop_b":
+            if _would_cycle_after(
+                plans,
+                lambda tr, d=b_sid, s=a_sid: _apply_overlap_drop(
+                    tr, dropped_sid=d, surviving_sid=s),
+            ):
+                applied.append({
+                    "action": "skipped_would_cycle", "resolution": "drop_b",
+                    "artifact": artifact,
+                    "a_sid": a_sid, "b_sid": b_sid,
+                    "original_a_sid": raw_a, "original_b_sid": raw_b,
+                    "reason": c.get("reason", ""),
+                })
+                log(f"phase 2¾: drop_b {b_sid} (keeping {a_sid}) would "
+                    f"introduce a dependency cycle (artifact: {artifact}) — "
+                    f"skipped_would_cycle; both subtasks kept separate for "
+                    f"the integrator to resolve at integration time")
+                continue
             _apply_overlap_drop(plans, dropped_sid=b_sid,
                                 surviving_sid=a_sid)
             survivor_of[b_sid] = a_sid
@@ -12214,11 +12312,14 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # Apply merges and drops in input order via the pure helper.
     applied = _apply_overlap_collisions(plans, collisions)
 
-    # Post-merge acyclicity gate. Merge dependency-union can introduce
-    # transitive cycles absent from the post-reconcile graph (phase 2½
-    # passed before these merges ran). Catch them here with a clear
-    # diagnostic instead of letting phase 3's Kahn fallback emit an
-    # opaque subtask dump.
+    # Post-merge acyclicity backstop. `_apply_overlap_collisions` already
+    # skips (skipped_would_cycle) any resolution whose dependency-union
+    # would close a cycle — per-resolution cycle avoidance (DESIGN §5
+    # *Post-merge acyclicity*). This final Tarjan pass must therefore never
+    # find a cycle; if it does, `_would_cycle_after` and the real apply path
+    # disagreed, which is an orchestrator logic bug, not a user-recoverable
+    # task-shape problem. Retained as defense-in-depth against future drift,
+    # mirroring `_apply_overlap_merge`'s defensive missing-sid die().
     post_merge_subtasks: dict[str, dict] = {}
     for plan in plans:
         for s in plan.get("subtasks", []):
@@ -12234,13 +12335,14 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
         diag = _format_cycle_diagnostic(
             pm_sccs, pm_succ, pm_edge_sources, {}, post_merge_subtasks)
         die(
-            f"phase 2¾: overlap-judge merges introduced "
-            f"{len(pm_sccs)} dependency cycle(s):\n{diag}\n"
-            "The pre-merge graph was acyclic (phase 2½ gate passed); "
-            "the merge dependency-union created a transitive cycle. "
-            "To unblock: re-run with --skip-overlap-judge and let the "
-            "integrator resolve file conflicts at integration time, or "
-            "narrow the task to reduce cross-planner overlap."
+            f"phase 2¾: post-merge acyclicity backstop found "
+            f"{len(pm_sccs)} dependency cycle(s) that per-resolution cycle "
+            f"avoidance should have skipped:\n{diag}\n"
+            "This is an orchestrator logic bug — `_would_cycle_after` and "
+            "the real `_apply_overlap_collisions` apply path disagreed. "
+            "Re-run with --skip-overlap-judge to bypass phase 2¾ entirely, "
+            "and please report this run (the tentative cycle check missed a "
+            "cycle the real apply produced)."
         )
 
     st.data["plan_overlap_applied"] = applied
@@ -12248,9 +12350,13 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     n_merge = sum(1 for a in applied if a['action'] == 'merge')
     n_drop = sum(1 for a in applied if a['action'].startswith('drop'))
     n_skip = sum(1 for a in applied if a['action'] == 'skipped_redundant')
+    n_cycle_skip = sum(1 for a in applied
+                       if a['action'] == 'skipped_would_cycle')
     parts = [f"{n_merge} merge", f"{n_drop} drop"]
     if n_skip:
         parts.append(f"{n_skip} skipped_redundant")
+    if n_cycle_skip:
+        parts.append(f"{n_cycle_skip} skipped_would_cycle")
     log(f"phase 2¾: applied {len(applied)} resolution(s) "
         f"({', '.join(parts)})")
     return plans

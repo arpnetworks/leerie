@@ -475,16 +475,35 @@ absorbed into A. This is the same silent-data-loss class the
 per-pair merge-feasibility discipline exists to prevent, applied
 across the chain of absorptions rather than within a single pair.
 
-**Post-merge acyclicity.** The merge dependency-union (B inherits A's
-`depends_on` when A is absorbed) plus downstream reference rewriting
-(any subtask depending on A now depends on B) can introduce transitive
-cycles absent from the post-reconcile graph — the phase 2½ acyclicity
-gate passed before these merges ran. The orchestrator therefore runs
-Tarjan's SCC on the post-merge graph immediately after applying
-collisions. On cycle detection it `die()`s with the full cycle
-diagnostic; the actionable recovery is `--skip-overlap-judge` (let the
-integrator resolve file conflicts at integration time) or narrowing the
-task to reduce cross-planner overlap.
+**Post-merge acyclicity.** A collision resolution's dependency-union — the
+survivor inheriting the absorbed subtask's `provides`/`requires`/`depends_on`,
+plus downstream reference rewriting (any subtask depending on the absorbed sid
+now depends on the survivor) — can introduce transitive cycles absent from the
+post-reconcile graph, even though the phase 2½ acyclicity gate passed before
+these resolutions ran. The most common shape is a *pure dependency-tag
+artifact*: the survivor absorbs a `provides` tag that some third subtask already
+`requires`, closing a back-edge through a node outside the merged pair — with no
+shared file overlap at all (the cycle diagnostic reports `Shared
+files_likely_touched: none`). This affects both `merge` and `drop_*`
+resolutions, because `_apply_overlap_drop` likewise unions the dropped subtask's
+`provides` into the survivor and rewrites downstream `depends_on`.
+
+The orchestrator handles this with **per-resolution cycle avoidance** rather than
+an all-or-nothing post-hoc gate. Before applying each collision it tentatively
+applies the resolution to a throwaway copy and runs Tarjan's SCC; if the
+resolution *would* introduce a cycle, that specific resolution is **skipped**
+(`skipped_would_cycle`) and both subtasks are kept separate for the integrator to
+resolve at integration time. Every non-cycling resolution still applies. This is
+a deterministic, per-resolution degradation of the `--skip-overlap-judge` escape
+hatch, achieved locally with no extra worker round-trip. The judge is *not*
+re-prompted: the cycle is a global-graph property of the whole subtask DAG,
+outside the judge's pairwise-surface competence (its merge decision is typically
+correct — two planners genuinely producing the same artifact — and the cycle is
+an orthogonal topology side effect of unioning their dependency tags). Tarjan's
+SCC still runs on the final post-merge graph as an internal backstop assertion;
+with per-resolution avoidance in place it must never fire, so a surviving cycle
+is treated as an orchestrator logic bug (the tentative check and the real apply
+path disagreed), not a user-recoverable condition.
 
 ### Migration-surface completeness
 

@@ -14,6 +14,7 @@ helper / reason over the result.
 """
 from __future__ import annotations
 
+import asyncio
 import copy
 
 import pytest
@@ -1134,12 +1135,29 @@ def test_apply_collisions_anchor_b_sid_lex_largest(leerie):
 
 
 # --------------------------------------------------------------------- #
-# Post-merge acyclicity — merges can introduce transitive cycles
+# Post-merge acyclicity — per-resolution cycle avoidance (DESIGN §5
+# *Post-merge acyclicity*). A merge/drop dependency-union that would
+# close a transitive cycle is skipped (skipped_would_cycle), not applied.
 # --------------------------------------------------------------------- #
 
-def test_merge_introduces_transitive_cycle(leerie):
-    """A(feat-001)→B(bugfix-001), C(bugfix-002)→A. Merge B+C collapses
-    to lex-smaller B; B inherits C's dep on A → A→B and B→A — cycle."""
+def _sccs_of(leerie, plans) -> list:
+    """Non-trivial SCCs of the plans' subtask dependency graph, via the
+    same helpers the orchestrator's gate uses."""
+    by_id = {s["id"]: s for p in plans for s in p.get("subtasks", [])}
+    preds, _, _ = leerie._build_predecessor_graph(by_id)
+    succ = {sid: set() for sid in by_id}
+    for tgt, src_set in preds.items():
+        for src in src_set:
+            succ[src].add(tgt)
+    return leerie._tarjan_sccs(set(by_id), succ)
+
+
+def test_merge_that_would_cycle_is_skipped(leerie):
+    """A(feat-001)→B(bugfix-001), C(bugfix-002)→A. Merging B+C would make
+    the survivor inherit C's dep on A → A→B and B→A. Per-resolution cycle
+    avoidance must SKIP this merge (skipped_would_cycle), leaving both
+    subtasks live and the graph acyclic — rather than applying it and
+    die()ing at the post-merge backstop."""
     plans = [
         {"domain": "feature-implementation", "subtasks": [
             {"id": "feat-001", "title": "A", "intent": "a",
@@ -1159,33 +1177,281 @@ def test_merge_introduces_transitive_cycle(leerie):
         ]},
     ]
     # Pre-merge: feat-001 → bugfix-001, bugfix-002 → feat-001. Acyclic.
-    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
-    preds, _, _ = leerie._build_predecessor_graph(by_id)
-    succ = {sid: set() for sid in by_id}
-    for tgt, src_set in preds.items():
-        for src in src_set:
-            succ[src].add(tgt)
-    assert leerie._tarjan_sccs(set(by_id), succ) == []
+    assert _sccs_of(leerie, plans) == []
 
-    # Merge collision between bugfix-001 and bugfix-002.  Lex-smaller
-    # bugfix-001 survives; it inherits bugfix-002's depends_on: [feat-001].
-    # feat-001 already depends_on bugfix-001 → cycle.
     collisions = [{
         "a_sid": "bugfix-001", "b_sid": "bugfix-002",
         "artifact": "src/shared.tsx", "resolution": "merge",
         "merge_feasibility": "both touch shared.tsx", "reason": "overlap",
     }]
-    leerie._apply_overlap_collisions(plans, collisions)
+    applied = leerie._apply_overlap_collisions(plans, collisions)
 
-    # Post-merge: rebuild graph and confirm cycle exists.
-    by_id2 = {s["id"]: s for p in plans for s in p["subtasks"]}
-    preds2, _, _ = leerie._build_predecessor_graph(by_id2)
-    succ2 = {sid: set() for sid in by_id2}
-    for tgt, src_set in preds2.items():
-        for src in src_set:
-            succ2[src].add(tgt)
-    sccs = leerie._tarjan_sccs(set(by_id2), succ2)
-    assert len(sccs) == 1, f"expected 1 cycle, got {sccs}"
-    # Lex-smaller bugfix-001 survives; it inherits bugfix-002's dep on
-    # feat-001, creating bugfix-001 → feat-001 → bugfix-001.
-    assert set(sccs[0]) == {"feat-001", "bugfix-001"}
+    # The merge was skipped, not applied.
+    assert len(applied) == 1
+    a = applied[0]
+    assert a["action"] == "skipped_would_cycle"
+    assert a["resolution"] == "merge"
+    assert a["a_sid"] == "bugfix-001" and a["b_sid"] == "bugfix-002"
+    assert a["artifact"] == "src/shared.tsx"
+    assert a["merge_feasibility"] == "both touch shared.tsx"
+
+    # Both subtasks still live; graph stayed acyclic.
+    ids = {s["id"] for p in plans for s in p["subtasks"]}
+    assert {"feat-001", "bugfix-001", "bugfix-002"} <= ids
+    assert _sccs_of(leerie, plans) == []
+
+
+def test_overlap_judge_cross_cluster_backedge_config_001_002(leerie):
+    """Regression for the real PER-REPO-CONFIG.md failure (run 311a67c6):
+    an anchor merge (config-001 ← feat-010) makes the survivor inherit
+    feat-010's provides tag `T`, which a THIRD subtask (config-002) already
+    requires in_plan → new edge config-001 → config-002. config-001 already
+    depends_on config-002 → 2-node cycle. Empirically this merge produced
+    the exact `config-001 <-> config-002` diagnostic; the fix must SKIP it
+    while still applying the separate non-cycling merge, and never
+    SystemExit."""
+    def make_plans():
+        return [
+            {"domain": "configuration-build", "subtasks": [
+                {"id": "config-001", "title": "impl knobs (anchor)",
+                 "intent": "c1", "provides": [], "requires": [],
+                 "depends_on": ["config-002"],
+                 "files_likely_touched": ["docs/IMPLEMENTATION.md"],
+                 "success_criteria_seed": "c1"},
+                {"id": "config-002", "title": "resolvers", "intent": "c2",
+                 "provides": [],
+                 "requires": [{"tag": "T", "extent": "in_plan"}],
+                 "depends_on": [],
+                 "files_likely_touched": ["orchestrator/leerie.py"],
+                 "success_criteria_seed": "c2"},
+            ]},
+            {"domain": "feature-implementation", "subtasks": [
+                {"id": "feat-010", "title": "impl doc rows", "intent": "f10",
+                 "provides": ["T"], "requires": [], "depends_on": [],
+                 "files_likely_touched": ["docs/IMPLEMENTATION.md"],
+                 "success_criteria_seed": "f10"},
+                # A separate, non-cycling merge partner for config-002.
+                {"id": "feat-003", "title": "resolvers dup", "intent": "f3",
+                 "provides": [], "requires": [], "depends_on": [],
+                 "files_likely_touched": ["orchestrator/leerie.py"],
+                 "success_criteria_seed": "f3"},
+            ]},
+        ]
+
+    cluster = {"a_sid": "config-001", "b_sid": "feat-010",
+               "artifact": "IMPLEMENTATION.md §6½ rows", "resolution": "merge",
+               "merge_feasibility": "same doc rows", "reason": "dup"}
+    separate = {"a_sid": "config-002", "b_sid": "feat-003",
+                "artifact": "resolve_capture_deps", "resolution": "merge",
+                "merge_feasibility": "same fn", "reason": "dup"}
+
+    plans = make_plans()
+    assert _sccs_of(leerie, plans) == []
+    applied = leerie._apply_overlap_collisions(plans, [cluster, separate])
+
+    actions = {(x["action"], x.get("resolution"),
+                x.get("a_sid") or x.get("surviving_sid"))
+               for x in applied}
+    # The cycle-closing cluster merge is skipped; the separate merge applies.
+    assert any(x["action"] == "skipped_would_cycle"
+               and {x["a_sid"], x["b_sid"]} == {"config-001", "feat-010"}
+               for x in applied)
+    assert any(x["action"] == "merge"
+               and x["dropped_sid"] == "feat-003"
+               for x in applied)
+    assert _sccs_of(leerie, plans) == []
+    # config-001 and config-002 both survive (cluster merge skipped).
+    ids = {s["id"] for p in plans for s in p["subtasks"]}
+    assert {"config-001", "config-002"} <= ids
+
+    # Determinism: reversed collision order → identical action multiset.
+    plans_rev = make_plans()
+    applied_rev = leerie._apply_overlap_collisions(
+        plans_rev, [separate, cluster])
+    actions_rev = {(x["action"], x.get("resolution"),
+                    x.get("a_sid") or x.get("surviving_sid"))
+                   for x in applied_rev}
+    assert actions == actions_rev
+    assert _sccs_of(leerie, plans_rev) == []
+
+
+def test_drop_that_would_cycle_is_skipped(leerie):
+    """A drop also unions the dropped subtask's `provides` into the
+    survivor and rewrites downstream `depends_on`, so it can close a cycle
+    too. drop_b(feat-010) folds provides `T` into config-001 → config-001
+    → config-002 (which requires T); config-001 already depends_on
+    config-002 → cycle. Must be skipped, not applied."""
+    plans = [
+        {"domain": "configuration-build", "subtasks": [
+            {"id": "config-001", "title": "anchor", "intent": "c1",
+             "provides": [], "requires": [], "depends_on": ["config-002"],
+             "files_likely_touched": ["docs/IMPLEMENTATION.md"],
+             "success_criteria_seed": "c1"},
+            {"id": "config-002", "title": "resolvers", "intent": "c2",
+             "provides": [],
+             "requires": [{"tag": "T", "extent": "in_plan"}],
+             "depends_on": [],
+             "files_likely_touched": ["orchestrator/leerie.py"],
+             "success_criteria_seed": "c2"},
+        ]},
+        {"domain": "feature-implementation", "subtasks": [
+            {"id": "feat-010", "title": "rows", "intent": "f", "provides": ["T"],
+             "requires": [], "depends_on": [],
+             "files_likely_touched": ["docs/IMPLEMENTATION.md"],
+             "success_criteria_seed": "f"},
+        ]},
+    ]
+    assert _sccs_of(leerie, plans) == []
+    collisions = [{"a_sid": "config-001", "b_sid": "feat-010",
+                   "artifact": "IMPL rows", "resolution": "drop_b",
+                   "reason": "supersede"}]
+    applied = leerie._apply_overlap_collisions(plans, collisions)
+    assert applied[0]["action"] == "skipped_would_cycle"
+    assert applied[0]["resolution"] == "drop_b"
+    ids = {s["id"] for p in plans for s in p["subtasks"]}
+    assert {"config-001", "config-002", "feat-010"} <= ids
+    assert _sccs_of(leerie, plans) == []
+
+
+def test_non_cycling_resolutions_still_apply(leerie):
+    """The cycle guard is a happy-path no-op: a merge that does NOT create
+    a cycle is applied exactly as before."""
+    plans = [{"domain": "a", "subtasks": [
+        {"id": "a-1", "title": "x", "intent": "i", "provides": [],
+         "requires": [], "depends_on": [],
+         "files_likely_touched": ["f.py"], "success_criteria_seed": "s"},
+        {"id": "b-1", "title": "y", "intent": "i", "provides": [],
+         "requires": [], "depends_on": [],
+         "files_likely_touched": ["f.py"], "success_criteria_seed": "s"},
+    ]}]
+    applied = leerie._apply_overlap_collisions(plans, [{
+        "a_sid": "a-1", "b_sid": "b-1", "artifact": "f.py",
+        "resolution": "merge", "merge_feasibility": "u", "reason": "r"}])
+    assert applied[0]["action"] == "merge"
+    survivors = {s["id"] for p in plans for s in p["subtasks"]}
+    assert survivors == {"a-1"}  # lex-smaller survives, b-1 absorbed
+
+
+def test_skip_does_not_update_survivor_of(leerie):
+    """A skipped merge must NOT pollute the survivor_of map: a later
+    collision referencing a skipped endpoint must still resolve to that
+    live sid, not a stale survivor. Here the first merge is skipped
+    (would cycle); the second merges the still-live config-001 with a
+    fresh non-cycling partner and must succeed."""
+    plans = [
+        {"domain": "configuration-build", "subtasks": [
+            {"id": "config-001", "title": "anchor", "intent": "c1",
+             "provides": [], "requires": [], "depends_on": ["config-002"],
+             "files_likely_touched": ["docs/IMPLEMENTATION.md"],
+             "success_criteria_seed": "c1"},
+            {"id": "config-002", "title": "resolvers", "intent": "c2",
+             "provides": [],
+             "requires": [{"tag": "T", "extent": "in_plan"}],
+             "depends_on": [],
+             "files_likely_touched": ["orchestrator/leerie.py"],
+             "success_criteria_seed": "c2"},
+        ]},
+        {"domain": "feature-implementation", "subtasks": [
+            {"id": "feat-010", "title": "rows", "intent": "f", "provides": ["T"],
+             "requires": [], "depends_on": [],
+             "files_likely_touched": ["docs/IMPLEMENTATION.md"],
+             "success_criteria_seed": "f"},
+            {"id": "feat-020", "title": "more rows", "intent": "f2",
+             "provides": [], "requires": [], "depends_on": [],
+             "files_likely_touched": ["docs/IMPLEMENTATION.md"],
+             "success_criteria_seed": "f2"},
+        ]},
+    ]
+    collisions = [
+        {"a_sid": "config-001", "b_sid": "feat-010", "artifact": "IMPL",
+         "resolution": "merge", "merge_feasibility": "u", "reason": "r"},
+        {"a_sid": "config-001", "b_sid": "feat-020", "artifact": "IMPL2",
+         "resolution": "merge", "merge_feasibility": "u", "reason": "r"},
+    ]
+    applied = leerie._apply_overlap_collisions(plans, collisions)
+    assert applied[0]["action"] == "skipped_would_cycle"
+    # Second merge references the still-live config-001 and applies.
+    assert applied[1]["action"] == "merge"
+    assert applied[1]["surviving_sid"] == "config-001"
+    assert applied[1]["dropped_sid"] == "feat-020"
+    assert _sccs_of(leerie, plans) == []
+
+
+def test_would_cycle_helper_is_side_effect_free(leerie):
+    """`_would_cycle_after` must not mutate the passed plans — it runs the
+    apply on a deep copy."""
+    plans = [
+        {"domain": "cb", "subtasks": [
+            {"id": "config-001", "title": "a", "intent": "c1", "provides": [],
+             "requires": [], "depends_on": ["config-002"],
+             "files_likely_touched": ["x"], "success_criteria_seed": "c1"},
+            {"id": "config-002", "title": "r", "intent": "c2", "provides": [],
+             "requires": [{"tag": "T", "extent": "in_plan"}], "depends_on": [],
+             "files_likely_touched": ["y"], "success_criteria_seed": "c2"},
+        ]},
+        {"domain": "fi", "subtasks": [
+            {"id": "feat-010", "title": "r", "intent": "f", "provides": ["T"],
+             "requires": [], "depends_on": [],
+             "files_likely_touched": ["x"], "success_criteria_seed": "f"},
+        ]},
+    ]
+    before = copy.deepcopy(plans)
+    result = leerie._would_cycle_after(
+        plans,
+        lambda tr: leerie._apply_overlap_merge(
+            tr, "config-001", "feat-010", "art", "mf"))
+    assert result is True  # this merge WOULD cycle
+    assert plans == before  # ...but plans is untouched
+
+
+def test_backstop_die_on_logic_bug(leerie, monkeypatch, capsys):
+    """If `_would_cycle_after` is (bug) forced to report no cycle, a
+    cycle-inducing merge gets applied and the post-merge backstop must
+    still fire — die()ing with the orchestrator-logic-bug wording, NOT
+    the user-facing --skip-overlap-judge recovery."""
+    monkeypatch.setattr(leerie, "_would_cycle_after", lambda *a, **k: False)
+
+    plans = [
+        {"domain": "feature-implementation", "subtasks": [
+            {"id": "feat-001", "title": "A", "intent": "a", "provides": [],
+             "requires": [], "depends_on": ["bugfix-001"],
+             "files_likely_touched": ["src/a.tsx"], "success_criteria_seed": "a"},
+        ]},
+        {"domain": "bug-fixing", "subtasks": [
+            {"id": "bugfix-001", "title": "B", "intent": "b", "provides": [],
+             "requires": [], "depends_on": [],
+             "files_likely_touched": ["src/shared.tsx"],
+             "success_criteria_seed": "b"},
+            {"id": "bugfix-002", "title": "C", "intent": "c", "provides": [],
+             "requires": [], "depends_on": ["feat-001"],
+             "files_likely_touched": ["src/shared.tsx"],
+             "success_criteria_seed": "c"},
+        ]},
+    ]
+    collisions = [{"a_sid": "bugfix-001", "b_sid": "bugfix-002",
+                   "artifact": "src/shared.tsx", "resolution": "merge",
+                   "merge_feasibility": "mf", "reason": "overlap"}]
+
+    class _St:
+        def __init__(self):
+            self.data = {}
+
+        def save(self):
+            pass
+
+    st = _St()
+    caps = {"judgment_check_rounds": 1}
+
+    async def _fake_loop(**kwargs):
+        return ({"collisions": collisions}, [])
+
+    monkeypatch.setattr(leerie, "_run_checked_loop", _fake_loop)
+    monkeypatch.setattr(leerie, "check_overlap_judge_output",
+                        lambda *a, **k: [])
+
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_overlap_judge(
+            plans, "task", st, caps, {}, {}))
+    err = capsys.readouterr().err
+    assert "orchestrator logic bug" in err
+    assert "post-merge acyclicity backstop" in err
