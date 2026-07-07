@@ -280,7 +280,6 @@ EOF
               + ( (([.reasons // [] | .[] | .reason // "" | select(. != "")]) | join("; "))
                   | if . != "" then " — " + . else "" end )
            ] | join("\n"))
-        + "\n"
     ' "$state_json" 2>/dev/null || true)"
     if [ -n "$deploy_note" ]; then
       pr_body="$pr_body$deploy_note"

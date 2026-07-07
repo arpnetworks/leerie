@@ -494,6 +494,44 @@ def test_fallback_deploy_note_joins_multiple_reasons(tmp_path):
     assert "- **auth-svc** — needs new scope; token refresh" in body, body
 
 
+def test_fallback_deploy_note_byte_matches_python_renderer(tmp_path):
+    """The bash (jq) deploy-ordering section must be byte-for-byte identical
+    to the Python compose_pr_body renderer (DESIGN §20). Guards against
+    drift — e.g. a stray trailing newline (jq -r already appends one, so the
+    jq expression must NOT add its own `+ "\\n"`)."""
+    preconditions = [
+        {"tag": "storage-api",
+         "reasons": [{"sid": "a", "reason": "adds /volumes"},
+                     {"sid": "b", "reason": "token scope"}]},
+        {"tag": "bare-one"},
+    ]
+    run_dir = _finalizable_run(
+        tmp_path, "grp-parity-aaa",
+        extra_state={"external_preconditions": preconditions},
+    )
+    proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
+    assert proc.returncode == 0, proc.stderr
+
+    # Reproduce the exact Python compose_pr_body deploy-section shape.
+    expected = "\n## ⚠ Deploy-ordering\n\n"
+    expected += ("One or more cross-repo prerequisites were declared by the "
+                 "planner. Merge and deploy the following before merging "
+                 "this PR:\n\n")
+    for entry in preconditions:
+        tag = entry.get("tag") or "(unknown)"
+        reason_texts = [r.get("reason", "")
+                        for r in (entry.get("reasons") or []) if r.get("reason")]
+        if reason_texts:
+            expected += f"- **{tag}** — {'; '.join(reason_texts)}\n"
+        else:
+            expected += f"- **{tag}**\n"
+
+    # The section must appear verbatim in the composed body, and the body
+    # must not end with a doubled trailing blank line (the drift we fixed).
+    assert expected in body, f"section not byte-identical.\n---got---\n{body!r}\n---want---\n{expected!r}"
+    assert not body.endswith("\n\n"), f"doubled trailing newline: {body[-8:]!r}"
+
+
 def test_fallback_no_deploy_note_when_preconditions_absent(tmp_path):
     """No external_preconditions → no Deploy-ordering section (the common
     single-repo / no-cross-repo case)."""

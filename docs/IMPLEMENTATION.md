@@ -2380,17 +2380,25 @@ Modeled on the `--chain` arm (`leerie:2033`). The `--group` arm:
    (reusing the inspect-dir translation at `leerie:3337`+), and
    backgrounds:
    ```bash
-   ( cd <repo> && "${LEERIE_SELF_CMD:-$0}" "<prompt>" <flags> \
+   # resolved once, before any cd, to an absolute path:
+   _grp_self_cmd="${LEERIE_SELF_CMD:-$_grp_leerie_dir/$(basename "$0")}"
+   ( cd <repo> && "$_grp_self_cmd" "<prompt>" <flags> \
        --group-id "$_group_id" ) &
    ```
    (mirrors `leerie:2237-2246` for chains). Each `cd` makes the member
    resolve its own `USER_REPO` and basename-keyed state directory
-   independently.
+   independently. The self-command **must** be absolutized *before* the
+   `cd`: a relative `$0` (e.g. `./leerie`, the documented quick-start
+   form) would not resolve from the member's cwd once the subshell has
+   `cd`'d into the member repo. Unlike chains — which never `cd`, so a
+   relative `$0` still resolves — the group fan-out changes directory,
+   so it anchors `$0` to the launcher's own resolved dir first.
 6. Waits for all members (`wait`), then runs group tag-back (below).
 
 Per-member flags are forwarded like `_ch_passthrough` for chains.
-`${LEERIE_SELF_CMD:-$0}` is the same test seam used by chain verbs —
-tests substitute a stub binary via `LEERIE_SELF_CMD`.
+`LEERIE_SELF_CMD` is the same test seam used by chain verbs — it still
+takes precedence in `_grp_self_cmd`, so tests substitute a stub binary
+via `LEERIE_SELF_CMD`.
 
 #### Group tag-back across state directories (both runtimes)
 
@@ -2458,7 +2466,7 @@ in `State.data["external_preconditions"]` (written at plan time,
 `{tag, reasons:[{sid, reason}], originating_subtasks}`.
 
 The deploy-note plumbing threads `external_preconditions` from State
-into the finalize path at two points:
+into the finalize path at three points:
 
 1. **`_compose_pr_via_llm` payload** (`orchestrator/leerie.py:14590`):
    `external_preconditions` is added as a field in the JSON payload
@@ -2467,10 +2475,23 @@ into the finalize path at two points:
    "⚠ Deploy-ordering" section when the field is non-empty.
 
 2. **`compose_pr_body` fallback** (`orchestrator/leerie.py:2119`):
-   The deterministic fallback PR body is extended to render a
+   The deterministic Python fallback PR body is extended to render a
    "⚠ Deploy-ordering" section from `external_preconditions` when
    present in state. This ensures the deploy note appears even when
    the `pr_writer` LLM worker fails or is skipped.
+
+3. **`host-finalize.sh` bash fallback** (`scripts/host-finalize.sh`):
+   the pure-bash deterministic PR body (used when neither `pr_body`
+   from the `pr_writer` worker nor the Python `compose_pr_body` output
+   reached `run.json` — the LLM-less host-side finalize path) renders
+   the same "⚠ Deploy-ordering" section from
+   `state.json.external_preconditions` via `jq`. Its output is
+   byte-for-byte identical to the Python renderer's section shape
+   (`- **<tag>** — <reason>`, reasons `"; "`-joined; nothing emitted
+   when the field is absent or empty), so the note survives even the
+   LLM-less path. No `run.json` persistence is needed —
+   `external_preconditions` is already a `STATE_FIELDS` key in
+   `state.json`.
 
 **Key design note:** `reason` in `external_preconditions` is
 unstructured free text (`required` is only `[tag, extent]`,
@@ -3753,10 +3774,12 @@ The launcher's finalize block in `leerie` (bash) does, in order:
    true (see DESIGN §6 *Finalization* and §9 *Structured-output
    schemas* `pr_writer` entry). Fallback path (pr_writer skipped or
    crashed): a bash heredoc reads `state.json` fields with `jq` and
-   emits the deterministic body shape that `compose_pr_body` used to
-   produce (task, category, source-of-truth, run timestamps, wave +
-   subtask + worker counts). The launcher branches on whether
-   `pr_title_llm` / `pr_body_llm` are non-empty.
+   emits the deterministic body shape that `compose_pr_body` produces
+   (task, category, source-of-truth, run timestamps, wave + subtask +
+   worker counts, and — when `external_preconditions` is non-empty — a
+   `⚠ Deploy-ordering` section rendered from it via `jq`, byte-identical
+   to the Python renderer; see "Deploy-ordering notes"). The launcher
+   branches on whether `pr_title_llm` / `pr_body_llm` are non-empty.
 5. **Open PR.** Before calling `gh pr create`, validate that
    `working_branch` still exists on origin via `git ls-remote
    --exit-code --heads`. If the branch was deleted (common when a
@@ -5475,6 +5498,7 @@ enforcement functions:
 | `test_group_launcher_fanout.py` | `--group` fan-out core contract: one child per member is spawned with `cwd=<member-repo>`, `--group-id <uuid>` in argv, `--inspect-dir <sibling>` for every other member (not itself), and the shared brief text prepended to the member's prompt. Uses LEERIE_SELF_CMD stub-recorder to assert both cwd and argv per child. Complements `test_group_launcher.py` with focused assertions on the fan-out mechanics. |
 | `test_group_run_json.py` | `group_id` in run.json Python-layer contract (DESIGN §20): `_validate_run_json` accepts `group_id`-bearing sidecars in every push/pause/kill state; `_write_run_json` persists and preserves `group_id` across incremental writes; `_derive_run_status` produces correct status for `group_id`-tagged runs (local-stub member without `fly_machine_id` and fly-stub member with `fly_machine_id`). |
 | `test_group_state_dir_guard.py` | State-dir isolation for group members (DESIGN §20 *State isolation is free*): two members in repos with distinct basenames resolve to distinct `~/.leerie/<basename>/` dirs even when the parent's `LEERIE_STATE_HOST_DIR` is inherited; `--group` arm rejects `LEERIE_STATE_DIR` env and `--state-dir` CLI arg before any child spawns, preventing the `.owner`-collision failure mode. |
+| `test_host_finalize_sh.py` | `scripts/host-finalize.sh` `host_finalize` contract via a bash-harness with stubbed `git`/`gh`: no-push / already-pushed idempotency, tip-aware re-push vs diverged-origin guard, completion gate (PR-#22), and the LLM-less **⚠ Deploy-ordering** fallback — the bash `jq` renderer emits the section from `state.json.external_preconditions` byte-identically to the Python `compose_pr_body` (DESIGN §20), and nothing when the field is absent/empty. |
 
 Run with `pytest tests/` from the repo root. The full suite (~1700
 tests across the deterministic-enforcement, bash-harness, and remote
