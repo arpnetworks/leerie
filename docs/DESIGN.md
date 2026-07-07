@@ -1478,6 +1478,25 @@ hit (delivered as assistant-text content in the verbatim format
 — anything outside the known-allowed set
 `{"allowed", "allowed_warning"}`), leerie raises
 `RateLimitedExit(reset_at, raw)`.
+
+There is a second, subtler trigger: an **out-of-credits mid-stream
+kill**. When the account is overage-blocked (a `rate_limit_event`
+carrying `overageStatus:"rejected"` / `overageDisabledReason:
+"out_of_credits"` while `status` is still the benign `"allowed"`),
+the gateway lets in-flight requests finish but terminates the
+`claude -p` process the moment credits run out — often mid-turn,
+before a `result` event is emitted. On its own the overage event is
+*not* terminal (empirically, most workers that see it complete
+normally), so it is not treated as a terminal `status`. Instead,
+`_invoke` latches the overage-block state as the stream flows and,
+in its no-result-envelope branch, raises `RateLimitedExit(reset_at=
+None, raw)` *only* when the stream truncated with no `result` event
+**and** the account was overage-blocked. Without this, the truncated
+stream surfaces as a bare `WorkerError`, which bypasses the
+auth/quota backoff (that classifier needs a result envelope to
+inspect) and `die()`s the run non-resumably — the failure mode this
+guard exists to prevent.
+
 The exception propagates through the existing asyncio cancellation
 chain — `_invoke`'s `BaseException` guard terminates the in-flight
 `claude -p` worker's full subprocess subtree (including detached

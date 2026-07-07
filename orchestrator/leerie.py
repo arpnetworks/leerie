@@ -6453,6 +6453,16 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     descendant_tracker = _DescendantTracker(proc.pid)
     descendant_tracker.start()
     envelope: dict | None = None
+    # Latch the account's overage state from `rate_limit_event`s as they
+    # stream. `overageStatus:"rejected"` / `out_of_credits` is a benign
+    # *warning* on its own — the worker usually completes fine and emits a
+    # `result` event (verified: 19/28 out-of-credits runs in the corpus
+    # exited 0). It only becomes fatal when it coincides with a stream that
+    # truncates *without* a result event: the CLI was killed mid-turn the
+    # moment credits ran out. The no-envelope branch below consults this
+    # latch to route that specific case into the resumable rate-limit pause
+    # instead of a bare WorkerError → die().
+    overage_blocked = False
     stderr_chunks: list[bytes] = []
     # Watchdog state: last_event_at is updated by _read_stream on every
     # successfully-parsed stream-json event. The _idle_watchdog coroutine
@@ -6461,7 +6471,7 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     last_event_at = time.monotonic()
 
     async def _read_stream():
-        nonlocal envelope, last_event_at
+        nonlocal envelope, last_event_at, overage_blocked
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
         # connected to a TTY, so `tail -f <state-root>/logs/<sid>.log` would
@@ -6491,6 +6501,17 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     sub = event.get("subtype")
                     header = f"{t}/{sub}" if sub else t
                     log_file.write(f"[{now()}] {header}\n{line}\n\n")
+                    # Latch overage-block state (see `overage_blocked`
+                    # declaration above). Tracked here rather than in
+                    # `_summarize_stream_event` because it must survive to
+                    # the post-stream no-envelope check even at quiet
+                    # verbosity, where the summarizer returns None.
+                    if t == "rate_limit_event":
+                        _rli = event.get("rate_limit_info") or {}
+                        if (_rli.get("overageStatus") == "rejected"
+                                or _rli.get("overageDisabledReason")
+                                in ("out_of_credits", "out_of_overage")):
+                            overage_blocked = True
                     # Inline summary (verbosity-gated). Multi-line
                     # summaries (multi-block events, multi-line text)
                     # are emitted one log() call per line so each
@@ -6682,6 +6703,22 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
 
     if envelope is None:
         stderr_txt = b"".join(stderr_chunks).decode(errors="replace").strip()
+        # Out-of-credits mid-stream kill: the account was overage-blocked
+        # and the CLI was terminated before emitting a result event. This
+        # is a rate-limit condition, not a worker fault — route it into the
+        # existing resumable-pause path (main()'s RateLimitedExit handler)
+        # instead of a bare WorkerError, which would bypass the auth/quota
+        # backoff (it needs an envelope to classify) and die() the run
+        # non-resumably. reset_at is unknown here (the kill left no
+        # resetsAt on a result envelope), so the None-reset arm prints a
+        # `--resume` hint and exits 75 (EX_TEMPFAIL). Checked before the
+        # returncode arm because the kill may exit nonzero.
+        if overage_blocked:
+            raise RateLimitedExit(
+                reset_at=None,
+                raw_message=(
+                    f"out of credits — claude -p ({sid}) terminated "
+                    "mid-stream with no result event"))
         if proc.returncode and proc.returncode != 0:
             raise WorkerError(
                 f"claude -p exited {proc.returncode}: "

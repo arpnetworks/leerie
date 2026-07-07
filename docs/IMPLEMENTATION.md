@@ -2601,6 +2601,24 @@ trip the text markers on its own correct output, and `claude_p()` would
 burn the full backoff budget re-running an already-successful worker
 before eventually raising a false subscription-cap `WorkerError`.
 
+Because `_is_auth_or_quota_failure` requires a *result envelope*, it
+cannot classify an **out-of-credits mid-stream kill** — the case where
+the `claude -p` process is terminated the instant credits run out, before
+a `result` event is emitted (`_invoke` returns `envelope is None`). That
+truncation is caught earlier, in `_invoke` itself: as events stream, a
+`nonlocal overage_blocked` flag latches when a `rate_limit_event` carries
+`overageStatus == "rejected"` or `overageDisabledReason in
+{"out_of_credits", "out_of_overage"}`. In the no-envelope branch, if
+`overage_blocked` is set, `_invoke` raises `RateLimitedExit(reset_at=None,
+raw)` instead of a bare `WorkerError`, routing the failure into the
+resumable rate-limit pause (DESIGN §6; `main()`'s None-reset arm prints a
+`--resume` hint and exits 75). The overage event alone is *not* treated
+as terminal — it is a benign warning most workers survive; only its
+coincidence with a missing `result` event triggers the pause. Covered by
+`test_invoke_overage_block_plus_truncation_raises_ratelimited` (raises)
+and `test_invoke_overage_block_with_result_returns_envelope` (the benign
+control) in `tests/test_invoke_streaming.py`.
+
 When `_is_auth_or_quota_failure(envelope)` matches, `claude_p()` enters a
 `tenacity.AsyncRetrying` loop with `wait_exponential_jitter(initial=15,
 max=120, jitter=5)` and `stop_after_delay(auth_retry_max_sec)`. Each

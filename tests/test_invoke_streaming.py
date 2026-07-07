@@ -173,6 +173,77 @@ def test_invoke_raises_when_no_result_event(leerie, leerie_dir, monkeypatch):
             verbosity="stream"))
 
 
+# ----- out-of-credits truncation → resumable rate-limit pause --------------
+
+# The exact rate_limit_event payload captured from a real out-of-credits
+# kill (navegando run 60c68e71…): the account is overage-blocked
+# (`overageStatus:"rejected"`, `overageDisabledReason:"out_of_credits"`)
+# while `status` is still the benign "allowed". This shape is invariant
+# across the run corpus (992 occurrences).
+_OVERAGE_BLOCKED_EVENT = {
+    "type": "rate_limit_event",
+    "rate_limit_info": {
+        "status": "allowed", "resetsAt": 1783446600,
+        "rateLimitType": "five_hour", "overageStatus": "rejected",
+        "overageDisabledReason": "out_of_credits", "isUsingOverage": False,
+    },
+}
+
+
+def test_invoke_overage_block_plus_truncation_raises_ratelimited(
+        leerie, leerie_dir, monkeypatch):
+    """The observed crash: an out-of-credits overage-block event, then a
+    truncated assistant turn and NO result event — the CLI was killed the
+    moment credits ran out. This must raise RateLimitedExit (routing into
+    main()'s resumable-pause path), NOT a bare WorkerError that bypasses
+    the auth/quota backoff and die()s the run non-resumably.
+
+    reset_at is None here: the kill left no result envelope carrying a
+    parseable resetsAt, so main()'s None-reset arm prints a --resume hint
+    and exits 75."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
+        json.dumps(_OVERAGE_BLOCKED_EVENT),
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "I'll analyze the rename"}]}}),
+        # Stream truncates — no result event.
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events, returncode=1))
+    with pytest.raises(leerie.RateLimitedExit) as ei:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="reconciler", leerie_dir=leerie_dir,
+            verbosity="stream"))
+    assert ei.value.reset_at is None
+    assert "out of credits" in ei.value.raw_message
+
+
+def test_invoke_overage_block_with_result_returns_envelope(
+        leerie, leerie_dir, monkeypatch):
+    """Control for the 19/28 corpus runs that carried the identical
+    overage-block event yet SUCCEEDED: when a result event DOES arrive,
+    the overage warning is benign and _invoke returns the envelope
+    normally — no RateLimitedExit. This is why the fix keys on the
+    *coincidence* of overage-block AND a missing result event, not on the
+    event alone."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
+        json.dumps(_OVERAGE_BLOCKED_EVENT),
+        json.dumps({"type": "result", "subtype": "success",
+                    "num_turns": 3, "total_cost_usd": 0.05,
+                    "structured_output": {"ok": True}, "is_error": False}),
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    result = asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="pr-writer", leerie_dir=leerie_dir,
+        verbosity="stream"))
+    assert result["type"] == "result"
+    assert result["structured_output"] == {"ok": True}
+
+
 # ----- per-worker log file --------------------------------------------------
 
 def test_log_file_written_at_stream(leerie, leerie_dir, monkeypatch):
