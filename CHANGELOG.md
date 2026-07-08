@@ -5,6 +5,33 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.42]
+
+### Fixed
+
+- **Worker PID-exhaustion loop on subprocess-heavy test suites.** A worker
+  running an un-scoped full test suite (e.g. leerie's own ~193-module suite,
+  run by the conformer) burst past the per-worker cgroup `pids.max=256` in
+  seconds, wedging every subsequent `fork()` with `EAGAIN`. The
+  PID-exhaustion detector then killed and retried the worker, but the retry
+  re-ran the same suite and re-blew the cap — a deterministic loop that
+  failed the wave. Raised the default per-worker PID cap to 1024 and added a
+  per-repo override (`--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` /
+  `worker_pids_max` in `leerie.toml`). There is no reliable way to detect and
+  refuse "a full test suite run", so the cap value is the enforcement surface
+  (DESIGN §6 / §12).
+- **`LEERIE_*` environment overrides never reached the orchestrator.** The
+  orchestrator runs inside a container and reads its overrides from
+  `os.environ`, but the launcher's `nerdctl run` forwarded only
+  `LEERIE_STATE_DIR` and `LEERIE_INSPECT_DIRS`. Every other documented host
+  override (`LEERIE_MAX_WORKERS`, `LEERIE_SOURCE_OF_TRUTH`, `LEERIE_MODEL`,
+  `LEERIE_EFFORT`, `LEERIE_VERBOSITY`, `LEERIE_WORKER_PIDS_MAX`, the
+  per-worker `LEERIE_MODEL_<WORKER>` / `LEERIE_EFFORT_<WORKER>` families, …)
+  died at the container boundary and silently did nothing. The launcher now
+  forwards every `LEERIE_*` variable in its environment except a deny-list of
+  launcher/host-only vars; a coupling test guards against a future override
+  being silently stranded.
+
 ## [0.9.22]
 
 ### Fixed
