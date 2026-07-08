@@ -561,6 +561,33 @@ forwarding is not available" note is gone for the same reason.
 | `~/.cache/leerie/bundle` | `/home/leerie/.cache/leerie/bundle` | rw | `BUNDLE_PATH` for Bundler (Ruby gems). `BUNDLE_CACHE_ALL=1` instructs Bundler to cache all gems (including git-sourced ones) so each `bundle install` reuses downloaded gems across worktrees and runs. |
 | Each `--inspect-dir` path (translated) | `/inspect/<basename>` | ro | See below. |
 
+### `LEERIE_*` env-var forwarding (local `nerdctl run`)
+
+The orchestrator runs **inside** the container and reads every override from
+`os.environ` — which only inherits what `nerdctl run` forwards. The launcher
+forwards **every `LEERIE_*` var in its environment except a deny-list** of
+launcher/host-only vars (the `_leerie_env_denylist` array in the `nerdctl run`
+block). A `for` loop over `compgen -v | grep '^LEERIE_'` appends a bare
+`-e "$name"` (host value passed through) for each non-deny-listed var with a
+non-empty value. Empty/unset vars are skipped.
+
+Deny-list = forward-all-minus-known-host-only, not an allow-list, so the
+dynamic per-worker names (`LEERIE_MODEL_<WORKER>`, `LEERIE_EFFORT_<WORKER>`,
+built at runtime from `f"{MODEL_ENV}_{worker.upper()}"`) forward automatically
+and a future override cannot silently be stranded at the container boundary.
+Deny-listed vars are the launcher/host-only ones: `LEERIE_STATE_DIR` and
+`LEERIE_INSPECT_DIRS` (remapped separately to container-internal values —
+`-e LEERIE_STATE_DIR=/leerie-state`, `-e LEERIE_INSPECT_DIRS=`), `LEERIE_HOME`
+/ `LEERIE_REPO` / `LEERIE_STATE_HOST_DIR` / `LEERIE_SELF_CMD` (self-location +
+host paths), `LEERIE_NO_PUSH` (orchestrator always gets `--no-push`; host does
+the push), `LEERIE_RUNTIME` (decided launcher-side before launch), and the
+Fly/remote/chain/wave machinery. `tests/test_launcher_env_forwarding.py`
+extracts the loop verbatim and includes a coupling guard asserting no
+orchestrator-read override is deny-listed except four justified exceptions
+(`LEERIE_STATE_DIR`, `LEERIE_INSPECT_DIRS`, `LEERIE_NO_PUSH`, `LEERIE_RUNTIME`).
+On the Fly path the equivalent forwarding is via `child_env` in the
+detached-launch heredoc, not this loop.
+
 ### `--inspect-dir` path translation
 
 Inspect dirs (`--add-dir` forwarded to `claude -p` for cross-repo
@@ -3210,7 +3237,10 @@ together close the leak.
 **PID-exhaustion detection (`_cgroup_stat` + `_read_stream` probe).** The
 above cleanup runs at worker *exit*; leaked `run_in_background`
 subprocesses accumulate against the worker cgroup's `pids.max` (default
-`worker_pids_max = 256`) *during* the run. Once the cap is hit every
+`worker_pids_max = 1024`, resolved by `resolve_worker_pids_max`:
+`--worker-pids-max` > `LEERIE_WORKER_PIDS_MAX` > `worker_pids_max` in
+`leerie.toml` > `DEFAULT_CAPS["worker_pids_max"]`) *during* the run.
+Once the cap is hit every
 `fork()` in the subtree returns `EAGAIN`, so every `Bash` tool-call fails
 (in-process tools are unaffected) and the worker spirals without
 diagnosing the cause (DESIGN §6 *Detecting PID exhaustion*). The broker
@@ -3465,7 +3495,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) | worker killed; implementer → `incomplete-handoff` |
 | per-worker idle-event warning (`worker_idle_warn_sec`) | 300 s (5 min) | log a `no stdout events in <gap>s` warning naming the worker, its PID, and any stderr tail. Observation-only — the worker is NOT killed; `worker_timeout_sec` remains the only kill. Surfaces silent-hang failures (a worker that never emits its first `system/init` event) so the user is not left with zero feedback between phase start and the 90-min hard kill. |
 | per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived from `/proc/meminfo` (VM ram split across `max_parallel + 1` slots, clamped to ≤ 4 GiB), or `--worker-memory-max SIZE` / `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max` in `leerie.toml`. Suffixes K/M/G/T accepted | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services (sshd, lima-guestagent) are not eligible victims. Enforcement goes through the **root cgroup broker** (`scripts/cgroup-broker.py`), which the non-root orchestrator drives over a Unix socket — worker enrollment and limit-setting cannot be done by non-root code (kernel keeps controller limit files root-owned in delegated subtrees; cross-scope migration needs common-ancestor write; both reproduced). The broker creates `leerie.slice/leerie-w-<sid>` (cgroup **v2**) or the split `pids/`+`memory/` hierarchies (cgroup **v1/hybrid**, e.g. some Fly VMs) and sets its `memory.max`. Local nerdctl needs the launcher's `--mount type=bind,source=/sys/fs/cgroup,...rshared` + `--cgroupns=host` (default `--cgroupns=private` + `nsdelegate` blocks migration even for the broker); Fly's microVM exposes cgroupfs directly. `_cgroup_probe` asks the broker to round-trip a create+enroll+destroy — the true test of the worker path — and `enforce_and_record_cgroup_containment` `die()`s before the first worker if it fails (unless `--dangerously-allow-uncapped`). See DESIGN §6 *Memory containment*. |
-| per-worker cgroup PIDs cap (`worker_pids_max`) | 256 | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Catches runaway fork-bomb behavior in tool subtrees. |
+| per-worker cgroup PIDs cap (`worker_pids_max`) | 1024, or `--worker-pids-max N` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in `leerie.toml` (positive integer; `resolve_worker_pids_max` `die()`s on bad input) | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Catches runaway fork-bomb behavior in tool subtrees while still admitting a legitimate heavy conformance run (a subprocess-heavy full test suite bursts past a too-low cap in seconds — faster than the mid-run reaper's 60 s min-age gate). Raise it per-repo for suites heavier than the 1024 default. |
 | aggregate container memory cap (`leerie.slice/memory.max`) | auto-derived in `scripts/container-entry.sh` (PID 1) from VM `MemTotal` in `/proc/meminfo`: `MemTotal - max(1 GiB, 12.5%)`, reserving headroom for PID 1 + VM daemons (sshd, lima-guestagent, containerd). Overridable via `LEERIE_CONTAINER_MEMORY_MAX_BYTES` (raw bytes); `0`/`max` opts out. **Intentional provenance deviation:** unlike the per-worker cap, there is *no* CLI flag / `leerie.toml` key / `DEFAULT_CAPS` entry — the cap is applied by the shell entrypoint *before* the Python orchestrator (and its resolver machinery) starts, so a Python-side resolver could not set it in time; the env var is the single override knob. Best-effort: any read/write failure leaves the slice uncapped (prior behavior). Sets `memory.max` (RAM) only, not `memory.swap.max` — a capped slice may swap before the cgroup OOM fires, which still contains the pressure to the slice (no global OOM); bounding total RAM+swap via `memory.swap.max` is a possible future refinement. | when the slice's aggregate RSS exceeds the cap the kernel triggers a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`) that kills a process *inside the container* (per-worker `-998` protection is only relative within the slice), instead of a VM-wide *global* OOM that would kill unprotected host-session processes — the `nerdctl` client especially — and orphan the container (wedging the run-dir flock). See DESIGN §6 *container boundary's hidden precondition*. |
 | auth/quota backoff budget (`auth_retry_max_sec`) | 300 s (5 min) | `claude_p()` retries the worker with `tenacity` exponential backoff (initial 15 s, max 120 s, ±5 s jitter) on 401/429/529/auth-message envelopes. Budget exhausted → `WorkerError` naming the subscription cap (401/429/auth-text) or the transient overload (529). See §3 *Auth/quota backoff*. |
 | mechanical-feedback rounds for judgment workers (`judgment_check_rounds`) | 3 | classifier, reconciler, provision, overlap judge, integrator. The orchestrator runs deterministic checks (file existence, graph cycles, lockfile consistency) on each worker's output and re-invokes with structured feedback if issues are found. On exhaustion, proceed with best result + warnings. CRITIC pattern (ICLR 2024). |

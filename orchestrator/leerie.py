@@ -158,10 +158,18 @@ DEFAULT_CAPS = {
     # start" (see _auto_worker_memory_max).
     "worker_memory_max_bytes": None,
     # Per-worker cgroup v2 PID cap. Catches runaway fork-bomb behavior
-    # from a worker's tool subtree. 256 is generous — webpack + vitest
-    # pools regularly hit 50+ PIDs per worker, but a runaway shell loop
-    # is in the thousands.
-    "worker_pids_max": 256,
+    # from a worker's tool subtree while still admitting a legitimate
+    # heavy conformance run. The prior default of 256 was too low for a
+    # real workload: a repo whose full test suite fans out across many
+    # subprocesses (e.g. leerie's own ~193-module suite, ~70 of which
+    # shell out to bash harnesses / git / the launcher, run un-scoped by
+    # the conformer per prompts/conformer.md) bursts past 256 in seconds
+    # and wedges every subsequent fork with EAGAIN — the exact failure
+    # the PID-exhaustion detector then reports. 1024 clears that burst
+    # while a runaway shell loop (in the thousands) still trips the cap.
+    # Overridable per-repo via resolve_worker_pids_max (CLI > env >
+    # leerie.toml > this default).
+    "worker_pids_max": 1024,
     # Auth/quota backoff budget. When `claude -p` returns an envelope
     # whose `api_error_status` is 401/429/529 or whose result message
     # names an auth/rate-limit failure, `claude_p()` retries with tenacity's
@@ -481,6 +489,13 @@ MAX_PARALLEL_FILE = SOURCE_OF_TRUTH_FILE
 # binary — 1G == 1024**3 bytes). See _parse_memory_size.
 WORKER_MEMORY_MAX_ENV = "LEERIE_WORKER_MEMORY_MAX"
 WORKER_MEMORY_MAX_FILE = SOURCE_OF_TRUTH_FILE
+
+# Per-worker cgroup PID cap (cgroup v2 pids.max). Same resolution shape:
+# CLI --worker-pids-max wins; then LEERIE_WORKER_PIDS_MAX env; then
+# worker_pids_max in leerie.toml; then DEFAULT_CAPS["worker_pids_max"].
+# A positive integer — see resolve_worker_pids_max.
+WORKER_PIDS_MAX_ENV = "LEERIE_WORKER_PIDS_MAX"
+WORKER_PIDS_MAX_FILE = SOURCE_OF_TRUTH_FILE
 
 # --no-push preference (DESIGN §6 "Push + PR"): skip the push + open-PR
 # step at finalize. Resolution order: --no-push CLI flag → LEERIE_NO_PUSH
@@ -3067,6 +3082,21 @@ def resolve_worker_memory_max(repo_root: Path,
         return _parse_memory_size(file_val,
                                   f"{cfg}: worker_memory_max")
     return _auto_worker_memory_max(max_parallel)
+
+
+def resolve_worker_pids_max(repo_root: Path,
+                            cli_value: int | None = None) -> int:
+    """Resolve the per-worker cgroup PID cap (pids.max). Order:
+    --worker-pids-max CLI flag → LEERIE_WORKER_PIDS_MAX env →
+    leerie.toml `worker_pids_max` → DEFAULT_CAPS["worker_pids_max"].
+    argparse validates `cli_value` is a positive int via
+    `type=_positive_int` so it is trusted when set; env and file values
+    die() when not a positive int — bad config caught at startup."""
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=WORKER_PIDS_MAX_ENV, file_key="worker_pids_max",
+        file_name=WORKER_PIDS_MAX_FILE,
+        default=DEFAULT_CAPS["worker_pids_max"])
 
 
 def resolve_inspect_dirs(repo_root: Path,
@@ -15939,6 +15969,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "/proc/meminfo when unset. Also "
                          f"{WORKER_MEMORY_MAX_ENV} env var or "
                          "worker_memory_max in leerie.toml")
+    ap.add_argument("--worker-pids-max", type=_positive_int, metavar="N",
+                    help="per-worker cgroup PID cap (positive integer; "
+                         f"default {DEFAULT_CAPS['worker_pids_max']}). "
+                         "Bounds fork/clone in each claude -p worker "
+                         "subtree; a runaway fork-bomb stays inside the "
+                         "worker cgroup rather than exhausting the VM's "
+                         "PID table. Raise it for repos whose conformance "
+                         "step runs a subprocess-heavy full test suite. "
+                         f"Also {WORKER_PIDS_MAX_ENV} env var or "
+                         "worker_pids_max in leerie.toml")
     ap.add_argument("--skip-smoke", action="store_true",
                     help="skip the live claude -p smoke test during preflight. "
                          "Default: off (smoke test runs)")
@@ -16169,6 +16209,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # derived value is "VM ram split N+1 ways, capped at 4 GiB".
     caps["worker_memory_max_bytes"] = resolve_worker_memory_max(
         Path(os.getcwd()), caps["max_parallel"], args.worker_memory_max)
+    # Per-worker cgroup PID cap. CLI > env > leerie.toml > default; the
+    # resolver die()s on a non-positive-integer value. Threaded into
+    # _cgroup_create via the caps.get("worker_pids_max", …) site so the
+    # broker writes it to the worker cgroup's pids.max.
+    caps["worker_pids_max"] = resolve_worker_pids_max(
+        Path(os.getcwd()), args.worker_pids_max)
     caps["strict_conformer"] = args.strict_conformer
 
     # Resolve verbosity. Explicit --verbosity wins; else -v/-q

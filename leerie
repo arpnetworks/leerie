@@ -3345,7 +3345,7 @@ LEERIE_TASK_ARG=""
 _prev=""
 _value_flags=" --run-id --answers --pr-template --max-workers \
 --max-parallel --confidence-rounds --planner-samples --worker-memory-max \
---source-of-truth --runtime --inspect-dir --model --effort \
+--worker-pids-max --source-of-truth --runtime --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \
 --heal-success-threshold --verbosity --telemetry-dir --judge-dir \
 --heal-dir --phase --host-no-push --status --chain-id \
@@ -5887,6 +5887,51 @@ else
   trap '_kill_container_from_cidfile; exit 130' INT
   trap '_kill_container_from_cidfile; exit 143' TERM
 
+  # Forward orchestrator-side LEERIE_* env overrides into the container.
+  # The orchestrator's resolve_* functions read os.environ *inside* the
+  # container, which only inherits what `nerdctl run` explicitly passes.
+  # Without this, every documented LEERIE_* knob a user sets on the host
+  # (LEERIE_WORKER_PIDS_MAX, LEERIE_MAX_WORKERS, LEERIE_SOURCE_OF_TRUTH,
+  # LEERIE_MODEL, LEERIE_EFFORT, per-worker LEERIE_MODEL_<W>/LEERIE_EFFORT_<W>,
+  # …) dies at the container boundary and silently does nothing.
+  #
+  # Design: forward every LEERIE_* var in the launcher's environment EXCEPT a
+  # deny-list of launcher/host-only vars, rather than an allow-list — an
+  # allow-list can't enumerate the dynamic per-worker LEERIE_MODEL_<WORKER> /
+  # LEERIE_EFFORT_<WORKER> names, and a future override would silently break.
+  # `tests/test_launcher_env_forwarding.py` guards this deny-list.
+  #
+  # Deny-list rationale:
+  #   - LEERIE_STATE_DIR / LEERIE_INSPECT_DIRS: remapped explicitly below to
+  #     container-internal values (-e ...=/leerie-state, -e ...=); the host
+  #     value would point at a host path meaningless inside the container.
+  #   - LEERIE_HOME / LEERIE_REPO / LEERIE_STATE_HOST_DIR / LEERIE_SELF_CMD:
+  #     launcher self-location + host paths.
+  #   - Fly/remote/chain/wave machinery: consumed launcher-side only.
+  #   - LEERIE_NO_PUSH: the orchestrator is always invoked with --no-push and
+  #     the host does the push; forwarding it would be redundant/confusing.
+  _leerie_env_denylist=" \
+    LEERIE_STATE_DIR LEERIE_INSPECT_DIRS LEERIE_HOME LEERIE_REPO \
+    LEERIE_STATE_HOST_DIR LEERIE_SELF_CMD LEERIE_VERSION LEERIE_TASK_ARG \
+    LEERIE_NO_PUSH LEERIE_GENERATED_SENTINEL LEERIE_RECAPTURE_WROTE \
+    LEERIE_NO_AUTO_PUBLISH LEERIE_LOCAL_BUILD LEERIE_FORCE_KILL \
+    LEERIE_NO_RUNTIME_INSTALL LEERIE_INSPECT_HOST_TARGETS \
+    LEERIE_FLY_APP LEERIE_FLY_IMAGE LEERIE_RUNTIME LEERIE_MACHINE_ID \
+    LEERIE_RUN_ID LEERIE_VOLUME_ID LEERIE_SEED_DEPTH \
+    LEERIE_SEED_SHALLOW_THRESHOLD_MB LEERIE_RE_SEED_FORCE \
+    LEERIE_REMOTE_EXIT_RC LEERIE_REMOTE_RUN_ID LEERIE_CHAIN_ID \
+    LEERIE_WAVE_IDX LEERIE_TAIL_RUN_ID LEERIE_LIST_FLY_JSON "
+  _leerie_env_args=()
+  # `compgen -v` lists shell + env variable names; filter to LEERIE_* and skip
+  # the deny-list and empty values. Bare `-e NAME` passes the host value.
+  for _name in $(compgen -v | grep '^LEERIE_' | sort -u); do
+    case "$_leerie_env_denylist" in
+      *" $_name "*) continue ;;
+    esac
+    [ -n "${!_name-}" ] || continue
+    _leerie_env_args+=("-e" "$_name")
+  done
+
   nerdctl run \
     --rm $TTY_FLAGS \
     --name "leerie-$(date +%s)-$$" \
@@ -5895,6 +5940,7 @@ else
     -v "$_cidfile:/run/leerie-cidfile:ro" \
     -e LEERIE_INSPECT_DIRS= \
     -e LEERIE_STATE_DIR=/leerie-state \
+    ${_leerie_env_args[@]+"${_leerie_env_args[@]}"} \
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"} \
     --cgroupns=host \
     ${ROOTLESS_SECOPT[@]+"${ROOTLESS_SECOPT[@]}"} \

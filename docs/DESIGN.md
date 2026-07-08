@@ -1347,7 +1347,9 @@ Each `claude -p` worker is therefore enrolled in its own child
 cgroup at `<cgroup-root>/leerie-w-<sid>/` with `memory.max` set to
 `caps["worker_memory_max_bytes"]` (default: VM RAM split across
 `max_parallel + 1` slots, clamped to ≤ 4 GiB) and `pids.max` set
-to `caps["worker_pids_max"]` (default 256). When the worker
+to `caps["worker_pids_max"]` (default 1024, overridable per-repo via
+`--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in
+leerie.toml). When the worker
 subtree blows past `memory.max`, the kernel OOM-kills *inside that
 cgroup*; sibling workers, the orchestrator, and host-side services
 in different cgroups are not eligible victims. `memory.swap.max=0`
@@ -1496,6 +1498,20 @@ worker cannot diagnose this — the CLI surfaces only a generic tool error,
 and the kernel's `EAGAIN` string usually does not survive into the
 tool-result text for trivial commands — so it mis-attributes the failure
 and burns its whole turn budget without recovering.
+
+Detection is a backstop, not a substitute for a cap sized to the
+workload. A *legitimate* heavy run can saturate a too-low cap in a burst
+that no reaper can catch in time: the conformer phase runs the full,
+un-scoped `TEST_CMD`, and for a repo whose suite fans out across many
+subprocesses (leerie's own ~193-module suite is the canonical example)
+that burst hits the cap in seconds — faster than the mid-run reaper's
+60-second min-age gate allows any PID to become eligible. There is no
+reliable way to *detect and refuse* "a full test suite run" (the command
+space — `pytest`, `make test`, `tox`, wrapper scripts — is open-ended,
+and a misfiring guard is worse than none), so the cap value itself is the
+enforcement surface: the default is set generous enough (1024) to admit a
+real conformance run, and it is overridable per-repo for suites heavier
+still. A runaway fork-bomb (thousands of PIDs) still trips the cap.
 
 Per §12 (*prompts are advisory, code enforces*), the orchestrator detects
 this mechanically rather than leaving it to the model. The broker gains a
