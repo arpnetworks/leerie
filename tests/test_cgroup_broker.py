@@ -122,6 +122,71 @@ def test_no_hierarchy_errors(broker, monkeypatch):
     assert broker._handle("create wsid 0 64") == "ERR no usable cgroup hierarchy"
 
 
+# ---- stat verb (PID-exhaustion detection, DESIGN §6) ----------------------
+
+def _seed_pids_files(broker, sid, current, maxval, events_max):
+    """Write fake v2 pids.* controller files for `sid`."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / f"leerie-w-{sid}"
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "pids.current").write_text(str(current))
+    (d / "pids.max").write_text(str(maxval))
+    (d / "pids.events").write_text(f"max {events_max}\n")
+    return d
+
+
+def test_stat_reads_v2_counters(broker):
+    _seed_pids_files(broker, "wsid", current=256, maxval=256, events_max=42)
+    assert broker._handle("stat wsid") == "OK 256 256 42"
+
+
+def test_stat_unlimited_max_reports_minus_one(broker):
+    """pids.max == 'max' (unlimited) → -1 so the client never false-detects
+    current >= max on an uncapped cgroup."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    d.mkdir(parents=True)
+    (d / "pids.current").write_text("5")
+    (d / "pids.max").write_text("max")
+    (d / "pids.events").write_text("max 0\n")
+    assert broker._handle("stat wsid") == "OK 5 -1 0"
+
+
+def test_stat_missing_cgroup_degrades_to_sentinels(broker):
+    """No cgroup dir (containment off / raced with destroy) → safe
+    sentinels (current 0, max -1, events 0), never a raise."""
+    assert broker._handle("stat ghost") == "OK 0 -1 0"
+
+
+def test_stat_rejects_bad_sid(broker):
+    assert broker._handle("stat ../evil") == "ERR bad sid"
+
+
+def test_stat_missing_sid_arg_errors(broker):
+    # _handle wraps _do in try/except (OSError, ValueError, IndexError).
+    assert broker._handle("stat").startswith("ERR")
+
+
+def test_stat_v1_has_no_events(broker, monkeypatch, tmp_path):
+    """v1's pids controller exposes current/max but no pids.events → the
+    events_max field is always 0 (detection falls back to current>=max)."""
+    monkeypatch.setattr(broker, "_HIER", "v1")
+    pdir = (Path(broker.V2_ROOT) / "pids" / broker.SLICE / "leerie-w-wsid")
+    pdir.mkdir(parents=True)
+    (pdir / "pids.current").write_text("100")
+    (pdir / "pids.max").write_text("100")
+    assert broker._handle("stat wsid") == "OK 100 100 0"
+
+
+def test_stat_events_parser_ignores_unknown_keys(broker):
+    """pids.events may carry keys other than 'max' (e.g. 'max.imposed' on
+    some kernels); only the exact 'max' line counts."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    d.mkdir(parents=True)
+    (d / "pids.current").write_text("10")
+    (d / "pids.max").write_text("64")
+    (d / "pids.events").write_text("max.imposed 7\nmax 3\n")
+    assert broker._handle("stat wsid") == "OK 10 64 3"
+
+
 # ---- probe round-trip -----------------------------------------------------
 
 def test_probe_round_trips_ok(broker):

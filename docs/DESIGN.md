@@ -1482,6 +1482,40 @@ survivors to the parent then rmdirs. See IMPLEMENTATION.md §"Caps" for
 the resolution surface, `scripts/cgroup-broker.py` for the broker, and
 the `_cgroup_*` clients in `orchestrator/leerie.py` for the call sites.
 
+**Detecting PID exhaustion — the broker `stat` read-back.** The
+`pids.max` cap protects the *host* (a runaway subtree cannot exhaust the
+VM's PID table), but it has a failure mode of its own for the *worker*:
+once the cap is reached, every subsequent `fork()`/`clone()` in the
+subtree returns `EAGAIN`, so **every shell the worker's Bash tool tries
+to launch fails** — while in-process tools (`Read`/`Grep`/`Glob`) keep
+working. Observed live: a worker leaked `run_in_background` subprocesses
+(reparented to init, so `_DescendantTracker` reaps them only at worker
+*exit*), saturated `pids.max`, and then spent the rest of the run in a
+spiral where even `echo`/`true`/`pwd` returned a bare "Exit code 1". The
+worker cannot diagnose this — the CLI surfaces only a generic tool error,
+and the kernel's `EAGAIN` string usually does not survive into the
+tool-result text for trivial commands — so it mis-attributes the failure
+and burns its whole turn budget without recovering.
+
+Per §12 (*prompts are advisory, code enforces*), the orchestrator detects
+this mechanically rather than leaving it to the model. The broker gains a
+read-only `stat <sid>` verb returning the worker cgroup's
+`pids.current` / `pids.max` and the `pids.events` `max` counter (the
+kernel increments the latter once per denied fork — the definitive,
+unambiguous signal, distinct from a memory OOM which instead bumps
+`memory.events`). When a worker emits several consecutive errored Bash
+tool-results, `_read_stream` probes the broker; if the cgroup is at its
+PID cap (or the `pids.events` `max` counter is climbing), the orchestrator
+logs the real cause, relabels the inline summary, and terminates the
+worker early via the existing abnormal-exit path (`_terminate_proc_tree`
++ the `_DescendantTracker` reap) with a `WorkerError`. That routes through
+the callers' existing handling: an implementer's PID-exhausted run becomes
+a retryable `incomplete-handoff` (a fresh worker restarts in a new
+worktree with a clean PID table, and the dead worker's leaked PIDs die
+with it), and a conformer's stays advisory (§9). The probe is gated behind
+a consecutive-error threshold so an ordinary failing test — which is not
+PID exhaustion — never triggers it.
+
 Earlier versions of leerie gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made
 accidental Ctrl-C catastrophic — and it conflated user intent ("stop

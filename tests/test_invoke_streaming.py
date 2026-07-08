@@ -628,3 +628,149 @@ def test_create_subprocess_exec_uses_high_limit(leerie, leerie_dir,
         f"limit={limit} is too close to asyncio's 64KB default. A "
         "large structured_output event would still crash _read_stream "
         "with LimitOverrunError. The shipped value is 10 MB.")
+
+
+# ----- PID-exhaustion detection → early WorkerError (DESIGN §6) -------------
+
+def _errored_tool_result(text: str = "Exit code 1") -> str:
+    """One stream line: a user/tool_result with is_error=true. Under PID
+    exhaustion the worker emits a run of these (every shell fails)."""
+    return json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": True, "content": text,
+         "tool_use_id": "tu"}]}})
+
+
+def _enable_fake_cgroup(leerie, monkeypatch, stat_triple):
+    """Make _invoke believe a worker cgroup exists (so cgroup_sid is set)
+    and have _cgroup_stat report `stat_triple`."""
+    monkeypatch.setattr(leerie, "_cgroup_create", lambda sid, mem, pids: sid)
+    monkeypatch.setattr(leerie, "_cgroup_enroll", lambda sid, pid: True)
+    monkeypatch.setattr(leerie, "_cgroup_destroy", lambda sid: None)
+    monkeypatch.setattr(leerie, "_cgroup_stat", lambda sid: stat_triple)
+
+
+def test_invoke_pid_exhaustion_raises_early(leerie, leerie_dir, monkeypatch):
+    """A worker at its pids.max cap (current >= max) that emits several
+    consecutive errored tool-results is terminated early with WorkerError,
+    instead of streaming to a (never-arriving) result event."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
+        _errored_tool_result(),   # 1
+        _errored_tool_result(),   # 2
+        _errored_tool_result(),   # 3 -> probe fires, current>=max -> raise
+        json.dumps({"type": "result", "subtype": "success",
+                    "structured_output": {"ok": True}, "is_error": False}),
+    ]
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0))
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    with pytest.raises(leerie.WorkerError) as ei:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
+            verbosity="stream",
+            worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+    assert "exhausted its PID cgroup" in str(ei.value)
+
+
+def test_invoke_pid_exhaustion_via_climbing_denials(leerie, leerie_dir,
+                                                    monkeypatch):
+    """Even when current < max, a climbing pids.events.max (fresh fork
+    denials since the FIRST probe) confirms exhaustion. The probe fires
+    once per errored result past the threshold; probe #1 (3rd error)
+    latches the baseline, probe #2 (4th error) sees the counter climbed
+    and raises."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
+        _errored_tool_result(),   # 1
+        _errored_tool_result(),   # 2
+        _errored_tool_result(),   # 3 -> probe #1: baseline latches to 0
+        _errored_tool_result(),   # 4 -> probe #2: events 0 -> 7 -> raise
+        json.dumps({"type": "result", "subtype": "success",
+                    "structured_output": {"ok": True}, "is_error": False}),
+    ]
+    seq = iter([(200, 256, 0), (200, 256, 7)])
+    _enable_fake_cgroup(leerie, monkeypatch, None)
+    monkeypatch.setattr(leerie, "_cgroup_stat",
+                        lambda sid: next(seq, (200, 256, 7)))
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    with pytest.raises(leerie.WorkerError):
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
+            verbosity="stream",
+            worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+
+
+def test_invoke_ordinary_failures_do_not_trigger(leerie, leerie_dir,
+                                                  monkeypatch):
+    """A worker with failing commands but a healthy cgroup (current far
+    below max, no denials) must NOT be terminated — it streams to its
+    result event normally. Guards against killing a worker whose tests
+    merely fail."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
+        _errored_tool_result("FAILED test_a"),
+        _errored_tool_result("FAILED test_b"),
+        _errored_tool_result("FAILED test_c"),
+        _errored_tool_result("FAILED test_d"),
+        json.dumps({"type": "result", "subtype": "success",
+                    "structured_output": {"ok": True}, "is_error": False}),
+    ]
+    _enable_fake_cgroup(leerie, monkeypatch, (12, 256, 0))  # healthy
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    result = asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
+        verbosity="stream",
+        worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+    assert result["structured_output"] == {"ok": True}
+
+
+def test_invoke_success_between_errors_resets_counter(leerie, leerie_dir,
+                                                      monkeypatch):
+    """Consecutive-error counting resets on any non-error event, so
+    scattered failures (never 3 in a row) don't accumulate to the
+    threshold even under an exhausted-looking stat stub."""
+    ok_tool = json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": False, "content": "ok",
+         "tool_use_id": "tu"}]}})
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
+        _errored_tool_result(), _errored_tool_result(), ok_tool,
+        _errored_tool_result(), _errored_tool_result(), ok_tool,
+        json.dumps({"type": "result", "subtype": "success",
+                    "structured_output": {"ok": True}, "is_error": False}),
+    ]
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 99))  # would trip if 3+
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    result = asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
+        verbosity="stream",
+        worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+    assert result["structured_output"] == {"ok": True}
+
+
+def test_invoke_stat_none_never_false_detects(leerie, leerie_dir, monkeypatch):
+    """When containment is off (_cgroup_stat returns None), the detector is
+    inert even under a long run of errors — no early kill."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
+        _errored_tool_result(), _errored_tool_result(),
+        _errored_tool_result(), _errored_tool_result(),
+        json.dumps({"type": "result", "subtype": "success",
+                    "structured_output": {"ok": True}, "is_error": False}),
+    ]
+    _enable_fake_cgroup(leerie, monkeypatch, None)
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    result = asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="cfg-002", leerie_dir=leerie_dir,
+        verbosity="stream",
+        worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+    assert result["structured_output"] == {"ok": True}

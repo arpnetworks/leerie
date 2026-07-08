@@ -230,3 +230,42 @@ def test_gate_takes_state_and_flag(leerie):
     import inspect
     sig = inspect.signature(leerie.enforce_and_record_cgroup_containment)
     assert list(sig.parameters) == ["st", "allow_uncapped"]
+
+
+# ---- stat (PID-exhaustion probe, DESIGN §6) -------------------------------
+
+def test_stat_parses_ok_triple(leerie, monkeypatch):
+    sent = _stub_broker(leerie, monkeypatch, "OK 256 256 42")
+    assert leerie._cgroup_stat("feat-001") == (256, 256, 42)
+    assert sent == ["stat feat-001"]
+
+
+def test_stat_none_sid_returns_none_without_calling(leerie, monkeypatch):
+    sent = _stub_broker(leerie, monkeypatch, "OK 1 2 3")
+    assert leerie._cgroup_stat(None) is None
+    assert sent == []  # short-circuits before the socket round-trip
+
+
+def test_stat_broker_unreachable_returns_none(leerie, monkeypatch):
+    _stub_broker(leerie, monkeypatch, "RAISE no broker")
+    assert leerie._cgroup_stat("feat-001") is None
+
+
+def test_stat_broker_error_returns_none(leerie, monkeypatch):
+    _stub_broker(leerie, monkeypatch, "ERR bad sid")
+    assert leerie._cgroup_stat("feat-001") is None
+
+
+def test_stat_malformed_ok_returns_none(leerie, monkeypatch):
+    # Wrong arity or non-integer fields must not crash the caller.
+    _stub_broker(leerie, monkeypatch, "OK 256 256")
+    assert leerie._cgroup_stat("feat-001") is None
+    _stub_broker(leerie, monkeypatch, "OK a b c")
+    assert leerie._cgroup_stat("feat-001") is None
+
+
+def test_stat_unlimited_max_passthrough(leerie, monkeypatch):
+    # Broker reports -1 for an uncapped cgroup; the client passes it through
+    # so the detector's `mx > 0` guard suppresses false exhaustion.
+    _stub_broker(leerie, monkeypatch, "OK 5 -1 0")
+    assert leerie._cgroup_stat("feat-001") == (5, -1, 0)

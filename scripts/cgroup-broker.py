@@ -104,6 +104,42 @@ def _write(path: str, val: str, swallow: bool = False,
             raise
 
 
+# --- pids.* parsers (for the read-only `stat` verb) ------------------------
+# Missing/unreadable files (containment off, race with destroy) degrade to
+# safe sentinels rather than raising: current/events → 0, max → -1 ("no cap
+# known"), so the orchestrator never false-detects exhaustion from a read
+# error. `pids.max` may be the literal string "max" (unlimited).
+
+def _pids_current(path: str) -> int:
+    try:
+        return int(_read(path).strip())
+    except ValueError:
+        return 0
+
+
+def _pids_max(path: str) -> int:
+    raw = _read(path).strip()
+    if not raw or raw == "max":
+        return -1
+    try:
+        return int(raw)
+    except ValueError:
+        return -1
+
+
+def _pids_events_max(path: str) -> int:
+    # cgroup v2 pids.events: newline-separated "<key> <count>" lines. The
+    # `max` key counts fork denials — the definitive PID-exhaustion signal.
+    for line in _read(path).splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == "max":
+            try:
+                return int(parts[1])
+            except ValueError:
+                return 0
+    return 0
+
+
 # --- v2 paths --------------------------------------------------------------
 
 def _v2_dir(sid: str) -> str:
@@ -132,6 +168,13 @@ def _v2_destroy(sid: str) -> None:
         os.rmdir(d)
     except OSError:
         pass
+
+
+def _v2_stat(sid: str) -> tuple[int, int, int]:
+    d = _v2_dir(sid)
+    return (_pids_current(f"{d}/pids.current"),
+            _pids_max(f"{d}/pids.max"),
+            _pids_events_max(f"{d}/pids.events"))
 
 
 # --- v1 paths (split controllers) -----------------------------------------
@@ -170,6 +213,18 @@ def _v1_destroy(sid: str) -> None:
             pass
 
 
+def _v1_stat(sid: str) -> tuple[int, int, int]:
+    # We do not read pids.events on v1 — always report events_max=0 and let
+    # detection fall back to the current >= max comparison. (Newer kernels
+    # do expose pids.events under the v1 pids controller, but skipping it
+    # keeps v1 handling simple and portable across kernels that may or may
+    # not have it.)
+    pdir, _ = _v1_dirs(sid)
+    return (_pids_current(f"{pdir}/pids.current"),
+            _pids_max(f"{pdir}/pids.max"),
+            0)
+
+
 # --- dispatch --------------------------------------------------------------
 
 def _valid_sid(sid: str) -> bool:
@@ -182,6 +237,7 @@ def _do(verb: str, args: list[str]) -> str:
     create = _v2_create if _HIER == "v2" else _v1_create
     enroll = _v2_enroll if _HIER == "v2" else _v1_enroll
     destroy = _v2_destroy if _HIER == "v2" else _v1_destroy
+    stat = _v2_stat if _HIER == "v2" else _v1_stat
 
     if verb == "create":
         sid, mem, pids = args[0], int(args[1]), int(args[2])
@@ -203,6 +259,12 @@ def _do(verb: str, args: list[str]) -> str:
             return "ERR bad sid"
         destroy(sid)
         return "OK"
+    if verb == "stat":
+        sid = args[0]
+        if not _valid_sid(sid):
+            return "ERR bad sid"
+        cur, mx, ev = stat(sid)
+        return f"OK {cur} {mx} {ev}"
     return f"ERR unknown verb {verb}"
 
 

@@ -372,6 +372,84 @@ def test_tool_failure_not_truncated(leerie):
     assert long_err in out
 
 
+# ----- PID-exhaustion relabel + _is_fork_exhaustion (DESIGN §6) -------------
+
+@pytest.mark.parametrize("text,expected", [
+    ("/bin/bash: fork: retry: Resource temporarily unavailable", True),
+    ("bash: cannot fork", True),
+    ("fork: Cannot allocate memory", True),
+    ("Exit code 1", False),                       # bare — no signature
+    ("FAILED tests/test_foo.py::test_bar", False),  # ordinary test failure
+    ("Output does not match required schema", False),
+    ("", False),
+])
+def test_is_fork_exhaustion(leerie, text, expected):
+    assert leerie._is_fork_exhaustion(text) is expected
+
+
+def test_fork_exhaustion_error_relabeled(leerie):
+    """A tool_result whose text carries the EAGAIN signature is relabeled
+    to name the PID cap — so a human reading the stream isn't misled."""
+    event = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": True,
+         "content": ("Exit code 254\n/bin/bash: fork: retry: Resource "
+                     "temporarily unavailable"),
+         "tool_use_id": "tu_1"},
+    ]}}
+    out = leerie._summarize_stream_event("cfg-002", event, "stream")
+    assert "PID cap reached" in out
+    assert "cannot fork" in out
+    # Original text is still present (not truncated away).
+    assert "Resource temporarily unavailable" in out
+
+
+def test_ordinary_error_not_relabeled(leerie):
+    """A genuine failing-test error must stay a plain tool-fail — no PID-cap
+    label (guards against false positives in the human-facing stream)."""
+    event = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": True,
+         "content": "Exit code 1\nFFFF.F [100%]",
+         "tool_use_id": "tu_1"},
+    ]}}
+    out = leerie._summarize_stream_event("cfg-002", event, "stream")
+    assert "tool-fail" in out
+    assert "PID cap" not in out
+
+
+# ----- _errored_bash_result_text (detector's consecutive-error counter) -----
+
+def test_errored_bash_result_text_extracts_error(leerie):
+    event = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": True, "content": "Exit code 1",
+         "tool_use_id": "tu_1"},
+    ]}}
+    assert leerie._errored_bash_result_text(event) == "Exit code 1"
+
+
+def test_errored_bash_result_text_none_on_success(leerie):
+    event = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": False, "content": "ok",
+         "tool_use_id": "tu_1"},
+    ]}}
+    assert leerie._errored_bash_result_text(event) is None
+
+
+def test_errored_bash_result_text_none_on_non_user_event(leerie):
+    assert leerie._errored_bash_result_text(
+        {"type": "assistant", "message": {"content": []}}) is None
+
+
+def test_errored_bash_result_text_empty_string_still_counts(leerie):
+    """A bare errored result with empty content returns "" (falsy but not
+    None) — the detector must count it, since PID-exhausted trivial
+    commands surface exactly this."""
+    event = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": True, "content": "",
+         "tool_use_id": "tu_1"},
+    ]}}
+    assert leerie._errored_bash_result_text(event) == ""
+
+
 def test_tool_success_dropped_at_stream(leerie):
     """Successful tool_result is the noise floor — drop from inline
     at stream level. File has it."""

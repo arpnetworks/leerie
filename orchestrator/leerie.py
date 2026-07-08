@@ -1607,6 +1607,13 @@ def _signal_pids(pids: set[int], sig: int) -> None:
 
 _DESCENDANT_POLL_SEC = 0.5
 
+# Consecutive errored tool-results before `_invoke`'s PID-exhaustion
+# detector probes the cgroup (DESIGN §6 *Detecting PID exhaustion*). A
+# single ordinary failing command must never trip it — 3-in-a-row plus a
+# confirming cgroup read is the signal that the whole subtree can no longer
+# fork, not that one test failed.
+_PID_EXHAUSTION_ERROR_THRESHOLD = 3
+
 
 class _DescendantTracker:
     """Background poller that accumulates every PID ever observed as a
@@ -5859,6 +5866,44 @@ def _extract_tool_result_text(block: dict) -> str:
     return ""
 
 
+# libc's EAGAIN ("Resource temporarily unavailable") / shell fork-failure
+# strings. When a worker has exhausted its cgroup pids.max, further forks
+# are denied and shells cannot launch. This text SURVIVES into the
+# tool-result only for commands that emit output before the shell dies;
+# trivial commands (`echo`, `true`) surface a bare "Exit code 1" instead.
+# So this is a cheap *fast-path* confirmation — the authoritative signal is
+# the cgroup `pids.events` read (DESIGN §6 *Detecting PID exhaustion*).
+_FORK_EAGAIN_MARKERS = (
+    "resource temporarily unavailable",
+    "cannot fork",
+    "cannot allocate memory",
+    "fork: retry",
+)
+
+
+def _is_fork_exhaustion(text: str) -> bool:
+    """True if `text` carries a shell fork-failure signature. Advisory —
+    absence does NOT rule out PID exhaustion (see marker list above)."""
+    low = text.lower()
+    return any(m in low for m in _FORK_EAGAIN_MARKERS)
+
+
+def _errored_bash_result_text(event: dict) -> str | None:
+    """If `event` is a user/tool_result carrying an errored result, return
+    its text (possibly empty ""); otherwise None. Used by `_read_stream`'s
+    PID-exhaustion detector to count consecutive tool failures. Not
+    Bash-specific at the event level (the stream doesn't name the tool on
+    the result), but under PID exhaustion every shell-spawning tool fails,
+    so the consecutive-failure signal plus the cgroup probe is what
+    distinguishes exhaustion from an ordinary single failing command."""
+    if event.get("type") != "user":
+        return None
+    for b in (event.get("message", {}) or {}).get("content", []) or []:
+        if b.get("type") == "tool_result" and b.get("is_error"):
+            return _extract_tool_result_text(b)
+    return None
+
+
 def _tag_each_line(prefix: str, content: str) -> str:
     """Prefix the first non-empty line of `content` with `prefix`;
     subsequent lines get a width-matched continuation prefix that
@@ -6026,6 +6071,16 @@ def _summarize_stream_event(sid: str, event: dict, verbosity: str) -> str | None
                 # so attribution survives parallel runs without
                 # repeating the kind token on every line — see
                 # _tag_each_line.
+                #
+                # When the failure carries an EAGAIN/fork signature, name
+                # the real cause inline so a human reading the stream isn't
+                # misled by a bare "Exit code 1" (DESIGN §6 *Detecting PID
+                # exhaustion*). The authoritative kill decision is made by
+                # `_read_stream`'s cgroup probe; this only relabels.
+                if _is_fork_exhaustion(content_txt):
+                    return _tag_each_line(
+                        f"  [{sid} tool-fail: PID cap reached — worker "
+                        f"subtree cannot fork]", content_txt)
                 return _tag_each_line(f"  [{sid} tool-fail]", content_txt)
             # Successful tool results are file-only at stream; debug
             # gets the FULL content. The user opting into debug is
@@ -6292,6 +6347,33 @@ def _cgroup_destroy(sid: str | None) -> None:
         _cgroup_request(f"destroy {sid}")
 
 
+def _cgroup_stat(sid: str | None) -> tuple[int, int, int] | None:
+    """Read-only probe of a worker cgroup's PID counters via the broker's
+    `stat` verb. Returns `(pids.current, pids.max, pids.events.max)`, or
+    None when the sid is None, containment is off (no broker / uncapped
+    run), or the broker errors — callers must treat None as "cannot tell"
+    and NOT infer exhaustion. `pids.max` is -1 when the cgroup is
+    uncapped/unlimited; `pids.events.max` counts kernel fork denials (the
+    broker reports 0 on v1 — where it is not read — so v1 detection falls
+    back to current >= max).
+    Used by `_read_stream` to distinguish a PID-exhausted worker (whose
+    every Bash call fails with EAGAIN) from a worker whose commands merely
+    fail (DESIGN §6 *Detecting PID exhaustion*)."""
+    if sid is None:
+        return None
+    try:
+        resp = _cgroup_request(f"stat {sid}")
+    except OSError:
+        return None
+    parts = resp.split()
+    if len(parts) == 4 and parts[0] == "OK":
+        try:
+            return (int(parts[1]), int(parts[2]), int(parts[3]))
+        except ValueError:
+            return None
+    return None
+
+
 def enforce_and_record_cgroup_containment(st: "State",
                                           allow_uncapped: bool) -> None:
     """Fail-closed containment gate + state recording, run once per run
@@ -6469,9 +6551,17 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # below observes this clock and warns when no events arrive for
     # `worker_idle_warn_sec` seconds.
     last_event_at = time.monotonic()
+    # PID-exhaustion detector state (DESIGN §6 *Detecting PID exhaustion*).
+    # Counts CONSECUTIVE errored tool-results; a short run of them triggers
+    # a cgroup probe. A single ordinary failing command never trips it.
+    consecutive_tool_errors = 0
+    # Baseline pids.events.max at the first probe, so we can tell "the
+    # counter is climbing" (fresh denials) from a stale nonzero value.
+    pids_events_baseline: int | None = None
 
     async def _read_stream():
         nonlocal envelope, last_event_at, overage_blocked
+        nonlocal consecutive_tool_errors, pids_events_baseline
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
         # connected to a TTY, so `tail -f <state-root>/logs/<sid>.log` would
@@ -6512,6 +6602,54 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                                 or _rli.get("overageDisabledReason")
                                 in ("out_of_credits", "out_of_overage")):
                             overage_blocked = True
+                    # PID-exhaustion detection (DESIGN §6 *Detecting PID
+                    # exhaustion*). A worker that has exhausted its cgroup
+                    # pids.max fails EVERY shell-spawning tool call with
+                    # EAGAIN — including trivial ones whose bare "Exit code
+                    # 1" gives the model no way to diagnose it, so it
+                    # spirals to the end of the run. Count consecutive
+                    # errored tool-results; once past the threshold, probe
+                    # the cgroup. If it confirms exhaustion (at cap, or the
+                    # fork-denial counter is climbing), raise WorkerError —
+                    # _invoke's `except BaseException` terminates the
+                    # subtree + reaps, and the callers route it (implementer
+                    # → retryable handoff; conformer → advisory). The
+                    # threshold gate means an ordinary failing test — which
+                    # is NOT exhaustion — never trips this.
+                    _err_txt = _errored_bash_result_text(event)
+                    if _err_txt is not None:
+                        consecutive_tool_errors += 1
+                        if (consecutive_tool_errors
+                                >= _PID_EXHAUSTION_ERROR_THRESHOLD):
+                            stat = _cgroup_stat(cgroup_sid)
+                            if stat is not None:
+                                cur, mx, ev_max = stat
+                                if pids_events_baseline is None:
+                                    pids_events_baseline = ev_max
+                                at_cap = mx > 0 and cur >= mx
+                                denials_climbing = (
+                                    ev_max > pids_events_baseline)
+                                # Fast-path text confirmation strengthens
+                                # the signal but is not required.
+                                if at_cap or denials_climbing:
+                                    log(f"  [{sid}] PID cap reached: cgroup "
+                                        f"pids.current={cur}/{mx}, fork "
+                                        f"denials={ev_max} — the worker "
+                                        f"leaked background processes "
+                                        f"(likely run_in_background test / "
+                                        f"build / dev-server subprocesses) "
+                                        f"until it could no longer fork a "
+                                        f"shell; every Bash call now fails. "
+                                        f"Terminating early so a fresh worker "
+                                        f"retries with a clean PID table.")
+                                    raise WorkerError(
+                                        f"worker {sid} exhausted its PID "
+                                        f"cgroup (pids.current={cur}/{mx}, "
+                                        f"fork denials={ev_max}); every "
+                                        f"shell-spawning tool call fails "
+                                        f"with EAGAIN")
+                    else:
+                        consecutive_tool_errors = 0
                     # Inline summary (verbosity-gated). Multi-line
                     # summaries (multi-block events, multi-line text)
                     # are emitted one log() call per line so each
