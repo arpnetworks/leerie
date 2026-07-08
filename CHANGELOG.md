@@ -5,6 +5,25 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.44]
+
+### Fixed
+
+- **Zombie reaper could steal a live worker's exit status (race with asyncio).**
+  The 0.9.43 `_zombie_reaper` used a blanket `os.waitpid(-1, WNOHANG)`, which
+  races asyncio's own child watcher: if the reaper reaped a live `claude -p`
+  worker's PID first, asyncio reported the worker's exit as returncode 255 and
+  logged a spurious "Unknown child process" warning every run (and mis-classified
+  a genuinely-failed worker's error). The reaper is now **targeted** — it scans
+  `/proc` for its own zombie children (`state == Z`, `PPid == getpid()`) that are
+  not in the set of asyncio-managed worker PIDs (`_invoke` registers each worker
+  at spawn, discards after its await) and `waitpid`s each individually, so it
+  never touches a PID asyncio is awaiting. Also: `_reparented_orphans` now accepts
+  `ppid in (1, os.getpid())` since the subreaper reparents orphans to the
+  orchestrator rather than PID 1. Verified in the Linux/Python-3.13 container: a
+  live child that exits 7 keeps its true exit code (not 255) with the reaper
+  running hot across its exit.
+
 ## [0.9.43]
 
 ### Fixed
