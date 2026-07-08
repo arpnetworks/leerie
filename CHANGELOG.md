@@ -5,6 +5,22 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.45]
+
+### Fixed
+
+- **Harden the zombie-reaper's worker-exclusion invariant.** `_invoke` now
+  registers a worker's PID in `_ASYNCIO_MANAGED_PIDS` as the first statement
+  inside the `try` whose `finally` discards it, so the discard genuinely runs on
+  every post-registration exit path (previously the `add` sat just outside that
+  try — a theoretical, fail-safe leak). Also corrected the accompanying comment
+  and a flaky test: `_ASYNCIO_MANAGED_PIDS` is **load-bearing**, not
+  belt-and-suspenders — a just-exited, not-yet-watcher-reaped asyncio child is
+  briefly a `state==Z, ppid==getpid()` zombie indistinguishable from a true
+  orphan, so only the registration set tells the reaper to leave it alone. The
+  race test now registers its child (mirroring `_invoke`) and is deterministic
+  (10/10 in the Linux container).
+
 ## [0.9.44]
 
 ### Fixed
