@@ -5,6 +5,31 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.43]
+
+### Fixed
+
+- **Worker PID-exhaustion from unreaped zombie subprocesses.** A worker could
+  wedge with `pids.current=N/N` (every `fork()` returning `EAGAIN`) not from a
+  live process burst but from **zombies**: the container's PID 1 is `runuser`/the
+  entrypoint (or an idle `sleep infinity` on Fly), not a reaping init, so
+  orphaned `git`/`ssh-agent` descendants reparented to PID 1 and were never
+  `wait()`ed — accumulating as `<defunct>` tasks that still count against the
+  cgroup `pids.max` (observed live: 453 defunct `git`, all ppid==1). The
+  orchestrator now installs itself as a child-subreaper
+  (`prctl(PR_SET_CHILD_SUBREAPER)`, early in `main()`) so orphaned descendants
+  reparent to it, and runs a background `os.waitpid(-1, WNOHANG)` reaper
+  (lifecycle mirrors the memory sampler) that clears them within ~1s — keeping
+  `pids.current` flat. Covers both the local (nerdctl) and Fly runtimes; chosen
+  over `nerdctl run --init` (which would not cover Fly and would perturb the
+  PID-1 namespace-teardown contract). Validated end-to-end: the run that
+  previously pegged 1024/1024 now stays at ≤17 tasks per worker.
+- **Leaked ssh-agent in the Fly SSH-isolation test.**
+  `tests/test_require_fly_ssh_isolation.py` spawned a daemonized `ssh-agent`
+  (via `_leerie_fly_agent_ensure`) whose fragile `pkill -f "ssh-agent -a <sock>"`
+  teardown could miss it; the teardown now kills every process under the unique
+  per-test HOME.
+
 ## [0.9.42]
 
 ### Fixed
