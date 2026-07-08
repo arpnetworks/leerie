@@ -6890,10 +6890,6 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # end. See DESIGN §6 *Cleanup on abnormal exit*.
     descendant_tracker = _DescendantTracker(proc.pid, cgroup_sid)
     descendant_tracker.start()
-    # Mark this worker as asyncio-managed so `_zombie_reaper` never `waitpid`s
-    # it and steals its exit status from asyncio's child watcher. Discarded in
-    # the finally below, on every exit path (DESIGN §6 *Zombie reaping*).
-    _ASYNCIO_MANAGED_PIDS.add(proc.pid)
     envelope: dict | None = None
     # Latch the account's overage state from `rate_limit_event`s as they
     # stream. `overageStatus:"rejected"` / `out_of_credits` is a benign
@@ -7157,6 +7153,12 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
 
     watchdog_task = asyncio.create_task(_idle_watchdog())
     try:
+        # Mark this worker as asyncio-managed so `_zombie_reaper` never
+        # `waitpid`s it and steals its exit status from asyncio's child watcher.
+        # Placed as the FIRST statement of this try so the `finally` discard
+        # below genuinely covers it on every exit path (DESIGN §6 *Zombie
+        # reaping*).
+        _ASYNCIO_MANAGED_PIDS.add(proc.pid)
         try:
             await asyncio.wait_for(
                 asyncio.gather(_read_stream(), _drain_stderr(),
@@ -7323,7 +7325,10 @@ _PR_GET_CHILD_SUBREAPER = 37
 # zombie reaper MUST NOT `waitpid` them or it would steal the status out from
 # under asyncio (which then reports returncode 255 and logs a spurious warning).
 # `_invoke` registers a worker here at spawn and discards it after the gather.
-# Belt-and-suspenders on top of the reaper's state==Z + ppid==getpid() filter.
+# This is LOAD-BEARING, not just belt-and-suspenders: an asyncio child that has
+# exited but not yet been watcher-reaped is briefly a `state==Z, ppid==getpid()`
+# zombie — indistinguishable by the reaper's /proc filter from a true orphan.
+# The registration set is what tells them apart, so the reaper must consult it.
 _ASYNCIO_MANAGED_PIDS: set[int] = set()
 
 

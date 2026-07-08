@@ -15,6 +15,7 @@ The fix: the orchestrator calls `_become_subreaper()` early in `main()`
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 import subprocess
 import sys
@@ -123,39 +124,47 @@ def test_main_installs_subreaper(leerie):
 
 @linux_only
 def test_zombie_reaper_does_not_steal_asyncio_worker_status(leerie):
-    """The reaper must NOT `waitpid` a live asyncio-managed subprocess — doing
-    so steals the exit status out from under asyncio's child watcher, which
-    then reports returncode 255 instead of the true code. This is the exact
-    race the targeted-reap fix (never `waitpid(-1)`) prevents.
+    """The reaper must NOT `waitpid` an asyncio-managed worker — doing so steals
+    the exit status out from under asyncio's child watcher, which then reports
+    returncode 255 instead of the true code.
 
-    Spawn a real `create_subprocess_exec` child that exits 7, run the reaper
-    concurrently across the child's exit, and assert `proc.wait()` returns the
-    TRUE code (7), not 255. Without the fix (blanket `waitpid(-1)`) this would
-    flake to 255 whenever the reaper won the race."""
+    The protection is `_ASYNCIO_MANAGED_PIDS`: `_invoke` registers each worker
+    pid there at spawn (and discards it after the await), and the reaper's
+    `_orphan_zombie_children` scan excludes any pid in that set. This is
+    LOAD-BEARING, not incidental — an asyncio child that has exited but not yet
+    been watcher-reaped is briefly a `state==Z, ppid==getpid()` zombie, exactly
+    what the reaper's own filter would otherwise select. Only the registration
+    set distinguishes it from a true orphan.
+
+    This test mirrors `_invoke`: register the child pid, run the reaper hot
+    across the child's exit, and assert `proc.wait()` returns the TRUE code (7),
+    not 255. Without registration this races (the reaper can win); with it, the
+    exclusion is deterministic. (`_invoke` always registers, so real workers are
+    always protected.)"""
     async def _run() -> int:
         proc = await asyncio.create_subprocess_exec(
             "sh", "-c", "sleep 0.3; exit 7",
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
         )
-        # The reaper registers no exclusion here (this isn't _invoke), so this
-        # test relies on the state==Z + ppid==getpid scan alone: a LIVE child
-        # is not state Z, and once it exits asyncio reaps it before it lingers.
-        # Run the reaper hot (20ms) across the whole lifetime to maximize the
-        # race window the old waitpid(-1) would have lost.
+        leerie._ASYNCIO_MANAGED_PIDS.add(proc.pid)  # what _invoke does at spawn
+        # Run the reaper hot (20ms) across the whole child lifetime — with the
+        # pid registered, `_orphan_zombie_children` must never return it, so the
+        # reaper never competes with asyncio for its status.
         reaper = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
-        rc = await proc.wait()
-        reaper.cancel()
         try:
-            await reaper
-        except asyncio.CancelledError:
-            pass
+            rc = await proc.wait()
+        finally:
+            reaper.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await reaper
+            leerie._ASYNCIO_MANAGED_PIDS.discard(proc.pid)
         return rc
 
     rc = asyncio.run(_run())
     assert rc == 7, (
         f"worker exit code was stolen by the reaper (got {rc}, expected 7) — "
-        "the reaper must never waitpid an asyncio-managed child")
+        "a registered asyncio worker pid must be excluded from reaping")
 
 
 @linux_only
