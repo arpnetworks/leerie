@@ -580,3 +580,37 @@ class TestCaptureRepoDeps:
         assert "postgresql" in content
         assert "libpq-dev" in content
         assert "curl" in content
+
+
+# ---------------------------------------------------------------------------
+# resolve_capture_deps — direct precedence test (env → .leerie/config.toml →
+# default True). Mirrors test_resolve_no_push's precedence coverage (GAP 5b).
+# ---------------------------------------------------------------------------
+
+class TestResolveCaptureDeps:
+    def test_default_is_true(self, leerie, tmp_path, monkeypatch):
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        assert leerie.resolve_capture_deps(repo) is True
+
+    def test_env_false_wins(self, leerie, tmp_path, monkeypatch):
+        monkeypatch.setenv("LEERIE_CAPTURE_DEPS", "0")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        assert leerie.resolve_capture_deps(repo) is False
+
+    def test_config_false_when_no_env(self, leerie, tmp_path, monkeypatch):
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        repo = tmp_path / "repo"
+        (repo / ".leerie").mkdir(parents=True)
+        (repo / ".leerie" / "config.toml").write_text('capture_deps = "false"\n')
+        assert leerie.resolve_capture_deps(repo) is False
+
+    def test_env_overrides_config(self, leerie, tmp_path, monkeypatch):
+        """env=true beats config=false — env has higher precedence."""
+        monkeypatch.setenv("LEERIE_CAPTURE_DEPS", "true")
+        repo = tmp_path / "repo"
+        (repo / ".leerie").mkdir(parents=True)
+        (repo / ".leerie" / "config.toml").write_text('capture_deps = "false"\n')
+        assert leerie.resolve_capture_deps(repo) is True

@@ -65,14 +65,20 @@ nerdctl() {
   esac
 }
 
-# Stub git remote for repo-id tests.
+# Stub git remote for repo-id tests. Preserves `-C <dir>` for pass-through
+# commands (e.g. `git -C "$USER_REPO" ls-files`) so the auto-gen guard's
+# git-tracked authority check runs against the real fixture repo.
 git() {
-  if [ "${1:-}" = "-C" ]; then shift 2; fi
+  local _gitdir_args=()
+  if [ "${1:-}" = "-C" ]; then _gitdir_args=("-C" "$2"); shift 2; fi
   if [ "${1:-}" = "remote" ] && [ "${2:-}" = "get-url" ]; then
     echo "${FAKE_GIT_REMOTE:-}"
     return 0
   fi
-  command git "$@"
+  # ${arr[@]+"${arr[@]}"} so an empty array expands to nothing under `set -u`
+  # (bash 3.2, the macOS system default, otherwise errors) — the repo's own
+  # idiom (see leerie:5799, scripts/remote/build-push.sh:203).
+  command git "${_gitdir_args[@]+"${_gitdir_args[@]}"}" "$@"
 }
 
 LEERIE_VERSION="${LEERIE_VERSION:-0.99.test}"
@@ -519,8 +525,8 @@ def test_language_dep_layer_included_for_pnpm_repo(tmp_path):
     assert "pnpm-lock.yaml" in df_content
     # Must have RUN pnpm install.
     assert "RUN pnpm install --frozen-lockfile" in df_content
-    # Must have lockfile-shas comment so Dockerfile sha captures lockfile drift.
-    assert "lockfile-shas:" in df_content
+    # Must have copy-input-shas comment so Dockerfile sha captures dep drift.
+    assert "copy-input-shas:" in df_content
     assert "pnpm-lock.yaml=" in df_content
 
 
@@ -582,7 +588,7 @@ def test_language_dep_layer_disabled_by_env(tmp_path):
     # No language-dep layer.
     assert "COPY" not in df_content
     assert "pnpm install" not in df_content
-    assert "lockfile-shas" not in df_content
+    assert "copy-input-shas" not in df_content
 
 
 def test_language_dep_disabled_via_zero(tmp_path):
@@ -638,13 +644,13 @@ def test_lockfile_sha_in_dockerfile_triggers_rebuild_on_change(tmp_path):
     )
     assert result1.returncode == 0, result1.stderr
     df_content_v1 = result1.stdout
-    assert "lockfile-shas:" in df_content_v1
+    assert "copy-input-shas:" in df_content_v1
 
-    # Now simulate a lockfile change — the sha comment will differ in a new generation.
+    # Now simulate a lockfile change — the sha comment will differ in a new
+    # generation. No manual Dockerfile removal needed: the generated file
+    # carries the leerie-generated sentinel, so the launcher refreshes it
+    # in place (GAP 4 auto-refresh).
     lockfile.write_text("lockfileVersion: '6.0'\n# changed\n")
-    # Remove the auto-generated Dockerfile so it regenerates.
-    import os
-    os.remove(user_repo / ".leerie" / "Dockerfile")
 
     result2 = _run_harness(
         'cat "$USER_REPO/.leerie/Dockerfile"',
@@ -659,11 +665,10 @@ def test_lockfile_sha_in_dockerfile_triggers_rebuild_on_change(tmp_path):
     assert result2.returncode == 0, result2.stderr
     df_content_v2 = result2.stdout
 
-    # The lockfile-shas line must differ between v1 and v2 (different sha).
-    import re
-    sha_line_v1 = next((l for l in df_content_v1.splitlines() if "lockfile-shas:" in l), "")
-    sha_line_v2 = next((l for l in df_content_v2.splitlines() if "lockfile-shas:" in l), "")
-    assert sha_line_v1 != sha_line_v2, "lockfile sha comment must differ when lockfile changes"
+    # The copy-input-shas line must differ between v1 and v2 (different sha).
+    sha_line_v1 = next((l for l in df_content_v1.splitlines() if "copy-input-shas:" in l), "")
+    sha_line_v2 = next((l for l in df_content_v2.splitlines() if "copy-input-shas:" in l), "")
+    assert sha_line_v1 != sha_line_v2, "copy-input sha comment must differ when lockfile changes"
 
 
 def test_no_lockfile_no_language_dep_layer(tmp_path):
@@ -742,10 +747,283 @@ def test_language_dep_sentinel_strings_in_launcher():
     verbatim in the live launcher source so the test stays tied to reality."""
     launcher_text = _launcher_text()
     # The sha comment format string must be present in the Python embedded block.
-    assert "lockfile-shas:" in launcher_text
+    assert "copy-input-shas:" in launcher_text
     # The pnpm install command used in the RUN layer.
     assert "pnpm install --frozen-lockfile" in launcher_text
     # The COPY+RUN emission path.
     assert "COPY " in launcher_text
     # bake_language_deps resolution variable.
     assert "_BAKE_LANGUAGE_DEPS" in launcher_text
+    # Shared node-ancillary helper (GAP 2) and generated-Dockerfile sentinel (GAP 4).
+    assert "_node_ancillary" in launcher_text
+    assert "# leerie-generated" in launcher_text
+
+
+# ---------------------------------------------------------------------------
+# GAP 2 — COPY set complete for yarn AND npm (not just pnpm): workspace
+# children (from package.json "workspaces"), .npmrc, and patches/.
+# ---------------------------------------------------------------------------
+
+def _make_workspace_repo(user_repo, lockfile_name, workspaces_field):
+    """Build a node workspace repo with a child package, .npmrc, and a patch."""
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    import json
+    (user_repo / "package.json").write_text(
+        json.dumps({"name": "root", "workspaces": workspaces_field}))
+    (user_repo / lockfile_name).write_text("# lock\n")
+    (user_repo / ".npmrc").write_text("registry=https://example.com\n")
+    child = user_repo / "packages" / "child"
+    child.mkdir(parents=True)
+    (child / "package.json").write_text('{"name":"@x/child"}')
+    patches = user_repo / "patches"
+    patches.mkdir()
+    (patches / "foo.patch").write_text("--- a/f\n+++ b/f\n")
+
+
+def _assert_full_node_copy(df_content, lockfile_name):
+    assert lockfile_name in df_content
+    assert "packages/child/package.json" in df_content
+    assert ".npmrc" in df_content
+    assert "patches/" in df_content
+    # sha comment must include the patch + child manifest, not just the lockfile.
+    assert "copy-input-shas:" in df_content
+    assert "patches/foo.patch=" in df_content
+    assert "packages/child/package.json=" in df_content
+
+
+def test_language_dep_full_copy_for_yarn_workspace(tmp_path):
+    """GAP 2: a yarn workspace repo COPYs workspace children, .npmrc, patches/
+    (workspaces declared as a list in package.json)."""
+    user_repo = tmp_path / "repo"
+    _make_workspace_repo(user_repo, "yarn.lock", ["packages/*"])
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "RUN yarn install --frozen-lockfile" in result.stdout
+    _assert_full_node_copy(result.stdout, "yarn.lock")
+
+
+def test_language_dep_full_copy_for_npm_workspace(tmp_path):
+    """GAP 2: an npm workspace repo COPYs workspace children, .npmrc, patches/
+    (workspaces declared as a {"packages": [...]} object)."""
+    user_repo = tmp_path / "repo"
+    _make_workspace_repo(user_repo, "package-lock.json", {"packages": ["packages/*"]})
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "RUN npm ci" in result.stdout
+    _assert_full_node_copy(result.stdout, "package-lock.json")
+
+
+def test_patch_edit_changes_copy_input_sha(tmp_path):
+    """GAP 3: editing a file under patches/ WITHOUT touching the lockfile must
+    change the copy-input-shas line (so .dockerfile-hash flips → rebuild)."""
+    user_repo = tmp_path / "repo"
+    _make_workspace_repo(user_repo, "pnpm-lock.yaml", ["packages/*"])
+    (user_repo / "pnpm-workspace.yaml").write_text("packages:\n  - 'packages/*'\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    env = {
+        "USER_REPO": str(user_repo),
+        "LEERIE_STATE_HOST_DIR": str(state_dir),
+        "NERDCTL_INSPECT_RC": "1",
+        "NERDCTL_BUILD_RC": "0",
+        "FAKE_GIT_REMOTE": "",
+    }
+    r1 = _run_harness('cat "$USER_REPO/.leerie/Dockerfile"', env=env)
+    assert r1.returncode == 0, r1.stderr
+    sha1 = next((l for l in r1.stdout.splitlines() if "copy-input-shas:" in l), "")
+
+    # Edit the patch only; lockfile untouched. Generated Dockerfile refreshes
+    # in place (sentinel), so no manual removal.
+    (user_repo / "patches" / "foo.patch").write_text("--- a/f\n+++ b/f\n@@ changed\n")
+    r2 = _run_harness('cat "$USER_REPO/.leerie/Dockerfile"',
+                      env={**env, "NERDCTL_INSPECT_RC": "0"})
+    assert r2.returncode == 0, r2.stderr
+    sha2 = next((l for l in r2.stdout.splitlines() if "copy-input-shas:" in l), "")
+    assert sha1 and sha2 and sha1 != sha2, "patch edit must change copy-input-shas"
+
+
+# ---------------------------------------------------------------------------
+# GAP 4 — generated Dockerfile carries a sentinel and refreshes in place;
+# a hand-committed Dockerfile (no sentinel) is never overwritten.
+# ---------------------------------------------------------------------------
+
+def test_generated_dockerfile_has_sentinel(tmp_path):
+    """The auto-generated Dockerfile's first line is the leerie-generated sentinel."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    result = _run_harness(
+        'head -1 "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.startswith("# leerie-generated")
+
+
+def test_generated_dockerfile_refreshes_on_setup_packages_change(tmp_path):
+    """GAP 4b: a changed setup_packages refreshes an existing *generated*
+    Dockerfile in place (no manual removal), because it carries the sentinel."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    env = {
+        "USER_REPO": str(user_repo),
+        "LEERIE_STATE_HOST_DIR": str(state_dir),
+        "NERDCTL_INSPECT_RC": "1",
+        "NERDCTL_BUILD_RC": "0",
+        "FAKE_GIT_REMOTE": "",
+    }
+    r1 = _run_harness('cat "$USER_REPO/.leerie/Dockerfile"', env=env)
+    assert r1.returncode == 0 and "curl" in r1.stdout
+
+    # Change setup_packages; the generated Dockerfile must be refreshed.
+    (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
+    r2 = _run_harness('cat "$USER_REPO/.leerie/Dockerfile"',
+                      env={**env, "NERDCTL_INSPECT_RC": "0"})
+    assert r2.returncode == 0, r2.stderr
+    assert "postgresql" in r2.stdout, "generated Dockerfile must refresh from new setup_packages"
+
+
+def test_committed_dockerfile_is_never_overwritten(tmp_path):
+    """GAP 4: a hand-committed Dockerfile (no sentinel) is authoritative — the
+    auto-gen block must leave it byte-identical even when config.toml exists."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    committed = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nRUN echo hand-written\n"
+    (leerie_dir / "Dockerfile").write_text(committed)
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == committed, "committed Dockerfile must be untouched"
+    assert "# leerie-generated" not in result.stdout
+
+
+def _git_init_commit(repo: Path, path_rel: str) -> None:
+    """Initialize a git repo at `repo` and commit the file at `path_rel`."""
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.co"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=repo, check=True)
+    subprocess.run(["git", "add", path_rel], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add"], cwd=repo, check=True)
+
+
+def test_committed_generated_dockerfile_with_sentinel_not_overwritten(tmp_path):
+    """GAP 4 / D3: a COMMITTED (git-tracked) Dockerfile that carries the
+    leerie-generated sentinel is authoritative (DESIGN §6½ "a committed
+    Dockerfile always takes precedence") — the auto-gen guard must NOT
+    regenerate it, even though setup_packages changed. Only an UNCOMMITTED
+    generated file is refreshed in place. This is the concern-#7 edge that the
+    sentinel-only guard got wrong."""
+    sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    # A generated Dockerfile the user committed AND then hand-edited below the
+    # sentinel (they left line 1 intact, not knowing it is load-bearing).
+    committed = (
+        sentinel + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\n"
+        "RUN echo MY-CUSTOM-LAYER\n"
+    )
+    (leerie_dir / "Dockerfile").write_text(committed)
+    _git_init_commit(user_repo, ".leerie/Dockerfile")
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    # Change setup_packages — under the sentinel-only guard this would clobber.
+    (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == committed, (
+        "a committed (git-tracked) generated Dockerfile must NOT be regenerated"
+    )
+    assert "postgresql" not in result.stdout, "committed file's custom layer clobbered"
+
+
+def test_uncommitted_generated_dockerfile_still_refreshes_in_git_repo(tmp_path):
+    """D3 complement: in a git repo, an UNTRACKED generated Dockerfile is still
+    refreshed in place when setup_packages changes (git-tracked gate lets
+    untracked ones through)."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text('setup_packages = "curl"\n')
+    # git repo exists, but the Dockerfile is NOT added/committed.
+    subprocess.run(["git", "init", "-q"], cwd=user_repo, check=True)
+    sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
+    (leerie_dir / "Dockerfile").write_text(sentinel + "\nARG BASE_IMAGE\nFROM $BASE_IMAGE\nUSER root\nRUN apt-get install -y curl\nUSER leerie\n")
+
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
+    result = _run_harness(
+        'cat "$USER_REPO/.leerie/Dockerfile"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "0",
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    assert "postgresql" in result.stdout, (
+        "untracked generated Dockerfile should refresh from new setup_packages"
+    )

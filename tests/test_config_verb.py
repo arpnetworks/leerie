@@ -34,11 +34,18 @@ test_launcher_per_repo_image.py (extract-real-block-from-launcher harness).
 """
 from __future__ import annotations
 
+import json
 import subprocess
+import sys
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+# Directory of the running interpreter — put on PATH for the end-to-end
+# recapture tests so the real orchestrator's runtime deps (tenacity, …)
+# resolve when the seam imports orchestrator/leerie.py.
+_PYBIN = str(Path(sys.executable).parent)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -1243,6 +1250,127 @@ def test_recapture_no_nerdctl(tmp_path):
     assert result.returncode == 0, f"stderr: {result.stderr}"
     assert not nerdctl_log.exists() or nerdctl_log.read_text() == "", (
         "config --recapture must not invoke nerdctl"
+    )
+
+
+def _make_finished_run_with_apt_log(state_dir: Path, command: str) -> None:
+    """Create a finished run whose logs contain a Bash apt-install command,
+    in the _iter_log_tool_use JSONL shape the real orchestrator seam parses."""
+    runs_dir = state_dir / "runs" / "run-abc"
+    logs_dir = runs_dir / "logs"
+    logs_dir.mkdir(parents=True)
+    (runs_dir / "run.json").write_text('{"finished_at": "2026-01-01T12:00:00"}')
+    event = {
+        "message": {
+            "content": [
+                {"type": "tool_use", "name": "Bash", "id": "t-0",
+                 "input": {"command": command}}
+            ]
+        }
+    }
+    (logs_dir / "worker-001.log").write_text(json.dumps(event) + "\n")
+
+
+def test_recapture_removes_generated_dockerfile_end_to_end(tmp_path):
+    """GAP 4a: a real --recapture that writes a new setup_packages must remove
+    a *generated* .leerie/Dockerfile so it regenerates next run. Uses the real
+    python3 + orchestrator seam (no python3 stub)."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text("")
+    sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
+    (leerie_dir / "Dockerfile").write_text(sentinel + "\nARG BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    _make_finished_run_with_apt_log(state_dir, "apt-get install -y postgresql")
+
+    result = _run_real_config_arm_with_state(
+        user_repo, ["--recapture"], tmp_path, state_dir=state_dir,
+        extra_env={"PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    # config.toml gained the package.
+    assert "postgresql" in (leerie_dir / "config.toml").read_text()
+    # Generated Dockerfile was removed so it regenerates next run.
+    assert not (leerie_dir / "Dockerfile").exists(), (
+        "generated Dockerfile should be removed after a writing recapture"
+    )
+
+
+def test_recapture_keeps_committed_dockerfile_end_to_end(tmp_path):
+    """GAP 4: a --recapture that writes must NOT remove a hand-committed
+    Dockerfile (no sentinel) — it is authoritative."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text("")
+    committed = "ARG BASE_IMAGE\nFROM $BASE_IMAGE\nRUN echo hand-written\n"
+    (leerie_dir / "Dockerfile").write_text(committed)
+    state_dir = tmp_path / "state"
+    _make_finished_run_with_apt_log(state_dir, "apt-get install -y postgresql")
+
+    result = _run_real_config_arm_with_state(
+        user_repo, ["--recapture"], tmp_path, state_dir=state_dir,
+        extra_env={"PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert (leerie_dir / "Dockerfile").read_text() == committed, (
+        "committed Dockerfile must survive recapture"
+    )
+
+
+def test_recapture_noop_keeps_generated_dockerfile(tmp_path):
+    """GAP 4: a --recapture that writes NOTHING (no new packages) must leave an
+    existing generated Dockerfile in place (no spurious removal)."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    # Already declares postgresql, so recapture finds nothing new.
+    (leerie_dir / "config.toml").write_text('setup_packages = "postgresql"\n')
+    sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
+    (leerie_dir / "Dockerfile").write_text(sentinel + "\nARG BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    _make_finished_run_with_apt_log(state_dir, "apt-get install -y postgresql")
+
+    result = _run_real_config_arm_with_state(
+        user_repo, ["--recapture"], tmp_path, state_dir=state_dir,
+        extra_env={"PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert (leerie_dir / "Dockerfile").exists(), (
+        "no-op recapture must not remove the generated Dockerfile"
+    )
+
+
+def test_recapture_keeps_committed_generated_dockerfile_with_sentinel(tmp_path):
+    """D3: --recapture must NOT remove a COMMITTED (git-tracked) generated
+    Dockerfile even though it carries the sentinel — a committed Dockerfile is
+    authoritative (DESIGN §6½). Only an untracked generated file is removed."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "config.toml").write_text("")
+    sentinel = "# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
+    dockerfile = sentinel + "\nARG BASE_IMAGE\nRUN echo MY-CUSTOM\n"
+    (leerie_dir / "Dockerfile").write_text(dockerfile)
+    # Commit config.toml + Dockerfile so the Dockerfile is git-tracked.
+    subprocess.run(["git", "init", "-q"], cwd=user_repo, check=True)
+    subprocess.run(["git", "config", "user.email", "t@t.co"], cwd=user_repo, check=True)
+    subprocess.run(["git", "config", "user.name", "t"], cwd=user_repo, check=True)
+    subprocess.run(["git", "add", ".leerie/Dockerfile", ".leerie/config.toml"],
+                   cwd=user_repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "add"], cwd=user_repo, check=True)
+
+    state_dir = tmp_path / "state"
+    _make_finished_run_with_apt_log(state_dir, "apt-get install -y postgresql")
+
+    result = _run_real_config_arm_with_state(
+        user_repo, ["--recapture"], tmp_path, state_dir=state_dir,
+        extra_env={"PATH": f"{_PYBIN}:/usr/bin:/bin:/usr/local/bin"},
+    )
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert (leerie_dir / "Dockerfile").read_text() == dockerfile, (
+        "committed (git-tracked) generated Dockerfile must survive recapture"
     )
 
 

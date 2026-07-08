@@ -2297,11 +2297,14 @@ the derived image. Both the base tag and the per-repo tag are recorded in
 ### Auto-capture of repo dependencies
 
 At the end of a normal (non-resume) finalize, leerie scans this run's
-`logs/*.log` files to extract install intents — system-package `apt-get
-install` commands (including failed ones; the intent is the signal, not
-the outcome) and the language install command the workers actually used
-(`pnpm install`, `pip install`, `npm ci`, `cargo fetch`, `bundle install`,
-etc.). Two distinct bake paths follow.
+`logs/*.log` files to extract system-package `apt-get install` intents
+(including failed ones; the intent is the signal, not the outcome). Those
+intents feed the system-package bake path below. The language-dep bake is
+**not** fed by this scan — it is driven entirely by the launcher's own
+build-time lockfile detection (see below), so no per-command capture is
+needed for it. (The log scanner also collects the language install
+commands the workers ran, but that list is diagnostic only and is not
+persisted.) Two distinct bake paths follow.
 
 **System packages → `setup_packages` → warm apt layer.** Captured apt
 packages are union-merged into `setup_packages` in `.leerie/config.toml`
@@ -2323,11 +2326,12 @@ files, and any ancillary inputs the package manager requires (workspace
 find their `node_modules` / site-packages already populated — the per-worker
 install drops to near-zero.
 
-**Rebuild tradeoff.** A lockfile change triggers a full image rebuild
-(`build_repo_image` fires when the hash mismatches). To keep rebuilds
-narrow, `.dockerfile-hash` folds in the sha256 of every lockfile that
-participates in the `COPY` list. A change to an unrelated source file does
-not invalidate the layer. The cost — minutes per rebuild — is paid once
+**Rebuild tradeoff.** A dependency-input change triggers a full image
+rebuild (`build_repo_image` fires when the hash mismatches). To keep
+rebuilds narrow, `.dockerfile-hash` folds in the sha256 of every input that
+participates in the `COPY` list (lockfiles, manifests, workspace
+`package.json`s, `patches/`, `.npmrc`). A change to an unrelated source file
+does not invalidate the layer. The cost — minutes per rebuild — is paid once
 across all subsequent runs, a clear net win against per-worker install time
 accumulated across hundreds of workers.
 
