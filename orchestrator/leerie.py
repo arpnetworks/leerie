@@ -24,6 +24,7 @@ import argparse
 import asyncio
 import contextlib
 import copy
+import ctypes
 import fcntl
 import json
 import os
@@ -1619,7 +1620,12 @@ def _signal_pids(pids: set[int], sig: int) -> None:
     """Best-effort signal delivery to a set of PIDs. Drops ProcessLookupError
     (already dead) and PermissionError (not ours / already reaped). All other
     OSError variants are also swallowed — this is a cleanup path; we cannot
-    let signal-delivery failure abort the teardown."""
+    let signal-delivery failure abort the teardown.
+
+    Deliberately does NOT `waitpid` the signalled PIDs: a SIGKILLed orphan
+    becomes a `<defunct>` zombie until reaped, and the central `_zombie_reaper`
+    (armed by `_become_subreaper`) is the single place that reaps orphaned
+    descendants — see DESIGN §6 *Zombie reaping*."""
     for pid in pids:
         try:
             os.kill(pid, sig)
@@ -7291,6 +7297,77 @@ def _collect_memory_sample(st: "State") -> dict:
         "open_fds": open_fds,
         "thread_count": thread_count,
     }
+
+
+# Linux prctl option numbers (from <linux/prctl.h>). Set: make this process a
+# "child subreaper" so orphaned descendants reparent to it instead of climbing
+# to PID 1. Get: read the current flag back (used only by tests to verify Set).
+_PR_SET_CHILD_SUBREAPER = 36
+_PR_GET_CHILD_SUBREAPER = 37
+
+
+def _become_subreaper() -> bool:
+    """Install this process as a child-subreaper so orphaned descendants
+    reparent to it (DESIGN §6 *Zombie reaping*). Returns True on success.
+
+    Why this is load-bearing: the leerie container's PID 1 is `runuser`/the
+    entrypoint (or an idle `sleep infinity` on Fly), NOT a real init — it never
+    `wait()`s arbitrary orphans. A worker's tool subtree routinely orphans
+    short-lived subprocesses (git, ssh-agent, and their children); without a
+    subreaper those reparent to PID 1 and rot as zombies, each still counting
+    against the worker cgroup's `pids.max` until it fills and every `fork()`
+    EAGAINs. Claiming the subreaper role routes those orphans to the
+    orchestrator, where `_zombie_reaper` reaps them.
+
+    Linux-only (`prctl` is a Linux syscall). On any other platform, or if the
+    libc call fails, this is a logged no-op — the orchestrator only runs for
+    real inside the Linux container, so a dev-machine no-op is harmless.
+    Called once, early in `main()`, before any worker is spawned so every
+    descendant inherits the reparent-to-us behavior."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        rc = libc.prctl(_PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0)
+        if rc != 0:
+            err = ctypes.get_errno()
+            log(f"subreaper: prctl(PR_SET_CHILD_SUBREAPER) failed (errno "
+                f"{err}); orphaned worker subprocesses may accumulate as "
+                f"zombies against the cgroup PID cap")
+            return False
+        return True
+    except OSError as e:
+        log(f"subreaper: could not install child-subreaper ({e}); orphaned "
+            f"worker subprocesses may accumulate as zombies")
+        return False
+
+
+async def _zombie_reaper(interval_sec: float = 1.0) -> None:
+    """Periodically `waitpid` orphaned descendants that reparented to this
+    process (after `_become_subreaper`), clearing them before they pile up as
+    zombies against the worker cgroup's `pids.max` (DESIGN §6 *Zombie reaping*).
+
+    Complements `_DescendantTracker`: the tracker SIGKILLs *live* leaked PIDs
+    to relieve pressure, but a SIGKILLed orphan becomes a `<defunct>` zombie
+    that still occupies a task slot until someone `wait()`s it — that someone
+    is this loop. Distinct concerns: the tracker bounds live processes, this
+    reaps dead ones.
+
+    Reaps in a non-blocking drain each tick (`os.WNOHANG`), sleeps, repeats.
+    `ChildProcessError` (no children at all) is a benign no-op. Spawned as a
+    background task by `orchestrate()` and cancelled in its `finally`, mirroring
+    `_memory_sampler`'s lifecycle."""
+    while True:
+        try:
+            while True:
+                pid, _status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break  # children exist but none have exited yet
+        except ChildProcessError:
+            pass  # no children to wait on — nothing to reap
+        except Exception:
+            pass  # reaping must never crash the orchestrator
+        await asyncio.sleep(interval_sec)
 
 
 async def _memory_sampler(st: "State",
@@ -15563,13 +15640,22 @@ async def orchestrate(args, caps: dict, leerie_dir: Path, st: State,
     # after the fact. Lifecycle is bounded by this function — cancelled in
     # the finally so it never outlives the run.
     sampler_task = asyncio.create_task(_memory_sampler(st))
+    # Zombie reaper: `_become_subreaper()` (called in main()) routes orphaned
+    # worker descendants to us; this task `wait()`s them so they don't rot as
+    # zombies against the worker cgroup's pids.max (DESIGN §6 *Zombie reaping*).
+    # Same lifecycle as the sampler — cancelled in the finally so it never
+    # outlives the run.
+    reaper_task = asyncio.create_task(_zombie_reaper())
     try:
         await _run_phases(args, caps, leerie_dir, st, sot_pref, verbosity,
                           models, efforts)
     finally:
         sampler_task.cancel()
+        reaper_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
             await sampler_task
+        with contextlib.suppress(asyncio.CancelledError):
+            await reaper_task
 
 
 async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
@@ -15822,6 +15908,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
 
 
 def main() -> None:
+    # Install the child-subreaper role first thing, before any worker (or any
+    # subprocess this process spawns) exists, so every descendant inherits the
+    # reparent-to-us behavior. This is what makes `_zombie_reaper` able to reap
+    # orphaned git/ssh-agent subprocesses that would otherwise pile up as
+    # zombies against the worker cgroup's pids.max (DESIGN §6 *Zombie reaping*).
+    _become_subreaper()
     ap = argparse.ArgumentParser(
         prog="leerie", description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,

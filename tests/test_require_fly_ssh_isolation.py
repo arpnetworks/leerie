@@ -36,12 +36,16 @@ def short_home():
     try:
         yield home
     finally:
-        # Kill any ssh-agent we may have spawned under this HOME, then
-        # remove the tree.
-        sock = home / ".cache" / "leerie" / "agent" / "ssh-agent.sock"
-        subprocess.run(
-            ["pkill", "-f", f"ssh-agent -a {sock}"], check=False
-        )
+        # Kill every process this test spawned under this unique HOME, then
+        # remove the tree. `_leerie_fly_agent_ensure` spawns `ssh-agent -a
+        # <HOME>/.cache/leerie/agent/ssh-agent.sock`, which daemonizes and
+        # reparents to PID 1 — the test's subprocess.run parent never reaps
+        # it, so it must be killed here or it leaks. Match on the unique HOME
+        # substring (contains the per-test uuid) rather than the exact
+        # `ssh-agent -a <sock>` argv: a daemonized agent's argv spacing is
+        # not guaranteed to match the launch string, and the HOME prefix also
+        # catches any other stray child (ssh-add, etc.) under this test's tree.
+        subprocess.run(["pkill", "-f", str(home)], check=False)
         shutil.rmtree(home, ignore_errors=True)
 
 

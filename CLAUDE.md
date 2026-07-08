@@ -468,7 +468,16 @@ only at ≥90% pressure and stops below 75% (hysteresis); below 90% is a
 byte-identical no-op; young (<60s) and attached (ppid!=1) PIDs are never
 reaped; and a structural guard pins `cgroup_sid: str | None = None` on
 `_DescendantTracker.__init__` so the 3 pre-existing direct-constructor call
-sites remain compatible after the parameter was added. The `leerie config` verb (all four sub-modes: `--init`,
+sites remain compatible after the parameter was added. Zombie reaping (DESIGN
+§6 *Zombie reaping* — the container PID 1 is `runuser`/idle `sleep`, not a
+reaping init, so orphaned git/ssh-agent descendants would pile up as `<defunct>`
+against `pids.max`) is tested in `tests/test_subreaper.py`: `_become_subreaper`
+is a bool-returning no-op off Linux and (Linux-guarded) sets the flag verifiable
+via `prctl(PR_GET_CHILD_SUBREAPER)`; `_zombie_reaper` (Linux-guarded) reaps an
+orphaned exited child so it's no longer a zombie and survives having no children;
+plus source-coupling guards that `main()` calls `_become_subreaper()` and
+`orchestrate()` spawns+cancels `_zombie_reaper` (the fix is inert without the
+wiring). The `leerie config` verb (all four sub-modes: `--init`,
 bare, `--chat`, `--recapture`) is tested in `tests/test_config_verb.py`
 via a self-contained bash harness with stubbed `nerdctl` and `claude`,
 plus a parity guard that extracts the real launcher `config)` case arm and

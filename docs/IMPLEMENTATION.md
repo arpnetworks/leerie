@@ -3234,6 +3234,23 @@ together close the leak.
    `_PID_EXHAUSTION_WINDOW`): `_PID_REAP_HIGH_WATER = 0.90`,
    `_PID_REAP_LOW_WATER = 0.75`, `_PID_REAP_MIN_AGE_SEC = 60`.
 
+4. **Zombie reaping (`_become_subreaper` + `_zombie_reaper`).** The reaper
+   above handles *live* leaked processes; **zombies** (`<defunct>` tasks not
+   yet `wait()`ed) also count against the cgroup `pids.max`, and the container
+   PID 1 (`runuser` locally / idle `sleep infinity` on Fly) is not a reaping
+   init, so orphaned `git`/`ssh-agent` descendants reparent to it and rot
+   (DESIGN §6 *Zombie reaping*). `_become_subreaper()` — called once early in
+   `main()` before any worker spawns — issues
+   `ctypes.CDLL(None).prctl(_PR_SET_CHILD_SUBREAPER=36, 1, 0, 0, 0)` so
+   orphaned descendants reparent to the orchestrator; Linux-guarded
+   (`sys.platform`), a logged no-op elsewhere; returns `bool`. `_zombie_reaper()`
+   is a background asyncio task (`os.waitpid(-1, os.WNOHANG)` drain each ~1 s;
+   `ChildProcessError` benign) spawned in `orchestrate()` next to
+   `sampler_task` and cancelled in the same `finally` — mirroring
+   `_memory_sampler`'s lifecycle. `_signal_pids` deliberately does NOT `waitpid`
+   (it only SIGKILLs); the central `_zombie_reaper` is the single reaping point.
+   `_PR_GET_CHILD_SUBREAPER = 37` exists for the test read-back.
+
 **PID-exhaustion detection (`_cgroup_stat` + `_read_stream` probe).** The
 above cleanup runs at worker *exit*; leaked `run_in_background`
 subprocesses accumulate against the worker cgroup's `pids.max` (default

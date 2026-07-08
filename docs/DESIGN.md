@@ -1606,6 +1606,46 @@ this run") with run lifecycle ("nuke the artifacts"). The two are
 now separate: Ctrl-C stops; `scripts/cleanup.sh --run-id <id>
 --branches` is the explicit full-purge gesture.
 
+**Zombie reaping — the container PID 1 is not an init.** The mid-run reaper
+above relieves pressure from *live* leaked processes. A second, distinct
+population also counts against a worker cgroup's `pids.max`: **zombies**
+(`<defunct>` tasks — dead processes not yet `wait()`ed). These arise because
+the leerie container's PID 1 is **not a reaping init**: on the local path PID 1
+is the entrypoint's final `exec runuser -u leerie -- … python3 leerie.py` (so
+PID 1 is `runuser`, with the orchestrator as its child); on Fly, PID 1 is the
+idle `sleep infinity` and the orchestrator is a detached `Popen` grandchild. A
+worker's tool subtree routinely orphans short-lived subprocesses — notably
+`git` and the leerie-private `ssh-agent` (`_leerie_fly_agent_ensure`
+daemonizes one), plus their children. When those orphan, they reparent to PID 1,
+which — being `runuser`/`sleep`, not `init` — never `wait()`s them, so they
+persist as zombies. Each zombie still occupies a task slot counted by the
+cgroup, so they accumulate monotonically until `pids.max` fills and every
+`fork()` in the subtree returns `EAGAIN`. This was observed live: a worker
+running its repo's own test suite accumulated **453 `<defunct>` git** tasks
+(all ppid==1) and wedged at the cap. Crucially, the mid-run reaper cannot help
+here — a zombie is already dead; SIGKILL is a no-op on it, and only `wait()`
+clears it.
+
+The fix routes those orphans to the orchestrator and reaps them there.
+`_become_subreaper()` (called once early in `main()`, before any worker spawns)
+issues `prctl(PR_SET_CHILD_SUBREAPER)` so orphaned descendants in the
+orchestrator's subtree reparent to **it** instead of climbing to PID 1;
+`_zombie_reaper()` — a background asyncio task with the same lifecycle as
+`_memory_sampler` (spawned in `orchestrate()`, cancelled in its `finally`) —
+drains them with `os.waitpid(-1, WNOHANG)` roughly once a second, keeping
+`pids.current` flat (live processes only) instead of climbing. `prctl` is
+Linux-only and a logged no-op elsewhere (the orchestrator only runs for real
+inside the Linux container). This is chosen over inserting a real init (e.g.
+`nerdctl run --init` / tini as PID 1) because the subreaper (a) covers **both**
+the local and Fly runtimes — `--init` is a nerdctl-local flag and would leave
+the Fly path leaking — and (b) is purely additive in-process, changing neither
+the entrypoint/cgroup setup nor the "PID-1 death reaps the namespace" teardown
+contract above (the orchestrator remains a non-PID-1 process; PID-1 identity is
+unchanged). The complementary test-side leak — `_leerie_fly_agent_ensure`'s
+daemonized `ssh-agent` outliving its test — is fixed at its source in
+`tests/test_require_fly_ssh_isolation.py`'s teardown; on real Fly runs the
+in-container agent is now reaped by the subreaper when its run ends.
+
 **Rate-limited (RateLimitedExit) → auto-resume after the reset
 window.** When `claude -p` reports the subscription session-limit
 hit (delivered as assistant-text content in the verbatim format
