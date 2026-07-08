@@ -3244,12 +3244,21 @@ together close the leak.
    `ctypes.CDLL(None).prctl(_PR_SET_CHILD_SUBREAPER=36, 1, 0, 0, 0)` so
    orphaned descendants reparent to the orchestrator; Linux-guarded
    (`sys.platform`), a logged no-op elsewhere; returns `bool`. `_zombie_reaper()`
-   is a background asyncio task (`os.waitpid(-1, os.WNOHANG)` drain each ~1 s;
-   `ChildProcessError` benign) spawned in `orchestrate()` next to
-   `sampler_task` and cancelled in the same `finally` — mirroring
-   `_memory_sampler`'s lifecycle. `_signal_pids` deliberately does NOT `waitpid`
-   (it only SIGKILLs); the central `_zombie_reaper` is the single reaping point.
-   `_PR_GET_CHILD_SUBREAPER = 37` exists for the test read-back.
+   is a background asyncio task spawned in `orchestrate()` next to `sampler_task`
+   and cancelled in the same `finally` — mirroring `_memory_sampler`'s lifecycle.
+   It is **targeted, not `waitpid(-1)`**: `_orphan_zombie_children()` scans
+   `/proc` for this process's own zombie children (`state == Z`,
+   `PPid == getpid()`) not in `_ASYNCIO_MANAGED_PIDS`, and the reaper
+   `os.waitpid(pid, WNOHANG)`s each individually (~1 s; `ChildProcessError`/
+   `OSError` benign). A blanket `waitpid(-1)` would race asyncio's child watcher
+   and steal a live worker's exit status (→ returncode 255 + warning); the
+   targeted scan never touches an asyncio-awaited PID. `_invoke` adds `proc.pid`
+   to `_ASYNCIO_MANAGED_PIDS` at spawn and `discard`s it in its `finally`.
+   `_signal_pids` deliberately does NOT `waitpid` (it only SIGKILLs); the central
+   `_zombie_reaper` is the single reaping point. Because orphans now reparent to
+   the orchestrator (not PID 1), `_reparented_orphans` accepts
+   `ppid in (1, os.getpid())`. `_PR_GET_CHILD_SUBREAPER = 37` exists for the test
+   read-back.
 
 **PID-exhaustion detection (`_cgroup_stat` + `_read_stream` probe).** The
 above cleanup runs at worker *exit*; leaked `run_in_background`

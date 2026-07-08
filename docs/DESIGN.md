@@ -1632,10 +1632,23 @@ issues `prctl(PR_SET_CHILD_SUBREAPER)` so orphaned descendants in the
 orchestrator's subtree reparent to **it** instead of climbing to PID 1;
 `_zombie_reaper()` — a background asyncio task with the same lifecycle as
 `_memory_sampler` (spawned in `orchestrate()`, cancelled in its `finally`) —
-drains them with `os.waitpid(-1, WNOHANG)` roughly once a second, keeping
-`pids.current` flat (live processes only) instead of climbing. `prctl` is
-Linux-only and a logged no-op elsewhere (the orchestrator only runs for real
-inside the Linux container). This is chosen over inserting a real init (e.g.
+reaps them roughly once a second, keeping `pids.current` flat (live processes
+only) instead of climbing. `prctl` is Linux-only and a logged no-op elsewhere
+(the orchestrator only runs for real inside the Linux container).
+
+Crucially the reaper is **targeted, not `waitpid(-1)`**: a blanket
+`waitpid(-1, WNOHANG)` would race asyncio's own child watcher and steal the exit
+status of a live `claude -p` worker (asyncio spawns workers with
+`create_subprocess_exec` and awaits `proc.wait()`; a stolen status makes it
+report returncode 255 and log a spurious warning). Instead the reaper scans
+`/proc` for its own **zombie** children (`state == Z`, `PPid == getpid()`) that
+are not in `_ASYNCIO_MANAGED_PIDS` (the set of worker PIDs `_invoke` registers at
+spawn and discards after its await), and `os.waitpid(pid, WNOHANG)`s each one
+individually — so it only ever reaps PIDs that are already dead orphans, never a
+worker asyncio is still awaiting. Because the subreaper reparents orphans to the
+orchestrator rather than PID 1, the mid-run `_reparented_orphans` filter accepts
+`ppid in (1, getpid())`; exit-time `stop_and_reap` is unaffected (it SIGKILLs by
+PID with no ppid filter). This is chosen over inserting a real init (e.g.
 `nerdctl run --init` / tini as PID 1) because the subreaper (a) covers **both**
 the local and Fly runtimes — `--init` is a nerdctl-local flag and would leave
 the Fly path leaking — and (b) is purely additive in-process, changing neither

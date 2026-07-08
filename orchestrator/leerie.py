@@ -1663,7 +1663,11 @@ def _reparented_orphans(seen: set[int]) -> list[int]:
             pid, ppid, etimes = int(parts[0]), int(parts[1]), int(parts[2])
         except ValueError:
             continue
-        if pid in seen and ppid == 1 and etimes >= _PID_REAP_MIN_AGE_SEC:
+        # ppid in (1, our pid): a leaked orphan reparents to PID 1 on a plain
+        # init, but after `_become_subreaper` it reparents to the orchestrator
+        # itself — accept both so the mid-run reaper still recognizes orphans.
+        if (pid in seen and ppid in (1, os.getpid())
+                and etimes >= _PID_REAP_MIN_AGE_SEC):
             candidates.append((etimes, pid))
     # Oldest-first: killing the longest-running orphans first frees the most
     # slots while touching the fewest recently-launched background processes.
@@ -6886,6 +6890,10 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # end. See DESIGN §6 *Cleanup on abnormal exit*.
     descendant_tracker = _DescendantTracker(proc.pid, cgroup_sid)
     descendant_tracker.start()
+    # Mark this worker as asyncio-managed so `_zombie_reaper` never `waitpid`s
+    # it and steals its exit status from asyncio's child watcher. Discarded in
+    # the finally below, on every exit path (DESIGN §6 *Zombie reaping*).
+    _ASYNCIO_MANAGED_PIDS.add(proc.pid)
     envelope: dict | None = None
     # Latch the account's overage state from `rate_limit_event`s as they
     # stream. `overageStatus:"rejected"` / `out_of_credits` is a benign
@@ -7176,6 +7184,10 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
             await descendant_tracker.stop_and_reap()
             raise
     finally:
+        # Un-register the worker PID: asyncio has now finished awaiting it
+        # (proc.wait() resolved inside the gather, or we terminated it), so the
+        # zombie reaper may safely reap it if it lingers as a <defunct>.
+        _ASYNCIO_MANAGED_PIDS.discard(proc.pid)
         # The watchdog runs for the whole worker lifetime and must be
         # cancelled on every exit path (success, timeout, abort) so it
         # doesn't outlive the worker and fire spuriously against a stale
@@ -7305,6 +7317,15 @@ def _collect_memory_sample(st: "State") -> dict:
 _PR_SET_CHILD_SUBREAPER = 36
 _PR_GET_CHILD_SUBREAPER = 37
 
+# PIDs of the `claude -p` workers the orchestrator spawns via
+# `asyncio.create_subprocess_exec` and is actively awaiting (`proc.wait()` inside
+# a gather). asyncio's own child watcher owns these PIDs' exit statuses; the
+# zombie reaper MUST NOT `waitpid` them or it would steal the status out from
+# under asyncio (which then reports returncode 255 and logs a spurious warning).
+# `_invoke` registers a worker here at spawn and discards it after the gather.
+# Belt-and-suspenders on top of the reaper's state==Z + ppid==getpid() filter.
+_ASYNCIO_MANAGED_PIDS: set[int] = set()
+
 
 def _become_subreaper() -> bool:
     """Install this process as a child-subreaper so orphaned descendants
@@ -7342,8 +7363,48 @@ def _become_subreaper() -> bool:
         return False
 
 
+def _orphan_zombie_children() -> list[int]:
+    """Return PIDs of processes that are (a) zombies (`<defunct>`, state `Z`),
+    (b) direct children of this process (`PPid == os.getpid()`), and (c) NOT an
+    asyncio-managed worker. These are the orphaned descendants that reparented
+    to us after `_become_subreaper` and need `wait()`ing.
+
+    Reads `/proc/<pid>/stat` — field 3 is the state char, field 4 is PPid. The
+    comm field (field 2, parenthesized) can contain spaces/parens, so parse
+    from the LAST `)` to avoid mis-splitting. Non-Linux / no-`/proc` → empty
+    list (the reaper is a no-op there, matching `_become_subreaper`)."""
+    try:
+        pids = [int(e) for e in os.listdir("/proc") if e.isdigit()]
+    except OSError:
+        return []
+    me = os.getpid()
+    out: list[int] = []
+    for pid in pids:
+        if pid in _ASYNCIO_MANAGED_PIDS:
+            continue  # asyncio owns this worker's exit status — never touch it
+        try:
+            with open(f"/proc/{pid}/stat") as f:
+                data = f.read()
+        except OSError:
+            continue  # exited between listdir and open, or not readable
+        rparen = data.rfind(")")
+        if rparen == -1:
+            continue
+        fields = data[rparen + 2:].split()  # skip ") " → state is fields[0]
+        if len(fields) < 2:
+            continue
+        state, ppid_s = fields[0], fields[1]
+        try:
+            ppid = int(ppid_s)
+        except ValueError:
+            continue
+        if state == "Z" and ppid == me:
+            out.append(pid)
+    return out
+
+
 async def _zombie_reaper(interval_sec: float = 1.0) -> None:
-    """Periodically `waitpid` orphaned descendants that reparented to this
+    """Periodically `wait()` orphaned descendants that reparented to this
     process (after `_become_subreaper`), clearing them before they pile up as
     zombies against the worker cgroup's `pids.max` (DESIGN §6 *Zombie reaping*).
 
@@ -7353,18 +7414,20 @@ async def _zombie_reaper(interval_sec: float = 1.0) -> None:
     is this loop. Distinct concerns: the tracker bounds live processes, this
     reaps dead ones.
 
-    Reaps in a non-blocking drain each tick (`os.WNOHANG`), sleeps, repeats.
-    `ChildProcessError` (no children at all) is a benign no-op. Spawned as a
-    background task by `orchestrate()` and cancelled in its `finally`, mirroring
-    `_memory_sampler`'s lifecycle."""
+    Targeted, NOT `waitpid(-1)`: a blanket `waitpid(-1)` would race asyncio's
+    own child watcher and steal the exit status of a live `claude -p` worker
+    (asyncio then reports returncode 255 and logs a spurious warning). Instead
+    we `waitpid` only the specific PIDs `_orphan_zombie_children()` reports —
+    zombies that are our children and are not asyncio-managed workers — so we
+    never touch a PID asyncio is awaiting. Spawned as a background task by
+    `orchestrate()` and cancelled in its `finally`, mirroring `_memory_sampler`."""
     while True:
         try:
-            while True:
-                pid, _status = os.waitpid(-1, os.WNOHANG)
-                if pid == 0:
-                    break  # children exist but none have exited yet
-        except ChildProcessError:
-            pass  # no children to wait on — nothing to reap
+            for pid in _orphan_zombie_children():
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except (ChildProcessError, OSError):
+                    pass  # asyncio already reaped it, or it vanished — fine
         except Exception:
             pass  # reaping must never crash the orchestrator
         await asyncio.sleep(interval_sec)

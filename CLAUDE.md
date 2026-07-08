@@ -474,10 +474,15 @@ reaping init, so orphaned git/ssh-agent descendants would pile up as `<defunct>`
 against `pids.max`) is tested in `tests/test_subreaper.py`: `_become_subreaper`
 is a bool-returning no-op off Linux and (Linux-guarded) sets the flag verifiable
 via `prctl(PR_GET_CHILD_SUBREAPER)`; `_zombie_reaper` (Linux-guarded) reaps an
-orphaned exited child so it's no longer a zombie and survives having no children;
-plus source-coupling guards that `main()` calls `_become_subreaper()` and
-`orchestrate()` spawns+cancels `_zombie_reaper` (the fix is inert without the
-wiring). The `leerie config` verb (all four sub-modes: `--init`,
+orphaned exited child so it's no longer a zombie, survives having no children,
+and — the load-bearing race test — does NOT steal a live
+`create_subprocess_exec` child's exit status (asserts the true code, not 255)
+because it is targeted (`_orphan_zombie_children`: state==Z + ppid==getpid,
+minus `_ASYNCIO_MANAGED_PIDS`) rather than `waitpid(-1)`; plus a test that a
+registered worker pid is excluded from the reap set, a
+`_reparented_orphans`-accepts-`ppid==getpid` test, and source-coupling guards
+that `main()` calls `_become_subreaper()` and `orchestrate()` spawns+cancels
+`_zombie_reaper` (the fix is inert without the wiring). The `leerie config` verb (all four sub-modes: `--init`,
 bare, `--chat`, `--recapture`) is tested in `tests/test_config_verb.py`
 via a self-contained bash harness with stubbed `nerdctl` and `claude`,
 plus a parity guard that extracts the real launcher `config)` case arm and
