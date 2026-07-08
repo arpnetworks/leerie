@@ -640,6 +640,20 @@ def _errored_tool_result(text: str = "Exit code 1") -> str:
          "tool_use_id": "tu"}]}})
 
 
+def _asst_bash():
+    """An assistant turn requesting a Bash call — the kind of event that
+    ALWAYS sits between two tool-results in a real stream. The detector
+    must NOT let these reset its window (the v0.9.37 bug)."""
+    return json.dumps({"type": "assistant", "message": {"content": [
+        {"type": "tool_use", "name": "Bash", "id": "t", "input": {"command": "x"}}]}})
+
+
+def _ok_tool_result(text: str = "ok"):
+    return json.dumps({"type": "user", "message": {"content": [
+        {"type": "tool_result", "is_error": False, "content": text,
+         "tool_use_id": "tu"}]}})
+
+
 def _enable_fake_cgroup(leerie, monkeypatch, stat_triple):
     """Make _invoke believe a worker cgroup exists (so cgroup_sid is set)
     and have _cgroup_stat report `stat_triple`."""
@@ -647,6 +661,36 @@ def _enable_fake_cgroup(leerie, monkeypatch, stat_triple):
     monkeypatch.setattr(leerie, "_cgroup_enroll", lambda sid, pid: True)
     monkeypatch.setattr(leerie, "_cgroup_destroy", lambda sid: None)
     monkeypatch.setattr(leerie, "_cgroup_stat", lambda sid: stat_triple)
+
+
+def test_invoke_pid_exhaustion_realistic_interleaved_stream(
+        leerie, leerie_dir, monkeypatch):
+    """THE regression test for the v0.9.37 gap. In a real stream a
+    tool-result is ALWAYS followed by the model's assistant turn (and
+    system/rate_limit events) before the next tool-result — the events are
+    never adjacent. The old *consecutive* counter reset on every one of
+    those in-between events and so could never exceed 1, never firing. The
+    window counts only tool-result outcomes, so an exhausted worker is
+    caught despite the interleaving. Pattern mirrors the captured
+    config-003 log: err, <assistant>, err, <assistant>, err ..."""
+    events = [json.dumps({"type": "system", "subtype": "init", "model": "x"})]
+    for _ in range(4):
+        events.append(_errored_tool_result())
+        events.append(_asst_bash())          # the interleaved reset-bait
+        events.append(json.dumps({"type": "system"}))
+    events.append(json.dumps({"type": "result", "subtype": "success",
+                              "structured_output": {"ok": True},
+                              "is_error": False}))
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 0))  # at cap
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    with pytest.raises(leerie.WorkerError) as ei:
+        asyncio.run(leerie._invoke(
+            ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+            timeout=60, sid="cfg-003", leerie_dir=leerie_dir,
+            verbosity="stream",
+            worker_memory_max_bytes=1 << 30, worker_pids_max=256))
+    assert "exhausted its PID cgroup" in str(ei.value)
 
 
 def test_invoke_pid_exhaustion_raises_early(leerie, leerie_dir, monkeypatch):
@@ -729,22 +773,24 @@ def test_invoke_ordinary_failures_do_not_trigger(leerie, leerie_dir,
     assert result["structured_output"] == {"ok": True}
 
 
-def test_invoke_success_between_errors_resets_counter(leerie, leerie_dir,
-                                                      monkeypatch):
-    """Consecutive-error counting resets on any non-error event, so
-    scattered failures (never 3 in a row) don't accumulate to the
-    threshold even under an exhausted-looking stat stub."""
-    ok_tool = json.dumps({"type": "user", "message": {"content": [
-        {"type": "tool_result", "is_error": False, "content": "ok",
-         "tool_use_id": "tu"}]}})
-    events = [
-        json.dumps({"type": "system", "subtype": "init", "model": "x"}),
-        _errored_tool_result(), _errored_tool_result(), ok_tool,
-        _errored_tool_result(), _errored_tool_result(), ok_tool,
-        json.dumps({"type": "result", "subtype": "success",
-                    "structured_output": {"ok": True}, "is_error": False}),
-    ]
-    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 99))  # would trip if 3+
+def test_invoke_sparse_errors_below_window_threshold_do_not_trigger(
+        leerie, leerie_dir, monkeypatch):
+    """Errors that stay sparse — successes keep pushing them out of the
+    window so it never holds ≥3 at once — must NOT trigger, even with an
+    exhausted-looking stat stub. Window=6: the pattern err, ok, ok, err,
+    ok, ok, err, ok, ok never accumulates 3 errors in any 6-wide window.
+    This is the window analogue of "one failing test shouldn't fire."""
+    events = [json.dumps({"type": "system", "subtype": "init", "model": "x"})]
+    for _ in range(4):
+        events.append(_errored_tool_result())
+        events.append(_ok_tool_result())
+        events.append(_ok_tool_result())
+    events.append(json.dumps({"type": "result", "subtype": "success",
+                              "structured_output": {"ok": True},
+                              "is_error": False}))
+    # Stat would confirm exhaustion IF probed — proving the window gate
+    # (not the cgroup read) is what holds detection back here.
+    _enable_fake_cgroup(leerie, monkeypatch, (256, 256, 99))
     monkeypatch.setattr("asyncio.create_subprocess_exec",
                         _make_subprocess_exec_mock(events))
     result = asyncio.run(leerie._invoke(

@@ -1607,11 +1607,20 @@ def _signal_pids(pids: set[int], sig: int) -> None:
 
 _DESCENDANT_POLL_SEC = 0.5
 
-# Consecutive errored tool-results before `_invoke`'s PID-exhaustion
-# detector probes the cgroup (DESIGN §6 *Detecting PID exhaustion*). A
-# single ordinary failing command must never trip it — 3-in-a-row plus a
-# confirming cgroup read is the signal that the whole subtree can no longer
-# fork, not that one test failed.
+# `_invoke`'s PID-exhaustion detector probes the cgroup once the last
+# _PID_EXHAUSTION_WINDOW tool-results hold ≥_PID_EXHAUSTION_ERROR_THRESHOLD
+# errors (DESIGN §6 *Detecting PID exhaustion*). A *window*, not a run of
+# consecutive errors: tool-results are never adjacent in the stream (the
+# model's assistant turn always sits between them), so a consecutive
+# counter could never exceed one. A single ordinary failing command leaves
+# ≤1 error in the window and — with the confirming cgroup read — never
+# trips detection; a subtree that can no longer fork fills the window fast.
+# Window = double the error threshold: wide enough that an exhausted
+# worker's back-to-back failures land together, narrow enough that a few
+# unrelated failures scattered across a long healthy run don't accumulate
+# to the threshold. Validated on the captured config-003 exhaustion trace,
+# where window sizes 5 / 6 / 8 all first probe at the same point.
+_PID_EXHAUSTION_WINDOW = 6
 _PID_EXHAUSTION_ERROR_THRESHOLD = 3
 
 
@@ -5888,19 +5897,29 @@ def _is_fork_exhaustion(text: str) -> bool:
     return any(m in low for m in _FORK_EAGAIN_MARKERS)
 
 
-def _errored_bash_result_text(event: dict) -> str | None:
-    """If `event` is a user/tool_result carrying an errored result, return
-    its text (possibly empty ""); otherwise None. Used by `_read_stream`'s
-    PID-exhaustion detector to count consecutive tool failures. Not
-    Bash-specific at the event level (the stream doesn't name the tool on
-    the result), but under PID exhaustion every shell-spawning tool fails,
-    so the consecutive-failure signal plus the cgroup probe is what
-    distinguishes exhaustion from an ordinary single failing command."""
+def _tool_result_outcome(event: dict) -> bool | None:
+    """Classify a stream event for `_read_stream`'s PID-exhaustion window:
+
+    - `True`  — the event is a tool_result and it errored,
+    - `False` — the event is a tool_result and it succeeded,
+    - `None`  — the event is NOT a tool_result (assistant / system /
+      rate_limit / result).
+
+    The detector appends only non-None outcomes to its window, so the
+    events *between* tool-results (which are the majority of the stream,
+    and which always separate one tool-result from the next) neither count
+    as errors nor reset the window. This is the crux of the window design:
+    a *consecutive* tool-result counter could never exceed one, because two
+    tool-results are never adjacent in the stream (the model's assistant
+    turn always sits between them). Not tool-specific — under PID
+    exhaustion every shell-spawning tool fails, so the fraction of recent
+    tool-results that errored, plus the authoritative cgroup probe, is what
+    separates exhaustion from an ordinary single failing command."""
     if event.get("type") != "user":
         return None
     for b in (event.get("message", {}) or {}).get("content", []) or []:
-        if b.get("type") == "tool_result" and b.get("is_error"):
-            return _extract_tool_result_text(b)
+        if b.get("type") == "tool_result":
+            return bool(b.get("is_error"))
     return None
 
 
@@ -6552,16 +6571,18 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # `worker_idle_warn_sec` seconds.
     last_event_at = time.monotonic()
     # PID-exhaustion detector state (DESIGN §6 *Detecting PID exhaustion*).
-    # Counts CONSECUTIVE errored tool-results; a short run of them triggers
-    # a cgroup probe. A single ordinary failing command never trips it.
-    consecutive_tool_errors = 0
+    # A sliding window of recent tool-result outcomes (True=errored); the
+    # cgroup is probed once the window holds ≥threshold errors. A window
+    # (not a consecutive counter) is required because tool-results are never
+    # adjacent in the stream — see `_tool_result_outcome`.
+    tool_result_window: deque[bool] = deque(maxlen=_PID_EXHAUSTION_WINDOW)
     # Baseline pids.events.max at the first probe, so we can tell "the
     # counter is climbing" (fresh denials) from a stale nonzero value.
     pids_events_baseline: int | None = None
 
     async def _read_stream():
         nonlocal envelope, last_event_at, overage_blocked
-        nonlocal consecutive_tool_errors, pids_events_baseline
+        nonlocal pids_events_baseline
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
         # connected to a TTY, so `tail -f <state-root>/logs/<sid>.log` would
@@ -6607,19 +6628,32 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                     # pids.max fails EVERY shell-spawning tool call with
                     # EAGAIN — including trivial ones whose bare "Exit code
                     # 1" gives the model no way to diagnose it, so it
-                    # spirals to the end of the run. Count consecutive
-                    # errored tool-results; once past the threshold, probe
-                    # the cgroup. If it confirms exhaustion (at cap, or the
-                    # fork-denial counter is climbing), raise WorkerError —
-                    # _invoke's `except BaseException` terminates the
-                    # subtree + reaps, and the callers route it (implementer
-                    # → retryable handoff; conformer → advisory). The
-                    # threshold gate means an ordinary failing test — which
-                    # is NOT exhaustion — never trips this.
-                    _err_txt = _errored_bash_result_text(event)
-                    if _err_txt is not None:
-                        consecutive_tool_errors += 1
-                        if (consecutive_tool_errors
+                    # spirals to the end of the run. Track the last N
+                    # tool-result outcomes in a sliding window; once it
+                    # holds ≥threshold errors, probe the cgroup. If it
+                    # confirms exhaustion (at cap, or the fork-denial counter
+                    # is climbing), raise WorkerError — _invoke's `except
+                    # BaseException` terminates the subtree + reaps, and the
+                    # callers route it (implementer → retryable handoff;
+                    # conformer → advisory). A window, not a consecutive
+                    # counter: tool-results are never adjacent in the stream
+                    # (the model's assistant turn always sits between them),
+                    # so a consecutive count could never exceed one. The
+                    # window still leaves an ordinary failing test (≤1 error)
+                    # below the threshold — and the cgroup read is the final
+                    # authority regardless.
+                    _outcome = _tool_result_outcome(event)
+                    if _outcome is not None:
+                        tool_result_window.append(_outcome)
+                        # Probe only when THIS result errored (and the
+                        # window is error-heavy): the probe is a synchronous
+                        # broker round-trip, and gating on the error avoids
+                        # re-probing on the interleaved successes of a
+                        # healthy-but-failing worker. An exhausted worker —
+                        # whose every call errors — still probes on its
+                        # first qualifying error, so detection is unchanged.
+                        if (_outcome is True
+                                and sum(tool_result_window)
                                 >= _PID_EXHAUSTION_ERROR_THRESHOLD):
                             stat = _cgroup_stat(cgroup_sid)
                             if stat is not None:
@@ -6648,8 +6682,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                                         f"fork denials={ev_max}); every "
                                         f"shell-spawning tool call fails "
                                         f"with EAGAIN")
-                    else:
-                        consecutive_tool_errors = 0
+                    # No else-reset: successes age out of the bounded window
+                    # naturally as newer outcomes push them past maxlen.
                     # Inline summary (verbosity-gated). Multi-line
                     # summaries (multi-block events, multi-line text)
                     # are emitted one log() call per line so each

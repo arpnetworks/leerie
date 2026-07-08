@@ -3182,18 +3182,26 @@ diagnosing the cause (DESIGN §6 *Detecting PID exhaustion*). The broker
 gains a read-only `stat <sid>` verb → `OK <pids.current> <pids.max>
 <pids.events.max>` (or `ERR <msg>`); its client is
 `_cgroup_stat(sid) -> tuple[int,int,int] | None` (None when the broker is
-down or containment is off). `_read_stream` keeps a counter of
-*consecutive* errored Bash tool-results; at a small threshold (≥3) it
-calls `_cgroup_stat`, and if `current >= max` or `pids.events.max` is
-climbing it `log()`s the cause, relabels the inline `tool-fail` summary
-(`_summarize_stream_event`) to name the PID cap, and raises `WorkerError`
-— which the existing `except BaseException` in `_invoke` turns into a
-`_terminate_proc_tree` + tracker-reap, routing to the callers' normal
-handling (implementer → retryable `incomplete-handoff`; conformer →
-advisory `None`). `_is_fork_exhaustion(text)` is a cheap fast-path that
-also matches the `EAGAIN` string when it survives into the tool-result,
-but the cgroup probe is authoritative. The consecutive-error gate means an
-ordinary failing test never trips detection.
+down or containment is off). `_read_stream` keeps a bounded
+`deque(maxlen=_PID_EXHAUSTION_WINDOW)` of recent tool-result outcomes
+(True=errored) via `_tool_result_outcome(event)` — which returns None for
+non-tool-result events (assistant/system/rate_limit) so they are skipped,
+NOT counted as resets. When the window holds `≥_PID_EXHAUSTION_ERROR_THRESHOLD`
+(3) errors **and the latest result is itself an error** (so the synchronous
+broker probe is not re-issued on the interleaved successes of a
+healthy-but-failing worker), it calls `_cgroup_stat`, and if `current >= max` or
+`pids.events.max` is climbing it `log()`s the cause, relabels the inline
+`tool-fail` summary (`_summarize_stream_event`) to name the PID cap, and
+raises `WorkerError` — which the existing `except BaseException` in
+`_invoke` turns into a `_terminate_proc_tree` + tracker-reap, routing to
+the callers' normal handling (implementer → retryable `incomplete-handoff`;
+conformer → advisory `None`). `_is_fork_exhaustion(text)` is a cheap
+fast-path that also matches the `EAGAIN` string when it survives into the
+tool-result, but the cgroup probe is authoritative. A window (not a
+*consecutive* counter) is required because tool-results are never adjacent
+in the stream — the model's assistant turn always sits between them — so a
+consecutive counter could never exceed one. The window still leaves an
+ordinary failing test (≤1 error) well below the threshold.
 
 ### Abnormal exit and rate-limit contract (DESIGN §6 *Cleanup on abnormal exit*)
 

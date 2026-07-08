@@ -1503,18 +1503,29 @@ read-only `stat <sid>` verb returning the worker cgroup's
 `pids.current` / `pids.max` and the `pids.events` `max` counter (the
 kernel increments the latter once per denied fork — the definitive,
 unambiguous signal, distinct from a memory OOM which instead bumps
-`memory.events`). When a worker emits several consecutive errored Bash
-tool-results, `_read_stream` probes the broker; if the cgroup is at its
-PID cap (or the `pids.events` `max` counter is climbing), the orchestrator
-logs the real cause, relabels the inline summary, and terminates the
-worker early via the existing abnormal-exit path (`_terminate_proc_tree`
-+ the `_DescendantTracker` reap) with a `WorkerError`. That routes through
-the callers' existing handling: an implementer's PID-exhausted run becomes
-a retryable `incomplete-handoff` (a fresh worker restarts in a new
-worktree with a clean PID table, and the dead worker's leaked PIDs die
-with it), and a conformer's stays advisory (§9). The probe is gated behind
-a consecutive-error threshold so an ordinary failing test — which is not
-PID exhaustion — never triggers it.
+`memory.events`). When enough of a worker's *recent tool-results* are
+errors, `_read_stream` probes the broker; if the cgroup is at its PID cap
+(or the `pids.events` `max` counter is climbing), the orchestrator logs
+the real cause, relabels the inline summary, and terminates the worker
+early via the existing abnormal-exit path (`_terminate_proc_tree` + the
+`_DescendantTracker` reap) with a `WorkerError`. That routes through the
+callers' existing handling: an implementer's PID-exhausted run becomes a
+retryable `incomplete-handoff` (a fresh worker restarts in a new worktree
+with a clean PID table, and the dead worker's leaked PIDs die with it),
+and a conformer's stays advisory (§9).
+
+The error signal is measured over a **sliding window of the last N
+tool-results**, NOT a run of *consecutive* ones. The stream never places
+two tool-results next to each other — a tool-result is always followed by
+the model's next assistant turn plus `system`/`rate_limit` events before
+the next tool-result — so a "consecutive tool-result" counter can never
+exceed one and would never fire. The window counts only tool-result
+outcomes (the interleaved assistant/system events are ignored, not treated
+as resets); a single ordinary failing test leaves at most one error in the
+window and never reaches the threshold, while a PID-exhausted worker —
+whose every shell-spawning call fails — fills the window quickly. Even
+then the kill only fires when the authoritative cgroup read confirms
+exhaustion, so the window merely decides *when to probe*.
 
 Earlier versions of leerie gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made

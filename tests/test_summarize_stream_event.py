@@ -416,38 +416,49 @@ def test_ordinary_error_not_relabeled(leerie):
     assert "PID cap" not in out
 
 
-# ----- _errored_bash_result_text (detector's consecutive-error counter) -----
+# ----- _tool_result_outcome (detector's sliding-window classifier) ----------
 
-def test_errored_bash_result_text_extracts_error(leerie):
+def test_tool_result_outcome_error_is_true(leerie):
     event = {"type": "user", "message": {"content": [
         {"type": "tool_result", "is_error": True, "content": "Exit code 1",
          "tool_use_id": "tu_1"},
     ]}}
-    assert leerie._errored_bash_result_text(event) == "Exit code 1"
+    assert leerie._tool_result_outcome(event) is True
 
 
-def test_errored_bash_result_text_none_on_success(leerie):
+def test_tool_result_outcome_success_is_false(leerie):
+    """A SUCCESS is False, not None — it must occupy a window slot so it
+    ages out real errors. (The old consecutive counter returned None here
+    and reset; the window must not.)"""
     event = {"type": "user", "message": {"content": [
         {"type": "tool_result", "is_error": False, "content": "ok",
          "tool_use_id": "tu_1"},
     ]}}
-    assert leerie._errored_bash_result_text(event) is None
+    assert leerie._tool_result_outcome(event) is False
 
 
-def test_errored_bash_result_text_none_on_non_user_event(leerie):
-    assert leerie._errored_bash_result_text(
+def test_tool_result_outcome_none_on_non_tool_result_events(leerie):
+    """assistant / system / rate_limit events are None so they NEVER touch
+    the window — the crux of the window fix (they always sit between
+    tool-results, and must not reset it)."""
+    assert leerie._tool_result_outcome(
         {"type": "assistant", "message": {"content": []}}) is None
+    assert leerie._tool_result_outcome({"type": "system"}) is None
+    assert leerie._tool_result_outcome({"type": "rate_limit_event"}) is None
+    # a user event with no tool_result block is also None
+    assert leerie._tool_result_outcome(
+        {"type": "user", "message": {"content": [
+            {"type": "text", "text": "hi"}]}}) is None
 
 
-def test_errored_bash_result_text_empty_string_still_counts(leerie):
-    """A bare errored result with empty content returns "" (falsy but not
-    None) — the detector must count it, since PID-exhausted trivial
-    commands surface exactly this."""
+def test_tool_result_outcome_empty_error_still_true(leerie):
+    """A bare errored result with empty content is still True — PID-
+    exhausted trivial commands surface exactly this (empty body)."""
     event = {"type": "user", "message": {"content": [
         {"type": "tool_result", "is_error": True, "content": "",
          "tool_use_id": "tu_1"},
     ]}}
-    assert leerie._errored_bash_result_text(event) == ""
+    assert leerie._tool_result_outcome(event) is True
 
 
 def test_tool_success_dropped_at_stream(leerie):
