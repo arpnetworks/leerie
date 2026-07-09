@@ -42,14 +42,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from tenacity import (
-    AsyncRetrying,
-    RetryCallState,
-    RetryError,
-    retry_if_result,
-    stop_after_delay,
-    wait_exponential_jitter,
-)
+# tenacity is imported lazily inside claude_p() (its sole use site), not at
+# module scope, so orchestrator/leerie.py loads on a bare host python3 that
+# lacks requirements.txt deps. The `config --recapture` host seam
+# (leerie:864) exec_module()s this file on the host, where python3 is not
+# guaranteed to have tenacity; a module-scope import there would crash before
+# run_recapture_deps()'s pathlib guards can print their diagnostic. Do not
+# hoist it back to the top.
 
 ROOT = Path(__file__).resolve().parent.parent       # leerie plugin/repo root
 PROMPTS = ROOT / "prompts"
@@ -289,6 +288,11 @@ STATE_FIELDS = (
     # the time the run started (or resumed). Persisted so the PR footer can
     # show the exact version that produced the run, which aids debugging.
     "leerie_version",
+    # dep_capture_done: set to True in state.json and written as a sentinel
+    # file (<run_dir>/dep_capture.done) after capture_repo_deps completes a
+    # successful write. The run-start backstop checks the sentinel file to
+    # skip runs already captured (idempotency).
+    "dep_capture_done",
 )
 
 CATEGORIES = [
@@ -666,6 +670,7 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "provision": "high",
     "integrator": "high",
     "pr_writer": "high",
+    "dep_capture": "high",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
@@ -677,6 +682,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
 MODEL_JUDGE_ENV = "LEERIE_MODEL_JUDGE"
 MODEL_HEAL_ENV = "LEERIE_MODEL_HEAL"
 MODEL_PR_WRITER_ENV = "LEERIE_MODEL_PR_WRITER"
+MODEL_DEP_CAPTURE_ENV = "LEERIE_MODEL_DEP_CAPTURE"
 
 # Telemetry enabled/disabled — see IMPLEMENTATION.md §2 "Telemetry".
 # Resolution order: --telemetry/--no-telemetry CLI → LEERIE_TELEMETRY env →
@@ -1308,6 +1314,43 @@ SCHEMAS: dict[str, dict] = {
             "title": {"type": "string", "minLength": 1, "maxLength": 200},
             "body": {"type": "string", "minLength": 1},
             "used_template": {"type": ["string", "null"]},
+        },
+    },
+    "dep_capture": {
+        # DESIGN §6½: LLM worker that reads the shell commands workers
+        # ran (extracted from logs/*.log via _iter_log_tool_use) and
+        # decides what the repo genuinely needs across all languages and
+        # frameworks. Code enforces via this schema; the worker decides
+        # content; _write_config_toml_keys writes it deterministically.
+        "type": "object",
+        "required": ["setup_packages", "language_installs"],
+        "properties": {
+            "setup_packages": {
+                # apt packages for the warm apt layer in .leerie/Dockerfile.
+                "type": "array",
+                "items": {"type": "string"},
+            },
+            "language_installs": {
+                # Per-manager install commands the Dockerfile bakes in via
+                # COPY + RUN layers. `copy_inputs` are repo-relative paths
+                # COPYed in before the RUN (e.g. requirements.txt,
+                # package.json). Hallucinated paths are validated against
+                # the repo and skipped; the RUN is still emitted.
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["manager", "command"],
+                    "properties": {
+                        "manager": {"type": "string"},
+                        "command": {"type": "string"},
+                        "copy_inputs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                },
+            },
+            "dockerfile_notes": {"type": ["string", "null"]},
         },
     },
     "provision": {
@@ -3573,6 +3616,14 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
                            or pr_writer_file or global_file
                            or MODEL_DEFAULT_PER_WORKER.get(
                                "pr_writer", MODEL_DEFAULT))
+    dep_capture_cli = getattr(args, "dep_capture_model", None)
+    dep_capture_env = from_env(MODEL_DEP_CAPTURE_ENV)
+    dep_capture_file = from_file("model_dep_capture")
+    models["dep_capture"] = (dep_capture_cli or dep_capture_env
+                             or global_cli or global_env
+                             or dep_capture_file or global_file
+                             or MODEL_DEFAULT_PER_WORKER.get(
+                                 "dep_capture", MODEL_DEFAULT))
     return models
 
 
@@ -3634,6 +3685,9 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
     efforts["pr_writer"] = (global_cli or global_env or global_file
                             or EFFORT_DEFAULT_PER_WORKER.get(
                                 "pr_writer", EFFORT_DEFAULT))
+    efforts["dep_capture"] = (global_cli or global_env or global_file
+                              or EFFORT_DEFAULT_PER_WORKER.get(
+                                  "dep_capture", EFFORT_DEFAULT))
     return efforts
 
 
@@ -5272,67 +5326,13 @@ _INSTALL_CMD_HINT_RE = re.compile(
     r"yum|pacman|go install|make|bundle install|gem install|mise install)\b"
 )
 
-# Narrow regex: a shell segment that is an apt[-get] install invocation.
-_APT_INSTALL_RE = re.compile(
-    r"(?:sudo\s+(?:-[A-Za-z]+\s+)*)?apt(?:-get)?\s+install\b"
-)
-
-# Narrow regex: a language install command worth capturing.
-_LANG_INSTALL_RE = re.compile(
-    r"^\s*(?:"
-    r"pnpm\s+install|"
-    r"npm\s+(?:ci|install)|"
-    r"yarn\s+install|"
-    r"pip[23]?\s+install|"
-    r"uv\s+sync|"
-    r"poetry\s+install|"
-    r"cargo\s+fetch|"
-    r"bundle\s+install|"
-    r"composer\s+install|"
-    r"dotnet\s+restore|"
-    r"go\s+mod\s+download"
-    r")"
-)
-
-# Valid apt package-name token (split pkg=ver → keep pkg name).
-_APT_PKG_RE = re.compile(r"^[a-z0-9][a-z0-9+._-]*$")
-# Flag-like tokens to drop when parsing apt install args.
-_APT_FLAG_RE = re.compile(r"^-")
-
-
-def _parse_apt_intents(command: str) -> list[str]:
-    """Extract apt package names from a shell command string.
-
-    Splits on shell operators (&&, ;, |), finds segments that are
-    apt[-get] install invocations, drops flags and noise tokens, and
-    returns a stable-ordered deduplicated list of package names.
-    """
-    # Split on shell operators and collect apt-install segments.
-    segments = re.split(r"&&|;|\|", command)
-    seen: dict[str, None] = {}  # ordered set via dict insertion order
-    for seg in segments:
-        seg = seg.strip()
-        if not _APT_INSTALL_RE.search(seg):
-            continue
-        tokens = seg.split()
-        # Find the 'install' keyword and collect everything after it.
-        collecting = False
-        for tok in tokens:
-            if not collecting:
-                if tok == "install":
-                    collecting = True
-                continue
-            # Drop flags.
-            if _APT_FLAG_RE.match(tok):
-                continue
-            # Drop noise words that can appear before 'install'.
-            if tok in ("sudo", "apt", "apt-get", "install"):
-                continue
-            # Split pkg=version and keep name only.
-            name = tok.split("=")[0]
-            if _APT_PKG_RE.match(name):
-                seen[name] = None
-    return list(seen)
+# Byte budget for the dep_capture command extraction. Extracted Bash
+# commands from logs/*.log (deduped, newest-first) are admitted until this
+# ceiling; any truncation is noted in the worker prompt. Sized to admit
+# the full command set for essentially every run (~50–80k tokens undeduped,
+# ~66k worst-case) while bounding the LLM input. Mirrors the
+# _FIXTURE_TOTAL_BUDGET idiom in gather_provision_fixtures.
+_DEPCAP_TOTAL_BUDGET = 307200  # 300KB ≈ 75k tokens at 4 bytes/token
 
 
 def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
@@ -5397,27 +5397,27 @@ def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
     os.replace(tmp, cfg_path)
 
 
-def _capture_installs_from_logs(
-        log_dir: Path) -> tuple[list[str], list[str]]:
-    """Scan worker JSONL logs in log_dir and return (apt_packages, lang_cmds).
-
-    Iterates sorted *.log files via _iter_log_tool_use; for each Bash
-    tool_use feeds the command to _parse_apt_intents and a language-install
-    matcher. Returns stable-ordered deduplicated lists.
-    """
-    apt_seen: dict[str, None] = {}
-    lang_seen: dict[str, None] = {}
-    for log_path in sorted(log_dir.glob("*.log")):
+def _extract_depcap_commands(log_dir: Path) -> tuple[str, bool]:
+    """Dedup Bash commands from worker logs, newest-first, bounded to _DEPCAP_TOTAL_BUDGET bytes."""
+    seen: dict[str, None] = {}  # ordered set, dedup
+    for log_path in sorted(log_dir.glob("*.log"), reverse=True):
         for kind, inp, _result in _iter_log_tool_use(log_path):
             if kind != "Bash":
                 continue
             cmd = inp.get("command", "")
-            for pkg in _parse_apt_intents(cmd):
-                apt_seen[pkg] = None
-            if _LANG_INSTALL_RE.match(cmd):
-                stripped = cmd.strip().split("\n")[0].strip()
-                lang_seen[stripped] = None
-    return list(apt_seen), list(lang_seen)
+            if cmd:
+                seen[cmd] = None
+    total_bytes = 0
+    hit_ceiling = False
+    lines: list[str] = []
+    for cmd in seen:
+        encoded = (cmd + "\n---\n").encode()
+        if total_bytes + len(encoded) > _DEPCAP_TOTAL_BUDGET:
+            hit_ceiling = True
+            break
+        lines.append(cmd)
+        total_bytes += len(encoded)
+    return "\n---\n".join(lines), hit_ceiling
 
 
 def resolve_capture_deps(repo_root: Path) -> bool:
@@ -5446,14 +5446,19 @@ def resolve_capture_deps(repo_root: Path) -> bool:
     return True  # default: enabled
 
 
-def capture_repo_deps(repo_root: Path, st: object) -> None:
-    """Scan this run's logs and write setup_packages to .leerie/config.toml.
-
-    Called from phase_finalize, wrapped in try/except (non-fatal).
-    Skips writing when a committed .leerie/Dockerfile already exists
-    (it is authoritative and setup_packages is ignored in that case).
-    """
+async def capture_repo_deps(
+        repo_root: Path,
+        st: object,
+        caps: dict | None = None,
+        models: dict[str, str] | None = None,
+        efforts: dict[str, str | None] | None = None,
+) -> None:
+    """Invoke the dep_capture LLM worker and write deps to .leerie/config.toml (non-fatal)."""
     if not resolve_capture_deps(repo_root):
+        return
+    if caps is None or models is None or efforts is None:
+        log("capture: skipped dep_capture worker (caps/models/efforts not "
+            "available at finalize time)")
         return
     log_dir = getattr(st, "run_dir", None)
     if log_dir is None:
@@ -5461,11 +5466,8 @@ def capture_repo_deps(repo_root: Path, st: object) -> None:
     log_dir = Path(log_dir) / "logs"
     if not log_dir.is_dir():
         return
-    apt_pkgs, _lang_cmds = _capture_installs_from_logs(log_dir)
-    if not apt_pkgs:
-        return
-    # Skip setup_packages write when a committed .leerie/Dockerfile exists;
-    # it is authoritative (DESIGN §6½) and setup_packages is ignored.
+    # Skip when a committed .leerie/Dockerfile exists; it is authoritative
+    # (DESIGN §6½) and setup_packages / language_installs are ignored.
     dockerfile = repo_root / ".leerie" / "Dockerfile"
     if dockerfile.is_file():
         try:
@@ -5475,18 +5477,215 @@ def capture_repo_deps(repo_root: Path, st: object) -> None:
                 capture_output=True)
             if result.returncode == 0:
                 log("capture: .leerie/Dockerfile is committed — skipping "
-                    "setup_packages write (Dockerfile is authoritative)")
+                    "dep_capture (Dockerfile is authoritative)")
                 return
         except Exception:
             pass
-    cfg_path = repo_root / ".leerie" / "config.toml"
-    existing = _read_toml_key(cfg_path, "setup_packages") or ""
-    merged = _merge_setup_packages(existing, apt_pkgs)
-    if merged is None:
+    commands_text, hit_ceiling = _extract_depcap_commands(log_dir)
+    if not commands_text.strip():
+        log("capture: no Bash commands found in logs — skipping dep_capture")
         return
-    _write_config_toml_keys(cfg_path, {"setup_packages": merged})
-    log(f"capture: wrote setup_packages={merged!r} to {cfg_path}; "
-        "run `git add .leerie/ && git commit` to bake next run")
+    wc = st.data.get("worker_count", 0) if hasattr(st, "data") else 0
+    if wc >= caps["max_total_workers"]:
+        log(f"capture: skipped dep_capture worker (worker budget exhausted at "
+            f"{wc}/{caps['max_total_workers']})")
+        return
+    sys_prompt = load_prompt("dep_capture")
+    model = models.get("dep_capture", MODEL_DEFAULT)
+    effort = efforts.get("dep_capture")
+    truncation_note = (
+        "\n\n[NOTE: command list was truncated at the byte budget ceiling — "
+        "the most recent commands are shown first]"
+        if hit_ceiling else ""
+    )
+    user_prompt = (
+        f"Shell commands run by workers during this leerie run "
+        f"(newest-first, deduplicated):\n\n{commands_text}{truncation_note}"
+    )
+    if hasattr(st, "bump_workers"):
+        st.bump_workers(caps)
+    result = await claude_p(
+        user_prompt=user_prompt,
+        system_prompt=sys_prompt,
+        schema_key="dep_capture",
+        cwd=str(repo_root),
+        allowed_tools=INSPECT_TOOLS,
+        max_turns=10,
+        autonomous=False,
+        caps=caps,
+        st=st,
+        model=model,
+        effort=effort,
+        sid="dep-capture",
+    )
+    setup_packages: list[str] = result.get("setup_packages") or []
+    language_installs: list[dict] = result.get("language_installs") or []
+    cfg_path = repo_root / ".leerie" / "config.toml"
+    updates: dict[str, str] = {}
+    if setup_packages:
+        existing = _read_toml_key(cfg_path, "setup_packages") or ""
+        merged = _merge_setup_packages(existing, setup_packages)
+        if merged is not None:
+            updates["setup_packages"] = merged
+    if language_installs:
+        # JSON-in-TOML because TOML has no inline array type compatible with
+        # the flat _read_toml_key/_write_config_toml_keys surface.
+        existing_raw = _read_toml_key(cfg_path, "language_installs") or ""
+        try:
+            existing_list: list[dict] = json.loads(existing_raw) if existing_raw else []
+        except (json.JSONDecodeError, ValueError):
+            existing_list = []
+        existing_managers = {e.get("manager") for e in existing_list if e.get("manager")}
+        new_entries = [e for e in language_installs
+                       if e.get("manager") and e["manager"] not in existing_managers]
+        if new_entries:
+            merged_list = existing_list + new_entries
+            updates["language_installs"] = json.dumps(merged_list, separators=(",", ":"))
+    if updates:
+        _write_config_toml_keys(cfg_path, updates)
+        pkg_note = f" setup_packages={updates['setup_packages']!r}" if "setup_packages" in updates else ""
+        li_note = f" language_installs({len(language_installs)} entries)" if "language_installs" in updates else ""
+        log(f"capture: dep_capture wrote{pkg_note}{li_note} to {cfg_path}; "
+            "run `git add .leerie/ && git commit` to bake next run")
+    else:
+        log("capture: dep_capture found no new deps to write")
+    # Write idempotency sentinel. Both a state field (for in-run readers)
+    # and a lightweight file (for the next-run backstop, which reads past
+    # run dirs without constructing a full State).
+    run_dir_path = getattr(st, "run_dir", None)
+    if run_dir_path is not None:
+        try:
+            (Path(run_dir_path) / "dep_capture.done").write_text("1\n")
+        except Exception:
+            pass
+    if hasattr(st, "data"):
+        try:
+            st.data["dep_capture_done"] = True
+        except Exception:
+            pass
+
+
+async def _backstop_capture_prior_runs(
+        leerie_root: Path,
+        repo_root: Path,
+        caps: dict,
+        models: dict[str, str],
+        efforts: dict[str, str | None],
+) -> None:
+    """Cover SIGKILL/crash: run dep_capture over prior runs with logs/ but no sentinel."""
+    runs_dir = leerie_root / "runs"
+    if not runs_dir.is_dir():
+        return
+    for run_dir in sorted(runs_dir.iterdir(), reverse=True):
+        if not run_dir.is_dir():
+            continue
+        log_dir = run_dir / "logs"
+        if not log_dir.is_dir():
+            continue
+        sentinel = run_dir / "dep_capture.done"
+        if sentinel.is_file():
+            continue
+        log(f"backstop: running dep_capture for prior run {run_dir.name}")
+        try:
+
+            class _BackstopState:
+                pass
+
+            bst = _BackstopState()
+            bst.run_dir = run_dir  # type: ignore[attr-defined]
+            bst.data = {}  # type: ignore[attr-defined]
+            bst.bump_workers = lambda _caps: None  # type: ignore[attr-defined]
+            await capture_repo_deps(
+                repo_root, bst,
+                caps=caps, models=models, efforts=efforts,
+            )
+        except Exception as exc:
+            log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
+
+
+def run_recapture_deps(
+        leerie_root: Path,
+        repo_root: Path,
+        force: bool = False,
+        run_id: str | None = None,
+) -> None:
+    """Host-side recapture entrypoint (DESIGN §6½) — consolidates dep_capture across runs."""
+    caps = dict(DEFAULT_CAPS)
+
+    # Minimal args namespace so resolve_models/efforts can read env vars and
+    # TOML but have no CLI overrides (this is a host-side non-interactive call).
+    class _MinimalArgs:
+        model = None
+        dep_capture_model = None
+        pr_writer_model = None
+        effort = None
+
+    _args = _MinimalArgs()
+    models = resolve_models(repo_root, _args)
+    efforts = resolve_efforts(repo_root, _args)
+
+    if run_id is not None:
+        target_run_dir = leerie_root / "runs" / run_id
+        if not target_run_dir.is_dir():
+            die(f"recapture: run {run_id!r} not found under {leerie_root / 'runs'}")
+        target_dirs: list[Path] = [target_run_dir]
+    else:
+        runs_dir = leerie_root / "runs"
+        if not runs_dir.is_dir():
+            die(f"recapture: no runs directory at {runs_dir}; nothing to recapture")
+        finished: list[Path] = []
+        for d in runs_dir.iterdir():
+            if not d.is_dir():
+                continue
+            rj = d / "run.json"
+            if not rj.is_file():
+                continue
+            try:
+                rdata = json.loads(rj.read_text())
+            except (OSError, ValueError):
+                continue
+            if rdata.get("finished_at") and (d / "logs").is_dir():
+                finished.append(d)
+        if not finished:
+            die("recapture: no completed run with logs found; nothing to recapture")
+        # Process newest-first so the most recent installs inform the decision.
+        target_dirs = sorted(finished, reverse=True)
+
+    ran_any = False
+    for target_run_dir in target_dirs:
+        sentinel = target_run_dir / "dep_capture.done"
+        if force:
+            # Drop sentinel so the worker fires unconditionally on this run.
+            try:
+                sentinel.unlink(missing_ok=True)
+            except Exception:
+                pass
+        elif sentinel.is_file():
+            continue
+
+        # Flock the run dir (refuse to race a live orchestrator). --phase judge
+        # pattern: construct State → catch StateLockedError → skip (not fatal
+        # for multi-run consolidation; we still capture the others).
+        try:
+            target_st = State(leerie_root, target_run_dir.name, repo_root=repo_root)
+        except StateLockedError as e:
+            log(f"recapture: skipping {target_run_dir.name!r}: another "
+                f"orchestrator owns the run (holding flock on {e.run_dir}).")
+            continue
+        target_st.load()  # non-fatal if state.json is missing (older runs)
+
+        log(f"recapture: scanning {target_run_dir / 'logs'} ...")
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, target_st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+            ran_any = True
+        except Exception as exc:
+            log(f"recapture: error during dep_capture for {target_run_dir.name}: {exc}")
+
+    if not ran_any and not force:
+        log("recapture: all eligible runs already captured (use --force to re-run)")
 
 
 def _split_readme_headers(text: str) -> list[tuple[int, str, str]]:
@@ -7623,7 +7822,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # (`judge`, `patch_generator`) that are not main-loop workers but
     # do invoke claude_p with their own schema.
     _allowed_schema_keys = set(WORKER_TYPES) | {
-        "judge", "patch_generator", "pr_writer"}
+        "judge", "patch_generator", "pr_writer", "dep_capture"}
     if schema_key not in _allowed_schema_keys:
         raise ValueError(
             f"claude_p called with unknown schema_key {schema_key!r}; "
@@ -7764,6 +7963,17 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
         # invocation returns a non-auth envelope (success or a different
         # error class) or when the budget is exhausted.
         if _is_auth_or_quota_failure(envelope):
+            # Lazy import (not module-scope) so this file loads on a bare host
+            # python3 lacking requirements.txt deps — see the module-top note.
+            from tenacity import (
+                AsyncRetrying,
+                RetryCallState,
+                RetryError,
+                retry_if_result,
+                stop_after_delay,
+                wait_exponential_jitter,
+            )
+
             def _log_before_sleep(rs: RetryCallState) -> None:
                 env = rs.outcome.result()
                 marker = (env.get("api_error_status") or "auth/quota")
@@ -15740,7 +15950,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # Capture-and-bake hook (DESIGN §6½). Non-fatal: any error is
     # swallowed so capture failure never blocks a run from completing.
     try:
-        capture_repo_deps(Path(os.getcwd()), st)
+        await capture_repo_deps(
+            Path(os.getcwd()), st,
+            caps=caps, models=models, efforts=efforts,
+        )
     except Exception as _cap_exc:
         log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
             "continuing")
@@ -15931,6 +16144,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                         no_push=getattr(args, "no_push", False))
         supplied = (json.loads(Path(args.answers).read_text())
                     if args.answers else None)
+        # Run-start backstop (DESIGN §6½): before phase_classify, scan prior
+        # runs that produced logs but whose dep_capture.done sentinel is absent.
+        # Covers the SIGKILL / crash case where the cancel-arm capture couldn't
+        # run. Non-fatal: any error is logged and ignored.
+        await _backstop_capture_prior_runs(
+            leerie_dir, Path(os.getcwd()), caps, models, efforts)
         await phase_classify(task, st, caps, args.clarify, models, efforts)
         log(f"run id: {st.run_id}")
         # Initialize run.json with the immutable run-identity fields
@@ -16782,6 +17001,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         st.save()
         log("interrupted by user (SIGINT) — worktree cleanup; "
             f"state preserved (resume with leerie --resume {st.run_id})")
+        # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
+        # Mirrors the RateLimitedExit post-loop pattern. Non-fatal.
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+        except Exception as _cap_exc:
+            log(f"capture: non-fatal error during cancel-arm capture "
+                f"({_cap_exc})")
         exit_code = 130
     except InterruptedBySignal as e:
         # SIGTERM / SIGHUP → external orchestration (CI cancel, systemd
@@ -16792,6 +17021,16 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         st.save()
         log(f"interrupted by signal ({e}) — worktree cleanup; "
             f"state preserved (resume with leerie --resume {st.run_id})")
+        # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
+        # Non-fatal.
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+        except Exception as _cap_exc:
+            log(f"capture: non-fatal error during signal-arm capture "
+                f"({_cap_exc})")
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.
         signum = getattr(signal, str(e), None)
         exit_code = (128 + int(signum)) if signum else 1

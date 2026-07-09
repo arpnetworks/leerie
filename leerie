@@ -858,105 +858,30 @@ TOML
           shift
         fi
         _leerie_state_dir="${LEERIE_STATE_HOST_DIR:-$HOME/.leerie/$(basename "$_user_repo")}"
-        _runs_dir="$_leerie_state_dir/runs"
-        if [ ! -d "$_runs_dir" ]; then
-          remote_log "config --recapture: no runs directory at $_runs_dir; nothing to recapture"
-          exit 1
-        fi
-        # Find the newest finished run (has finished_at in run.json).
-        _newest_log_dir="$(python3 - "$_runs_dir" <<'PY'
-import json, sys
-from pathlib import Path
-
-runs = Path(sys.argv[1])
-best = ("", "")  # (finished_at, logs_dir)
-for run_dir in runs.iterdir():
-    if not run_dir.is_dir():
-        continue
-    rj = run_dir / "run.json"
-    if not rj.is_file():
-        continue
-    try:
-        data = json.loads(rj.read_text())
-    except (OSError, ValueError):
-        continue
-    fa = data.get("finished_at", "")
-    if fa and fa > best[0]:
-        log_dir = run_dir / "logs"
-        if log_dir.is_dir():
-            best = (fa, str(log_dir))
-print(best[1])
-PY
-        )"
-        if [ -z "$_newest_log_dir" ]; then
-          remote_log "config --recapture: no completed run with logs found in $_runs_dir"
-          exit 1
-        fi
-        remote_log "config --recapture: scanning $_newest_log_dir ..."
-        # Call orchestrator functions via python3.  The orchestrator's leerie.py
-        # must be importable (it's on the host path via the leerie install).
+        # Call run_recapture_deps from the orchestrator module. It handles run
+        # discovery, State construction + flock, and asyncio.run(capture_repo_deps).
         _recapture_rc=0
-        _recapture_out="$(python3 - "$_user_repo" "$_newest_log_dir" "$_recapture_force" \
-            "$LEERIE_REPO/orchestrator/leerie.py" <<'PY'
+        python3 - "$_user_repo" "$_leerie_state_dir" "$_recapture_force" \
+            "$LEERIE_REPO/orchestrator/leerie.py" <<'PY' || _recapture_rc=$?
 import sys, importlib.util, pathlib
 
-user_repo = pathlib.Path(sys.argv[1])
-log_dir   = pathlib.Path(sys.argv[2])
-force     = sys.argv[3] == "true"
-orch_path = pathlib.Path(sys.argv[4])
+user_repo    = pathlib.Path(sys.argv[1])
+leerie_root  = pathlib.Path(sys.argv[2])
+force        = sys.argv[3] == "true"
+orch_path    = pathlib.Path(sys.argv[4])
 
 # Load the orchestrator module by path so we never mutate sys.path permanently.
 spec = importlib.util.spec_from_file_location("leerie_orch", orch_path)
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
 
-apt_pkgs, _lang = m._capture_installs_from_logs(log_dir)
-cfg_path = user_repo / ".leerie" / "config.toml"
-
-if force:
-    # Wholesale replace: write apt_pkgs directly (even if empty — clears stale).
-    if apt_pkgs:
-        m._write_config_toml_keys(cfg_path, {"setup_packages": " ".join(apt_pkgs)})
-        print(f"config --recapture --force: wrote setup_packages={' '.join(apt_pkgs)!r}")
-        print("LEERIE_RECAPTURE_WROTE")  # machine marker: config.toml changed
-    else:
-        print("config --recapture --force: no apt packages found in logs; setup_packages unchanged")
-else:
-    existing = m._read_toml_key(cfg_path, "setup_packages") or ""
-    merged = m._merge_setup_packages(existing, apt_pkgs)
-    if merged is None:
-        print(f"config --recapture: no new packages vs existing {existing!r}; nothing to write")
-    else:
-        m._write_config_toml_keys(cfg_path, {"setup_packages": merged})
-        print(f"config --recapture: wrote setup_packages={merged!r}")
-        print("LEERIE_RECAPTURE_WROTE")  # machine marker: config.toml changed
+m.run_recapture_deps(leerie_root, user_repo, force=force)
 PY
-)" || _recapture_rc=$?
-        # Echo the seam's human-readable lines (drop the machine marker).
-        printf '%s\n' "$_recapture_out" | grep -v '^LEERIE_RECAPTURE_WROTE$' || true
         if [ "$_recapture_rc" -ne 0 ]; then
           remote_log "config --recapture: python3 seam failed (rc=$_recapture_rc); check orchestrator path"
           exit 1
         fi
-        # If setup_packages changed and an UNCOMMITTED *generated* Dockerfile
-        # exists, remove it so the next `leerie` run regenerates the image from
-        # the new packages. A committed Dockerfile is authoritative (DESIGN §6½)
-        # and is left untouched even if it carries the sentinel — same
-        # git-tracked authority test as the auto-gen guard and capture_repo_deps.
-        _gen_sentinel="# leerie-generated: do not edit (regenerated from .leerie/config.toml)"
-        if printf '%s\n' "$_recapture_out" | grep -q '^LEERIE_RECAPTURE_WROTE$'; then
-          _df="$_user_repo/.leerie/Dockerfile"
-          if [ -f "$_df" ] && IFS= read -r _df_line < "$_df" 2>/dev/null && \
-             [ "$_df_line" = "$_gen_sentinel" ] && \
-             ! git -C "$_user_repo" ls-files --error-unmatch \
-                 ".leerie/Dockerfile" >/dev/null 2>&1; then
-            rm -f "$_df"
-            remote_log "config --recapture: removed generated .leerie/Dockerfile; it regenerates on next run"
-          fi
-          unset _df _df_line
-        fi
-        unset _recapture_force _leerie_state_dir _runs_dir _newest_log_dir \
-              _recapture_rc _recapture_out _gen_sentinel
+        unset _recapture_force _leerie_state_dir _recapture_rc
         exit 0
         ;;
       "")
@@ -4079,14 +4004,13 @@ if [ "$_leerie_do_gen" = "true" ]; then
     printf '    && rm -rf /var/lib/apt/lists/*\nUSER leerie\n' >> "$_gen_df_tmp"
 
     # Language-dep layer (gated on bake_language_deps, default true).
-    # Uses python3 to detect lockfiles/manifests and emit COPY+RUN.
-    # Every COPY-input sha (lockfiles, manifests, workspace children,
-    # patches/*, .npmrc) is embedded as a comment inside the Dockerfile, so the
+    # Every COPY-input sha is embedded as a comment inside the Dockerfile so the
     # Dockerfile sha folds them into .dockerfile-hash (the single hash site
-    # below). The Fly path inherits this same generated Dockerfile via the
-    # seed-repo whitelist, so no second hash-computation is needed there.
+    # below). Each copy_input is existence-checked (p.exists()) before being
+    # added to the COPY list — hallucinated paths are silently dropped while
+    # the RUN line is always emitted.
     if [ "$_BAKE_LANGUAGE_DEPS" = "true" ]; then
-      _lang_layer="$(python3 - "$USER_REPO" <<'PY'
+      _lang_layer="$(python3 - "$USER_REPO" "$_leerie_config_toml" <<'PY'
 import glob as _glob
 import hashlib
 import json as _json
@@ -4096,7 +4020,83 @@ import sys
 from pathlib import Path
 
 repo = Path(sys.argv[1])
+config_toml = Path(sys.argv[2]) if len(sys.argv) > 2 else None
 
+
+def sha256(p):
+    h = hashlib.sha256()
+    h.update(p.read_bytes())
+    return h.hexdigest()
+
+
+def _hash_copy_files(repo, copy_files):
+    copy_shas = {}
+    for rel in copy_files:
+        p = repo / rel.rstrip("/")
+        if p.is_file():
+            copy_shas[rel] = sha256(p)
+        elif p.is_dir():
+            for f in sorted(p.rglob("*")):
+                if f.is_file():
+                    copy_shas[os.path.relpath(f, str(repo))] = sha256(f)
+    return copy_shas
+
+
+def _emit_layer(copy_files, run_cmd, copy_shas):
+    sha_comment = "# copy-input-shas: " + " ".join(
+        f"{k}={v[:12]}" for k, v in sorted(copy_shas.items())
+    )
+    copy_line = "COPY " + " ".join(copy_files) + " ./"
+    run_line = f"RUN {run_cmd}"
+    print(sha_comment)
+    print(copy_line)
+    print(run_line)
+
+
+persisted_installs = []
+if config_toml and config_toml.is_file():
+    try:
+        raw = config_toml.read_text()
+    except OSError:
+        raw = ""
+    # Extract the language_installs value from a flat TOML file.
+    # The value is a JSON string (possibly quoted with " or ').
+    for line in raw.splitlines():
+        m = re.match(
+            r"^\s*language_installs\s*=\s*(?:\"(.*)\"|'(.*)'|(.*))$",
+            line.strip(),
+        )
+        if m:
+            val = m.group(1) or m.group(2) or m.group(3) or ""
+            val = val.strip()
+            if val:
+                try:
+                    persisted_installs = _json.loads(val)
+                    if not isinstance(persisted_installs, list):
+                        persisted_installs = []
+                except (ValueError, TypeError):
+                    persisted_installs = []
+            break
+
+if persisted_installs:
+    emitted = False
+    for entry in persisted_installs:
+        if not isinstance(entry, dict):
+            continue
+        run_cmd = (entry.get("command") or "").strip()
+        copy_inputs = entry.get("copy_inputs") or []
+        if not run_cmd:
+            continue
+        # Validate each copy_input; skip hallucinated paths but always emit RUN.
+        copy_files = [ci for ci in copy_inputs if ci and (repo / ci).exists()]
+        if copy_files:
+            copy_shas = _hash_copy_files(repo, copy_files)
+            _emit_layer(copy_files, run_cmd, copy_shas)
+        else:
+            # No valid copy inputs: emit RUN without COPY.
+            print(f"RUN {run_cmd}")
+        emitted = True
+    sys.exit(0 if emitted else 0)
 
 def _node_ancillary(repo, copy_files):
     """Append the ancillary inputs a node install needs beyond the lockfile:
@@ -4151,11 +4151,6 @@ has_dotnet = (repo / "packages.lock.json").is_file()
 
 copy_files = []
 run_cmd = ""
-
-def sha256(p):
-    h = hashlib.sha256()
-    h.update(p.read_bytes())
-    return h.hexdigest()
 
 if has_pnpm:
     copy_files.append("pnpm-lock.yaml")
@@ -4220,24 +4215,11 @@ if not run_cmd:
 # only a lockfile bump — triggers a rebuild. A patch edit that leaves the
 # lockfile untouched must still invalidate the image (DESIGN §6½: "every
 # lockfile that participates in the COPY list"; patches participate).
-copy_shas = {}
-for rel in copy_files:
-    p = repo / rel.rstrip("/")
-    if p.is_file():
-        copy_shas[rel] = sha256(p)
-    elif p.is_dir():  # e.g. patches/ — hash each contained file, sorted-stable
-        for f in sorted(p.rglob("*")):
-            if f.is_file():
-                copy_shas[os.path.relpath(f, str(repo))] = sha256(f)
+copy_shas = _hash_copy_files(repo, copy_files)
 
 # Emit COPY + RUN lines.
 # Shas are embedded as a comment so the Dockerfile sha captures dep-input drift.
-sha_comment = "# copy-input-shas: " + " ".join(f"{k}={v[:12]}" for k, v in sorted(copy_shas.items()))
-copy_line = "COPY " + " ".join(copy_files) + " ./"
-run_line = f"RUN {run_cmd}"
-print(sha_comment)
-print(copy_line)
-print(run_line)
+_emit_layer(copy_files, run_cmd, copy_shas)
 PY
       )"
       if [ -n "$_lang_layer" ]; then

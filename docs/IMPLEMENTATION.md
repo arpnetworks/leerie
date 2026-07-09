@@ -38,7 +38,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Exports `re_seed()`: reads `fly_machine_id` from the run sidecar, wakes the machine via `flyctl machine start` if stopped, runs a safety check that refuses re-seed when machine-side `/work` has uncommitted tracked changes (unless `LEERIE_RE_SEED_FORCE=1`), then calls `seed_repo_dirty` from `seed-repo.sh`. Invoked by the launcher's `--re-seed <run-id>` fast-path and by the auto-re-seed step in the `--resume <run-id> --runtime fly` flow. |
 | `scripts/remote/seed-auth.sh` | Seeds Claude config + git identity into the provisioned Fly Machine. Tar-pipes the host's `$STAGE` (Keychain-extracted OAuth credentials + projects-stripped `~/.claude.json` + `.claude/` subdirs, with `.claude/local`, `.claude/plugins/cache`, and `.claude/plugins/marketplaces` skipped; `~/.aws/` also included when Bedrock mode is enabled — see `$STAGE/.aws` mount row above; `.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc`, `.ssh`, `.gnupg`, and `.config` are explicitly excluded from the tar — those are git/push auth that lives on the host per DESIGN §6 *Finalization* — ~408 MB host npm install duplicated by the Dockerfile's globally-installed claude binary, plus the bulky plugin cache that's rebuilt on the remote post-tar via `claude plugin marketplace add` + `claude plugin install` from the seeded `installed_plugins.json` / `known_marketplaces.json`) to `/home/leerie/` via `flyctl ssh console -C "tar -xzC /home/leerie"` (gzip on both ends). The tar pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts that have GNU `timeout`; no-op fallback otherwise) so a stalled `flyctl ssh console` session — observed mode where flyctl never exits even though the remote tar made progress — produces a clean rc 124/137 instead of hanging forever. rc 124/137 triggers a one-shot `flyctl agent restart` retry; if the retry also stalls, the function returns 1 and leerie's existing PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*). A background heartbeat (`_seed_progress_bg`) logs "seed_auth: still streaming (Ns elapsed)" every `LEERIE_PROGRESS_INTERVAL_S` seconds (default 10) so the user sees activity rather than a silent multi-minute wait. Writes git identity to `/home/leerie/.gitconfig` (not `--global`, which would land in `/root/.gitconfig` under the ssh-console session's default root user). Pre-warms `claude --version` once as the leerie user so the orchestrator's preflight call hits warm caches (the FIRST claude invocation on a cold Fly machine takes ~17 s — Node + statsig cold start — and would otherwise exceed the orchestrator's preflight timeout). |
 | `scripts/remote/seed-repo.sh` | Two-phase bundle + delta repo seeding helper (sourced by the `leerie` launcher after `provision_machine()` succeeds). Exports `seed_repo_clone` (wipe `/work` contents but preserve the inode; create `git bundle` for the parent and each submodule; pipe each bundle via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"` — `sh -c` is required because bare `cat > ...` fails on flyctl's `-C`; have the machine `git clone` from the parent bundle, wire submodule URLs to their per-submodule bundles, run `git -c protocol.file.allow=always submodule update --recursive` — `protocol.file.allow` is required by git 2.38+ for file://-style submodule URLs per CVE-2022-39253 — then chown to leerie; clean up the bundle tmpfiles), `seed_repo_dirty` (rsync the dirty/untracked delta plus force-included `.claude/`, used by both fresh-seed delta and the Phase 4 `re-seed.sh` flow), and the wrapper `seed_repo`. Bundles sidestep macOS BSD tar's NFC→NFD filename normalization, which corrupted submodule working trees containing non-ASCII filenames on the Linux receiver. No in-machine `git clone` from origin — Fly machines deliberately receive no GitHub credentials. The parent-bundle pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts with GNU `timeout`; no-op fallback otherwise) and surrounded by a `_seed_progress_bg` background heartbeat; on rc 124/137 (timeout fired) the function returns 1 with a "flyctl ssh console likely stalled" diagnosis so leerie's PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*) matching the seed_auth pattern. A second `_seed_progress_bg` covers the submodule-bundle `git submodule foreach --recursive` batch so the user sees activity across multi-submodule transfers instead of a silent pause. **Shallow-seed path (heavy repos, DESIGN §6 *Shallow seeding for heavy repos*):** when the host repo's `.git` exceeds `LEERIE_SEED_SHALLOW_THRESHOLD_MB` (default `200`) AND the resolved seed depth is non-zero, `seed_repo_clone` skips the full `--all` bundle for the *parent* and instead: makes a throwaway `git clone --depth="$LEERIE_SEED_DEPTH" --no-local --branch <cur-branch> "file://$USER_REPO"`; `tar -cf -`s **only that clone's `.git`**; pipes the tar over the identical `$(_seed_timeout_prefix)`-wrapped `flyctl ssh console -C "sh -c 'cat > /tmp/leerie-seed-git.tar'"` channel (same heartbeat, same `PIPESTATUS[1]` + rc 124/137 handling); and the machine-side heredoc script (same pattern as `_seed_one_inspect_dir_clone`) empties `/work` inode-preservingly, untars `.git`, `git checkout -f`s the branch, `git remote remove origin` (the stale `file://<laptop>` origin is inert but removed defensively), runs the **unchanged** per-submodule bundle wiring, and `chown -R leerie: /work` last. Tarring `.git`-only (never the working tree) preserves the NFC→NFD safety property. `git bundle` cannot ship a shallow repo (grafted parents), which is why the shallow path uses tar rather than a shallow bundle. `LEERIE_SEED_DEPTH=0` (or a `.git` under threshold) keeps the full-bundle path. The shallow checkout yields a byte-identical tracked tree to the bundle clone, so `seed_repo_dirty` layers on unchanged. The shallow path additionally requires a shell-safe working-branch name (`_seed_branch_shallow_safe`: `^[A-Za-z0-9/._-]+$`, no placeholder tokens) because the branch is interpolated into the machine-side `git checkout -f <branch>` inside a `sh -c '…'` wrapper; a branch with `'`/`$`/backtick/space falls back to the full-bundle path (which never interpolates the branch). Detached HEAD likewise falls back. |
-| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.leerie/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry (stderr is captured to a tmpfile, NOT merged via `2>&1`, because `flyctl ssh console`'s "Connecting to ..." stderr would shift parsed-line indices and corrupt the discovered branch name); (2) probes whether the run branch actually exists on the machine via `git rev-parse --verify refs/heads/<branch>` — only then bundles; the bundle includes **all `leerie/subtasks/<run-id>/*` branches** present on the machine alongside the run branch (defense-in-depth: if integration never ran — crash, OOM, or `die()` before integration in older images — the raw subtask work is recoverable on the host; `git for-each-ref` discovers subtask branches dynamically; on any bundle failure the script retries with the run branch alone). A missing run branch is the cleared-but-empty terminal-state case (DESIGN §6); when the run branch is absent but subtask branches exist, they are bundled independently. The `no_push` flag on `run.json` is NOT used as a proxy because it's a mechanism flag the launcher forces (the in-Fly orchestrator can't push), not a user-intent flag; (3) tars `.leerie/runs/<run-id>/` from the machine and extracts it on the host; (4) **defense-in-depth, conditional on branch presence**: when a run branch *was* fetched, strips a stray mechanism-flag `no_push=true` from the host-side `run.json` (defense against in-flight old-image runs that wrote the mechanism flag before the `--host-no-push` intent split). When no branch was fetched (the cleared-but-empty terminal-state case — DESIGN §8), preserves `_finish_no_work_run`'s `no_push=true` intent so `host_finalize` short-circuits cleanly instead of attempting a `git push` against a non-existent ref. |
+| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.leerie/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry (stderr is captured to a tmpfile, NOT merged via `2>&1`, because `flyctl ssh console`'s "Connecting to ..." stderr would shift parsed-line indices and corrupt the discovered branch name); (2) probes whether the run branch actually exists on the machine via `git rev-parse --verify refs/heads/<branch>` — only then bundles; the bundle includes **all `leerie/subtasks/<run-id>/*` branches** present on the machine alongside the run branch (defense-in-depth: if integration never ran — crash, OOM, or `die()` before integration in older images — the raw subtask work is recoverable on the host; `git for-each-ref` discovers subtask branches dynamically; on any bundle failure the script retries with the run branch alone). A missing run branch is the cleared-but-empty terminal-state case (DESIGN §6); when the run branch is absent but subtask branches exist, they are bundled independently. The `no_push` flag on `run.json` is NOT used as a proxy because it's a mechanism flag the launcher forces (the in-Fly orchestrator can't push), not a user-intent flag; (3) tars `.leerie/runs/<run-id>/` from the machine and extracts it on the host; (4) **defense-in-depth, conditional on branch presence**: when a run branch *was* fetched, strips a stray mechanism-flag `no_push=true` from the host-side `run.json` (defense against in-flight old-image runs that wrote the mechanism flag before the `--host-no-push` intent split). When no branch was fetched (the cleared-but-empty terminal-state case — DESIGN §8), preserves `_finish_no_work_run`'s `no_push=true` intent so `host_finalize` short-circuits cleanly instead of attempting a `git push` against a non-existent ref; (5) **best-effort `.leerie/` stream-back**: iterates `config.toml` and `Dockerfile`; for each, skips if the host target already exists (never clobbers), checks remote existence via `_fetch_machine_exec test -f`, then streams via `_fetch_machine_exec cat` directly to the host target; failure removes any partial write and logs a warning but does not affect the function's return code. The destination root is `$LEERIE_STATE_HOST_DIR` when set, otherwise `$USER_REPO/.leerie`. |
 | `scripts/host-finalize.sh` | Host-side push + PR creation block, sourced by three call sites: the local-runtime post-run code path in `leerie`, `decide_teardown` in `scripts/remote/provision.sh` (Fly clean-exit auto-finalize), and the `leerie --finalize <run-id>` recovery fast-path. Exports `host_finalize <run-dir>`: honors `run.json.no_push` (skip — this is the **intent** flag, written by the orchestrator's `phase_finalize` from `push_will_happen(no_push, host_no_push)`, not the launcher-forced mechanism flag), short-circuits when `pushed_at` is already set **by branch position, not mere presence** (DESIGN §6 *Finalization*): compares the local run-branch tip against the pushed origin tip via `git rev-parse` / `git ls-remote` — equal tips → no-op (the idempotent common case, including fully-pushed chain waves); origin a strict ancestor of the local tip via `git merge-base --is-ancestor`, or origin absent (a prior finalize pushed a *partial* branch — e.g. a mid-wave `die()` stamped `finished_at` before the completion gate) → falls through to a fast-forward re-push + re-open PR, still behind the completion gate so only a `completed_waves == len(waves)` run can re-push (the gate itself fails open on a missing/unreadable `state.json`, so that check only applies when the signal exists); a *diverged* origin (has commits the local branch lacks) keeps the idempotent short-circuit instead, since its push could not fast-forward; on success keeps `pushed_at` set and sets `pr_url` (invariant `pr_url ⇒ pushed_at` preserved), **defense-in-depth**: when the run branch named in `run.json` does not exist locally (`git rev-parse --verify refs/heads/<branch>` fails — the cleared-but-empty terminal-state case where no `setup-run.sh` ran), logs "run branch absent locally; treating as no-op" and returns 0 rather than attempting a push that would error with `src refspec ... does not match any`, runs `git push -u origin <run-branch>` (with `--no-verify` if `NO_VERIFY_PUSH=true`). Before PR creation, validates that `working_branch` still exists on origin via `git ls-remote --exit-code --heads`; if deleted (common when a stacked run's parent was squash-merged while this run was in flight), falls back to the repo's default branch. Then `gh pr create` (using `pr_title`/`pr_body` from `run.json` if the pr_writer worker populated them, otherwise the deterministic fallback), wrapped in a bounded retry (`0 5 10 20 30`s backoff, ~68 s total) to ride out GitHub's post-push ref-indexing lag ("No commits between" / "Head sha can't be blank"). PR-creation failure is non-fatal (push already succeeded); the error message suggests a retry command using the resolved base (original or fallback). Replaces ~140 lines of inline launcher code with a single function call so the three callers stay in sync. |
 
 ### Python runtime — provisioned inside the container
@@ -155,17 +155,20 @@ claims a state directory. Four sub-modes:
   with `--system-prompt-file $LEERIE_REPO/prompts/config_chat.md` and
   `--add-dir $USER_REPO`. No container started. Exits 1 if
   `prompts/config_chat.md` is missing.
-- **`leerie config --recapture [--force]`**: host-only (no container). Scans
-  the newest finished run's logs in `$LEERIE_STATE_HOST_DIR/runs/*/` via the
-  same `_capture_installs_from_logs` + `_merge_setup_packages` seam used by
-  finalize-time capture (DESIGN §6½). Without `--force`: never-clobber union
-  (only new packages appended). With `--force`: wholesale replace. Exits 1 if
-  no runs directory or no finished run found. When the recapture actually
-  writes `setup_packages` (the seam emits a `LEERIE_RECAPTURE_WROTE` marker on
-  stdout) and a *generated* `.leerie/Dockerfile` is present (its first line is
-  the `# leerie-generated: …` sentinel), the launcher removes it so the next
-  `leerie` run regenerates the image from the new packages. A hand-committed
-  Dockerfile (no sentinel) is left untouched.
+- **`leerie config --recapture [--force]`**: host-only (no container). Calls
+  `run_recapture_deps()` from the orchestrator module, which consolidates
+  across **all** finished runs with `logs/` under the state dir (not just the
+  newest — each run's commands inform the dep decision). With an explicit
+  `--run-id`, only that run is targeted. Without `--force`, runs that already
+  have a `dep_capture.done` sentinel are skipped (never-clobber union);
+  `--force` drops the sentinel on each target run so the worker re-fires
+  unconditionally. Each run's `State` is flocked (skipped, not fatal, on
+  `StateLockedError`). Exits 1 if no runs directory or no finished run found.
+  The seam `exec_module()`s `orchestrator/leerie.py` on the **host**, whose
+  `python3` is not guaranteed to have `requirements.txt` deps (§0), so the
+  orchestrator's sole third-party import (`tenacity`) is deferred into
+  `claude_p()` rather than module scope — the run-discovery guards above are
+  pure pathlib checks and print their diagnostic even when `tenacity` is absent.
 
 All four sub-modes share an inline BLT inferrer (`_config_read_key`,
 `_infer_axis`, `_axis_source`) implemented directly in the launcher bash
@@ -2004,10 +2007,11 @@ pr_writer) — default to Sonnet.
 | judge        | sonnet  | scoring a batch of captured calls; throughput matters more than broad judgment |
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
 | pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise; throughput-shaped one-shot call |
+| dep_capture  | opus    | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets warrants full-tier reasoning |
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
 overrides it for specific workers (`implementer`, `conformer`, `judge`,
-`heal`, and `pr_writer` all default to `sonnet`).
+`heal`, and `pr_writer` all default to `sonnet`; `dep_capture` defaults to `opus`).
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2020,7 +2024,7 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Twelve worker types (plus the global override), each independently overridable:
+Thirteen worker types (plus the global override), each independently overridable:
 
 | Worker             | env var                           | CLI flag                     | TOML key                  |
 |--------------------|-----------------------------------|------------------------------|---------------------------|
@@ -2037,14 +2041,15 @@ Twelve worker types (plus the global override), each independently overridable:
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
 | pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
+| dep_capture        | `LEERIE_MODEL_DEP_CAPTURE`      | *(none)*                     | `model_dep_capture`       |
 
-Note: `judge`, `heal`, and `pr_writer` use dedicated CLI flags
-(`--judge-model`, `--heal-model`, `--pr-writer-model`) rather than the
-`--model-<W>` pattern used by orchestrator workers, because they are
-post-run / finalize-time skill workers invoked outside the main
-orchestrate loop and do not participate in the `--model` global-default
-resolution path. They still honor the global `--model` / `LEERIE_MODEL`
-override.
+Note: `judge`, `heal`, `pr_writer`, and `dep_capture` do not follow the
+`--model-<W>` CLI flag pattern used by orchestrator workers, because they
+are post-run / finalize-time workers invoked outside the main orchestrate loop.
+`judge`, `heal`, and `pr_writer` have dedicated CLI flags; `dep_capture` has no
+dedicated CLI flag and supports env-var (`LEERIE_MODEL_DEP_CAPTURE`) and TOML
+key (`model_dep_capture`) overrides only. All four still honor the global
+`--model` / `LEERIE_MODEL` override.
 
 An invalid value in env or file is rejected at startup via `die()`. CLI
 values are validated by argparse `choices=` and rejected with the standard
@@ -2096,10 +2101,11 @@ keeps acting workers' reasoning bounded by their own evidence gates
 | judge        | unset   | post-run scoring; no need to pin |
 | heal         | unset   | post-run patch generation; no need to pin |
 | pr_writer    | high    | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
+| dep_capture  | high    | finalize-time dep inference; broad judgment over shell command sets benefits from pinned reasoning depth |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the six judgment
-workers above and for the finalize-time `pr_writer` worker.
+workers above and for the finalize-time `pr_writer` and `dep_capture` workers.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -2125,6 +2131,15 @@ model selection:
 | implementer        | `LEERIE_EFFORT_IMPLEMENTER`      | `--effort-implementer`        | `effort_implementer`       |
 | integrator         | `LEERIE_EFFORT_INTEGRATOR`       | `--effort-integrator`         | `effort_integrator`        |
 | conformer          | `LEERIE_EFFORT_CONFORMER`        | `--effort-conformer`          | `effort_conformer`         |
+| judge              | *(none)*                         | *(none)*                      | *(none)*                   |
+| heal               | *(none)*                         | *(none)*                      | *(none)*                   |
+| pr_writer          | *(none)*                         | *(none)*                      | *(none)*                   |
+| dep_capture        | *(none)*                         | *(none)*                      | *(none)*                   |
+
+Note: `judge`, `heal`, `pr_writer`, and `dep_capture` are post-run / finalize-time
+workers not in `WORKER_TYPES`; they receive no per-worker effort override (no
+dedicated env var, CLI flag, or TOML key). They do honor the global
+`--effort` / `LEERIE_EFFORT` override.
 
 An invalid value in env or file is rejected at startup via `die()`. CLI
 values are validated by argparse `choices=`. A worker that resolves to `None`
@@ -3910,25 +3925,77 @@ surface lives in `orchestrator/leerie.py`.
 
 #### Capture functions
 
-| Function | Signature | Role |
-|----------|-----------|------|
-| `_parse_apt_intents` | `(command: str) -> list[str]` | Split a shell command on `&&`, `;`, `\|`; find `apt[-get] install` segments; take tokens after `install`; drop flags (`-y`, `--no-install-recommends`, etc.) and non-package tokens (`sudo`, `apt`, `apt-get`, `install`); keep tokens matching `^[a-z0-9][a-z0-9+._-]*$`; split `pkg=ver` → keep name; dedup, stable order. Uses a narrow `_APT_INSTALL_RE` pattern; `_INSTALL_CMD_HINT_RE` is the coarse pre-filter. |
-| `_capture_installs_from_logs` | `(log_dir: Path) -> tuple[list[str], list[str]]` | Iterates `sorted(log_dir.glob("*.log"))`; calls `_iter_log_tool_use` on each; for `kind == "Bash"` feeds `input["command"]` to `_parse_apt_intents` and a language-install matcher (`pnpm`/`pip`/`npm`/`yarn`/`cargo`/`bundle`); returns `(apt_packages, install_commands)` — both deduped, stable order. **Only `apt_packages` is consumed** (by `capture_repo_deps`); `install_commands` is captured for diagnostics but not persisted — the language-dep bake is driven by the launcher's own build-time lockfile detection, not by these captured commands (see the language-dep template below). |
+| Function / Constant | Signature / Value | Role |
+|---------------------|-------------------|------|
+| `_DEPCAP_TOTAL_BUDGET` | `307200` (bytes) | Byte ceiling for the commands text fed to the dep_capture worker (~300 KB ≈ 75k tokens). Mirrors the `gather_provision_fixtures` add_bytes/hit_ceiling idiom. |
+| `_extract_depcap_commands` | `(log_dir: Path) -> tuple[str, bool]` | Iterates `sorted(log_dir.glob("*.log"), reverse=True)` (newest-first); calls `_iter_log_tool_use` on each; collects distinct `command` values from `kind == "Bash"` tool-use blocks into an insertion-order dict. Then admits commands under `_DEPCAP_TOTAL_BUDGET` bytes (separator `\n---\n`). Returns `(commands_text, hit_ceiling)`. |
 | `_merge_setup_packages` | `(existing: str, captured: list[str]) -> str \| None` | Parses `existing` (space- or comma-separated, per DESIGN §6½); takes the union with `captured`; returns the merged string only if it grew (else `None` → no write). Preserves user-narrowed lists: only genuinely-new packages are appended; nothing is removed. |
 | `_write_config_toml_keys` | `(cfg_path: Path, updates: dict[str, str]) -> None` | Minimal deterministic TOML upsert. Creates the file with a leerie header (matching the launcher's `config --init` heredoc tone) if absent; otherwise replaces the first *uncommented* `key =` line for each key, or appends if absent. Never touches commented lines. Writes via temp-file + `os.replace()` (State.save atomicity discipline). |
-| `capture_repo_deps` | `(repo_root: Path, st: State) -> None` | Main entry point. Calls `resolve_capture_deps(repo_root)`; if disabled, returns immediately. Calls `_capture_installs_from_logs(st.run_dir / "logs")`; calls `_merge_setup_packages` to compute the union. If a committed `.leerie/Dockerfile` exists, skips `setup_packages` write (the Dockerfile is authoritative). Otherwise writes updates via `_write_config_toml_keys` and logs one line prompting `git add .leerie/ && git commit`. Entire function body is wrapped in `try/except Exception` — any error is logged at debug level and swallowed (non-fatal). |
+| `capture_repo_deps` | `async (repo_root: Path, st: State, caps: dict \| None, models: dict[str, str] \| None, efforts: dict[str, str \| None] \| None) -> None` | Main entry point. Guards: `resolve_capture_deps`, caps/models/efforts availability, `log_dir` existence, committed `.leerie/Dockerfile` skip. Calls `_extract_depcap_commands` to build the command corpus; if empty, returns. Checks worker budget; invokes `claude_p(schema_key='dep_capture', ...)` with `load_prompt("dep_capture")`. Writes `setup_packages` (via `_merge_setup_packages`, never-clobber) and `language_installs` (new managers only, keyed by `manager` field, never-clobber) to `.leerie/config.toml` via `_write_config_toml_keys`. Entire function body wrapped in `try/except Exception` — any error is logged and swallowed (non-fatal). |
 | `resolve_capture_deps` | `(repo_root: Path) -> bool` | env `LEERIE_CAPTURE_DEPS` > `.leerie/config.toml` `capture_deps` key; default `True`. No CLI flag and no `leerie.toml` tier (env → config → default only). |
 
-#### Finalize hook point
+#### dep_capture worker
 
-`capture_repo_deps` is called from `phase_finalize`, after `finished_at`
-is written and run-branch verification completes, wrapped in a
-`try/except` that swallows all exceptions (non-fatal). The
-resume-of-finished guard in `_run_phases` returns before `phase_finalize`
-is reached, so capture never re-fires on a completed resume. A partial
-resume that reaches finalize re-runs capture — the union merge makes this
-a no-op when nothing new was found. `st.run_dir / "logs" / "*.log"` is
-populated by this point.
+`dep_capture` is a non-WORKER_TYPES worker (like `pr_writer`) registered in
+`SCHEMAS`, `_allowed_schema_keys`, `MODEL_DEFAULT_PER_WORKER` (opus),
+`EFFORT_DEFAULT_PER_WORKER` (high), and `resolve_models`/`resolve_efforts`.
+Its env-override constant is `MODEL_DEP_CAPTURE_ENV = "LEERIE_MODEL_DEP_CAPTURE"`.
+System prompt is `prompts/dep_capture.md`. Output schema:
+
+```json
+{
+  "setup_packages": ["string"],
+  "language_installs": [
+    {"manager": "string", "command": "string", "copy_inputs": ["string"]}
+  ],
+  "dockerfile_notes": "string | null"
+}
+```
+
+#### Capture trigger seams
+
+`capture_repo_deps` is called from three seams; all are non-fatal (wrapped in
+`try/except`):
+
+1. **Finalize (clean finish).** Called with `await` from `phase_finalize`,
+   after `finished_at` is written and run-branch verification completes.
+   `caps`, `models`, and `efforts` are forwarded from `phase_finalize`'s
+   parameters. The resume-of-finished guard in `_run_phases` returns before
+   `phase_finalize` is reached, so capture never re-fires on a completed
+   resume. A partial resume that reaches finalize re-runs capture — the union
+   merge makes this a no-op when nothing new was found.
+   `st.run_dir / "logs" / "*.log"` is populated by this point.
+
+2. **Cancel / SIGTERM arm (catchable signals).** In `main()`'s
+   `KeyboardInterrupt` and `InterruptedBySignal` exception handlers, after
+   `st.save()`, a best-effort `asyncio.run(capture_repo_deps(...))` runs in
+   its own event loop — the same post-loop pattern as the `RateLimitedExit`
+   arm. Non-fatal: any exception is logged and suppressed. This covers the
+   Ctrl-C and `nerdctl stop` cases where the orchestrator gets a real Python
+   window before the `finally` cleanup block.
+
+3. **Host-side (`run_recapture_deps` / run-start backstop).** Two host-side
+   seams funnel to the same worker:
+   - **`run_recapture_deps(leerie_root, repo_root, force, run_id)`**: the
+     on-demand recapture entrypoint invoked by `leerie config --recapture`.
+     When `run_id` is given, targets that run only; otherwise consolidates
+     across **all** finished runs with `logs/` (newest-first). Each target
+     run's `State` is flocked (skipped on `StateLockedError`); with
+     `force=True` the sentinel is dropped before capture. Exits 1 if no
+     runs directory or no finished run found; per-run errors are logged and
+     skipped (non-fatal for multi-run consolidation).
+   - **`_backstop_capture_prior_runs(leerie_root, repo_root, caps, models,
+     efforts)`**: called at run-start (in `_run_phases`, before
+     `phase_classify`) to cover SIGKILL / crash cases where the cancel arm
+     could not fire. Scans `leerie_root/runs/` for run dirs that have `logs/`
+     but no `dep_capture.done` sentinel and calls `capture_repo_deps` over
+     each via a lightweight ad-hoc state object.
+
+**Idempotency sentinel.** `capture_repo_deps` writes `<run_dir>/dep_capture.done`
+(a one-line file) and sets `st.data["dep_capture_done"] = True` after a
+successful write. The run-start backstop skips runs whose sentinel file is
+present. The `dep_capture_done` state field is defined in `STATE_FIELDS` and
+documented in the state-schema table above.
 
 #### Language-dep Dockerfile template (launcher, gated on `bake_language_deps`)
 
@@ -3938,21 +4005,35 @@ When the launcher auto-generates `.leerie/Dockerfile` from `setup_packages`
 after the apt `RUN`:
 
 ```dockerfile
-COPY <lockfiles> <manifests> [patches/] [.npmrc] [pnpm-workspace.yaml] ./
-RUN <detected install command>
+COPY <copy_inputs> ./
+RUN <install command>
 ```
 
-The `COPY` set is computed by an inline `python3` heredoc inside the
-launcher's auto-gen block that mirrors `_lockfile_table_entries`'s
-manager-precedence by hand (the launcher cannot import the
-orchestrator). For **all** node ecosystems (pnpm, yarn, npm) a shared
-`_node_ancillary` helper adds workspace `package.json`s, `patches/`,
-`.npmrc`, and `pnpm-workspace.yaml` to the lockfile + root manifest,
-because the frozen install requires them — workspace globs come from
-`pnpm-workspace.yaml` (pnpm) or `package.json`'s `workspaces` field
-(yarn/npm, both list and `{packages: [...]}` forms). On a build failure
-(e.g. a missing patch file), the launcher falls back to
-`bake_language_deps=false` (apt layer only) and logs loudly.
+The `COPY`+`RUN` layer is determined by an inline `python3` heredoc in
+the launcher's auto-gen block with two tiers:
+
+1. **Primary — persisted `language_installs` from `.leerie/config.toml`.**
+   The `dep_capture` worker writes a `language_installs` JSON array (keyed
+   by `manager`) to `.leerie/config.toml`. When this key is present, the
+   launcher reads it, iterates over every `{manager, command, copy_inputs}`
+   entry, and emits one `COPY`+`RUN` block per manager. Each `copy_input`
+   is validated with `p.exists()` before being added to the `COPY` list —
+   hallucinated paths are silently dropped while the `RUN` line is always
+   emitted (the install command itself is authoritative; the COPY list is
+   advisory). Multiple managers yield multiple `COPY`+`RUN` layers.
+
+2. **Fallback — lockfile detection (clean first run).** When no
+   `language_installs` key is present in config.toml (e.g. on the very
+   first run before `dep_capture` has fired), the heredoc mirrors
+   `_lockfile_table_entries`'s manager-precedence by hand to detect a
+   single lockfile manager. For **all** node ecosystems (pnpm, yarn, npm)
+   a shared `_node_ancillary` helper adds workspace `package.json`s,
+   `patches/`, `.npmrc`, and `pnpm-workspace.yaml`, because the frozen
+   install requires them — workspace globs come from `pnpm-workspace.yaml`
+   (pnpm) or `package.json`'s `workspaces` field (yarn/npm, both list and
+   `{packages: [...]}` forms). On a build failure (e.g. a missing patch
+   file), the launcher falls back to `bake_language_deps=false` (apt layer
+   only) and logs loudly.
 
 **COPY-input-sha rebuild trigger.** Every file that participates in the
 `COPY` list — lockfiles, manifests, workspace children, `patches/*`,
@@ -5442,6 +5523,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. Keys are domain names (e.g. `"bug-fixing"`, `"testing"`); values are the `basis` string the planner emitted explaining why no work was needed. Absent on every normal run. |
 | `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `<state-root>/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
 | `leerie_version` | str | the leerie version string from `.claude-plugin/plugin.json` at the time the run started (or resumed). Persisted so the PR footer and Run metadata block can show the exact version that produced the run, which aids debugging when a run was produced by an older release. |
+| `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. Combined with the sibling sentinel file `<run_dir>/dep_capture.done`, this makes the next-run backstop idempotent: the backstop skips runs whose sentinel file is present, and the cancel-arm capture skips already-captured runs. Absent on runs where capture was skipped or has not yet run. |
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
 the plugin skill in `commands/leerie.md`):
@@ -5628,7 +5710,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `<state-root>/runs/` |
-| `call_type` | str | one of the schema keys `claude_p()` accepts: the eight `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`) plus the three post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`) |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the nine `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
@@ -5679,7 +5761,7 @@ Every `call_type` resolves to a file under `prompts/`. The heal loop's
 patch-generator worker calls
 `resolve_prompt(call_type: str) -> tuple[str, str, str]` to load a
 worker's system prompt: given any member of `WORKER_TYPES` (the
-self-heal target set is the eight main-loop workers, not the post-run
+self-heal target set is the nine main-loop workers, not the post-run
 workers), it returns `(source_kind, content, location_hint)` where
 `source_kind` is `"file"`, `content` is the prompt body, and
 `location_hint` is the relative path `"prompts/<call_type>.md"`.
@@ -5730,6 +5812,7 @@ enforcement functions:
 | `test_resolve_source_of_truth.py` | `resolve_source_of_truth()` |
 | `test_resolve_runtime.py` | `resolve_runtime()` — CLI > env > TOML > default `local` precedence, both valid values, invalid-value die() paths, empty/whitespace env handling |
 | `test_resolve_models.py` | `resolve_models()` — per-worker precedence (CLI > env > TOML), defaults, validation, empty/whitespace handling |
+| `test_resolve_dep_capture_model.py` | `resolve_models()` / `resolve_efforts()` for `dep_capture` — full per-worker and global override precedence chain; `MODEL_DEP_CAPTURE_ENV` constant; `dep_capture` absent from `MODEL_DEFAULT_PER_WORKER` (falls through to `MODEL_DEFAULT`); `dep_capture` in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; isolation (override doesn't bleed to other workers); structural wiring guards |
 | `test__read_toml_key.py` | `_read_toml_key()` — the shared `leerie.toml` line parser used by both resolvers |
 | `test_gather_answers_validation.py` | the source-of-truth validation gate in `gather_answers()` |
 | `test_retryable_failure.py` | `_retryable_failure()`, **including a coupling test** that every producer's retryable-path return tags a `failure_kind` in `_RETRYABLE_FAILURE_KINDS` (`validate_result`, `check_branch_has_commits`, the inline dirty-worktree check in `settle_subtask`) |
@@ -5748,8 +5831,10 @@ enforcement functions:
 | `test_launcher_cache_mounts.py` | Coupling test for the Ruby bundle cache in `CACHE_MOUNTS`: asserts `-v ...:/home/leerie/.cache/leerie/bundle` volume mount and `-e BUNDLE_PATH=.../bundle` env entry appear inside the `CACHE_MOUNTS=(...)` array; companion assertion confirms `$HOME/.cache/leerie/bundle` is `mkdir -p`'d before the array. Reads launcher source text directly — no subprocess — so a future refactor that drops the bundle lines causes immediate test failure (guards the regression where every `bundle install` recompiles gems from scratch). |
 | `test_launcher_per_repo_image.py` | Per-repo derived image bash-harness tests: `resolve_repo_image_tag()` with/without Dockerfile and with setup_packages only; `_leerie_repo_id()` from HTTPS/SSH remote and basename fallback; `build_repo_image` success/failure/error-message sentinel; rebuild-skip when image present and hash matches; rebuild fires on hash mismatch or image absence |
 | `test_dockerfile_autogen.py` | Auto-generation of `.leerie/Dockerfile` from `setup_packages`: generated content contains ARG BASE_IMAGE, FROM \$BASE_IMAGE, USER root, apt-get install, declared packages, and trailing USER leerie in order; log message emitted during auto-gen; existing Dockerfile preserved verbatim and suppresses auto-gen; no setup_packages + no Dockerfile → REPO_IMAGE_TAG empty, no build fires; coupling tests that sentinel strings exist verbatim in launcher source |
+| `test_dockerfile_bake_from_capture.py` | Bake-from-persisted-installs path (distinct from `test_dockerfile_autogen.py`): launcher emits apt layer from `setup_packages` plus a `COPY`+`RUN` layer per `language_installs` entry with embedded `copy-input-shas` comment; `p.exists()` guard silently drops hallucinated `copy_input` paths from COPY while always emitting the RUN; all copy_inputs absent → RUN emitted, no COPY; multi-manager (pnpm+pip) → two COPY+RUN layers each with their own sha comment; pip install with only `requirements.txt` (no lockfile) → baked via persisted path, not lockfile fallback; identical regen → bit-identical Dockerfile (sha stable, no needless rebuild); changing `copy_input` file content → sha comment changes; committed `.leerie/Dockerfile` left untouched even when `language_installs` present; coupling tests that `persisted_installs`, `.exists()`, `copy-input-shas`, and `language_installs` sentinel strings exist in extracted launcher block |
 | `test_base_dockerfile_chromium.py` | Base image `./Dockerfile` (not the per-repo autogen one): asserts `chromium` and `chromium-driver` are installed and the three container flags (`--no-sandbox`, `--disable-setuid-sandbox`, `--disable-dev-shm-usage`) are baked into `/etc/chromium.d/leerie-container-flags` after the chromium install (ordering guard) — see *Browser-based testing* above |
-| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; `--recapture` exits 1 with diagnostic when no runs directory or no finished run found, and dispatches to the python3 seam when a finished run exists; `--recapture --force` triggers wholesale replace; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run` |
+| `test_config_verb.py` | `leerie config` verb (Phase 3 bash-harness tests): `--init` creates `.leerie/config.toml` with auto-detected BLT values (uncommented) and a commented `setup_packages` example, prints the path, suggests `git add .leerie/`, and does NOT invoke `nerdctl run`; bare mode prints each axis with provenance (`[config]` vs `[inference]`) and shows `leerie.toml` keys when present; `--chat` invokes `claude --system-prompt-file prompts/config_chat.md --add-dir <USER_REPO>` (NOT `claude -p`) without `nerdctl run`; `--recapture` exits 1 with diagnostic when no runs directory or no finished run found, and dispatches to the python3 seam (`run_recapture_deps`) when a finished run exists; `--recapture --force` triggers wholesale replace; content assertions on `prompts/config_chat.md` (exists, mentions `build`/`lint`/`test`/`setup_packages` keys, `ARG BASE_IMAGE`, `USER leerie`, `config.toml`, `Dockerfile`); coupling tests that verify the `config)` arm exists in the live launcher and exits before `nerdctl run`. Also covers the Dockerfile language-layer bake-from-persisted-installs logic (extracted Python heredoc invoked directly): persisted `language_installs` → COPY+RUN emitted per manager; hallucinated copy_inputs silently dropped while RUN always emitted; all copy_inputs missing → RUN without COPY; multi-manager → multiple COPY+RUN layers; no persisted installs → lockfile-detection fallback; empty `language_installs` list → lockfile fallback; no lockfile and no persisted installs → empty output; identical inputs → identical output (hash stability). |
+| `test_config_recapture.py` | `leerie config --recapture` LLM-seam dispatch and multi-run consolidation: launcher `--recapture` arm dispatches to the python3 seam; exits 1 with diagnostic when no runs directory or no finished run found; `--force` flag passed to the seam; python3 failure exits 1; no `nerdctl` invoked; `--recapture` arm within extraction boundary; `run_recapture_deps` consolidates across ≥2 finished runs (all captured, not just newest); `--force` drops sentinel on each run (wholesale replace semantics); without `--force` already-captured runs are skipped (never-clobber union); Dockerfile survivor tests (committed and generated) |
 | `test_replay_capture.py` | `replay_capture()` — args reconstructed from capture record, `override_system_prompt` plumbed through, no `calls.ndjson` written during replay, return-value shape `(envelope, structured_output)` |
 | `test_phase_judge.py` | `phase_judge()` / `judge_capture()` — 3 verdicts written for 3-record NDJSON, INDEX.json content, schema validation, max_parallel semaphore bound, call_type filtering, empty/missing NDJSON edge cases |
 | `test_heal_loop.py` | `HealState` save/load round-trip + atomic write; `heal_baseline()` — state.json + 6 verdict files for 2 samples n=3; `heal_apply_patch()` — patched prompts written per sample under iter-1/; `heal_replay_patched()` — history + best_so_far updated in state.json |

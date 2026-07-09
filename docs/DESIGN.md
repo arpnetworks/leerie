@@ -2436,35 +2436,36 @@ the derived image. Both the base tag and the per-repo tag are recorded in
 
 ### Auto-capture of repo dependencies
 
-At the end of a normal (non-resume) finalize, leerie scans this run's
-`logs/*.log` files to extract system-package `apt-get install` intents
-(including failed ones; the intent is the signal, not the outcome). Those
-intents feed the system-package bake path below. The language-dep bake is
-**not** fed by this scan — it is driven entirely by the launcher's own
-build-time lockfile detection (see below), so no per-command capture is
-needed for it. (The log scanner also collects the language install
-commands the workers ran, but that list is diagnostic only and is not
-persisted.) Two distinct bake paths follow.
+At the end of a normal (non-resume) finalize, leerie invokes the `dep_capture`
+LLM worker. The worker reads the complete set of shell commands workers ran
+(extracted from `logs/*.log` via `_iter_log_tool_use`, deduped, newest-first,
+bounded to a byte budget of ~300 KB) and **decides** what the repo genuinely
+needs across all languages and frameworks. Its structured output (`setup_packages`
+and `language_installs`) is validated against a JSON schema and written to
+`.leerie/config.toml` deterministically — code enforces; the model decides
+content (§12 *Prompts are advisory, code enforces*). The `dep_capture` worker
+defaults to `opus`/`high` and is overridable via `LEERIE_MODEL_DEP_CAPTURE`.
 
-**System packages → `setup_packages` → warm apt layer.** Captured apt
-packages are union-merged into `setup_packages` in `.leerie/config.toml`
-(never clobber: only new discoveries are appended; user-edited values and
-comments are preserved). The existing launcher auto-generation path (see
-*Per-repo container image* above) turns the updated `setup_packages` into a
-derived apt-install Dockerfile next run. Workers that previously failed
-every `apt-get install` attempt (because they run unprivileged) find the
-package pre-installed; the install-intent loop stops.
+**System packages → `setup_packages` → warm apt layer.** `dep_capture`'s
+`setup_packages` output is union-merged into `setup_packages` in
+`.leerie/config.toml` (never clobber: only new packages are appended;
+user-edited values and comments are preserved). The existing launcher
+auto-generation path (see *Per-repo container image* above) turns the updated
+`setup_packages` into a derived apt-install Dockerfile next run. Workers that
+previously failed every `apt-get install` attempt (because they run unprivileged)
+find the package pre-installed; the install-intent loop stops.
 
-**Language deps → richer Dockerfile bake (gated on `bake_language_deps`,
-default true).** When `bake_language_deps` is enabled, the auto-generated
-`.leerie/Dockerfile` (and, when `build_repo_image` builds it, the derived
-image) also includes a language-dep layer: `COPY` for the lockfile, manifest
-files, and any ancillary inputs the package manager requires (workspace
-`package.json`s, `patches/`, `.npmrc`, `pnpm-workspace.yaml`), followed by
-`RUN <detected install command>` (`pnpm install --frozen-lockfile`,
-`pip install -r requirements.txt`, etc.). Workers that inherit this image
-find their `node_modules` / site-packages already populated — the per-worker
-install drops to near-zero.
+**Language deps → `language_installs` → richer Dockerfile bake (gated on
+`bake_language_deps`, default true).** `dep_capture`'s `language_installs`
+output (per-manager `{manager, command, copy_inputs}` entries) is written to
+`.leerie/config.toml`, keyed by manager, never-clobber. When `bake_language_deps`
+is enabled, the auto-generated `.leerie/Dockerfile` (and, when `build_repo_image`
+builds it, the derived image) also includes a language-dep layer: `COPY` for the
+lockfile, manifest files, and any ancillary inputs the package manager requires,
+followed by `RUN <command>` (`pnpm install --frozen-lockfile`,
+`pip install -r requirements.txt`, etc.). Workers that inherit this image find
+their `node_modules` / site-packages already populated — the per-worker install
+drops to near-zero.
 
 **Rebuild tradeoff.** A dependency-input change triggers a full image
 rebuild (`build_repo_image` fires when the hash mismatches). To keep
@@ -2475,14 +2476,36 @@ does not invalidate the layer. The cost — minutes per rebuild — is paid once
 across all subsequent runs, a clear net win against per-worker install time
 accumulated across hundreds of workers.
 
-**Trigger and idempotence.** Capture fires exactly once, during a normal
-(non-resume) run's finalize phase, after `finished_at` is written and
-run-branch verification completes. On a `--resume` of an already-finished
-run the resume guard returns before finalize; capture does not re-fire. On a
-`--resume` that reaches finalize (partial resume), capture re-runs — the
-union merge makes this a no-op when nothing new was found. When the union
-adds no new packages and no new install command is detected, the function
-returns immediately without touching `.leerie/config.toml`.
+**Trigger seams.** All three funnel to one `dep_capture` worker — the trigger
+differs, the decision-maker does not:
+
+- **Clean finish → finalize.** `capture_repo_deps` is called (with `await`)
+  from `phase_finalize` after `finished_at` is written and run-branch
+  verification completes. On a `--resume` of an already-finished run the
+  resume guard returns before finalize; capture does not re-fire. On a
+  `--resume` that reaches finalize (partial resume), capture re-runs — the
+  union merge makes this a no-op when nothing new was found.
+- **Cancel / SIGTERM → cancel arm in `main()`.** Catchable signals
+  (`KeyboardInterrupt` / `InterruptedBySignal`) surface in `main()` after
+  `asyncio.run(orchestrate)` unwinds, with a real Python window before the
+  `finally` cleanup block. A best-effort `asyncio.run(capture_repo_deps(...))`
+  runs there — the same post-loop pattern as the `RateLimitedExit` arm.
+  Non-fatal; covers `nerdctl stop` / Ctrl-C. `SIGKILL` gives no window.
+- **SIGKILL / crash / host-side → backstop + `--recapture`.** Covered two
+  ways, both host-side, modeled on the `--phase judge` scaffolding:
+  *Run-start backstop* — at run start, before `phase_classify`, a scan of
+  prior run dirs detects any with `logs/` but no `dep_capture.done` sentinel
+  and runs capture over them automatically. *On-demand `--recapture`* — the
+  `leerie config --recapture` verb resolves the target run, constructs and
+  flocks its `State` (refusing to race a live orchestrator via
+  `StateLockedError`), and runs the worker via `asyncio.run`.
+
+**Idempotency.** After a successful write, `capture_repo_deps` writes a
+lightweight `<run_dir>/dep_capture.done` sentinel file and sets
+`dep_capture_done = True` in `state.json`. The run-start backstop skips
+any run whose sentinel file is already present. When the union merge adds
+no new packages and no new install command, the function returns immediately
+without touching `.leerie/config.toml`.
 
 **No auto-commit.** Capture writes `.leerie/config.toml` (and, if generated,
 `.leerie/Dockerfile`) as uncommitted files in the user's working tree.
@@ -2510,9 +2533,20 @@ is ignored when a committed Dockerfile is present (see *Per-repo container
 image* above).
 
 **Fly parity.** Capture writes the same files regardless of runtime. On
-`--runtime fly` the `.leerie/config.toml` and `.leerie/Dockerfile` changes
-are included in the `seed-repo.sh` whitelist so the Fly derived-image path
-picks them up on the next run identically to the local nerdctl path.
+`--runtime fly` the workflow is split across two directions:
+- **Machine → host (stream-back).** After the run-state tar, `fetch-branch.sh`
+  best-effort streams `/work/.leerie/config.toml` and `/work/.leerie/Dockerfile`
+  from the Fly Machine back to `$USER_REPO/.leerie/` (or `$LEERIE_STATE_HOST_DIR`).
+  Each file is existence-guarded on the remote side and never clobbers a
+  host-edited file; failure is non-fatal and does not affect `fetch_branch`'s
+  return code. This fires only on a clean finish (the same condition gate that
+  runs `fetch_branch` at all — rc `0|10|11|75`). Cancel/kill recovery uses the
+  host-side `--recapture` / next-run backstop instead.
+- **Host → machine (seed-repo whitelist).** Pre-existing committed `.leerie/`
+  files (including a previously streamed-back and committed `config.toml`
+  or `Dockerfile`) are included in the `seed-repo.sh` dirty-delta filter so
+  they reach the machine's `/work/.leerie/` on the next run. The Fly
+  derived-image path then picks them up identically to the local nerdctl path.
 
 ### Browser-based test execution in the base image
 
@@ -3230,6 +3264,15 @@ recurs everywhere in the design:
   produces is still externally verified by the orchestrator rather than
   trusted at face value.
 
+- The orchestrator does not trust the `dep_capture` worker to self-select
+  what to write; it schema-validates the worker's structured output
+  (`setup_packages`, `language_installs`) before writing anything to
+  `.leerie/config.toml`. The worker decides content — what the repo
+  genuinely needs — but the code enforces the write path: union merge,
+  never-clobber, and the committed-Dockerfile-authoritative rule are all
+  implemented as deterministic Python checks that the worker cannot
+  override (§6½).
+
 The complementary half of the principle is just as important: **what cannot be
 checked mechanically is left to the worker, and not second-guessed by code.**
 Understanding intent, writing code, decomposing a domain, resolving the
@@ -3409,12 +3452,15 @@ matches the same precedence chain as `--skip-smoke` and
 
 ## 14. Telemetry, judging, and self-healing
 
-Every LLM call in Leerie passes through one of the nine worker types in
+Every main-loop LLM call in Leerie passes through one of the nine worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, or `conformer`. Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
-worker role, no overlap, no gap.
+worker role, no overlap, no gap. Post-run skill workers — `judge`, `heal`,
+`pr_writer`, and `dep_capture` — are not in `WORKER_TYPES` (they run outside
+the main orchestrate loop), but they share the same `claude_p()` invocation
+path and emit telemetry records with their `schema_key` as `call_type`.
 
 ### The three pillars
 

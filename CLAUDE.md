@@ -201,7 +201,7 @@ tests/                      pytest suite
 # Launch an interactive Claude session to configure leerie for this repo:
 ./leerie config --chat
 
-# Re-scan the latest completed run's logs and rewrite setup_packages in
+# Run the dep_capture LLM worker over past runs' logs and write/update
 # .leerie/config.toml without starting a new run (host-only, no container):
 ./leerie config --recapture
 ./leerie config --recapture --force   # wholesale replace (not union)
@@ -329,6 +329,10 @@ export LEERIE_BAKE_LANGUAGE_DEPS=0
 # Override the model for the finalize-time PR-writer worker (default sonnet).
 # Also LEERIE_MODEL_PR_WRITER or `model_pr_writer` in leerie.toml.
 ./leerie "task" --pr-writer-model opus
+
+# Override the model for the dep_capture worker (default opus). Env-var only
+# (no CLI flag or leerie.toml key — dep_capture is a post-run worker):
+export LEERIE_MODEL_DEP_CAPTURE=sonnet
 
 # Filter `--list` output by run status:
 ./leerie --list --status paused
@@ -482,7 +486,19 @@ minus `_ASYNCIO_MANAGED_PIDS`) rather than `waitpid(-1)`; plus a test that a
 registered worker pid is excluded from the reap set, a
 `_reparented_orphans`-accepts-`ppid==getpid` test, and source-coupling guards
 that `main()` calls `_become_subreaper()` and `orchestrate()` spawns+cancels
-`_zombie_reaper` (the fix is inert without the wiring). The `leerie config` verb (all four sub-modes: `--init`,
+`_zombie_reaper` (the fix is inert without the wiring). The `fetch_branch()` stream-back surface (`scripts/remote/fetch-branch.sh`)
+is tested across two files. `tests/test_fetch_branch_sh.py` covers run
+discovery, bundle fetch, run-state tar, `no_push` strip, and baseline Step 4
+stream-back (both files streamed when host has neither, never clobbers an
+existing host file, non-fatal on absent machine files, respects
+`LEERIE_STATE_HOST_DIR`) via bash-harness subprocess tests with a stubbed
+`flyctl`. The expanded Step 4 best-effort `.leerie/` stream-back contracts are
+covered by `tests/test_fetch_branch_leerie_streamback.py` (imports stub
+helpers from `test_fetch_branch_sh` to avoid duplication): streams both files
+when host has neither, never clobbers an existing `config.toml`, never clobbers
+an existing `Dockerfile`, non-fatal when machine files are absent, streams only
+the present machine file when only one exists, skips both when both host
+files exist, and respects `LEERIE_STATE_HOST_DIR` for the destination root. The `leerie config` verb (all four sub-modes: `--init`,
 bare, `--chat`, `--recapture`) is tested in `tests/test_config_verb.py`
 via a self-contained bash harness with stubbed `nerdctl` and `claude`,
 plus a parity guard that extracts the real launcher `config)` case arm and
@@ -501,12 +517,54 @@ Python-layer `group_id` in `run.json` (`_validate_run_json`,
 `tests/test_group_run_json.py`. State-dir isolation (distinct
 basename-keyed dirs per member, guard rejects `LEERIE_STATE_DIR`/
 `--state-dir`) is in `tests/test_group_state_dir_guard.py`. The
-capture engine (DESIGN §6½) — `_parse_apt_intents`, `_merge_setup_packages`,
-`_capture_installs_from_logs`, and `capture_repo_deps` — is tested in
-`tests/test_capture_deps.py` against a synthetic JSONL fixture in the
-`_iter_log_tool_use` shape, covering parser cases, merger union/no-op/
-never-clobber, scanner dedup, write, warm-repo no-op, committed-Dockerfile
-skip, write-failure non-fatal, and opt-out. No coverage
+capture engine (DESIGN §6½) — `_extract_depcap_commands`, `_merge_setup_packages`,
+`capture_repo_deps` (async, with stubbed `claude_p`), the idempotency
+sentinel (`dep_capture_done` state field + `<run_dir>/dep_capture.done`
+file), and `_backstop_capture_prior_runs` (skips runs with sentinel, captures
+runs without) — is tested across four files. `tests/test_dep_capture_budget.py`
+covers the extraction+budget unit (`_extract_depcap_commands`) in focused
+isolation: dedup, newest-first ordering, budget gate (`_DEPCAP_TOTAL_BUDGET`),
+`hit_ceiling` flag semantics, non-Bash filtering, and malformed-line tolerance.
+`tests/test_capture_deps.py` covers the integration against a synthetic
+JSONL fixture in the `_iter_log_tool_use` shape: absence pins
+(`TestRegexPathAbsent`) that assert the four deleted regex-path symbols
+no longer exist on the module (so the regex path can never
+silently return); command extraction, budget ceiling truncation, merger
+union/no-op/never-clobber, schema-validated worker output → setup_packages +
+language_installs write, committed-Dockerfile skip, write-failure non-fatal,
+and opt-out. Source-coupling guards in the same file pin that `main()`'s
+`KeyboardInterrupt` and `InterruptedBySignal` handlers each invoke
+`capture_repo_deps` (the cancel-arm seam — the fix is inert without the
+wiring). The worker-driven write path specifically — `capture_repo_deps`
+invoked with a stubbed `_invoke` returning a fixed structured_output envelope
+(mirroring `test_phase_judge.py`'s `_JUDGE_ENVELOPE` pattern) — is separately
+covered in `tests/test_dep_capture_worker.py`: schema-validated output written
+to `.leerie/config.toml`, warm-repo never-clobber (mtime unchanged when all
+deps already present), union append for new packages, env + config-file opt-out
+(worker not invoked), committed `.leerie/Dockerfile` guard (worker not invoked),
+missing logs dir silent no-op, and non-fatal write failure. The `dep_capture`
+schema contract — required fields, `language_installs` item shape, valid/invalid
+instance acceptance, JSON round-trip, and wiring checks (`WORKER_TYPES`
+exclusion, effort/model defaults) — is pinned in
+`tests/test_dep_capture_schema.py` (mirrors `test_pr_writer_schema.py`).
+The full model/effort resolution precedence for `dep_capture` (CLI >
+per-worker env > global CLI > global env > per-worker TOML > global TOML >
+`MODEL_DEFAULT`; effort: global CLI > global env > global TOML >
+`EFFORT_DEFAULT_PER_WORKER["dep_capture"]`; `MODEL_DEP_CAPTURE_ENV`
+constant; `dep_capture` absent from `MODEL_DEFAULT_PER_WORKER` but present
+in `EFFORT_DEFAULT_PER_WORKER` with value `"high"`) is pinned in
+`tests/test_resolve_dep_capture_model.py` (mirrors `test_resolve_models.py`
+and `test_resolve_efforts.py`).
+The three orchestrator wiring seams that are only verifiable by source
+inspection are pinned in `tests/test_dep_capture_wiring.py` (mirrors
+`test_phase_finalize_capture_hook.py`'s `inspect.getsource` approach):
+`main()`'s `KeyboardInterrupt` and `InterruptedBySignal` exit arms each
+invoke `capture_repo_deps` inside their own `asyncio.run()` wrapped in a
+non-fatal `try/except Exception`; `_run_phases()` calls
+`_backstop_capture_prior_runs` before `phase_classify` (the SIGKILL /
+crash recovery path); and the `dep_capture` prompt file exists alongside
+`SCHEMAS['dep_capture']` (the §12 advisory + code-enforces split).
+No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 
