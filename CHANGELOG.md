@@ -5,6 +5,36 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.47]
+
+### Fixed
+
+- **The `cfg-*` startup sweep can no longer delete a live run's staging dir.**
+  The sweep keys on each `cfg-*` dir's top-level mtime, which freezes at
+  staging-completion — nested writes by the running container's rw bind-mount do
+  not bump it. A run whose container stayed up past the `-mtime +1` threshold
+  (now plausible given 0.9.46's auto-resume loop holding the mount open across
+  backoffs) had a stale-*looking*-but-live cfg dir that a concurrent launch's
+  sweep would `rm -rf`, corrupting the live container's `.claude`/creds. Each run
+  now runs a background keepalive that `touch`es `$STAGE` hourly for the run's
+  lifetime, so a live dir never looks stale to `-mtime +1`; the keepalive is
+  torn down by the same EXIT traps that remove `$STAGE`.
+- **`_sleep_then_reexec` now returns a correct exit code on interrupt/execv
+  failure.** SIGTERM/SIGHUP during the rate-limit backoff wait now exits
+  `128+signum` (e.g. 143) instead of a bare 1, and an `os.execv` failure exits
+  `EXIT_LOCKED` (75, EX_TEMPFAIL) instead of falling through — matching the
+  documented signal/temp-fail contract. State is preserved either way (cleanup
+  runs before the sleep).
+
+### Changed
+
+- **Doc-drift cleanup for the 0.9.46 auto-resume change.** Three stale references
+  to the retired "reset-time-unparseable → exit 75 / manual resume" behavior were
+  rewritten to the shipped auto-resume contract: the `_invoke` overage comment
+  and the rate-limit doc-comment in `orchestrator/leerie.py`, and the exit-75
+  teardown-table row in `docs/DESIGN.md` (exit 75 remains legit for `EXIT_LOCKED`
+  and genuine EX_TEMPFAIL worker surfaces).
+
 ## [0.9.46]
 
 ### Changed
