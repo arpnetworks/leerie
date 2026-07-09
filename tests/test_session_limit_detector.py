@@ -192,14 +192,87 @@ def test_main_has_rate_limited_exit_arm():
 
 
 def test_main_rate_limit_arm_appears_before_keyboard_interrupt():
-    """except RateLimitedExit must be matched BEFORE except
+    """except RateLimitedExit must be matched BEFORE main()'s except
     KeyboardInterrupt — both inherit BaseException, but the more
-    specific one needs to come first or it never fires."""
+    specific one needs to come first or it never fires. Note there's
+    ALSO a local `except KeyboardInterrupt` inside `_sleep_then_reexec`
+    (the auto-resume sleep guard) that appears earlier in the file, so
+    we compare the RateLimitedExit arm against the FIRST KeyboardInterrupt
+    that follows it (main()'s arm), not the first in the file."""
     from pathlib import Path
     src = (Path(__file__).resolve().parent.parent
            / "orchestrator" / "leerie.py").read_text()
     rl_pos = src.find("except RateLimitedExit")
-    ki_pos = src.find("except KeyboardInterrupt")
     assert rl_pos != -1
-    assert ki_pos != -1
-    assert rl_pos < ki_pos
+    ki_after = src.find("except KeyboardInterrupt", rl_pos)
+    assert ki_after != -1, "main()'s except KeyboardInterrupt must follow the arm"
+
+
+# --- _sleep_then_reexec (auto-resume tail) --------------------------------
+# Shared by both rate-limit arms: cleanup → sleep → os.execv --resume. A
+# reset_at=None rate-limit (out-of-credits) now auto-resumes on a fixed
+# backoff instead of exiting 75 — these pin that behavior.
+
+from types import SimpleNamespace  # noqa: E402
+
+
+def _fake_st(run_id="run-abc"):
+    return SimpleNamespace(run_id=run_id, run_dir=None, data={})
+
+
+def test_sleep_then_reexec_cleans_sleeps_and_reexecs(leerie, monkeypatch):
+    """Happy path: cleanup runs, time.sleep gets the wait, os.execv is
+    invoked with `--resume --run-id <id>` (and never returns)."""
+    calls = {}
+    monkeypatch.setattr(leerie, "_cleanup_on_abnormal_exit",
+                        lambda st, **k: calls.setdefault("cleanup", True))
+    monkeypatch.setattr(leerie.time, "sleep",
+                        lambda s: calls.setdefault("slept", s))
+
+    def fake_execv(exe, argv):
+        calls["execv"] = argv
+        raise SystemExit(0)  # stand in for "execv replaces the process"
+    monkeypatch.setattr(leerie.os, "execv", fake_execv)
+
+    st = _fake_st("run-xyz")
+    import pytest
+    with pytest.raises(SystemExit):
+        leerie._sleep_then_reexec(st, 300, "out of credits / no reset time")
+
+    assert calls.get("cleanup") is True
+    assert calls.get("slept") == 300
+    argv = calls.get("execv")
+    assert argv is not None
+    assert "--resume" in argv and "--run-id" in argv
+    assert argv[argv.index("--run-id") + 1] == "run-xyz"
+
+
+def test_sleep_then_reexec_ctrl_c_during_sleep_returns_true(leerie, monkeypatch):
+    """Ctrl-C during the sleep → returns True (caller exits 130) and does
+    NOT os.execv — state is preserved for a manual --resume."""
+    execv_called = {"v": False}
+    monkeypatch.setattr(leerie, "_cleanup_on_abnormal_exit", lambda st, **k: None)
+
+    def boom(_s):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(leerie.time, "sleep", boom)
+    monkeypatch.setattr(leerie.os, "execv",
+                        lambda *a: execv_called.__setitem__("v", True))
+
+    interrupted = leerie._sleep_then_reexec(_fake_st(), 300, "reason")
+    assert interrupted is True
+    assert execv_called["v"] is False
+
+
+def test_rate_limit_no_reset_uses_fixed_backoff_not_exit_75(leerie):
+    """Source-pin the new contract: the reset_at-None arm calls
+    `_sleep_then_reexec(... RATE_LIMIT_RETRY_BACKOFF_SEC ...)` instead of
+    printing 'resume manually' + exit 75."""
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent
+           / "orchestrator" / "leerie.py").read_text()
+    assert "RATE_LIMIT_RETRY_BACKOFF_SEC = 300" in src
+    # the handler routes both arms through the shared helper
+    assert "_sleep_then_reexec(st, wait_seconds, reason)" in src
+    # the old "could not parse reset time … exit 75" manual path is gone
+    assert "could not parse reset time" not in src

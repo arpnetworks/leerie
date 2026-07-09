@@ -27,7 +27,7 @@ inside the container (DESIGN §6 / §0.5 below).
 | `.claude-plugin/marketplace.json` | Single-plugin marketplace manifest. Makes the repo itself discoverable via `/plugin marketplace add enricai/leerie` from inside Claude Code. Points at `.` so Claude Code reads the sibling `.claude-plugin/plugin.json`. |
 | `.claude-plugin/plugin.json` | Existing plugin manifest (commands, skills, metadata). The `version` field is the single source of truth for `leerie --version`. |
 | `scripts/install.sh` | The `curl \| bash` shell installer. Preflight (git/claude/curl) → runtime preflight (colima on macOS, nerdctl+containerd on Linux) → clone → symlink → verify. Self-contained bash; deps: `bash`, `curl`, `git`. |
-| `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Passes `--cgroupns=host` so the container shares the host VM's cgroup namespace — required for cgroup v2 process enrollment (nerdctl's default `--cgroupns=private` + `nsdelegate` blocks non-root `cgroup.procs` writes; see DESIGN §6 *Memory containment*). Fast paths for `--version` and `config` skip container startup. |
+| `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Passes `--cgroupns=host` so the container shares the host VM's cgroup namespace — required for cgroup v2 process enrollment (nerdctl's default `--cgroupns=private` + `nsdelegate` blocks non-root `cgroup.procs` writes; see DESIGN §6 *Memory containment*). Fast paths for `--version` and `config` skip container startup. Per-run auth/config is staged into a fresh `mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX"` (`$STAGE`); a `rm -rf "$STAGE"` EXIT trap is registered **immediately after the mktemp** (before the ~250-line stage-assembly block, which contains an `exit 1`) so an early exit can't leak the dir, and a best-effort startup sweep (`find "$HOME/.cache/leerie" -maxdepth 1 -type d -name 'cfg-*' -mtime +1 -exec rm -rf`) reclaims dirs leaked by trap-bypassing exits (SIGKILL / OOM / `nerdctl kill`). |
 | `Dockerfile` | Image recipe (Debian 13 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
 | `scripts/container-entry.sh` | Container PID 1. Runs as **root** (the Dockerfile intentionally omits `USER leerie` so the entrypoint can set up cgroup containment before privilege drop; see DESIGN §6 *Memory containment*). It creates the `/sys/fs/cgroup/leerie.slice` cgroup and enables the memory+pids controllers (needed for the aggregate `memory.max` cap), then — the load-bearing step — launches the **root cgroup broker** (`python3 /opt/leerie-image/scripts/cgroup-broker.py &`) while still root, because worker cgroup enrollment and limit-setting cannot be done by the non-root orchestrator (see `scripts/cgroup-broker.py` below and DESIGN §6). `ulimit -c 0`, the cgroup slice setup, the broker launch, `cd /work`, `chown leerie: /work`, and `chown -R leerie: /tmp/.cache` all run as root. The `/tmp/.cache` chown is a runtime safety net for the same fix applied in the Dockerfile (after `useradd`, since the leerie user must exist): the build-time `mise install --system` creates `/tmp/.cache/mise/` as root (via `XDG_CACHE_HOME=/tmp/.cache`), and on Fly Machines the rootfs preserves this ownership (unlike local nerdctl where `/tmp` is an ephemeral overlay), causing `mise install` to fail with EACCES when a repo pins a runtime version not pre-baked in the image. The final exec drops to leerie via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...`: if invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately, which also drops via `Popen(user="leerie")`), the runuser exec wraps `sleep infinity` to keep the namespace alive; otherwise it wraps `python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). The explicit `env` form is used instead of `runuser --login` because the login form would chdir to `/home/leerie` and override the `cd /work` invariant. |
 | `scripts/cgroup-broker.py` | Root-privileged cgroup broker (DESIGN §6 *Memory containment*). Launched by `container-entry.sh` at PID 1 (root) before the privilege drop; the non-root orchestrator drives it over a Unix socket at `/run/leerie-cgroup.sock`. Handles `ping` / `probe` / `create <sid> <mem> <pids>` / `enroll <sid> <pid>` / `destroy <sid>` / `stat <sid>` (read-only → `OK <pids.current> <pids.max> <pids.events.max>`, used by `_cgroup_stat` for PID-exhaustion detection; DESIGN §6 *Detecting PID exhaustion*). Exists because worker cgroup enrollment and limit-setting cannot be done from non-root code (the kernel keeps controller limit files root-owned in delegated subtrees, and cross-scope task migration needs write on the common-ancestor cgroup the leerie user doesn't own — both reproduced live). Detects and handles cgroup **v2** (unified `leerie.slice/leerie-w-<sid>/{pids,memory}.max`, Colima) vs **v1/hybrid** (split `pids/`+`memory/` hierarchies, observed on Fly Firecracker VMs). Validates every `<sid>` against `^[A-Za-z0-9._-]+$` (no path traversal) and requires integer pids/limits — it is the single root surface, so it is kept minimal and auditable. |
@@ -2649,8 +2649,9 @@ truncation is caught earlier, in `_invoke` itself: as events stream, a
 {"out_of_credits", "out_of_overage"}`. In the no-envelope branch, if
 `overage_blocked` is set, `_invoke` raises `RateLimitedExit(reset_at=None,
 raw)` instead of a bare `WorkerError`, routing the failure into the
-resumable rate-limit pause (DESIGN §6; `main()`'s None-reset arm prints a
-`--resume` hint and exits 75). The overage event alone is *not* treated
+resumable rate-limit pause (DESIGN §6; `main()`'s None-reset arm now sleeps
+`RATE_LIMIT_RETRY_BACKOFF_SEC` and auto-resumes via `_sleep_then_reexec`,
+rather than exiting 75). The overage event alone is *not* treated
 as terminal — it is a benign warning most workers survive; only its
 coincidence with a missing `result` event triggers the pause. Covered by
 `test_invoke_overage_block_plus_truncation_raises_ratelimited` (raises)
@@ -3359,8 +3360,14 @@ and accepts `--resume --run-id`). The `--max-workers` budget is NOT
 reset across the re-exec: `worker_count` persists in state.json,
 so a run that repeatedly hits the rate-limit still respects the
 user's cap;
-when `reset_at` is None, print the literal message and the manual
-resume command, exit with code 75 (`EX_TEMPFAIL`).
+when `reset_at` is None (out-of-credits mid-stream kill, or an
+unparseable session-limit message), sleep a fixed
+`RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s) and re-exec `--resume` the same
+way — we can't compute a wake time, so we poll; a premature retry
+re-hits the same clean pause. Both arms route through the shared
+`_sleep_then_reexec(st, wait_seconds, reason)` helper (cleanup → sleep →
+`os.execv`; returns True on Ctrl-C so the caller exits 130). The old
+`reset_at=None → exit 75 manual-resume` behavior is gone.
 
 **Auto-resume override persistence.** The re-exec passes only
 `--resume <id>` as argv — any CLI overrides on the original

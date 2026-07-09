@@ -1697,27 +1697,36 @@ PID-namespace teardown is the abnormal-exit guarantee — see "Worker
 subtree termination — kernel-enforced via the container boundary"
 above). Then:
 
-- If `reset_at` was parsed cleanly from the literal Claude Code
-  message format, leerie runs the worktree-only cleanup, sleeps until
-  the reset moment + a small margin, then `os.execv`'s the
-  orchestrator itself (`sys.executable __file__ --resume --run-id <id>`)
-  to start a fresh orchestrator process. We re-exec the orchestrator,
-  not the launcher: the orchestrator already runs inside the
-  container with state on disk, the launcher is not baked into the
-  container image, and the launcher's `--resume` path would try to
-  launch a new container (no inside-container sentinel exists).
-  The `--max-workers` budget persists across the re-exec —
-  `worker_count` lives in state.json — so a run that repeatedly hits
-  the rate-limit still respects the user's cap.
-- If the reset clause didn't parse (malformed time, unknown
-  timezone, or Anthropic changed the message format), leerie runs
-  the worktree-only cleanup, prints the literal message and the
-  manual resume command, and exits with code 75 (`EX_TEMPFAIL`).
+Both cases now auto-resume — they differ only in the wait — via the shared
+`_sleep_then_reexec(st, wait_seconds, reason)`: worktree-only cleanup, sleep,
+then `os.execv` the orchestrator (`sys.executable __file__ --resume --run-id
+<id>`) into a fresh process. We re-exec the orchestrator, not the launcher: the
+orchestrator already runs inside the container with state on disk; the launcher
+is not baked into the image and would try to launch a new container. The
+`--max-workers` budget persists across the re-exec (`worker_count` lives in
+state.json), so a run that repeatedly hits the rate-limit still respects the cap
+and can never run away. Cleanup runs before the sleep, and because
+`_cleanup_on_abnormal_exit` removes every worktree — git-registered AND orphaned
+dirs, then `git worktree prune` — the re-exec'd `--resume` finds a clean slate
+(`setup-run.sh`'s staging-worktree re-creation can't hit a stale-dir conflict).
+Ctrl-C during the sleep drops to a manual `--resume` (exit 130).
 
-The auto-resume path is opt-in by message format: we only sleep
-when the reset time is unambiguously parseable. A parse failure
-must never produce a wrong-time sleep — the user gets a clean
-manual-resume instruction instead.
+- If `reset_at` parsed cleanly from the literal message format, `wait_seconds`
+  is the time until that moment + a small margin.
+- If the reset clause didn't parse (malformed time, unknown timezone, format
+  change) OR the rate-limit was an **out-of-credits mid-stream kill** (which
+  carries no reset time at all), `wait_seconds` is a fixed
+  `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s). We can't know when the limit refreshes,
+  so we poll: sleep the fixed interval and re-resume. A premature retry (still
+  limited) just re-hits the same clean pause and sleeps again — cheap, and
+  bounded by the persisted worker budget.
+
+Rationale for the change from the earlier "parse failure → exit 75 manual
+resume" behavior: the old concern was that a *wrong-time* sleep is worse than no
+sleep. With a fixed backoff there is no time being guessed — the trade is
+"retry in 5 min" vs "die and require a human," and an early retry is a harmless
+no-op re-pause. For the out-of-credits case especially (no reset time ever), a
+run now self-heals once credits return instead of stopping.
 
 `_cleanup_on_abnormal_exit(st, full_purge=False)` is the single
 helper for all four paths. The classification happens in `main()`'s

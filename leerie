@@ -4662,7 +4662,23 @@ fi
 # uniform across platforms and matches the existing cache-dir
 # convention used for mise / pnpm / pip / go / cargo (see below).
 mkdir -p "$HOME/.cache/leerie"
+
+# Best-effort sweep of stale per-run staging dirs. The EXIT trap below removes
+# $STAGE on a clean exit, but a SIGKILL (OOM, `nerdctl kill`) or a hard crash
+# bypasses the trap and leaks the dir. Left unchecked these accumulate (each is
+# tens of MB to ~GB of staged ~/.claude). Remove cfg-* dirs older than a day —
+# any run still using one is far younger. Backgrounded + time-bounded so a large
+# backlog never delays a launch. Mirrors the _reap_orphaned_container idea.
+( find "$HOME/.cache/leerie" -maxdepth 1 -type d -name 'cfg-*' -mtime +1 \
+    -exec rm -rf {} + 2>/dev/null ) &
+
 STAGE="$(mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX")"
+# Register STAGE removal immediately — BEFORE the ~250 lines of stage assembly
+# below (which includes an `exit 1` on bad config) and before the container-arm
+# EXIT trap is set. Bash keeps only the last EXIT trap per scope; the container
+# arm re-sets it (adding container-kill) and still removes $STAGE, so this early
+# trap only matters for exits that happen before that point.
+trap 'rm -rf "$STAGE" 2>/dev/null' EXIT
 
 # -- .claude.json: copy with projects[] stripped. --
 # The projects[] block stores prior-session per-project state

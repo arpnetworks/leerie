@@ -338,35 +338,39 @@ def test_main_keyboard_interrupt_no_full_purge():
 
 def test_main_rate_limit_sleep_catches_keyboard_interrupt():
     """Ctrl-C during the auto-resume sleep must produce the friendly
-    'state preserved' log message, not a silent exit. The outer
-    KeyboardInterrupt arm of main() is reached *outside* the
-    RateLimitedExit arm — when the user Ctrl-C's while we're inside
-    `time.sleep` within the RateLimitedExit arm, the KeyboardInterrupt
-    would escape to Python's default handler without our friendly
-    message unless it's caught locally. Pin that the local catch
-    exists."""
+    'state preserved' message and exit 130, not a silent exit. The
+    cleanup→sleep→re-exec logic (and its local KeyboardInterrupt catch
+    around `time.sleep`) now lives in the shared `_sleep_then_reexec`
+    helper; the RateLimitedExit arm calls it and maps a True return to
+    exit 130. Pin both halves: the helper has the local catch, and the
+    arm routes through it. (The helper's Ctrl-C→return-True behavior is
+    exercised behaviorally in test_session_limit_detector.py.)"""
+    src = (Path(__file__).resolve().parent.parent
+           / "orchestrator" / "leerie.py").read_text()
+    # The helper owns the sleep + local KeyboardInterrupt catch.
+    hm = re.search(
+        r"\ndef _sleep_then_reexec\(.*?\):(.*?)(?=\n\ndef |\n\nasync def )",
+        src, re.DOTALL,
+    )
+    assert hm, "could not locate _sleep_then_reexec in leerie.py"
+    helper = hm.group(1)
+    assert "time.sleep" in helper
+    assert "except KeyboardInterrupt" in helper, (
+        "_sleep_then_reexec must locally catch KeyboardInterrupt around "
+        "time.sleep so Ctrl-C during the auto-resume wait produces the "
+        "'state preserved' message rather than a silent exit.")
+    assert "os.execv" in helper, "_sleep_then_reexec must re-exec --resume"
+    # The RateLimitedExit arm routes through the helper and maps a True
+    # return (Ctrl-C) to exit 130.
     body = _main_body()
-    # Find the OUTER except RateLimitedExit block (4-space indent).
-    # The lookahead anchors on the same outer-try indent to avoid
-    # truncating at inner `except BaseException` clauses nested inside
-    # the arm (e.g. the cleanup-failure guard).
     m = re.search(
         r"\n    except RateLimitedExit[^:]*:(.*?)(?=\n    except |\n    finally:)",
         body, re.DOTALL,
     )
-    assert m, ("could not locate outer except RateLimitedExit block in "
-               "main() at the 4-space indent")
+    assert m, "could not locate except RateLimitedExit block in main()"
     block = m.group(1)
-    # The block must contain a local KeyboardInterrupt catch wrapping
-    # time.sleep — otherwise Ctrl-C during the wait silently kills the
-    # process without the user-facing "state preserved" message.
-    assert "time.sleep" in block
-    assert "except KeyboardInterrupt" in block, (
-        "RateLimitedExit arm must locally catch KeyboardInterrupt "
-        "around time.sleep so Ctrl-C during the auto-resume wait "
-        "produces the standard 'state preserved' message rather than "
-        "a silent exit."
-    )
+    assert "_sleep_then_reexec(st, wait_seconds, reason)" in block
+    assert "exit_code = 130" in block
 
 
 def test_main_interrupted_by_signal_no_full_purge():

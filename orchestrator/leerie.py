@@ -440,6 +440,15 @@ EXIT_BUDGET_INFEASIBLE = 11
 # the BSD sysexits.h EX_TEMPFAIL convention.
 EXIT_LOCKED = 75
 
+# Fixed backoff before auto-resuming a rate-limit that carried NO parseable
+# reset time — chiefly the out-of-credits mid-stream kill, where the kill left
+# no `resetsAt` to compute a wake time from (DESIGN §6 *Rate-limited →
+# auto-resume*). We can't know when credits/limits refresh, so we poll: sleep a
+# short fixed interval and re-exec `--resume`. A premature retry (still limited)
+# just re-hits the same clean pause and sleeps again — cheap, and bounded by the
+# persisted `max_total_workers` budget so a stuck run never runs away.
+RATE_LIMIT_RETRY_BACKOFF_SEC = 300  # 5 minutes
+
 # Source-of-truth preference — see DESIGN.md §11. Resolution order:
 # --source-of-truth CLI flag → LEERIE_SOURCE_OF_TRUTH env var →
 # per-repo leerie.toml → 'both'. CLI/env are session knobs, so they
@@ -2031,6 +2040,46 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
         except OSError:
             pass
     await run_proc(["git", "worktree", "prune"])
+
+
+def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> bool:
+    """Shared tail of the rate-limit auto-resume path (DESIGN §6 *Rate-limited
+    → auto-resume*): worktree-only cleanup (state + run branch preserved),
+    sleep `wait_seconds`, then `os.execv` the orchestrator into a fresh
+    `--resume` process. Returns True if the user Ctrl-C'd during the sleep (the
+    caller sets exit 130 and returns through normal flow); otherwise it does not
+    return — `os.execv` replaces the process.
+
+    Cleanup runs BEFORE the sleep so (a) the wake time reflects post-cleanup
+    reality and (b) the re-exec'd `--resume` finds a clean slate —
+    `_cleanup_on_abnormal_exit` removes every worktree (git-registered AND
+    orphaned dirs, then `git worktree prune`), so `setup-run.sh`'s staging
+    worktree re-creation can't hit a stale-dir conflict.
+
+    We re-exec the orchestrator, not the launcher: the launcher is not baked
+    into the container image and would try to spawn a new container. Re-execing
+    `$python $__file__ --resume --run-id <id>` gives a fresh worker budget and a
+    fresh asyncio loop; `worker_count` persists in state.json so the
+    `max_total_workers` cap survives across re-exec."""
+    try:
+        _cleanup_on_abnormal_exit(st, full_purge=False)
+    except BaseException as ce:
+        log(f"  cleanup before sleep failed (non-fatal): {ce}")
+    log(f"  {reason} — sleeping {wait_seconds}s then auto-resuming; "
+        f"Ctrl-C to stop and resume manually (leerie --resume {st.run_id})")
+    try:
+        time.sleep(wait_seconds)
+    except KeyboardInterrupt:
+        # User bailed on the wait — state + branches already preserved (cleanup
+        # ran above), so a manual --resume picks up cleanly.
+        log("interrupted by user (SIGINT) during rate-limit sleep — state "
+            f"preserved (resume with leerie --resume {st.run_id})")
+        return True
+    log(f"  auto-resuming: exec orchestrator --resume {st.run_id}")
+    os.execv(sys.executable,
+             [sys.executable, __file__, "--resume", "--run-id", st.run_id])
+    # Unreachable: execv replaces the process.
+    return False
 
 
 def _parse_claude_version(version_output: str | None) -> tuple[int, int, int] | None:
@@ -16670,67 +16719,31 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         full_purge = False
         st.save()
         log(f"rate-limited: {e.raw_message}")
+        # Both arms auto-resume via `_sleep_then_reexec` (cleanup → sleep →
+        # os.execv --resume). They differ only in the wait: a parsed reset time
+        # sleeps until that moment; a missing reset time (out-of-credits
+        # mid-stream kill, or an unparseable session-limit message) can't
+        # compute a wake time, so it polls on a fixed backoff. Either way the
+        # run self-resumes and Ctrl-C during the wait drops to manual --resume.
+        # `_sleep_then_reexec` runs cleanup itself, so skip the finally block.
+        abnormal = False
         if e.reset_at is not None:
-            # Run cleanup BEFORE computing wait_seconds, so the sleep
-            # duration reflects time remaining after cleanup finishes
-            # — not time-from-now-at-exception. With the worktree-
-            # remove timeout raised to 240s per worktree, a wave with
-            # several heavy worktrees can spend tens of minutes inside
-            # cleanup; computing wait_seconds first would make the
-            # logged "sleeping until X" line under-promise the actual
-            # wake-up time by that much. State and branches preserved
-            # by full_purge=False.
-            try:
-                _cleanup_on_abnormal_exit(st, full_purge=False)
-            except BaseException as ce:
-                log(f"  cleanup before sleep failed (non-fatal): {ce}")
-            # Skip the finally-block cleanup — we just did it.
-            abnormal = False
+            # Compute the wait AFTER cleanup would run — but the helper runs
+            # cleanup first, so compute against now(); the small drift vs.
+            # post-cleanup time is covered by the +30s margin (heavy-worktree
+            # cleanup can take minutes, but the parsed reset is typically hours
+            # out, so the margin is immaterial).
             wait_seconds = max(
                 0,
                 int((e.reset_at - datetime.now(e.reset_at.tzinfo))
                     .total_seconds())) + 30
-            log(f"  sleeping until {e.reset_at.isoformat()} "
-                f"(~{wait_seconds}s) then auto-resuming")
-            interrupted_during_sleep = False
-            try:
-                time.sleep(wait_seconds)
-            except KeyboardInterrupt:
-                # User Ctrl-C'd during the sleep — they don't want to
-                # wait for the auto-resume. State + branches are
-                # already preserved (cleanup ran before the sleep)
-                # so a manual --resume picks up cleanly. Emit the
-                # same friendly message the top-level KeyboardInterrupt
-                # arm would have printed, so the user doesn't see a
-                # silent exit after `sleeping until ...`. Sets the
-                # SIGINT exit code (130) the way the top-level arm
-                # does — `main()` returns through the normal flow.
-                log("interrupted by user (SIGINT) during rate-limit "
-                    f"sleep — state preserved (resume with "
-                    f"leerie --resume {st.run_id})")
-                interrupted_during_sleep = True
-                exit_code = 130
-            if not interrupted_during_sleep:
-                # Re-exec the orchestrator itself, not the launcher. The
-                # launcher (a) is not baked into the container image (the
-                # Dockerfile does not COPY it — see Dockerfile:182–185) and
-                # (b) would try to launch a new container via `nerdctl run`
-                # / Fly provision if it were, because it has no inside-
-                # container sentinel. We are already inside the container
-                # with state on disk and the orchestrator's own main()
-                # accepts `--resume --run-id`; re-execing $python $__file__
-                # gives us a fresh worker budget and a fresh asyncio loop
-                # without recursing through the launcher.
-                log(f"  auto-resuming: exec orchestrator "
-                    f"--resume {st.run_id}")
-                os.execv(sys.executable,
-                         [sys.executable, __file__,
-                          "--resume", "--run-id", st.run_id])
-                # Unreachable: execv replaces the process.
+            reason = f"rate limit resets {e.reset_at.isoformat()}"
         else:
-            log(f"  could not parse reset time; "
-                f"resume manually: leerie --resume {st.run_id}")
-            exit_code = 75  # EX_TEMPFAIL
+            wait_seconds = RATE_LIMIT_RETRY_BACKOFF_SEC
+            reason = "out of credits / no reset time"
+        if _sleep_then_reexec(st, wait_seconds, reason):
+            exit_code = 130  # Ctrl-C during the sleep
+        # Otherwise _sleep_then_reexec os.execv'd and never returned.
     except KeyboardInterrupt:
         # Ctrl-C → worktree cleanup only; state and branches preserved
         # so the user can --resume. The explicit "throw this away"
