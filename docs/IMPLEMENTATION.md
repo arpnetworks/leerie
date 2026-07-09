@@ -3365,9 +3365,17 @@ unparseable session-limit message), sleep a fixed
 `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s) and re-exec `--resume` the same
 way — we can't compute a wake time, so we poll; a premature retry
 re-hits the same clean pause. Both arms route through the shared
-`_sleep_then_reexec(st, wait_seconds, reason)` helper (cleanup → sleep →
-`os.execv`; returns True on Ctrl-C so the caller exits 130). The old
-`reset_at=None → exit 75 manual-resume` behavior is gone.
+`_sleep_then_reexec(st, wait_seconds, reason) -> int | None` helper
+(cleanup → sleep → `os.execv`). It returns `None` when the `os.execv`
+succeeds (the process is replaced, so the return is unreachable), and an
+**exit code** when the sleep or re-exec was interrupted/failed instead:
+`130` on Ctrl-C (SIGINT), `128 + signum` on SIGTERM/SIGHUP (143 / 129,
+matching main()'s top-level signal arm), and `EXIT_LOCKED` (75) on the
+should-never-happen `os.execv` failure. The caller does
+`rc = _sleep_then_reexec(...); if rc is not None: exit_code = rc` and
+leaves `abnormal = False` (the helper already ran cleanup, so the
+`finally` must not re-run it). The old `reset_at=None → exit 75
+manual-resume` behavior is gone.
 
 **Auto-resume override persistence.** The re-exec passes only
 `--resume <id>` as argv — any CLI overrides on the original

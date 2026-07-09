@@ -1709,7 +1709,13 @@ and can never run away. Cleanup runs before the sleep, and because
 `_cleanup_on_abnormal_exit` removes every worktree — git-registered AND orphaned
 dirs, then `git worktree prune` — the re-exec'd `--resume` finds a clean slate
 (`setup-run.sh`'s staging-worktree re-creation can't hit a stale-dir conflict).
-Ctrl-C during the sleep drops to a manual `--resume` (exit 130).
+Ctrl-C during the sleep drops to a manual `--resume` (exit 130); a
+SIGTERM/SIGHUP during the sleep drops to a manual `--resume` with the
+signal's exit code (128 + signum → 143 / 129), matching main()'s
+top-level signal arm; and the should-never-happen case of `os.execv`
+itself failing exits `EXIT_LOCKED` (75, EX_TEMPFAIL). In every one of
+these the worktree cleanup has already run, so state and the run branch
+are intact for the manual `--resume`.
 
 - If `reset_at` parsed cleanly from the literal message format, `wait_seconds`
   is the time until that moment + a small margin.

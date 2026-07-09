@@ -199,8 +199,8 @@ def test_invoke_overage_block_plus_truncation_raises_ratelimited(
     the auth/quota backoff and die()s the run non-resumably.
 
     reset_at is None here: the kill left no result envelope carrying a
-    parseable resetsAt, so main()'s None-reset arm prints a --resume hint
-    and exits 75."""
+    parseable resetsAt, so main()'s None-reset arm sleeps a fixed
+    RATE_LIMIT_RETRY_BACKOFF_SEC and auto-resumes via _sleep_then_reexec."""
     events = [
         json.dumps({"type": "system", "subtype": "init", "model": "opus"}),
         json.dumps(_OVERAGE_BLOCKED_EVENT),
