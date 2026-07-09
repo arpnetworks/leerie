@@ -5,6 +5,48 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.50]
+
+### Changed
+
+- **`leerie config --recapture --force` now performs a true wholesale
+  replace** (#43 follow-up). Previously `--force` only dropped the
+  `dep_capture.done` sentinel so the worker re-fired over already-captured
+  runs, but the write still union-merged — the "wholesale replace" the
+  launcher comment advertised was never implemented. `capture_repo_deps`
+  gains a `replace: bool = False` parameter that `run_recapture_deps` threads
+  as `replace=force`: under `--force` the persisted `setup_packages` +
+  `language_installs` are overwritten from the fresh capture (deps no longer
+  captured are dropped), while every automatic seam (finalize / cancel /
+  backstop) stays union / never-clobber. An empty capture under `--force`
+  leaves the existing config untouched, so a bad run can never blank a good
+  config.
+- **The `dep_capture` model override is now env-var-only.** `resolve_models`
+  carried inert `--model-dep-capture` (`args.dep_capture_model`) and
+  `model_dep_capture` `leerie.toml` slots that no CLI flag or documented key
+  ever populated; both are removed. `dep_capture` is overridable via
+  `LEERIE_MODEL_DEP_CAPTURE` (and the global `--model` / `LEERIE_MODEL` /
+  `model` key) only, matching what CLAUDE.md already documented. Its `opus`
+  default comes from the global `MODEL_DEFAULT` fallback — it is intentionally
+  absent from `MODEL_DEFAULT_PER_WORKER`, and the stale IMPLEMENTATION.md /
+  README.md claims that it was registered there (or honored a `model_dep_capture`
+  TOML key) are corrected.
+
+### Fixed
+
+- **`--recapture --force` could blank a good `.leerie/config.toml`.** A
+  schema-valid empty-item capture — `setup_packages: [""]` or a
+  `language_installs` entry with an empty `manager`/`command` — passed the
+  `if setup_packages:` list-truthiness guard, rendered to `""`, and was
+  persisted by `_write_config_toml_keys`, wiping the existing config under the
+  replace path (the default union path was unaffected). Fixed two ways
+  (DESIGN §12 — guarantees that can be checked mechanically live in code): the
+  replace path now gates each write on the *rendered* value being non-empty
+  (and filters empty-manager `language_installs` entries), and the
+  `dep_capture` schema gains `minLength: 1` on `setup_packages` items and on
+  each `language_installs` `manager`/`command` (mirroring `pr_writer`). Pinned
+  by a regression test that fails against the pre-fix code.
+
 ## [0.9.49]
 
 ### Changed
