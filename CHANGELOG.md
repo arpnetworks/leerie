@@ -5,6 +5,20 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.48]
+
+### Changed
+
+- **Documentation-only follow-up to 0.9.47** (no code or behavior change).
+  Corrected three residual references to the retired "reset-time-unparseable →
+  exit 75 / manual resume" behavior that the 0.9.47 edits missed:
+  `docs/IMPLEMENTATION.md` still described `_sleep_then_reexec` with its old
+  `bool` return ("returns True on Ctrl-C") rather than the shipped
+  `-> int | None` contract (130 / 128+signum / 75 / None); `docs/DESIGN.md` §6
+  documented only the SIGINT→130 sleep-interrupt case and now also covers
+  SIGTERM/SIGHUP→128+signum and `os.execv`-failure→75; and a stale docstring in
+  `tests/test_invoke_streaming.py` described the removed exit-75 path.
+
 ## [0.9.47]
 
 ### Fixed
