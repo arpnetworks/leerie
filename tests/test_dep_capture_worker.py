@@ -319,6 +319,198 @@ class TestDepCaptureNeverClobber:
 
 
 # ---------------------------------------------------------------------------
+# Tests: replace=True (the --recapture --force path) — wholesale replace
+# ---------------------------------------------------------------------------
+
+class TestDepCaptureReplace:
+    """replace=True overwrites persisted deps; replace=False (default) unions.
+
+    Only the operator-driven `--recapture --force` path passes replace=True;
+    every automatic seam uses the default union/never-clobber behavior.
+    """
+
+    def test_replace_overwrites_setup_packages_dropping_stale(
+            self, leerie, tmp_path, monkeypatch):
+        """replace=True: packages no longer captured are dropped (not unioned)."""
+        repo = tmp_path / "repo"
+        leerie_dir = repo / ".leerie"
+        leerie_dir.mkdir(parents=True)
+        cfg = leerie_dir / "config.toml"
+        # A stale package the fresh capture does NOT return.
+        cfg.write_text('setup_packages = "postgresql stale-pkg"\n')
+
+        env = dict(_DEP_CAPTURE_ENVELOPE)
+        env["structured_output"] = {
+            "setup_packages": ["postgresql", "libpq-dev"],
+            "language_installs": [],
+            "dockerfile_notes": None,
+        }
+
+        st = _make_fake_state(leerie, tmp_path, ["apt-get install -y postgresql"])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        _patch_invoke(leerie, monkeypatch, envelope=env)
+
+        asyncio.run(leerie.capture_repo_deps(
+            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+            replace=True,
+        ))
+
+        content = cfg.read_text()
+        assert "postgresql" in content
+        assert "libpq-dev" in content
+        assert "stale-pkg" not in content, (
+            "replace=True must drop packages no longer captured")
+
+    def test_replace_overwrites_language_installs_dropping_stale_manager(
+            self, leerie, tmp_path, monkeypatch):
+        """replace=True: a manager no longer captured is dropped from the array."""
+        repo = tmp_path / "repo"
+        leerie_dir = repo / ".leerie"
+        leerie_dir.mkdir(parents=True)
+        existing = [
+            {"manager": "pip", "command": "pip install -r requirements.txt",
+             "copy_inputs": ["requirements.txt"]},
+            {"manager": "cargo", "command": "cargo build",
+             "copy_inputs": ["Cargo.toml"]},
+        ]
+        cfg = leerie_dir / "config.toml"
+        cfg.write_text(
+            f'language_installs = "{json.dumps(existing, separators=(",", ":"))}"\n')
+
+        env = dict(_DEP_CAPTURE_ENVELOPE)
+        env["structured_output"] = {
+            "setup_packages": [],
+            # Fresh capture: only pip (cargo is gone).
+            "language_installs": [
+                {"manager": "pip", "command": "pip install -e .",
+                 "copy_inputs": ["setup.py"]},
+            ],
+            "dockerfile_notes": None,
+        }
+
+        st = _make_fake_state(leerie, tmp_path, ["pip install -e ."])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        _patch_invoke(leerie, monkeypatch, envelope=env)
+
+        asyncio.run(leerie.capture_repo_deps(
+            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+            replace=True,
+        ))
+
+        raw = leerie._read_toml_key(cfg, "language_installs")
+        managers = {e["manager"] for e in json.loads(raw)}
+        assert managers == {"pip"}, (
+            f"replace=True must drop stale managers; got {managers}")
+        # And the surviving pip entry is the freshly-captured command.
+        assert "setup.py" in raw
+
+    def test_replace_empty_capture_leaves_existing_untouched(
+            self, leerie, tmp_path, monkeypatch):
+        """replace=True with an empty capture must NOT blank a good config."""
+        repo = tmp_path / "repo"
+        leerie_dir = repo / ".leerie"
+        leerie_dir.mkdir(parents=True)
+        cfg = leerie_dir / "config.toml"
+        cfg.write_text('setup_packages = "postgresql libpq-dev"\n')
+        mtime_before = cfg.stat().st_mtime
+        content_before = cfg.read_text()
+
+        env = dict(_DEP_CAPTURE_ENVELOPE)
+        env["structured_output"] = {
+            "setup_packages": [],
+            "language_installs": [],
+            "dockerfile_notes": None,
+        }
+
+        st = _make_fake_state(leerie, tmp_path, ["echo noop"])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        _patch_invoke(leerie, monkeypatch, envelope=env)
+
+        asyncio.run(leerie.capture_repo_deps(
+            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+            replace=True,
+        ))
+
+        assert cfg.stat().st_mtime == mtime_before, (
+            "empty capture under replace=True must not rewrite config.toml")
+        assert cfg.read_text() == content_before
+
+    def test_replace_empty_item_capture_does_not_blank_config(
+            self, leerie, tmp_path, monkeypatch):
+        """A schema-valid empty-*item* capture (setup_packages=[""], an
+        empty-manager language_install) must NOT blank a good config under
+        replace=True. Regression pin: a truthy list of empty strings passes the
+        `if setup_packages:` guard but renders to "" — the write must be gated on
+        the rendered value, not list truthiness."""
+        repo = tmp_path / "repo"
+        leerie_dir = repo / ".leerie"
+        leerie_dir.mkdir(parents=True)
+        cfg = leerie_dir / "config.toml"
+        good_li = [{"manager": "pip", "command": "pip install -r requirements.txt",
+                    "copy_inputs": ["requirements.txt"]}]
+        cfg.write_text(
+            'setup_packages = "postgresql libpq-dev"\n'
+            f'language_installs = "{json.dumps(good_li, separators=(",", ":"))}"\n')
+        mtime_before = cfg.stat().st_mtime
+        content_before = cfg.read_text()
+
+        env = dict(_DEP_CAPTURE_ENVELOPE)
+        env["structured_output"] = {
+            # Empty *items*, not an empty list — a truthy list.
+            "setup_packages": ["", ""],
+            "language_installs": [{"manager": "", "command": ""}],
+            "dockerfile_notes": None,
+        }
+
+        st = _make_fake_state(leerie, tmp_path, ["echo noop"])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        _patch_invoke(leerie, monkeypatch, envelope=env)
+
+        asyncio.run(leerie.capture_repo_deps(
+            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+            replace=True,
+        ))
+
+        assert cfg.stat().st_mtime == mtime_before, (
+            "empty-item capture under replace=True must not rewrite config.toml")
+        assert cfg.read_text() == content_before, (
+            "empty-item capture under replace=True blanked a good config")
+        # Belt-and-suspenders: the good values must still be intact.
+        assert "postgresql" in cfg.read_text()
+        assert "requirements.txt" in cfg.read_text()
+
+    def test_default_is_union_not_replace(
+            self, leerie, tmp_path, monkeypatch):
+        """replace defaults to False: existing (stale) packages are preserved."""
+        repo = tmp_path / "repo"
+        leerie_dir = repo / ".leerie"
+        leerie_dir.mkdir(parents=True)
+        cfg = leerie_dir / "config.toml"
+        cfg.write_text('setup_packages = "postgresql stale-pkg"\n')
+
+        env = dict(_DEP_CAPTURE_ENVELOPE)
+        env["structured_output"] = {
+            "setup_packages": ["postgresql", "libpq-dev"],
+            "language_installs": [],
+            "dockerfile_notes": None,
+        }
+
+        st = _make_fake_state(leerie, tmp_path, ["apt-get install -y postgresql"])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        _patch_invoke(leerie, monkeypatch, envelope=env)
+
+        # No replace= kwarg — must default to union.
+        asyncio.run(leerie.capture_repo_deps(
+            repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+        ))
+
+        content = cfg.read_text()
+        assert "stale-pkg" in content, (
+            "default (replace=False) must preserve existing packages (union)")
+        assert "libpq-dev" in content
+
+
+# ---------------------------------------------------------------------------
 # Tests: opt-out
 # ---------------------------------------------------------------------------
 

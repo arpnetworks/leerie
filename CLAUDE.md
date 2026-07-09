@@ -532,7 +532,9 @@ no longer exist on the module (so the regex path can never
 silently return); command extraction, budget ceiling truncation, merger
 union/no-op/never-clobber, schema-validated worker output → setup_packages +
 language_installs write, committed-Dockerfile skip, write-failure non-fatal,
-and opt-out. Source-coupling guards in the same file pin that `main()`'s
+and opt-out. It also pins the `--recapture --force` wholesale-replace path
+(`replace=True` drops deps no longer captured; an empty capture leaves the
+existing config untouched) alongside the default union. Source-coupling guards in the same file pin that `main()`'s
 `KeyboardInterrupt` and `InterruptedBySignal` handlers each invoke
 `capture_repo_deps` (the cancel-arm seam — the fix is inert without the
 wiring). The worker-driven write path specifically — `capture_repo_deps`
@@ -542,19 +544,29 @@ covered in `tests/test_dep_capture_worker.py`: schema-validated output written
 to `.leerie/config.toml`, warm-repo never-clobber (mtime unchanged when all
 deps already present), union append for new packages, env + config-file opt-out
 (worker not invoked), committed `.leerie/Dockerfile` guard (worker not invoked),
-missing logs dir silent no-op, and non-fatal write failure. The `dep_capture`
+missing logs dir silent no-op, and non-fatal write failure. A `TestDepCaptureReplace`
+class covers the `replace=True` (`--recapture --force`) path: wholesale-overwrite
+of `setup_packages`/`language_installs` (stale deps dropped), an empty capture
+leaving the config untouched, and — the regression pin for the empty-item
+blanking bug — a schema-valid empty-item capture (`setup_packages=[""]`,
+empty-manager `language_installs`) not blanking a good config. The `dep_capture`
 schema contract — required fields, `language_installs` item shape, valid/invalid
-instance acceptance, JSON round-trip, and wiring checks (`WORKER_TYPES`
+instance acceptance, `minLength:1` on package/manager/command (empty-string
+rejection), JSON round-trip, and wiring checks (`WORKER_TYPES`
 exclusion, effort/model defaults) — is pinned in
 `tests/test_dep_capture_schema.py` (mirrors `test_pr_writer_schema.py`).
-The full model/effort resolution precedence for `dep_capture` (CLI >
-per-worker env > global CLI > global env > per-worker TOML > global TOML >
-`MODEL_DEFAULT`; effort: global CLI > global env > global TOML >
-`EFFORT_DEFAULT_PER_WORKER["dep_capture"]`; `MODEL_DEP_CAPTURE_ENV`
-constant; `dep_capture` absent from `MODEL_DEFAULT_PER_WORKER` but present
-in `EFFORT_DEFAULT_PER_WORKER` with value `"high"`) is pinned in
+The model/effort resolution precedence for `dep_capture` is pinned in
 `tests/test_resolve_dep_capture_model.py` (mirrors `test_resolve_models.py`
-and `test_resolve_efforts.py`).
+and `test_resolve_efforts.py`). `dep_capture`'s model override is
+**env-var-only** — no `--model-dep-capture` CLI flag and no `model_dep_capture`
+`leerie.toml` key (both were removed as dead slots); precedence is
+per-worker env (`LEERIE_MODEL_DEP_CAPTURE`) > global CLI > global env >
+global TOML > `MODEL_DEFAULT`. The file asserts a stray `args.dep_capture_model`
+and a `model_dep_capture` TOML key are **not** honored. Effort: global CLI >
+global env > global TOML > `EFFORT_DEFAULT_PER_WORKER["dep_capture"]`. It also
+pins the `MODEL_DEP_CAPTURE_ENV` constant, `dep_capture` absent from
+`MODEL_DEFAULT_PER_WORKER` (opus via the global `MODEL_DEFAULT` fallback), and
+present in `EFFORT_DEFAULT_PER_WORKER` with value `"high"`.
 The three orchestrator wiring seams that are only verifiable by source
 inspection are pinned in `tests/test_dep_capture_wiring.py` (mirrors
 `test_phase_finalize_capture_hook.py`'s `inspect.getsource` approach):

@@ -258,6 +258,45 @@ def test_dep_capture_schema_rejects_language_installs_item_missing_command(leeri
         )
 
 
+# --- empty-string rejection (minLength) ------------------------------------
+# Regression guard: an empty-string package/manager/command would render to ""
+# and, under `--recapture --force` (replace path), could blank a good config.
+# minLength:1 enforces "no empty names" at the schema layer (DESIGN §12).
+
+def test_dep_capture_schema_declares_minlength_on_string_fields(leerie):
+    """Structural pin (works without jsonschema): setup_packages items and the
+    language_installs manager/command carry minLength:1."""
+    schema = leerie.SCHEMAS["dep_capture"]
+    props = schema["properties"]
+    assert props["setup_packages"]["items"].get("minLength") == 1
+    li_item = props["language_installs"]["items"]["properties"]
+    assert li_item["manager"].get("minLength") == 1
+    assert li_item["command"].get("minLength") == 1
+
+
+def test_dep_capture_schema_rejects_empty_setup_package(leerie):
+    if not HAS_JSONSCHEMA:
+        pytest.skip("jsonschema not available; minLength check requires it")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {"setup_packages": [""], "language_installs": []},
+            leerie.SCHEMAS["dep_capture"],
+        )
+
+
+def test_dep_capture_schema_rejects_empty_manager(leerie):
+    if not HAS_JSONSCHEMA:
+        pytest.skip("jsonschema not available; minLength check requires it")
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(
+            {
+                "setup_packages": [],
+                "language_installs": [{"manager": "", "command": "pip install x"}],
+            },
+            leerie.SCHEMAS["dep_capture"],
+        )
+
+
 # --- round-trip and serialization -----------------------------------------
 
 def test_dep_capture_schema_is_json_serializable(leerie):

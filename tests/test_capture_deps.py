@@ -639,6 +639,71 @@ class TestCaptureRepoDeps:
         # pip already existed — the original command must not be replaced.
         assert "requirements.txt" in content
 
+    def test_replace_true_wholesale_overwrites(
+            self, leerie, tmp_path, monkeypatch):
+        """replace=True (the --recapture --force path) drops deps no longer
+        captured, for both setup_packages and language_installs."""
+        repo = tmp_path / "repo"
+        leerie_dir = repo / ".leerie"
+        leerie_dir.mkdir(parents=True)
+        cfg = leerie_dir / "config.toml"
+        stale_li = [{"manager": "cargo", "command": "cargo build",
+                     "copy_inputs": ["Cargo.toml"]}]
+        cfg.write_text(
+            'setup_packages = "postgresql stale-pkg"\n'
+            f'language_installs = "{json.dumps(stale_li, separators=(",", ":"))}"\n')
+
+        st = _make_fake_state(tmp_path, ["pip install -r requirements.txt"])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+        worker_result = {
+            "setup_packages": ["postgresql"],
+            "language_installs": [
+                {"manager": "pip", "command": "pip install -r requirements.txt",
+                 "copy_inputs": ["requirements.txt"]},
+            ],
+            "dockerfile_notes": None,
+        }
+        with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
+            asyncio.run(leerie.capture_repo_deps(
+                repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                replace=True,
+            ))
+
+        content = cfg.read_text()
+        assert "postgresql" in content
+        assert "stale-pkg" not in content, "replace=True must drop stale packages"
+        managers = {e["manager"]
+                    for e in json.loads(leerie._read_toml_key(cfg, "language_installs"))}
+        assert managers == {"pip"}, "replace=True must drop stale managers (cargo)"
+
+    def test_replace_true_empty_capture_leaves_existing(
+            self, leerie, tmp_path, monkeypatch):
+        """replace=True with an empty capture must not blank a good config."""
+        repo = tmp_path / "repo"
+        leerie_dir = repo / ".leerie"
+        leerie_dir.mkdir(parents=True)
+        cfg = leerie_dir / "config.toml"
+        cfg.write_text('setup_packages = "postgresql"\n')
+        mtime_before = cfg.stat().st_mtime
+
+        st = _make_fake_state(tmp_path, ["echo noop"])
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+        worker_result = {
+            "setup_packages": [], "language_installs": [], "dockerfile_notes": None,
+        }
+        with patch.object(leerie, "claude_p", new=AsyncMock(return_value=worker_result)):
+            asyncio.run(leerie.capture_repo_deps(
+                repo, st, caps=_FAKE_CAPS,
+                models=_FAKE_MODELS, efforts=_FAKE_EFFORTS,
+                replace=True,
+            ))
+
+        assert cfg.stat().st_mtime == mtime_before
+        assert "postgresql" in cfg.read_text()
+
 
 # ---------------------------------------------------------------------------
 # resolve_capture_deps — direct precedence test (env → .leerie/config.toml →

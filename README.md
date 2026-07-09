@@ -355,8 +355,8 @@ details and sub-flags.
 | `config` | Print the effective build/lint/test config for this repo, with `[config]` or `[inference]` provenance for each axis. Also shows `leerie.toml` operational knobs when present. |
 | `config --init` | Create `.leerie/config.toml` with auto-detected BLT commands (uncommented) and a commented `setup_packages` example. Errors if the file already exists. Prints the path and suggests `git add .leerie/`. |
 | `config --chat` | Open an interactive `claude` session with a config-generation system prompt and `--add-dir` pointing at the current repo. The model can read the repo and write `.leerie/config.toml` (and optionally `.leerie/Dockerfile`). |
-| `config --recapture` | Host-only (no container). Consolidates across **all** finished runs' logs (not just the newest) and writes merged `setup_packages` / language-dep installs to `.leerie/config.toml` via the dep_capture LLM worker. Never-clobber union: already-captured runs (sentinel present) are skipped. |
-| `config --recapture --force` | Same as `--recapture` but drops the sentinel on every target run so the worker re-fires unconditionally (wholesale replace). Use when you want to re-derive deps even for runs that were already captured. |
+| `config --recapture` | Host-only (no container). Consolidates across **all** finished runs' logs (not just the newest) and writes merged `setup_packages` / language-dep installs to `.leerie/config.toml` via the dep_capture LLM worker. Never-clobber union: already-captured runs (sentinel present) are skipped and only new packages/managers are added. |
+| `config --recapture --force` | Re-runs the worker over runs already captured (drops the `dep_capture.done` sentinel) **and** wholesale-replaces the persisted `setup_packages` / `language_installs` from the fresh capture — deps no longer captured are dropped. An empty capture leaves the existing config untouched (never blanks a good config). Use to re-derive deps from current run history. |
 
 **Lifecycle (remote mode):**
 
@@ -418,7 +418,7 @@ details and sub-flags.
 | `LEERIE_SKIP_BUDGET_CHECK` | `skip_budget_check` | Skip the post-schedule budget-feasibility preflight (truthy → skip). Overridden by `--skip-budget-check`. Unset → default `false`. |
 | `LEERIE_PR_TEMPLATE` | `pr_template` | PR template basename for repos with multiple templates. Overridden by `--pr-template`. Unset → alphabetically first `.md`. |
 | `LEERIE_MODEL_PR_WRITER` | `model_pr_writer` | Model alias for the finalize-time PR writer. Overridden by `--pr-writer-model`. Unset → default `sonnet`. |
-| `LEERIE_MODEL_DEP_CAPTURE` | `model_dep_capture` | Model alias for the finalize-time dep_capture worker. No per-worker CLI flag (unlike `pr_writer`); controlled via env var and `leerie.toml` key only. Unset → default `opus`. |
+| `LEERIE_MODEL_DEP_CAPTURE` | *(none)* | Model alias for the finalize-time dep_capture worker. Env var only — no per-worker CLI flag and no `leerie.toml` key (it still honors the global `model` key / `--model`). Unset → default `opus`. |
 | `LEERIE_CAPTURE_DEPS` | `capture_deps` (`.leerie/config.toml` only — not `leerie.toml`) | Enable finalize-time dependency capture (truthy → on). Precedence: `LEERIE_CAPTURE_DEPS` > `.leerie/config.toml` > default `true`. Set to `false` / `0` to disable entirely. |
 | `LEERIE_BAKE_LANGUAGE_DEPS` | `bake_language_deps` | Include a language-dep `COPY`+`RUN` layer in the auto-generated `.leerie/Dockerfile` (truthy → on). Precedence: `LEERIE_BAKE_LANGUAGE_DEPS` > `leerie.toml` > `.leerie/config.toml` > default `true`. Set to `false` for an apt-only bake. |
 | `LEERIE_WORKER_DEBUG` | — | Enable debug-level logging injection (`DEBUG=*`, `ANTHROPIC_LOG=debug`) into worker processes. Truthy → on. |

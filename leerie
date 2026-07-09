@@ -849,8 +849,11 @@ TOML
         # setup_packages in .leerie/config.toml.  Uses the same orchestrator-side
         # python functions as finalize-time capture (Stage 4), called via a
         # host-side python3 seam.  Host-only — no nerdctl invoked.
-        # With --force: wholesale replace (bake_language_deps unaffected).
-        # Without --force: never-clobber union (only new packages appended).
+        # With --force: re-run the worker over runs already captured (clears the
+        #   dep_capture.done sentinel) AND wholesale-replace the persisted
+        #   setup_packages + language_installs from the fresh capture (drops deps
+        #   no longer captured; an empty capture leaves the existing config).
+        # Without --force: never-clobber union (only new packages/managers added).
         shift  # consume --recapture; next arg may be --force
         _recapture_force=false
         if [ "${1:-}" = "--force" ]; then

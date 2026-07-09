@@ -160,9 +160,13 @@ claims a state directory. Four sub-modes:
   across **all** finished runs with `logs/` under the state dir (not just the
   newest — each run's commands inform the dep decision). With an explicit
   `--run-id`, only that run is targeted. Without `--force`, runs that already
-  have a `dep_capture.done` sentinel are skipped (never-clobber union);
-  `--force` drops the sentinel on each target run so the worker re-fires
-  unconditionally. Each run's `State` is flocked (skipped, not fatal, on
+  have a `dep_capture.done` sentinel are skipped and the write is a never-clobber
+  **union** (only new packages/managers added). `--force` drops the sentinel on
+  each target run so the worker re-fires unconditionally **and** switches the
+  write to a wholesale **replace** (`capture_repo_deps(replace=True)`) — the
+  fresh capture is authoritative and deps no longer captured are dropped; an
+  empty capture leaves the existing config untouched. Each run's `State` is
+  flocked (skipped, not fatal, on
   `StateLockedError`). Exits 1 if no runs directory or no finished run found.
   The seam `exec_module()`s `orchestrator/leerie.py` on the **host**, whose
   `python3` is not guaranteed to have `requirements.txt` deps (§0), so the
@@ -2011,7 +2015,9 @@ pr_writer) — default to Sonnet.
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
 overrides it for specific workers (`implementer`, `conformer`, `judge`,
-`heal`, and `pr_writer` all default to `sonnet`; `dep_capture` defaults to `opus`).
+`heal`, `pr_writer`, and `satisfied_probe` all default to `sonnet`).
+`dep_capture` is **absent** from `MODEL_DEFAULT_PER_WORKER` — its `opus` default
+comes from the global `MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2041,14 +2047,14 @@ Thirteen worker types (plus the global override), each independently overridable
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
 | pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
-| dep_capture        | `LEERIE_MODEL_DEP_CAPTURE`      | *(none)*                     | `model_dep_capture`       |
+| dep_capture        | `LEERIE_MODEL_DEP_CAPTURE`      | *(none)*                     | *(none)*                  |
 
 Note: `judge`, `heal`, `pr_writer`, and `dep_capture` do not follow the
 `--model-<W>` CLI flag pattern used by orchestrator workers, because they
 are post-run / finalize-time workers invoked outside the main orchestrate loop.
-`judge`, `heal`, and `pr_writer` have dedicated CLI flags; `dep_capture` has no
-dedicated CLI flag and supports env-var (`LEERIE_MODEL_DEP_CAPTURE`) and TOML
-key (`model_dep_capture`) overrides only. All four still honor the global
+`judge`, `heal`, and `pr_writer` have dedicated CLI flags; `dep_capture` has
+**neither a CLI flag nor a `leerie.toml` key** — it supports the env-var
+`LEERIE_MODEL_DEP_CAPTURE` override only. All four still honor the global
 `--model` / `LEERIE_MODEL` override.
 
 An invalid value in env or file is rejected at startup via `die()`. CLI
@@ -3929,17 +3935,20 @@ surface lives in `orchestrator/leerie.py`.
 |---------------------|-------------------|------|
 | `_DEPCAP_TOTAL_BUDGET` | `307200` (bytes) | Byte ceiling for the commands text fed to the dep_capture worker (~300 KB ≈ 75k tokens). Mirrors the `gather_provision_fixtures` add_bytes/hit_ceiling idiom. |
 | `_extract_depcap_commands` | `(log_dir: Path) -> tuple[str, bool]` | Iterates `sorted(log_dir.glob("*.log"), reverse=True)` (newest-first); calls `_iter_log_tool_use` on each; collects distinct `command` values from `kind == "Bash"` tool-use blocks into an insertion-order dict. Then admits commands under `_DEPCAP_TOTAL_BUDGET` bytes (separator `\n---\n`). Returns `(commands_text, hit_ceiling)`. |
-| `_merge_setup_packages` | `(existing: str, captured: list[str]) -> str \| None` | Parses `existing` (space- or comma-separated, per DESIGN §6½); takes the union with `captured`; returns the merged string only if it grew (else `None` → no write). Preserves user-narrowed lists: only genuinely-new packages are appended; nothing is removed. |
+| `_normalize_setup_packages` | `(pkgs: list[str]) -> str` | Renders a package list in the canonical persisted form: order-preserving dedup, space-joined. Shared by `_merge_setup_packages` (union) and the `replace` path so both emit byte-identical TOML values. |
+| `_merge_setup_packages` | `(existing: str, captured: list[str]) -> str \| None` | Parses `existing` (space- or comma-separated, per DESIGN §6½); takes the union with `captured`; returns the merged string (via `_normalize_setup_packages`) only if it grew (else `None` → no write). Preserves user-narrowed lists: only genuinely-new packages are appended; nothing is removed. |
 | `_write_config_toml_keys` | `(cfg_path: Path, updates: dict[str, str]) -> None` | Minimal deterministic TOML upsert. Creates the file with a leerie header (matching the launcher's `config --init` heredoc tone) if absent; otherwise replaces the first *uncommented* `key =` line for each key, or appends if absent. Never touches commented lines. Writes via temp-file + `os.replace()` (State.save atomicity discipline). |
-| `capture_repo_deps` | `async (repo_root: Path, st: State, caps: dict \| None, models: dict[str, str] \| None, efforts: dict[str, str \| None] \| None) -> None` | Main entry point. Guards: `resolve_capture_deps`, caps/models/efforts availability, `log_dir` existence, committed `.leerie/Dockerfile` skip. Calls `_extract_depcap_commands` to build the command corpus; if empty, returns. Checks worker budget; invokes `claude_p(schema_key='dep_capture', ...)` with `load_prompt("dep_capture")`. Writes `setup_packages` (via `_merge_setup_packages`, never-clobber) and `language_installs` (new managers only, keyed by `manager` field, never-clobber) to `.leerie/config.toml` via `_write_config_toml_keys`. Entire function body wrapped in `try/except Exception` — any error is logged and swallowed (non-fatal). |
+| `capture_repo_deps` | `async (repo_root: Path, st: State, caps: dict \| None, models: dict[str, str] \| None, efforts: dict[str, str \| None] \| None, replace: bool = False) -> None` | Main entry point. Guards: `resolve_capture_deps`, caps/models/efforts availability, `log_dir` existence, committed `.leerie/Dockerfile` skip. Calls `_extract_depcap_commands` to build the command corpus; if empty, returns. Checks worker budget; invokes `claude_p(schema_key='dep_capture', ...)` with `load_prompt("dep_capture")`. **`replace=False` (default, every automatic seam):** writes `setup_packages` (via `_merge_setup_packages`, never-clobber) and `language_installs` (new managers only, keyed by `manager` field, never-clobber) to `.leerie/config.toml`. **`replace=True` (only the operator-driven `--recapture --force` path):** wholesale-replaces both keys from the fresh capture (drops deps no longer captured); an empty capture leaves the existing config untouched. Writes via `_write_config_toml_keys`. Non-fatality is enforced at each call site's `try/except`, not inside the function. |
 | `resolve_capture_deps` | `(repo_root: Path) -> bool` | env `LEERIE_CAPTURE_DEPS` > `.leerie/config.toml` `capture_deps` key; default `True`. No CLI flag and no `leerie.toml` tier (env → config → default only). |
 
 #### dep_capture worker
 
 `dep_capture` is a non-WORKER_TYPES worker (like `pr_writer`) registered in
-`SCHEMAS`, `_allowed_schema_keys`, `MODEL_DEFAULT_PER_WORKER` (opus),
-`EFFORT_DEFAULT_PER_WORKER` (high), and `resolve_models`/`resolve_efforts`.
-Its env-override constant is `MODEL_DEP_CAPTURE_ENV = "LEERIE_MODEL_DEP_CAPTURE"`.
+`SCHEMAS`, `_allowed_schema_keys`, `EFFORT_DEFAULT_PER_WORKER` (high), and
+`resolve_models`/`resolve_efforts`. It is **absent** from
+`MODEL_DEFAULT_PER_WORKER`; its `opus` default comes from the global
+`MODEL_DEFAULT` fallback. Its model override is env-var-only (no CLI flag, no
+`leerie.toml` key): `MODEL_DEP_CAPTURE_ENV = "LEERIE_MODEL_DEP_CAPTURE"`.
 System prompt is `prompts/dep_capture.md`. Output schema:
 
 ```json
@@ -3951,6 +3960,12 @@ System prompt is `prompts/dep_capture.md`. Output schema:
   "dockerfile_notes": "string | null"
 }
 ```
+
+`setup_packages` items and each `language_installs` `manager`/`command` carry
+`minLength: 1` (mirrors `pr_writer`): a schema-valid empty-item capture would
+render to `""` and, under `--recapture --force` (replace path), blank the
+persisted config. The schema is the enforcement layer (DESIGN §12); the replace
+path additionally gates the write on the rendered value being non-empty.
 
 #### Capture trigger seams
 
@@ -3981,9 +3996,11 @@ System prompt is `prompts/dep_capture.md`. Output schema:
      When `run_id` is given, targets that run only; otherwise consolidates
      across **all** finished runs with `logs/` (newest-first). Each target
      run's `State` is flocked (skipped on `StateLockedError`); with
-     `force=True` the sentinel is dropped before capture. Exits 1 if no
-     runs directory or no finished run found; per-run errors are logged and
-     skipped (non-fatal for multi-run consolidation).
+     `force=True` the sentinel is dropped before capture **and**
+     `capture_repo_deps(replace=True)` wholesale-replaces the persisted deps
+     (vs. the default never-clobber union). Exits 1 if no runs directory or no
+     finished run found; per-run errors are logged and skipped (non-fatal for
+     multi-run consolidation).
    - **`_backstop_capture_prior_runs(leerie_root, repo_root, caps, models,
      efforts)`**: called at run-start (in `_run_phases`, before
      `phase_classify`) to cover SIGKILL / crash cases where the cancel arm

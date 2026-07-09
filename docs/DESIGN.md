@@ -2500,6 +2500,16 @@ differs, the decision-maker does not:
   flocks its `State` (refusing to race a live orchestrator via
   `StateLockedError`), and runs the worker via `asyncio.run`.
 
+**Union by default; replace only on `--recapture --force`.** Every automatic
+seam — finalize, cancel, backstop — writes as a never-clobber *union* so a
+capture can only ever add packages/managers, never remove one the operator
+narrowed by hand. The single deliberate exception is the operator-driven
+`leerie config --recapture --force`, which wholesale-*replaces* the persisted
+`setup_packages` + `language_installs` from the fresh capture (dropping deps no
+longer captured) — an explicit "rebuild the dep set from current history"
+gesture. Even under `--force`, an empty capture leaves the existing config
+untouched, so a bad run can never blank a good config.
+
 **Idempotency.** After a successful write, `capture_repo_deps` writes a
 lightweight `<run_dir>/dep_capture.done` sentinel file and sets
 `dep_capture_done = True` in `state.json`. The run-start backstop skips

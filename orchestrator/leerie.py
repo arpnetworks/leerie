@@ -1327,8 +1327,12 @@ SCHEMAS: dict[str, dict] = {
         "properties": {
             "setup_packages": {
                 # apt packages for the warm apt layer in .leerie/Dockerfile.
+                # minLength enforces "no empty package names" at the schema layer
+                # (DESIGN §12: guarantees that can be checked mechanically live in
+                # code) so an empty-item capture can't render to "" and blank the
+                # persisted config.
                 "type": "array",
-                "items": {"type": "string"},
+                "items": {"type": "string", "minLength": 1},
             },
             "language_installs": {
                 # Per-manager install commands the Dockerfile bakes in via
@@ -1341,8 +1345,8 @@ SCHEMAS: dict[str, dict] = {
                     "type": "object",
                     "required": ["manager", "command"],
                     "properties": {
-                        "manager": {"type": "string"},
-                        "command": {"type": "string"},
+                        "manager": {"type": "string", "minLength": 1},
+                        "command": {"type": "string", "minLength": 1},
                         "copy_inputs": {
                             "type": "array",
                             "items": {"type": "string"},
@@ -3616,14 +3620,14 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
                            or pr_writer_file or global_file
                            or MODEL_DEFAULT_PER_WORKER.get(
                                "pr_writer", MODEL_DEFAULT))
-    dep_capture_cli = getattr(args, "dep_capture_model", None)
+    # dep_capture is env-var-only (no CLI flag, no leerie.toml key) — it is a
+    # post-run worker with no argparse registration. Its opus default comes from
+    # the global MODEL_DEFAULT fallback (it is intentionally absent from
+    # MODEL_DEFAULT_PER_WORKER).
     dep_capture_env = from_env(MODEL_DEP_CAPTURE_ENV)
-    dep_capture_file = from_file("model_dep_capture")
-    models["dep_capture"] = (dep_capture_cli or dep_capture_env
-                             or global_cli or global_env
-                             or dep_capture_file or global_file
-                             or MODEL_DEFAULT_PER_WORKER.get(
-                                 "dep_capture", MODEL_DEFAULT))
+    models["dep_capture"] = (dep_capture_env
+                             or global_cli or global_env or global_file
+                             or MODEL_DEFAULT)
     return models
 
 
@@ -5335,6 +5339,13 @@ _INSTALL_CMD_HINT_RE = re.compile(
 _DEPCAP_TOTAL_BUDGET = 307200  # 300KB ≈ 75k tokens at 4 bytes/token
 
 
+def _normalize_setup_packages(pkgs: list[str]) -> str:
+    """Render a package list in the canonical persisted form: order-preserving
+    dedup, space-joined. Shared by _merge_setup_packages (union) and the
+    replace path so both emit byte-identical TOML values."""
+    return " ".join(dict.fromkeys(p for p in pkgs if p))
+
+
 def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
     """Union existing setup_packages with newly-captured packages.
 
@@ -5352,7 +5363,7 @@ def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
         return None
     merged = list(existing_set) + new_pkgs
     # Deduplicate while preserving order (existing_set already dedups existing).
-    return " ".join(merged)
+    return _normalize_setup_packages(merged)
 
 
 def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
@@ -5452,8 +5463,17 @@ async def capture_repo_deps(
         caps: dict | None = None,
         models: dict[str, str] | None = None,
         efforts: dict[str, str | None] | None = None,
+        replace: bool = False,
 ) -> None:
-    """Invoke the dep_capture LLM worker and write deps to .leerie/config.toml (non-fatal)."""
+    """Invoke the dep_capture LLM worker and write deps to .leerie/config.toml (non-fatal).
+
+    replace=False (default, every automatic seam): union / never-clobber —
+    only new packages/managers are added, existing entries are preserved.
+    replace=True (only the operator-driven `--recapture --force` path):
+    wholesale-replace the persisted setup_packages + language_installs from the
+    fresh capture. A capture that yields nothing under replace leaves the
+    existing values untouched (never blanks a good config with an empty run).
+    """
     if not resolve_capture_deps(repo_root):
         return
     if caps is None or models is None or efforts is None:
@@ -5523,30 +5543,52 @@ async def capture_repo_deps(
     cfg_path = repo_root / ".leerie" / "config.toml"
     updates: dict[str, str] = {}
     if setup_packages:
-        existing = _read_toml_key(cfg_path, "setup_packages") or ""
-        merged = _merge_setup_packages(existing, setup_packages)
-        if merged is not None:
-            updates["setup_packages"] = merged
+        if replace:
+            # Wholesale replace: drop packages no longer captured. Gate on the
+            # *rendered* value, not list truthiness — a schema-valid empty-item
+            # capture ([""]) is a truthy list but renders to "", which would
+            # blank a good config. Only write a non-empty value.
+            norm = _normalize_setup_packages(setup_packages)
+            if norm:
+                updates["setup_packages"] = norm
+        else:
+            existing = _read_toml_key(cfg_path, "setup_packages") or ""
+            merged = _merge_setup_packages(existing, setup_packages)
+            if merged is not None:
+                updates["setup_packages"] = merged
     if language_installs:
         # JSON-in-TOML because TOML has no inline array type compatible with
         # the flat _read_toml_key/_write_config_toml_keys surface.
-        existing_raw = _read_toml_key(cfg_path, "language_installs") or ""
-        try:
-            existing_list: list[dict] = json.loads(existing_raw) if existing_raw else []
-        except (json.JSONDecodeError, ValueError):
-            existing_list = []
-        existing_managers = {e.get("manager") for e in existing_list if e.get("manager")}
-        new_entries = [e for e in language_installs
-                       if e.get("manager") and e["manager"] not in existing_managers]
-        if new_entries:
-            merged_list = existing_list + new_entries
-            updates["language_installs"] = json.dumps(merged_list, separators=(",", ":"))
+        if replace:
+            # Wholesale replace: the fresh capture is authoritative — drop
+            # managers no longer present. Filter empty-manager junk (mirrors the
+            # union path below) and gate on the filtered list being non-empty so
+            # an empty-item capture never blanks a good config.
+            kept = [e for e in language_installs if e.get("manager")]
+            if kept:
+                updates["language_installs"] = json.dumps(
+                    kept, separators=(",", ":"))
+        else:
+            existing_raw = _read_toml_key(cfg_path, "language_installs") or ""
+            try:
+                existing_list: list[dict] = json.loads(existing_raw) if existing_raw else []
+            except (json.JSONDecodeError, ValueError):
+                existing_list = []
+            existing_managers = {e.get("manager") for e in existing_list if e.get("manager")}
+            new_entries = [e for e in language_installs
+                           if e.get("manager") and e["manager"] not in existing_managers]
+            if new_entries:
+                merged_list = existing_list + new_entries
+                updates["language_installs"] = json.dumps(merged_list, separators=(",", ":"))
     if updates:
         _write_config_toml_keys(cfg_path, updates)
         pkg_note = f" setup_packages={updates['setup_packages']!r}" if "setup_packages" in updates else ""
         li_note = f" language_installs({len(language_installs)} entries)" if "language_installs" in updates else ""
         log(f"capture: dep_capture wrote{pkg_note}{li_note} to {cfg_path}; "
             "run `git add .leerie/ && git commit` to bake next run")
+    elif replace:
+        # Under --force, an empty capture must not blank a good config.
+        log("capture: dep_capture captured no deps — leaving existing config unchanged")
     else:
         log("capture: dep_capture found no new deps to write")
     # Write idempotency sentinel. Both a state field (for in-run readers)
@@ -5616,7 +5658,6 @@ def run_recapture_deps(
     # TOML but have no CLI overrides (this is a host-side non-interactive call).
     class _MinimalArgs:
         model = None
-        dep_capture_model = None
         pr_writer_model = None
         effort = None
 
@@ -5679,6 +5720,7 @@ def run_recapture_deps(
             asyncio.run(capture_repo_deps(
                 repo_root, target_st,
                 caps=caps, models=models, efforts=efforts,
+                replace=force,
             ))
             ran_any = True
         except Exception as exc:

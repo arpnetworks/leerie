@@ -1,18 +1,13 @@
 """Tests for dep_capture model and effort resolution.
 
-dep_capture is a post-run skill worker (like pr_writer) — not in WORKER_TYPES.
-Model precedence (highest first):
-  1. --model-dep-capture CLI flag  (args.dep_capture_model)
-  2. LEERIE_MODEL_DEP_CAPTURE env var
-  3. --model CLI flag (global)
-  4. LEERIE_MODEL env var (global)
-  5. model_dep_capture in leerie.toml
-  6. model in leerie.toml (global)
-  7. MODEL_DEFAULT ("opus") — dep_capture is absent from MODEL_DEFAULT_PER_WORKER
-
-Note: unlike WORKER_TYPES workers (where global CLI > per-worker env), post-run
-skill workers use per-worker env > global CLI (see resolve_models() source). This
-matches the pr_writer resolution chain.
+dep_capture is a post-run skill worker — not in WORKER_TYPES. Its model override
+is env-var-only: there is NO --model-dep-capture CLI flag and NO model_dep_capture
+leerie.toml key (both were removed as dead slots). Model precedence (highest first):
+  1. LEERIE_MODEL_DEP_CAPTURE env var
+  2. --model CLI flag (global)
+  3. LEERIE_MODEL env var (global)
+  4. model in leerie.toml (global)
+  5. MODEL_DEFAULT ("opus") — dep_capture is absent from MODEL_DEFAULT_PER_WORKER
 
 Effort precedence (highest first):
   1. --effort CLI flag (global — no per-worker effort flag for dep_capture)
@@ -20,8 +15,7 @@ Effort precedence (highest first):
   3. effort in leerie.toml (global)
   4. EFFORT_DEFAULT_PER_WORKER["dep_capture"] ("high")
 
-Mirrors test_resolve_models.py / test_resolve_efforts.py fixture patterns and
-tests the pr_writer-style dedicated-flag/env/toml plumbing for dep_capture.
+Mirrors test_resolve_models.py / test_resolve_efforts.py fixture patterns.
 """
 from __future__ import annotations
 
@@ -38,12 +32,12 @@ _WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
 
 def ns(**overrides):
     """Build an argparse.Namespace matching resolve_models / resolve_efforts
-    expectations: global `model`/`effort`, per-worker `model_<w>`/`effort_<w>`
-    for WORKER_TYPES, and the dep_capture-specific `dep_capture_model`."""
+    expectations: global `model`/`effort` and per-worker `model_<w>`/`effort_<w>`
+    for WORKER_TYPES. Deliberately has NO `dep_capture_model` attribute —
+    dep_capture's model override is env-var-only (the CLI slot was removed)."""
     base: dict = {
         "model": None,
         "effort": None,
-        "dep_capture_model": None,
         **{f"model_{w}": None for w in _WORKER_TYPES},
         **{f"effort_{w}": None for w in _WORKER_TYPES},
     }
@@ -78,24 +72,7 @@ def test_dep_capture_model_default_is_opus(leerie, repo_root):
 
 
 # ---------------------------------------------------------------------------
-# Model — per-worker CLI override (highest priority)
-# ---------------------------------------------------------------------------
-
-def test_dep_capture_model_cli_beats_env_and_toml(leerie, repo_root, monkeypatch):
-    (repo_root / "leerie.toml").write_text("model_dep_capture = haiku\n")
-    monkeypatch.setenv("LEERIE_MODEL_DEP_CAPTURE", "haiku")
-    models = leerie.resolve_models(repo_root, ns(dep_capture_model="sonnet"))
-    assert models["dep_capture"] == "sonnet"
-
-
-def test_dep_capture_model_cli_beats_global_cli(leerie, repo_root):
-    models = leerie.resolve_models(
-        repo_root, ns(model="haiku", dep_capture_model="sonnet"))
-    assert models["dep_capture"] == "sonnet"
-
-
-# ---------------------------------------------------------------------------
-# Model — per-worker env var (second priority, after per-worker CLI)
+# Model — per-worker env var (highest priority)
 # ---------------------------------------------------------------------------
 
 def test_dep_capture_model_env_beats_global_env(leerie, repo_root, monkeypatch):
@@ -105,15 +82,23 @@ def test_dep_capture_model_env_beats_global_env(leerie, repo_root, monkeypatch):
     assert models["dep_capture"] == "sonnet"
 
 
-def test_dep_capture_model_env_beats_toml(leerie, repo_root, monkeypatch):
-    (repo_root / "leerie.toml").write_text("model_dep_capture = haiku\n")
+def test_dep_capture_model_env_beats_global_toml(leerie, repo_root, monkeypatch):
+    (repo_root / "leerie.toml").write_text("model = haiku\n")
     monkeypatch.setenv("LEERIE_MODEL_DEP_CAPTURE", "sonnet")
     models = leerie.resolve_models(repo_root, ns())
     assert models["dep_capture"] == "sonnet"
 
 
+def test_dep_capture_model_env_beats_global_cli(leerie, repo_root, monkeypatch):
+    """dep_capture's per-worker env var outranks even the global --model flag
+    (post-run skill workers rank per-worker env above global CLI)."""
+    monkeypatch.setenv("LEERIE_MODEL_DEP_CAPTURE", "haiku")
+    models = leerie.resolve_models(repo_root, ns(model="sonnet"))
+    assert models["dep_capture"] == "haiku"
+
+
 # ---------------------------------------------------------------------------
-# Model — global CLI (third priority after per-worker CLI/env)
+# Model — global CLI (top override once per-worker env is unset)
 # ---------------------------------------------------------------------------
 
 def test_dep_capture_model_global_cli_beats_global_env(leerie, repo_root, monkeypatch):
@@ -123,15 +108,8 @@ def test_dep_capture_model_global_cli_beats_global_env(leerie, repo_root, monkey
 
 
 # ---------------------------------------------------------------------------
-# Model — per-worker TOML (below all env/CLI)
+# Model — global TOML (below all env/CLI)
 # ---------------------------------------------------------------------------
-
-def test_dep_capture_model_toml_key_beats_global_toml(leerie, repo_root):
-    (repo_root / "leerie.toml").write_text(
-        "model = haiku\nmodel_dep_capture = sonnet\n")
-    models = leerie.resolve_models(repo_root, ns())
-    assert models["dep_capture"] == "sonnet"
-
 
 def test_dep_capture_model_global_toml_beats_default(leerie, repo_root):
     (repo_root / "leerie.toml").write_text("model = haiku\n")
@@ -140,45 +118,54 @@ def test_dep_capture_model_global_toml_beats_default(leerie, repo_root):
 
 
 # ---------------------------------------------------------------------------
+# Model — env-var-only: no CLI flag, no per-worker TOML key
+# ---------------------------------------------------------------------------
+
+def test_dep_capture_model_no_cli_flag(leerie, repo_root):
+    """There is no --model-dep-capture flag: a stray args.dep_capture_model
+    attribute must NOT influence resolution (the dead CLI slot was removed)."""
+    models = leerie.resolve_models(
+        repo_root, ns(dep_capture_model="sonnet"))
+    assert models["dep_capture"] == "opus"  # falls through to MODEL_DEFAULT
+
+
+def test_dep_capture_model_no_toml_key(leerie, repo_root):
+    """A model_dep_capture key in leerie.toml is NOT honored (dead TOML slot
+    removed) — only the global `model` key applies to dep_capture."""
+    (repo_root / "leerie.toml").write_text("model_dep_capture = sonnet\n")
+    models = leerie.resolve_models(repo_root, ns())
+    assert models["dep_capture"] == "opus"  # model_dep_capture ignored
+
+
+# ---------------------------------------------------------------------------
 # Model — full precedence walkthrough
 # ---------------------------------------------------------------------------
 
 def test_dep_capture_model_full_precedence(leerie, repo_root, monkeypatch):
-    """Exercise each rung of the precedence chain in order.
-
-    Post-run skill workers use: per-worker CLI > per-worker env > global CLI
-    > global env > per-worker TOML > global TOML > MODEL_DEFAULT. The
-    per-worker env slot (rung 2) ranks above global CLI (rung 3) — different
-    from WORKER_TYPES workers but consistent with pr_writer."""
+    """Exercise each rung of the env-var-only precedence chain in order:
+    per-worker env > global CLI > global env > global TOML > MODEL_DEFAULT.
+    The per-worker env slot (rung 1) ranks above global CLI (rung 2)."""
     cfg = repo_root / "leerie.toml"
 
-    # rung 7: MODEL_DEFAULT ("opus") — no overrides
+    # rung 5: MODEL_DEFAULT ("opus") — no overrides
     assert leerie.resolve_models(repo_root, ns())["dep_capture"] == "opus"
 
-    # rung 6: global TOML beats default
+    # rung 4: global TOML beats default
     cfg.write_text("model = haiku\n")
     assert leerie.resolve_models(repo_root, ns())["dep_capture"] == "haiku"
 
-    # rung 5: per-worker TOML beats global TOML
-    cfg.write_text("model = haiku\nmodel_dep_capture = sonnet\n")
-    assert leerie.resolve_models(repo_root, ns())["dep_capture"] == "sonnet"
-
-    # rung 4: global env beats TOML rungs
+    # rung 3: global env beats TOML
     monkeypatch.setenv("LEERIE_MODEL", "opus")
     assert leerie.resolve_models(repo_root, ns())["dep_capture"] == "opus"
 
-    # rung 3: global CLI beats global env (per-worker env still unset)
+    # rung 2: global CLI beats global env (per-worker env still unset)
     assert leerie.resolve_models(
         repo_root, ns(model="sonnet"))["dep_capture"] == "sonnet"
 
-    # rung 2: per-worker env beats global CLI
+    # rung 1: per-worker env beats global CLI
     monkeypatch.setenv("LEERIE_MODEL_DEP_CAPTURE", "haiku")
     assert leerie.resolve_models(
         repo_root, ns(model="sonnet"))["dep_capture"] == "haiku"
-
-    # rung 1: per-worker CLI beats per-worker env
-    assert leerie.resolve_models(
-        repo_root, ns(model="sonnet", dep_capture_model="opus"))["dep_capture"] == "opus"
 
 
 # ---------------------------------------------------------------------------
