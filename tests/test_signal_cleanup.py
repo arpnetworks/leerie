@@ -360,8 +360,12 @@ def test_main_rate_limit_sleep_catches_keyboard_interrupt():
         "time.sleep so Ctrl-C during the auto-resume wait produces the "
         "'state preserved' message rather than a silent exit.")
     assert "os.execv" in helper, "_sleep_then_reexec must re-exec --resume"
-    # The RateLimitedExit arm routes through the helper and maps a True
-    # return (Ctrl-C) to exit 130.
+    assert "InterruptedBySignal" in helper, (
+        "_sleep_then_reexec must also catch InterruptedBySignal (SIGTERM/"
+        "SIGHUP) around time.sleep so it maps to 128+signum rather than "
+        "escaping as a bare traceback.")
+    # The RateLimitedExit arm routes through the helper and adopts its returned
+    # exit code (130 SIGINT / 143 SIGTERM / 75 execv-fail) via `exit_code = rc`.
     body = _main_body()
     m = re.search(
         r"\n    except RateLimitedExit[^:]*:(.*?)(?=\n    except |\n    finally:)",
@@ -370,7 +374,7 @@ def test_main_rate_limit_sleep_catches_keyboard_interrupt():
     assert m, "could not locate except RateLimitedExit block in main()"
     block = m.group(1)
     assert "_sleep_then_reexec(st, wait_seconds, reason)" in block
-    assert "exit_code = 130" in block
+    assert "exit_code = rc" in block
 
 
 def test_main_interrupted_by_signal_no_full_purge():

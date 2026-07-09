@@ -1812,7 +1812,7 @@ finishes, not when the orchestrator finishes. The reclassified table:
 |---|---|---|
 | `0` | tail saw orchestrator exit cleanly (or could not read exit code) | destroy after stream-back |
 | `EXIT_NEEDS_ANSWERS=10` | clarification (plugin re-runs) | destroy (nothing to inspect) |
-| `75` (EX_TEMPFAIL) | rate-limit, parse-fail | destroy (state in run branch; cheaper to re-provision) |
+| `75` (EX_TEMPFAIL) | single-owner-per-run-dir refusal (`EXIT_LOCKED`) or a genuine EX_TEMPFAIL worker surface. NOTE: rate-limit / out-of-credits / parse-fail no longer exit 75 — they auto-resume in-process (see *Rate-limited → auto-resume*). | destroy (state in run branch; cheaper to re-provision) |
 | `130` / `143` | host-side SIGINT / SIGTERM | **detach: leave machine alone, print reattach hints** |
 | any other non-zero | worker/orchestrator failure (`die()`, etc.) | **pause: stop machine, write sidecar, notify** |
 

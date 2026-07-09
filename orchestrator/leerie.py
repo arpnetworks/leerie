@@ -2042,19 +2042,34 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     await run_proc(["git", "worktree", "prune"])
 
 
-def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> bool:
+def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
     """Shared tail of the rate-limit auto-resume path (DESIGN §6 *Rate-limited
     → auto-resume*): worktree-only cleanup (state + run branch preserved),
     sleep `wait_seconds`, then `os.execv` the orchestrator into a fresh
-    `--resume` process. Returns True if the user Ctrl-C'd during the sleep (the
-    caller sets exit 130 and returns through normal flow); otherwise it does not
-    return — `os.execv` replaces the process.
+    `--resume` process.
 
-    Cleanup runs BEFORE the sleep so (a) the wake time reflects post-cleanup
-    reality and (b) the re-exec'd `--resume` finds a clean slate —
-    `_cleanup_on_abnormal_exit` removes every worktree (git-registered AND
-    orphaned dirs, then `git worktree prune`), so `setup-run.sh`'s staging
-    worktree re-creation can't hit a stale-dir conflict.
+    Returns None when it does not return (the `os.execv` succeeded and replaced
+    the process — unreachable code after it). Returns an **exit code** when the
+    sleep or re-exec was interrupted/failed instead of resuming, so the caller
+    sets `exit_code` and returns through main()'s normal flow:
+      - Ctrl-C (SIGINT) during the sleep → 130
+      - SIGTERM/SIGHUP during the sleep → 128 + signum (143 / 129)
+      - `os.execv` itself failed (should-never-happen; e.g. ENOENT on the
+        interpreter) → 75 (EX_TEMPFAIL) — state is preserved, so a manual
+        `--resume` recovers.
+    In every interrupted/failed case cleanup has already run, so state and the
+    run branch are intact for a manual `--resume`; the caller must NOT re-run
+    cleanup (it leaves `abnormal=False`).
+
+    Cleanup runs BEFORE the sleep so the re-exec'd `--resume` finds a clean
+    slate — `_cleanup_on_abnormal_exit` removes every worktree (git-registered
+    AND orphaned dirs, then `git worktree prune`), so `setup-run.sh`'s staging
+    worktree re-creation can't hit a stale-dir conflict. A consequence: the
+    sleep is measured from AFTER cleanup, so for a parsed reset time the wait
+    under-counts by the cleanup duration. That is harmless and self-correcting:
+    if it wakes early the re-exec'd run immediately re-hits `RateLimitedExit`,
+    re-computes the (now-shorter) wait, and sleeps again — bounded by the
+    persisted `max_total_workers` budget.
 
     We re-exec the orchestrator, not the launcher: the launcher is not baked
     into the container image and would try to spawn a new container. Re-execing
@@ -2074,12 +2089,30 @@ def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> bool:
         # ran above), so a manual --resume picks up cleanly.
         log("interrupted by user (SIGINT) during rate-limit sleep — state "
             f"preserved (resume with leerie --resume {st.run_id})")
-        return True
+        return 130
+    except InterruptedBySignal as e:
+        # SIGTERM/SIGHUP during the wait (CI cancel, systemd stop, terminal
+        # close). Same preserved-state guarantee; map to 128+signum the way
+        # main()'s top-level InterruptedBySignal arm does, instead of letting it
+        # escape uncaught (a sibling except can't catch it) as a bare traceback.
+        log(f"  interrupted by signal ({e}) during rate-limit sleep — state "
+            f"preserved (resume with leerie --resume {st.run_id})")
+        signum = getattr(signal, str(e), None)
+        return (128 + int(signum)) if signum else 1
     log(f"  auto-resuming: exec orchestrator --resume {st.run_id}")
-    os.execv(sys.executable,
-             [sys.executable, __file__, "--resume", "--run-id", st.run_id])
-    # Unreachable: execv replaces the process.
-    return False
+    try:
+        os.execv(sys.executable,
+                 [sys.executable, __file__, "--resume", "--run-id", st.run_id])
+    except OSError as ex:
+        # execv essentially never fails (the interpreter that's running us
+        # exists), but if it does the exception would otherwise escape past the
+        # sibling except arms as a bare traceback. Cleanup already ran, so fall
+        # back to the manual-resume path with EX_TEMPFAIL.
+        log(f"  auto-resume exec failed ({ex}); resume manually: "
+            f"leerie --resume {st.run_id}")
+        return EXIT_LOCKED  # 75, EX_TEMPFAIL
+    # Unreachable: a successful execv replaces the process.
+    return None
 
 
 def _parse_claude_version(version_output: str | None) -> tuple[int, int, int] | None:
@@ -7278,9 +7311,9 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         # instead of a bare WorkerError, which would bypass the auth/quota
         # backoff (it needs an envelope to classify) and die() the run
         # non-resumably. reset_at is unknown here (the kill left no
-        # resetsAt on a result envelope), so the None-reset arm prints a
-        # `--resume` hint and exits 75 (EX_TEMPFAIL). Checked before the
-        # returncode arm because the kill may exit nonzero.
+        # resetsAt on a result envelope), so main()'s None-reset arm sleeps a
+        # fixed RATE_LIMIT_RETRY_BACKOFF_SEC and auto-resumes (DESIGN §6). Checked
+        # before the returncode arm because the kill may exit nonzero.
         if overage_blocked:
             raise RateLimitedExit(
                 reset_at=None,
@@ -16693,46 +16726,36 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         exit_message = str(e)
         exit_code = 1
     except RateLimitedExit as e:
-        # Claude Code session-limit / rate-limit hit mid-worker. See
-        # DESIGN §6 *Cleanup on abnormal exit*. Two paths:
-        #   - reset_at parsed cleanly → run worktree-only cleanup,
-        #     sleep until the moment + 30s margin, then os.execv the
-        #     orchestrator itself (sys.executable __file__ --resume
-        #     --run-id <id>) for a fresh orchestrator process. We
-        #     re-exec the orchestrator, not the launcher: the launcher
-        #     is not baked into the container image (Dockerfile only
-        #     COPYs orchestrator/, scripts/, prompts/, .claude-plugin/)
-        #     and would try to spawn a new container if it were.
-        #     The `worker_count` cap is NOT reset — it persists in
-        #     state.json so a run repeatedly re-exec'ing through the
-        #     rate-limit still respects the user's --max-workers cap.
-        #   - reset_at is None (parse failed or protocol-level event
-        #     carried no time) → run cleanup, print the manual
-        #     --resume instruction, exit 75 (EX_TEMPFAIL).
-        # Subprocess cleanup before sleep is handled by the existing
-        # asyncio cancellation chain (DESIGN §6, IMPLEMENTATION §5
-        # *Abnormal exit and rate-limit contract*): _invoke's
-        # BaseException guard kills the rate-limited claude -p child;
-        # sibling wave-tasks cancel through gather and each kills its
-        # own child.
-        abnormal = True
+        # Claude Code session-limit / rate-limit (or out-of-credits mid-stream
+        # kill) hit mid-worker. See DESIGN §6 *Rate-limited → auto-resume*. Both
+        # cases now AUTO-RESUME via `_sleep_then_reexec` (worktree-only cleanup →
+        # sleep → os.execv the orchestrator into a fresh `--resume --run-id`
+        # process). They differ only in the wait:
+        #   - reset_at parsed cleanly → sleep until that moment + 30s margin.
+        #   - reset_at is None (parse failed, or the out-of-credits kill left no
+        #     resetsAt) → sleep a fixed RATE_LIMIT_RETRY_BACKOFF_SEC and poll;
+        #     we can't compute a wake time, and an early retry just re-hits the
+        #     same clean pause. (This replaced the old "exit 75, resume
+        #     manually" behavior — a fixed backoff guesses no wrong time.)
+        # We re-exec the orchestrator, not the launcher: the launcher isn't baked
+        # into the image and would spawn a new container. `worker_count` persists
+        # in state.json so `--max-workers` survives the re-exec — a run that
+        # repeatedly hits the limit still respects the cap. Subprocess cleanup is
+        # handled by the asyncio cancellation chain (IMPLEMENTATION §5): _invoke's
+        # BaseException guard kills the rate-limited claude -p child; sibling
+        # wave-tasks cancel through gather.
         full_purge = False
         st.save()
         log(f"rate-limited: {e.raw_message}")
-        # Both arms auto-resume via `_sleep_then_reexec` (cleanup → sleep →
-        # os.execv --resume). They differ only in the wait: a parsed reset time
-        # sleeps until that moment; a missing reset time (out-of-credits
-        # mid-stream kill, or an unparseable session-limit message) can't
-        # compute a wake time, so it polls on a fixed backoff. Either way the
-        # run self-resumes and Ctrl-C during the wait drops to manual --resume.
-        # `_sleep_then_reexec` runs cleanup itself, so skip the finally block.
+        # `_sleep_then_reexec` runs cleanup itself and either os.execv's (never
+        # returns) or returns an exit code on interrupt/failure — so leave
+        # abnormal=False (the finally must NOT re-run cleanup).
         abnormal = False
         if e.reset_at is not None:
-            # Compute the wait AFTER cleanup would run — but the helper runs
-            # cleanup first, so compute against now(); the small drift vs.
-            # post-cleanup time is covered by the +30s margin (heavy-worktree
-            # cleanup can take minutes, but the parsed reset is typically hours
-            # out, so the margin is immaterial).
+            # `_sleep_then_reexec` runs cleanup first, so the wait is measured
+            # from after cleanup; the +30s margin absorbs the drift, and a
+            # premature wake self-corrects (the re-exec'd run re-hits the limit
+            # and re-sleeps). See the helper's docstring.
             wait_seconds = max(
                 0,
                 int((e.reset_at - datetime.now(e.reset_at.tzinfo))
@@ -16741,8 +16764,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         else:
             wait_seconds = RATE_LIMIT_RETRY_BACKOFF_SEC
             reason = "out of credits / no reset time"
-        if _sleep_then_reexec(st, wait_seconds, reason):
-            exit_code = 130  # Ctrl-C during the sleep
+        rc = _sleep_then_reexec(st, wait_seconds, reason)
+        if rc is not None:
+            # Interrupted (SIGINT→130, SIGTERM/SIGHUP→128+signum) or execv
+            # failed (→75). Cleanup already ran; state preserved for --resume.
+            exit_code = rc
         # Otherwise _sleep_then_reexec os.execv'd and never returned.
     except KeyboardInterrupt:
         # Ctrl-C → worktree cleanup only; state and branches preserved

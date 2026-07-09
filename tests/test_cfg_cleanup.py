@@ -71,17 +71,60 @@ def test_startup_sweep_removes_old_but_keeps_fresh(tmp_path):
 
 
 def test_stage_trap_registered_immediately_after_mktemp():
-    """The `rm -rf "$STAGE"` EXIT trap must be registered right after the
-    `STAGE=$(mktemp …)` line — before the stage-assembly block (which has an
-    `exit 1`) — so an early exit can't leak the dir. Pin the ordering."""
+    """The EXIT trap that removes `$STAGE` (and kills the keepalive) must be
+    registered right after the `STAGE=$(mktemp …)` line — before the
+    stage-assembly block (which has an `exit 1`) — so an early exit can't leak
+    the dir. Pin the ordering."""
     src = LAUNCHER.read_text()
     mktemp_pos = src.find('STAGE="$(mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX")"')
     assert mktemp_pos != -1, "STAGE mktemp line not found"
-    trap_pos = src.find("trap 'rm -rf \"$STAGE\" 2>/dev/null' EXIT", mktemp_pos)
+    trap_pos = src.find('rm -rf "$STAGE" 2>/dev/null\' EXIT', mktemp_pos)
     assert trap_pos != -1, "early STAGE-removal EXIT trap not found after mktemp"
     # The trap must appear within a few lines of the mktemp (before the
     # ~250-line assembly block, well before the first `exit 1` in it).
     between = src[mktemp_pos:trap_pos]
-    assert between.count("\n") < 12, (
+    assert between.count("\n") < 16, (
         "the STAGE EXIT trap drifted far from mktemp; an early exit in the "
         "gap would leak the staging dir")
+
+
+def test_all_stage_traps_kill_the_keepalive():
+    """Every EXIT trap that removes `$STAGE` must also kill the keepalive
+    (`$_stage_keepalive_pid`) — otherwise the hourly `touch $STAGE` loop
+    outlives the run and leaks a background process."""
+    src = LAUNCHER.read_text()
+    # Each EXIT trap line that removes $STAGE must also reference the keepalive.
+    for line in src.splitlines():
+        if 'rm -rf "$STAGE"' in line and "EXIT" in line and line.strip().startswith("trap"):
+            assert "_stage_keepalive_pid" in line, (
+                f"STAGE-removing EXIT trap missing keepalive kill: {line.strip()}")
+
+
+def test_keepalive_touch_protects_a_live_dir_from_the_sweep(tmp_path):
+    """The keepalive `touch`es `$STAGE` so a live long-running dir never looks
+    stale to the `-mtime +1` sweep, even when its nested files are old. Pin the
+    behavior the keepalive relies on (top-level touch resets -mtime) so a future
+    refactor can't silently reintroduce the frozen-mtime deletion of live dirs."""
+    import os
+    cache = tmp_path / ".cache" / "leerie"
+    cache.mkdir(parents=True)
+    live = cache / "cfg-LIVE"
+    dead = cache / "cfg-DEAD"
+    old = time.time() - 3 * 86400
+    for d in (live, dead):
+        (d / ".claude").mkdir(parents=True)
+        (d / ".claude" / "f").write_text("x")
+        os.utime(d / ".claude" / "f", (old, old))
+        os.utime(d, (old, old))  # both dirs start stale
+    (live).touch()  # keepalive freshens the live dir only
+
+    sweep = _extract_sweep_command()
+    subprocess.run(["bash", "-c", sweep],
+                   env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"},
+                   check=True)
+    for _ in range(50):
+        if not dead.exists():
+            break
+        time.sleep(0.05)
+    assert live.exists(), "keepalive-touched (live) dir must survive the sweep"
+    assert not dead.exists(), "stale (untouched) dir must be swept"

@@ -4666,19 +4666,34 @@ mkdir -p "$HOME/.cache/leerie"
 # Best-effort sweep of stale per-run staging dirs. The EXIT trap below removes
 # $STAGE on a clean exit, but a SIGKILL (OOM, `nerdctl kill`) or a hard crash
 # bypasses the trap and leaks the dir. Left unchecked these accumulate (each is
-# tens of MB to ~GB of staged ~/.claude). Remove cfg-* dirs older than a day —
-# any run still using one is far younger. Backgrounded + time-bounded so a large
-# backlog never delays a launch. Mirrors the _reap_orphaned_container idea.
+# a few MB of staged ~/.claude). Remove cfg-* dirs older than a day. Backgrounded
+# so a large backlog never delays a launch. Mirrors the _reap_orphaned_container
+# idea. IMPORTANT: `-mtime` tests the cfg dir's OWN top-level mtime, which
+# freezes at staging-completion — writes the running container makes into
+# $STAGE/.claude/* do NOT bump it. So a genuinely LIVE long-running run (its
+# container's rw bind-mount is $STAGE) would look "old" to this sweep and be
+# deleted out from under itself. The keepalive below (which `touch`es $STAGE
+# hourly for the run's lifetime) is what keeps a live dir's mtime fresh, so
+# `-mtime +1` only ever matches truly-abandoned dirs.
 ( find "$HOME/.cache/leerie" -maxdepth 1 -type d -name 'cfg-*' -mtime +1 \
     -exec rm -rf {} + 2>/dev/null ) &
 
 STAGE="$(mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX")"
-# Register STAGE removal immediately — BEFORE the ~250 lines of stage assembly
-# below (which includes an `exit 1` on bad config) and before the container-arm
-# EXIT trap is set. Bash keeps only the last EXIT trap per scope; the container
-# arm re-sets it (adding container-kill) and still removes $STAGE, so this early
-# trap only matters for exits that happen before that point.
-trap 'rm -rf "$STAGE" 2>/dev/null' EXIT
+# Keepalive: touch $STAGE hourly so a live-but-long-running dir never looks
+# stale to the sweep above (see the -mtime note). Backgrounded; killed by the
+# EXIT trap below (so it never outlives the run and leak a `touch` loop). The
+# 3600s interval is far tighter than the 1-day sweep floor, so a live dir's
+# mtime stays comfortably fresh even across an auto-resume re-exec (each re-exec
+# is a fresh launcher-less orchestrator process, but the container — and this
+# host-side keepalive — persist for the run's lifetime).
+( while :; do touch "$STAGE" 2>/dev/null || exit 0; sleep 3600; done ) &
+_stage_keepalive_pid=$!
+# Register STAGE removal + keepalive kill immediately — BEFORE the ~250 lines of
+# stage assembly below (which includes an `exit 1` on bad config) and before the
+# container-arm EXIT trap is set. Bash keeps only the last EXIT trap per scope;
+# the container arm re-sets it (adding container-kill) and still removes $STAGE
+# + kills the keepalive, so this early trap only matters for exits before that.
+trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE" 2>/dev/null' EXIT
 
 # -- .claude.json: copy with projects[] stripped. --
 # The projects[] block stores prior-session per-project state
@@ -4927,7 +4942,7 @@ fi
 
 # Best-effort host cleanup. Container is --rm; its writes inside the
 # mounts vanish with the container. This removes the host scratch.
-trap 'rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
 
 # --- finalize-phase auth is host-side now -------------------------------
 # Previous versions of leerie bind-mounted ~/.config/gh, ~/.git-credentials,
@@ -5899,7 +5914,7 @@ else
       [ -n "$_cid" ] && nerdctl kill "$_cid" >/dev/null 2>&1 || true
     fi
   }
-  trap '_kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null; _kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
   trap '_kill_container_from_cidfile; exit 130' INT
   trap '_kill_container_from_cidfile; exit 143' TERM
 

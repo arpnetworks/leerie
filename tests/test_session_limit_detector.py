@@ -247,8 +247,8 @@ def test_sleep_then_reexec_cleans_sleeps_and_reexecs(leerie, monkeypatch):
     assert argv[argv.index("--run-id") + 1] == "run-xyz"
 
 
-def test_sleep_then_reexec_ctrl_c_during_sleep_returns_true(leerie, monkeypatch):
-    """Ctrl-C during the sleep → returns True (caller exits 130) and does
+def test_sleep_then_reexec_ctrl_c_during_sleep_returns_130(leerie, monkeypatch):
+    """Ctrl-C during the sleep → returns 130 (caller sets exit_code) and does
     NOT os.execv — state is preserved for a manual --resume."""
     execv_called = {"v": False}
     monkeypatch.setattr(leerie, "_cleanup_on_abnormal_exit", lambda st, **k: None)
@@ -259,9 +259,43 @@ def test_sleep_then_reexec_ctrl_c_during_sleep_returns_true(leerie, monkeypatch)
     monkeypatch.setattr(leerie.os, "execv",
                         lambda *a: execv_called.__setitem__("v", True))
 
-    interrupted = leerie._sleep_then_reexec(_fake_st(), 300, "reason")
-    assert interrupted is True
+    rc = leerie._sleep_then_reexec(_fake_st(), 300, "reason")
+    assert rc == 130
     assert execv_called["v"] is False
+
+
+def test_sleep_then_reexec_sigterm_during_sleep_returns_128_plus_signum(
+        leerie, monkeypatch):
+    """SIGTERM/SIGHUP during the sleep → InterruptedBySignal caught, mapped to
+    128+signum (SIGTERM=15→143), NOT allowed to escape as a bare traceback with
+    exit 1. State preserved (cleanup already ran)."""
+    execv_called = {"v": False}
+    monkeypatch.setattr(leerie, "_cleanup_on_abnormal_exit", lambda st, **k: None)
+
+    def boom(_s):
+        raise leerie.InterruptedBySignal("SIGTERM")
+    monkeypatch.setattr(leerie.time, "sleep", boom)
+    monkeypatch.setattr(leerie.os, "execv",
+                        lambda *a: execv_called.__setitem__("v", True))
+
+    rc = leerie._sleep_then_reexec(_fake_st(), 300, "reason")
+    assert rc == 143, f"SIGTERM should map to 128+15=143, got {rc}"
+    assert execv_called["v"] is False
+
+
+def test_sleep_then_reexec_execv_failure_returns_75(leerie, monkeypatch):
+    """If os.execv itself fails (should-never-happen), the helper catches the
+    OSError and returns 75 (EX_TEMPFAIL) rather than letting a bare traceback
+    escape past the sibling except arms. State preserved for a manual --resume."""
+    monkeypatch.setattr(leerie, "_cleanup_on_abnormal_exit", lambda st, **k: None)
+    monkeypatch.setattr(leerie.time, "sleep", lambda _s: None)
+
+    def bad_execv(*_a):
+        raise OSError("no such interpreter")
+    monkeypatch.setattr(leerie.os, "execv", bad_execv)
+
+    rc = leerie._sleep_then_reexec(_fake_st(), 300, "reason")
+    assert rc == leerie.EXIT_LOCKED == 75
 
 
 def test_rate_limit_no_reset_uses_fixed_backoff_not_exit_75(leerie):
