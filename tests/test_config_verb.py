@@ -1482,9 +1482,17 @@ def test_write_config_toml_keys_round_trips_via_launcher_read(tmp_path):
 
 
 def _extract_lang_layer_script() -> str:
-    """Return the Python heredoc body for the _lang_layer block verbatim."""
+    """Return the Python heredoc body for the _lang_layer block verbatim.
+
+    The launcher writes this body to a temp file via ``cat >"$_dep_pyf" <<'PY'``
+    (rather than piping it inline through ``"$(python3 - ... <<'PY')"``) to avoid
+    a bash 3.2 parser bug with a quoted heredoc nested inside ``"$(...)"``; the
+    body is then run as ``python3 "$_dep_pyf" "$USER_REPO" "$_leerie_config_toml"``,
+    so extracting the body and running it with (repo, config_toml) args stays a
+    faithful mirror of the live launcher path.
+    """
     launcher_text = (REPO_ROOT / "leerie").read_text()
-    start_marker = '_lang_layer="$(python3 - "$USER_REPO" "$_leerie_config_toml" <<\'PY\'\n'
+    start_marker = 'cat >"$_dep_pyf" <<\'PY\'\n'
     end_marker = "\nPY\n"
     s = launcher_text.index(start_marker) + len(start_marker)
     e = launcher_text.index(end_marker, s)

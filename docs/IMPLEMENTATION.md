@@ -4009,8 +4009,12 @@ COPY <copy_inputs> ./
 RUN <install command>
 ```
 
-The `COPY`+`RUN` layer is determined by an inline `python3` heredoc in
-the launcher's auto-gen block with two tiers:
+The `COPY`+`RUN` layer is emitted by a `python3` script the launcher
+writes to a temp file (`cat >"$_dep_pyf" <<'PY'`) and runs as
+`python3 "$_dep_pyf" "$USER_REPO" "$_leerie_config_toml"` — de-nested
+from a `"$(…)"` command substitution so the block parses under bash 3.2
+(it is extracted and run under the system bash by the Dockerfile-bake
+tests). It has two tiers:
 
 1. **Primary — persisted `language_installs` from `.leerie/config.toml`.**
    The `dep_capture` worker writes a `language_installs` JSON array (keyed
@@ -4024,7 +4028,7 @@ the launcher's auto-gen block with two tiers:
 
 2. **Fallback — lockfile detection (clean first run).** When no
    `language_installs` key is present in config.toml (e.g. on the very
-   first run before `dep_capture` has fired), the heredoc mirrors
+   first run before `dep_capture` has fired), the script mirrors
    `_lockfile_table_entries`'s manager-precedence by hand to detect a
    single lockfile manager. For **all** node ecosystems (pnpm, yarn, npm)
    a shared `_node_ancillary` helper adds workspace `package.json`s,

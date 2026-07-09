@@ -4010,7 +4010,13 @@ if [ "$_leerie_do_gen" = "true" ]; then
     # added to the COPY list — hallucinated paths are silently dropped while
     # the RUN line is always emitted.
     if [ "$_BAKE_LANGUAGE_DEPS" = "true" ]; then
-      _lang_layer="$(python3 - "$USER_REPO" "$_leerie_config_toml" <<'PY'
+      # The heredoc is written to a temp file rather than piped inline via
+      # "$(python3 - ... <<'PY' ... )". bash 3.2 (macOS /bin/bash) mis-scans a
+      # quoted heredoc nested inside a "$(...)" command substitution once the
+      # body grows past a threshold and aborts with "unexpected EOF" — de-nesting
+      # the heredoc from the command substitution sidesteps that parser bug.
+      _dep_pyf="$(mktemp)"
+      cat >"$_dep_pyf" <<'PY'
 import glob as _glob
 import hashlib
 import json as _json
@@ -4221,13 +4227,21 @@ copy_shas = _hash_copy_files(repo, copy_files)
 # Shas are embedded as a comment so the Dockerfile sha captures dep-input drift.
 _emit_layer(copy_files, run_cmd, copy_shas)
 PY
-      )"
+      # Guard the exit code so `set -e` never aborts before the temp file is
+      # cleaned up (mirrors the _launch_stderr/_early_probe_stderr sites), then
+      # re-raise a real interpreter crash — the original inline command-sub
+      # aborted the launcher on python failure, and that contract is preserved.
+      _lang_rc=0
+      _lang_layer="$(python3 "$_dep_pyf" "$USER_REPO" "$_leerie_config_toml")" \
+        || _lang_rc=$?
+      rm -f "$_dep_pyf"
+      if [ "$_lang_rc" != "0" ]; then exit "$_lang_rc"; fi
       if [ -n "$_lang_layer" ]; then
         printf '%s\n' "$_lang_layer" >> "$_gen_df_tmp"
       else
         remote_log "auto-generating: no lockfile detected; skipping language-dep layer"
       fi
-      unset _lang_layer
+      unset _lang_layer _lang_rc _dep_pyf
     fi
 
     mv "$_gen_df_tmp" "$_leerie_dockerfile"
