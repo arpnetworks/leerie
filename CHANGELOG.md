@@ -5,6 +5,46 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.49]
+
+### Changed
+
+- **Per-repo dependency capture is now decided by an LLM `dep_capture`
+  worker instead of a regex scanner** (#43). The old regex path only
+  persisted `apt-get install` packages and discarded every language
+  install (pip/pnpm/uv/cargo/go/…), so pip/pnpm repos got no `.leerie/`
+  at all. The new `dep_capture` worker reads the Bash command corpus from
+  each run's `logs/` (bounded by `_DEPCAP_TOTAL_BUDGET`), decides the
+  dependencies the repo genuinely needs across all languages, and emits
+  `setup_packages` + `language_installs` via schema-validated structured
+  output; the code writes them deterministically to `.leerie/config.toml`
+  (union-merged, never-clobber) and the launcher bakes per-manager
+  `COPY`+`RUN` layers into the generated Dockerfile. One worker funnels
+  three triggers — in-run finalize, the cancel/SIGTERM exit arms, and a
+  SIGKILL/crash backstop (next-run + `--recapture`) — with a
+  `dep_capture.done` idempotency sentinel. The regex helpers
+  (`_capture_installs_from_logs`, `_parse_apt_intents`, `_LANG_INSTALL_RE`,
+  `_APT_INSTALL_RE`, and their apt sub-regexes) are deleted.
+
+### Fixed
+
+- **The language-dep Dockerfile bake now parses under bash 3.2 (macOS
+  `/bin/bash`), unbreaking `pytest tests/`.** #43 enlarged the Python
+  heredoc the launcher piped inline via
+  `_lang_layer="$(python3 - … <<'PY' … PY )"`. bash 3.2 mis-scans a quoted
+  heredoc nested inside a `"$(…)"` command substitution once the body
+  grows past a threshold and aborts with `unexpected EOF while looking for
+  matching ''`. The Dockerfile-bake test harnesses extract that block and
+  run it under the system bash, so 58 tests failed — including #43's own
+  `test_dockerfile_bake_from_capture.py`. The launcher now writes the
+  heredoc body to a temp file (`cat >"$_dep_pyf" <<'PY'`, outside any
+  command substitution) and runs `python3 "$_dep_pyf" …`; the Python body
+  and its argv indices are unchanged. Cleanup is guarded with
+  `|| _lang_rc=$?` (mirroring the `_launch_stderr`/`_early_probe_stderr`
+  sites) so `set -euo pipefail` never aborts before `rm -f` runs, and the
+  original abort-on-python-crash contract is preserved by re-raising the
+  exit code.
+
 ## [0.9.48]
 
 ### Changed
