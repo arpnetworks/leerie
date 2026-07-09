@@ -5,6 +5,29 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.46]
+
+### Changed
+
+- **Rate-limit with no reset time now auto-resumes instead of exiting.** When a
+  run hit an out-of-credits mid-stream kill (or a session-limit message whose
+  reset time couldn't be parsed), it previously printed a manual `--resume` hint
+  and exited 75. It now sleeps a fixed `RATE_LIMIT_RETRY_BACKOFF_SEC` (5 min) and
+  auto-resumes via the same `os.execv --resume` path the parsed-reset-time case
+  uses — so a run self-heals once the limit/credits refresh. Bounded by the
+  persisted `max_total_workers` budget; Ctrl-C during the wait still drops to a
+  manual resume (exit 130). Both rate-limit arms now share
+  `_sleep_then_reexec(st, wait_seconds, reason)`.
+
+### Fixed
+
+- **Per-run staging dirs (`~/.cache/leerie/cfg-*`) no longer leak unbounded.**
+  The `rm -rf "$STAGE"` EXIT trap is now registered immediately after the
+  `mktemp` (previously ~250 lines later, past an `exit 1`, so early exits leaked
+  the dir), and a best-effort startup sweep removes `cfg-*` dirs older than a day
+  to reclaim leaks from trap-bypassing exits (SIGKILL / OOM / `nerdctl kill`).
+  (A backlog of 500+ dirs / ~31 GB had accumulated.)
+
 ## [0.9.45]
 
 ### Fixed
