@@ -5,6 +5,61 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.52]
+
+### Fixed
+
+- **Local per-repo derived image build no longer fails with "pull access
+  denied `leerie:<version>`".** Under Colima, buildkitd's containerd worker is
+  bound to the `buildkit` containerd namespace while the base image is built and
+  stored in `default` (where `nerdctl build`/`inspect`/`run` operate). The two
+  namespaces are isolated, so the derived build's `FROM $BASE_IMAGE` could not
+  see the local base and fell back to the registry, where the never-pushed tag
+  401s. The launcher now runs `ensure_base_in_buildkit_ns` — an idempotent,
+  best-effort `nerdctl save "$IMAGE_TAG" | nerdctl --namespace buildkit load` —
+  before the derived and language-dep-probe builds, so `FROM` resolves against
+  the local image store. The builds themselves stay in `default`, where
+  `nerdctl run` reads the result. Reproduced byte-identically and fixed
+  end-to-end; pinned by two new tests in `test_build_repo_image.py` (copy fires
+  and precedes the build; idempotent skip when the base is already present).
+
+- **`dep_capture` no longer writes prose as apt packages.** The worker was fed
+  the *complete* set of shell commands a run logged (~96% noise: `git`, `grep`,
+  `pytest`, `python3 -c` one-liners) and could degenerate into echoing prompt
+  text as `setup_packages`. Redesigned to a **manifests-first** corpus (DESIGN
+  §6½): `_gather_dep_manifests` reads the repo's dependency-manifest files
+  (`requirements.txt`, `package.json` + lockfile, `pyproject.toml`, `go.mod`,
+  `Cargo.toml`, `Gemfile`, `composer.json`, …) as primary ground truth, and
+  `_extract_depcap_commands` now keeps only install-shaped commands
+  (`_is_install_command`, evaluated per shell segment so chained/multi-line
+  installs survive while `grep "apt-get install …"`-style leaks are dropped) as a
+  secondary hint for system/native (apt) deps. Verified live via `claude -p`
+  opus on Python-only and Node + native-dep repos.
+
+- **`language_installs` in `.leerie/config.toml` is now valid TOML.** The
+  JSON-encoded value (`[{"manager":"pip",…}]`) was written inside a basic
+  (`"…"`) string, whose inner quotes broke the TOML. `_toml_value` now renders
+  quote-containing values as TOML *literal* (single-quoted) strings, and
+  `_dump_language_installs` escapes any single quote in a shell-quoted install
+  command (`pip install 'requests[security]'`) so the value round-trips
+  losslessly through strict `tomllib`, `_read_toml_key`, and the launcher reader.
+
+- **The install-subtree state-dir validator now protects the `.leerie/`
+  directory.** `.leerie/config.toml` (and `Dockerfile`) are now committed to
+  version control (run artifacts under `.leerie/` stay git-ignored), which makes
+  `.leerie` a tracked top-level directory. `_validate_state_ownership`'s guard
+  against a basename-keyed state dir landing inside the installer clone now
+  includes `.leerie`, keeping the drift-detection invariant
+  (`test_install_subtree_list_matches_repo_top_level_dirs`) satisfied.
+
+### Changed
+
+- **`leerie config --recapture` gathers manifests + install-filtered commands.**
+  The recapture seam (already wired to `run_recapture_deps` →
+  `capture_repo_deps`) now benefits from the manifests-first corpus, so
+  `--recapture`/`--recapture --force` produce correct structured
+  `language_installs`/`setup_packages` for the repo.
+
 ## [0.9.51]
 
 ### Fixed
