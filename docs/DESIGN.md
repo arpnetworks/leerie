@@ -2461,14 +2461,34 @@ the derived image. Both the base tag and the per-repo tag are recorded in
 ### Auto-capture of repo dependencies
 
 At the end of a normal (non-resume) finalize, leerie invokes the `dep_capture`
-LLM worker. The worker reads the complete set of shell commands workers ran
-(extracted from `logs/*.log` via `_iter_log_tool_use`, deduped, newest-first,
-bounded to a byte budget of ~300 KB) and **decides** what the repo genuinely
-needs across all languages and frameworks. Its structured output (`setup_packages`
-and `language_installs`) is validated against a JSON schema and written to
-`.leerie/config.toml` deterministically — code enforces; the model decides
-content (§12 *Prompts are advisory, code enforces*). The `dep_capture` worker
-defaults to `opus`/`high` and is overridable via `LEERIE_MODEL_DEP_CAPTURE`.
+LLM worker. The worker is given a **manifests-first** corpus and **decides** what
+the repo genuinely needs across all languages and frameworks:
+
+- **Primary — dependency-manifest files.** The contents of the repo's dependency
+  manifests present in `repo_root` (`requirements.txt`, `pyproject.toml`,
+  `Pipfile`, `package.json` + lockfile, `go.mod`, `Cargo.toml`, `Gemfile`,
+  `composer.json`, …), gathered by `_gather_dep_manifests` (bounded per file and
+  in total). These are the unambiguous ground truth for a repo's language
+  dependencies.
+- **Secondary — install-filtered commands.** A hint list of package-manager
+  *install* commands observed during the run (extracted from `logs/*.log` via
+  `_iter_log_tool_use`, then narrowed by `_extract_depcap_commands` to commands
+  that invoke an install verb at a command boundary, excluding text-scanning
+  tools; deduped, newest-first, byte-bounded). Purpose: surface **system/native**
+  (apt) deps a worker had to install that no language manifest records (e.g.
+  `libvips-dev`, `pkg-config`).
+
+This replaces an earlier design in which the worker read the *complete* set of
+shell commands and reverse-engineered deps from command strings — that corpus was
+overwhelmingly noise (greps, `git`, `pytest`, `python3 -c` one-liners) and let the
+worker degenerate into echoing prose as package names. Reasoning over manifest
+files (with commands as a hint) is what actually delivers the "across all
+languages and frameworks" goal. Which files and commands the worker sees is
+deterministic corpus selection in code; the model still decides content (§12
+*Prompts are advisory, code enforces*). Structured output (`setup_packages` and
+`language_installs`) is validated against a JSON schema and written to
+`.leerie/config.toml` deterministically. The `dep_capture` worker defaults to
+`opus`/`high` and is overridable via `LEERIE_MODEL_DEP_CAPTURE`.
 
 **System packages → `setup_packages` → warm apt layer.** `dep_capture`'s
 `setup_packages` output is union-merged into `setup_packages` in

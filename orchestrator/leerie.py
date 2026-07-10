@@ -5353,6 +5353,105 @@ _INSTALL_CMD_HINT_RE = re.compile(
 # _FIXTURE_TOTAL_BUDGET idiom in gather_provision_fixtures.
 _DEPCAP_TOTAL_BUDGET = 307200  # 300KB ≈ 75k tokens at 4 bytes/token
 
+# Manifests-first dep_capture (DESIGN §6½). The worker's PRIMARY corpus is the
+# repo's dependency-manifest files; the install-filtered command list is only a
+# SECONDARY hint for system/native (apt) deps that appear in no manifest. This
+# replaced an earlier design that fed the worker the *complete* command corpus —
+# overwhelmingly noise (git/grep/pytest/`python3 -c`), which let the model
+# degenerate into emitting prose as package names.
+
+# Dependency manifests to gather, primary corpus. Bounded per file and in total
+# so a giant lockfile can't blow the budget. Order is display order.
+_DEP_MANIFEST_NAMES = (
+    "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
+    "pyproject.toml", "Pipfile", "Pipfile.lock", "setup.py", "setup.cfg",
+    "package.json", "pnpm-lock.yaml", "package-lock.json", "yarn.lock",
+    "go.mod", "Cargo.toml", "Cargo.lock", "Gemfile", "Gemfile.lock",
+    "composer.json", "composer.lock",
+)
+_DEPCAP_MANIFEST_FILE_BUDGET = 16384    # 16 KB per manifest file
+_DEPCAP_MANIFEST_TOTAL_BUDGET = 131072  # 128 KB across all manifests
+
+# Install-verb matcher for the SECONDARY command hint. A command is kept only
+# when it invokes a package-manager install verb at a command boundary (start of
+# string, or after ; & | ( or `sudo`). Commands whose leading word is a
+# text-scanning tool (grep/git/…) are dropped even if the verb appears inside a
+# quoted pattern — that is how prose ("grep 'apt-get install intents'") leaked in.
+_DEPCAP_INSTALL_RE = re.compile(
+    r"(?:^|[\s;&|(])(?:sudo\s+)?(?:"
+    r"apt-get\s+install|apt\s+install|yum\s+install|dnf\s+install|apk\s+add|"
+    r"pip3?\s+install|pipx\s+install|poetry\s+add|uv\s+(?:add|pip\s+install)|"
+    r"npm\s+(?:install|i|ci|add)|pnpm\s+(?:add|install|i)|yarn\s+(?:add|install)|"
+    r"cargo\s+(?:install|add)|go\s+(?:install|get)|"
+    r"gem\s+install|bundle\s+(?:add|install)|composer\s+require|dotnet\s+add"
+    r")(?:\s|$)"
+)
+# Leading command words that scan text: their args routinely contain install
+# verbs inside quoted patterns, so drop them from the hint corpus.
+_DEPCAP_TEXT_TOOLS = frozenset(
+    {"grep", "rg", "git", "sed", "awk", "echo", "cat", "printf", "ag", "ack"}
+)
+# Shell separators between commands. A single logged Bash call is often several
+# commands (newlines from a `python3 -c` heredoc, `&&`/`|` chains). Splitting on
+# these lets the text-tool gate apply per-command, so `echo hi\npip install x`
+# keeps the install segment instead of being dropped by the leading `echo`.
+_DEPCAP_SEGMENT_RE = re.compile(r"[\n;]|&&|\|\||[|&]")
+
+
+def _is_install_command(cmd: str) -> bool:
+    """True if `cmd` invokes a package-manager install verb (SECONDARY hint).
+
+    Evaluates each shell segment independently: keep the command if ANY segment
+    whose leading word is NOT a text-scanning tool (grep/git/…) matches an
+    install verb. Per-segment evaluation matters because a single logged Bash
+    call may chain commands (`echo hi; pip install x`) — the whole-string first
+    word would otherwise let a leading `echo`/`grep` drop a genuine install on a
+    later segment. The text-tool gate still suppresses the leak that motivated it
+    (`grep "apt-get install …"`), because there the verb lives *inside* the text
+    tool's own segment."""
+    for seg in _DEPCAP_SEGMENT_RE.split(cmd):
+        words = seg.split()
+        if not words:
+            continue
+        first = words[0]
+        # Strip a leading sudo so `sudo grep …` is still treated as a grep.
+        if first == "sudo":
+            first = words[1] if len(words) > 1 else ""
+        if first in _DEPCAP_TEXT_TOOLS:
+            continue
+        if _DEPCAP_INSTALL_RE.search(seg):
+            return True
+    return False
+
+
+def _gather_dep_manifests(repo_root: Path) -> str:
+    """Read the repo's dependency-manifest files (PRIMARY dep_capture corpus).
+
+    Returns a labeled text block (one section per manifest found), bounded per
+    file and in total. Absent manifests are skipped. This is deterministic
+    corpus selection (DESIGN §6½ / §12): the model decides content, code decides
+    what it is shown."""
+    blocks: list[str] = []
+    total = 0
+    for name in _DEP_MANIFEST_NAMES:
+        p = repo_root / name
+        if not p.is_file():
+            continue
+        try:
+            text = p.read_text(errors="replace")
+        except OSError:
+            continue
+        if len(text.encode()) > _DEPCAP_MANIFEST_FILE_BUDGET:
+            text = text.encode()[:_DEPCAP_MANIFEST_FILE_BUDGET].decode(
+                errors="ignore") + "\n… (truncated)"
+        block = f"### {name}\n```\n{text}\n```"
+        encoded = len(block.encode())
+        if total + encoded > _DEPCAP_MANIFEST_TOTAL_BUDGET:
+            break
+        blocks.append(block)
+        total += encoded
+    return "\n\n".join(blocks)
+
 
 def _normalize_setup_packages(pkgs: list[str]) -> str:
     """Render a package list in the canonical persisted form: order-preserving
@@ -5379,6 +5478,37 @@ def _merge_setup_packages(existing: str, captured: list[str]) -> str | None:
     merged = list(existing_set) + new_pkgs
     # Deduplicate while preserving order (existing_set already dedups existing).
     return _normalize_setup_packages(merged)
+
+
+def _dump_language_installs(entries: list[dict]) -> str:
+    """JSON-encode `language_installs` for TOML persistence, single-quote-safe.
+
+    The value is stored as a JSON string inside `.leerie/config.toml`.
+    `_toml_value` wraps a `"`-containing value in a TOML *literal* (`'...'`)
+    string, which cannot itself contain a `'`. A captured install command may
+    carry single quotes (e.g. `pip install 'requests[security]'`,
+    `gem install -v '~> 7.0'`), which would otherwise break the literal wrapper
+    and yield invalid TOML. Escaping them as the JSON escape `\\u0027` keeps the
+    value free of literal `'` while `json.loads` (both readers) recovers the
+    original quote — so the round-trip is lossless and the file is valid TOML."""
+    return json.dumps(entries, separators=(",", ":")).replace("'", "\\u0027")
+
+
+def _toml_value(val: str) -> str:
+    """Render `val` as a TOML string literal.
+
+    A value containing `"` — notably the JSON-encoded `language_installs`
+    (`[{"manager":"pip",...}]`) — would terminate a basic (`"..."`) string
+    early and produce invalid TOML. TOML *literal* strings (`'...'`) process no
+    escapes, so wrap such values in single quotes. This requires the value to
+    contain no literal `'` — guaranteed for `language_installs` by
+    `_dump_language_installs` (which escapes `'`→`\\u0027`) and trivially true
+    for `setup_packages` (apt names have no quotes). Both readers (`_read_toml_key`
+    and the launcher's flat-TOML regex) already `.strip("'")`, so this
+    round-trips cleanly with no unescaping. Plain values keep the `"..."` form."""
+    if '"' in val and "'" not in val:
+        return f"'{val}'"
+    return f'"{val}"'
 
 
 def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
@@ -5412,26 +5542,32 @@ def _write_config_toml_keys(cfg_path: Path, updates: dict[str, str]) -> None:
                 break
         if matched_key is not None:
             val = remaining.pop(matched_key)
-            out.append(f'{matched_key} = "{val}"\n')
+            out.append(f'{matched_key} = {_toml_value(val)}\n')
         else:
             out.append(line)
     # Append any keys that were not found in the file.
     for k, v in remaining.items():
-        out.append(f'{k} = "{v}"\n')
+        out.append(f'{k} = {_toml_value(v)}\n')
     tmp = Path(str(cfg_path) + f".tmp.{os.getpid()}")
     tmp.write_text("".join(out))
     os.replace(tmp, cfg_path)
 
 
 def _extract_depcap_commands(log_dir: Path) -> tuple[str, bool]:
-    """Dedup Bash commands from worker logs, newest-first, bounded to _DEPCAP_TOTAL_BUDGET bytes."""
+    """Install-shaped Bash commands from worker logs (SECONDARY dep_capture hint).
+
+    Dedup, newest-first, bounded to _DEPCAP_TOTAL_BUDGET bytes. Only commands that
+    invoke a package-manager install verb are kept (`_is_install_command`); the
+    other ~96% (git/grep/pytest/`python3 -c`) is noise that let the worker
+    degenerate into echoing prose as packages. This is the SECONDARY hint —
+    manifests (`_gather_dep_manifests`) are the primary corpus (DESIGN §6½)."""
     seen: dict[str, None] = {}  # ordered set, dedup
     for log_path in sorted(log_dir.glob("*.log"), reverse=True):
         for kind, inp, _result in _iter_log_tool_use(log_path):
             if kind != "Bash":
                 continue
             cmd = inp.get("command", "")
-            if cmd:
+            if cmd and _is_install_command(cmd):
                 seen[cmd] = None
     total_bytes = 0
     hit_ceiling = False
@@ -5516,9 +5652,13 @@ async def capture_repo_deps(
                 return
         except Exception:
             pass
+    # Manifests-first corpus (DESIGN §6½): manifest files are primary ground
+    # truth; install-filtered commands are only a hint for system/native deps.
+    manifests_text = _gather_dep_manifests(repo_root)
     commands_text, hit_ceiling = _extract_depcap_commands(log_dir)
-    if not commands_text.strip():
-        log("capture: no Bash commands found in logs — skipping dep_capture")
+    if not manifests_text.strip() and not commands_text.strip():
+        log("capture: no dependency manifests and no install commands found — "
+            "skipping dep_capture")
         return
     wc = st.data.get("worker_count", 0) if hasattr(st, "data") else 0
     if wc >= caps["max_total_workers"]:
@@ -5533,9 +5673,20 @@ async def capture_repo_deps(
         "the most recent commands are shown first]"
         if hit_ceiling else ""
     )
+    manifests_section = (
+        manifests_text if manifests_text.strip()
+        else "(No dependency manifest files found in the repo.)"
+    )
+    commands_section = (
+        f"{commands_text}{truncation_note}" if commands_text.strip()
+        else "(No package-manager install commands observed during the run.)"
+    )
     user_prompt = (
-        f"Shell commands run by workers during this leerie run "
-        f"(newest-first, deduplicated):\n\n{commands_text}{truncation_note}"
+        "## Dependency manifest files found in the repo (PRIMARY):\n\n"
+        f"{manifests_section}\n\n"
+        "## Install commands observed during the run "
+        "(SECONDARY hint, filtered):\n\n"
+        f"{commands_section}"
     )
     if hasattr(st, "bump_workers"):
         st.bump_workers(caps)
@@ -5581,8 +5732,7 @@ async def capture_repo_deps(
             # an empty-item capture never blanks a good config.
             kept = [e for e in language_installs if e.get("manager")]
             if kept:
-                updates["language_installs"] = json.dumps(
-                    kept, separators=(",", ":"))
+                updates["language_installs"] = _dump_language_installs(kept)
         else:
             existing_raw = _read_toml_key(cfg_path, "language_installs") or ""
             try:
@@ -5594,7 +5744,7 @@ async def capture_repo_deps(
                            if e.get("manager") and e["manager"] not in existing_managers]
             if new_entries:
                 merged_list = existing_list + new_entries
-                updates["language_installs"] = json.dumps(merged_list, separators=(",", ":"))
+                updates["language_installs"] = _dump_language_installs(merged_list)
     if updates:
         _write_config_toml_keys(cfg_path, updates)
         pkg_note = f" setup_packages={updates['setup_packages']!r}" if "setup_packages" in updates else ""

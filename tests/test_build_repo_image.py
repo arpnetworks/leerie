@@ -53,11 +53,20 @@ remote_log() {{ echo "[leerie] $*" >&2; }}
 # argv-recording nerdctl stub.  `return` (not `exit`) so set -e does not
 # kill the shell on a deliberately non-zero exit.
 nerdctl() {{
+  # Record the full argv for later inspection.
+  echo "$*" >> "$NERDCTL_LOG"
+  # Skip a leading `--namespace <ns>` so the real subcommand is inspected
+  # (ensure_base_in_buildkit_ns calls `nerdctl --namespace buildkit image …`).
+  local ns=""
+  if [ "${{1:-}}" = "--namespace" ]; then ns="${{2:-}}"; shift 2 || true; fi
   local cmd="${{1:-}}"; shift || true
-  # Record the subcommand + args for later inspection.
-  echo "$cmd $*" >> "$NERDCTL_LOG"
   case "$cmd" in
     image)
+      # Base-image presence probe. NERDCTL_BUILDKIT_INSPECT_RC (if set) governs
+      # the buildkit-ns probe specifically; else NERDCTL_INSPECT_RC.
+      if [ "$ns" = "buildkit" ] && [ -n "${{NERDCTL_BUILDKIT_INSPECT_RC:-}}" ]; then
+        return "$NERDCTL_BUILDKIT_INSPECT_RC"
+      fi
       return "${{NERDCTL_INSPECT_RC:-0}}"
       ;;
     build)
@@ -168,6 +177,87 @@ def test_build_repo_image_argv_contains_required_flags(tmp_path):
 
     # Build context must be the USER_REPO path (last positional arg).
     assert str(user_repo) in build_args, build_args
+
+
+# ---------------------------------------------------------------------------
+# (a) buildkit-namespace copy before the derived build (Bug B)
+# ---------------------------------------------------------------------------
+
+def test_base_copied_into_buildkit_namespace_before_build(tmp_path):
+    """Before the derived build, the base is copied into the buildkit namespace.
+
+    Colima's buildkitd reads the `buildkit` containerd namespace, not the
+    `default` one the base is built in; without this copy `FROM $BASE_IMAGE`
+    401s against the registry. Assert the launcher probes the buildkit ns and
+    (when absent) runs `nerdctl save | nerdctl --namespace buildkit load`,
+    and that this happens before the `nerdctl build`."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "Dockerfile").write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        tmp_path,
+        'echo "done"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",            # derived image absent → build fires
+            "NERDCTL_BUILDKIT_INSPECT_RC": "1",   # base absent in buildkit ns → copy fires
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
+            "LEERIE_VERSION": "1.2.3",
+            "IMAGE_TAG": "leerie:1.2.3",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+
+    log_content = (tmp_path / "nerdctl.log").read_text()
+    lines = log_content.splitlines()
+    # The copy path: `save leerie:1.2.3` and a `--namespace buildkit load`.
+    assert any(l.startswith("save leerie:1.2.3") for l in lines), log_content
+    assert any("--namespace buildkit load" in l for l in lines), log_content
+    # The buildkit-ns probe is `--namespace buildkit image inspect leerie:1.2.3`.
+    assert any("--namespace buildkit image inspect leerie:1.2.3" in l
+               for l in lines), log_content
+    # Copy must precede the derived build.
+    save_idx = next(i for i, l in enumerate(lines) if l.startswith("save "))
+    build_idx = next(i for i, l in enumerate(lines) if l.startswith("build "))
+    assert save_idx < build_idx, f"copy did not precede build:\n{log_content}"
+
+
+def test_base_not_recopied_when_present_in_buildkit_namespace(tmp_path):
+    """Idempotency: when the base is already in the buildkit ns, skip save|load."""
+    user_repo = tmp_path / "repo"
+    leerie_dir = user_repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    (leerie_dir / "Dockerfile").write_text("ARG BASE_IMAGE\nFROM $BASE_IMAGE\n")
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+
+    result = _run_harness(
+        tmp_path,
+        'echo "done"',
+        env={
+            "USER_REPO": str(user_repo),
+            "LEERIE_STATE_HOST_DIR": str(state_dir),
+            "NERDCTL_INSPECT_RC": "1",            # derived image absent → build fires
+            "NERDCTL_BUILDKIT_INSPECT_RC": "0",   # base already in buildkit ns → no copy
+            "NERDCTL_BUILD_RC": "0",
+            "FAKE_GIT_REMOTE": "https://github.com/owner/myrepo.git",
+            "LEERIE_VERSION": "1.2.3",
+            "IMAGE_TAG": "leerie:1.2.3",
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    log_content = (tmp_path / "nerdctl.log").read_text()
+    # Base present in buildkit ns → no save|load copy.
+    assert "save leerie:1.2.3" not in log_content, log_content
+    assert "buildkit load" not in log_content, log_content
+    # But the build still happens.
+    assert any(l.startswith("build ") for l in log_content.splitlines()), log_content
 
 
 # ---------------------------------------------------------------------------

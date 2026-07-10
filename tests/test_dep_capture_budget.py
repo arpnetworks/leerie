@@ -197,13 +197,13 @@ class TestExtractDepcapCommandsFiltering:
                     "type": "tool_use",
                     "name": "Bash",
                     "id": "ok-1",
-                    "input": {"command": "echo valid"},
+                    "input": {"command": "pip install valid-pkg"},
                 }]
             }
         })
         (log_dir / "w-001.log").write_text("THIS IS NOT JSON\n" + valid + "\n")
         text, _ = leerie._extract_depcap_commands(log_dir)
-        assert "echo valid" in text
+        assert "pip install valid-pkg" in text
 
     def test_empty_command_string_excluded(self, leerie, tmp_path):
         """A Bash block with an empty command string contributes nothing."""
@@ -250,8 +250,10 @@ class TestExtractDepcapCommandsBudget:
     def test_ceiling_hit_when_budget_exceeded(self, leerie, tmp_path):
         """Under a small budget, hit_ceiling=True and output is truncated."""
         log_dir = tmp_path / "logs"
-        big_cmd = "x" * 1000
-        cmds = [f"{big_cmd}-{i}" for i in range(100)]
+        # Install-shaped commands (the only kind the filter keeps), each distinct
+        # so dedup does not collapse them and their bytes sum past the budget.
+        pad = "x" * 1000
+        cmds = [f"pip install pkg{i}-{pad}" for i in range(100)]
         _write_log(log_dir, cmds, "w-001.log")
         orig = leerie._DEPCAP_TOTAL_BUDGET
         try:
@@ -260,7 +262,7 @@ class TestExtractDepcapCommandsBudget:
             assert hit_ceiling
             # Not all 100 commands can fit in 1500 bytes
             for i in range(100):
-                if f"{big_cmd}-{i}" not in text:
+                if f"pip install pkg{i}-{pad}" not in text:
                     break
             else:
                 pytest.fail("Expected some commands to be truncated")

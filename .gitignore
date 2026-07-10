@@ -17,8 +17,12 @@ venv/
 
 # Leerie run artifacts — only present when leerie is run directly in this
 # repo (dogfooding). Target repos no longer accumulate .leerie/ directories;
-# state lives in $HOME/.leerie/<basename>/ by default.
-.leerie/
+# state lives in $HOME/.leerie/<basename>/ by default. Ignore the run
+# state/logs, but DO track the committable per-repo config + Dockerfile
+# (leerie:813 "commit this file to version-control").
+.leerie/*
+!.leerie/config.toml
+!.leerie/Dockerfile
 # Top-level log when the CLI is teed (`./leerie "..." | tee leerie.log`).
 leerie.log
 

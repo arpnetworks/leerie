@@ -223,9 +223,11 @@ class TestExtractDepcapCommands:
 
     def test_budget_ceiling_truncates(self, leerie, tmp_path):
         """Commands exceeding _DEPCAP_TOTAL_BUDGET are truncated; hit_ceiling=True."""
-        # Generate commands that sum beyond the budget.
-        big_cmd = "x" * 1000
-        log_dir = _make_jsonl_log(tmp_path, [f"{big_cmd}-{i}" for i in range(500)])
+        # Install-shaped commands (the filter keeps only these) that sum beyond
+        # the budget. Each is a distinct pip install so dedup does not collapse them.
+        pad = "x" * 1000
+        log_dir = _make_jsonl_log(
+            tmp_path, [f"pip install pkg{i}-{pad}" for i in range(500)])
         orig_budget = leerie._DEPCAP_TOTAL_BUDGET
         try:
             leerie._DEPCAP_TOTAL_BUDGET = 2000
@@ -233,6 +235,141 @@ class TestExtractDepcapCommands:
             assert hit_ceiling
         finally:
             leerie._DEPCAP_TOTAL_BUDGET = orig_budget
+
+    def test_filters_to_install_shaped_only(self, leerie, tmp_path):
+        """Only package-manager install commands survive; noise is dropped."""
+        log_dir = _make_jsonl_log(tmp_path, [
+            "pip install -r requirements.txt",   # kept
+            "apt-get install -y libvips-dev",    # kept
+            "pnpm add sharp",                    # kept
+            "git log --oneline -10",             # dropped
+            "ls /work/subtasks",                 # dropped
+            "python3 -m pytest tests/ -x",       # dropped
+        ])
+        text, _ = leerie._extract_depcap_commands(log_dir)
+        assert "pip install -r requirements.txt" in text
+        assert "apt-get install -y libvips-dev" in text
+        assert "pnpm add sharp" in text
+        assert "git log" not in text
+        assert "ls /work" not in text
+        assert "pytest" not in text
+
+    def test_excludes_install_verb_inside_text_tool_pattern(self, leerie, tmp_path):
+        """A grep/git whose quoted arg embeds an install verb is NOT kept.
+
+        This is the exact leak that let dep_capture prompt prose (e.g.
+        `grep "apt-get install intents"`) reach setup_packages as fake packages."""
+        log_dir = _make_jsonl_log(tmp_path, [
+            'grep -n "apt-get install intents" docs/DESIGN.md',
+            "git commit -m 'wire pip install seam'",
+            'echo "run pnpm install to build"',
+        ])
+        text, _ = leerie._extract_depcap_commands(log_dir)
+        assert text == ""
+
+
+class TestGatherDepManifests:
+    """Manifests-first PRIMARY corpus (DESIGN §6½): read repo dependency manifests."""
+
+    def test_reads_present_manifest_labeled_by_path(self, leerie, tmp_path):
+        (tmp_path / "requirements.txt").write_text("tenacity==9.1.4\n")
+        block = leerie._gather_dep_manifests(tmp_path)
+        assert "### requirements.txt" in block
+        assert "tenacity==9.1.4" in block
+
+    def test_skips_absent_manifests(self, leerie, tmp_path):
+        # No manifests at all → empty block.
+        assert leerie._gather_dep_manifests(tmp_path) == ""
+
+    def test_multiple_manifests_each_labeled(self, leerie, tmp_path):
+        (tmp_path / "package.json").write_text('{"dependencies":{"sharp":"^1"}}')
+        (tmp_path / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+        block = leerie._gather_dep_manifests(tmp_path)
+        assert "### package.json" in block
+        assert "### pnpm-lock.yaml" in block
+        assert "sharp" in block
+
+    def test_per_file_budget_truncates_large_manifest(self, leerie, tmp_path):
+        big = "x" * (leerie._DEPCAP_MANIFEST_FILE_BUDGET + 5000)
+        (tmp_path / "package-lock.json").write_text(big)
+        block = leerie._gather_dep_manifests(tmp_path)
+        assert "(truncated)" in block
+        assert len(block.encode()) < len(big)
+
+
+class TestIsInstallCommand:
+    """SECONDARY hint filter: only package-manager install verbs survive."""
+
+    def test_accepts_real_install_commands(self, leerie):
+        for cmd in ("pip install -r requirements.txt",
+                    "apt-get install -y libvips-dev",
+                    "sudo apt install pkg-config",
+                    "pnpm add sharp", "npm ci", "cargo add serde"):
+            assert leerie._is_install_command(cmd), cmd
+
+    def test_rejects_noise_and_text_tool_pattern_leaks(self, leerie):
+        for cmd in ("git log --oneline",
+                    "pytest tests/",
+                    'grep -n "apt-get install intents" f.md',
+                    "git commit -m 'pip install x'",
+                    'echo "run npm install"',
+                    "sudo grep 'apt install' log"):
+            assert not leerie._is_install_command(cmd), cmd
+
+    def test_multiline_install_after_text_tool_segment_is_kept(self, leerie):
+        """A5: a genuine install on a later line/segment is kept even when the
+        first segment leads with a text tool — the gate is per-segment, not on
+        the whole-string first word. Regression for the multi-line false negative
+        (worker Bash calls chain commands via newlines / && / ; )."""
+        for cmd in ("echo hi\npip install requests",
+                    "git status\napt-get install -y curl",
+                    "git log --oneline && pip install x",
+                    "cat setup.py; pip install -e ."):
+            assert leerie._is_install_command(cmd), cmd
+        # The text-tool LEAK must still be dropped — the install verb lives
+        # INSIDE the text tool's own segment, not a separate command.
+        for cmd in ('grep -n "apt-get install intents" f.md',
+                    "git commit -m 'wire pip install seam'"):
+            assert not leerie._is_install_command(cmd), cmd
+
+
+class TestTomlValue:
+    """Bug C: quote-containing values must render as valid TOML literals."""
+
+    def test_plain_value_uses_basic_string(self, leerie):
+        assert leerie._toml_value("libvips-dev pkg-config") == '"libvips-dev pkg-config"'
+
+    def test_quote_containing_value_uses_literal_string(self, leerie):
+        v = '[{"manager":"pip"}]'
+        assert leerie._toml_value(v) == "'[{\"manager\":\"pip\"}]'"
+
+    def test_round_trips_through_toml_parser(self, leerie):
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover
+            import tomli as tomllib
+        v = '[{"manager":"pip","command":"pip install -r requirements.txt"}]'
+        line = f"language_installs = {leerie._toml_value(v)}\n"
+        assert tomllib.loads(line)["language_installs"] == v
+
+    def test_dump_language_installs_handles_single_quotes(self, leerie):
+        """A1: a command with BOTH " (JSON) and ' (shell-quoted arg) must still
+        produce valid TOML — the single quote is escaped so the literal wrapper
+        stays intact and json.loads recovers it."""
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover
+            import tomli as tomllib
+        entries = [
+            {"manager": "pip", "command": "pip install 'requests[security]'",
+             "copy_inputs": ["requirements.txt"]},
+            {"manager": "gem", "command": "gem install rails -v '~> 7.0'"},
+        ]
+        dumped = leerie._dump_language_installs(entries)
+        assert "'" not in dumped  # no literal single quote survives
+        line = f"language_installs = {leerie._toml_value(dumped)}\n"
+        parsed = tomllib.loads(line)          # strict TOML must accept it
+        assert json.loads(parsed["language_installs"]) == entries
 
 
 # ---------------------------------------------------------------------------
@@ -362,6 +499,18 @@ class TestCaptureRepoDeps:
         content = cfg.read_text()
         assert "language_installs" in content
         assert "pip" in content
+        # Bug C regression: the JSON-encoded value contains `"`; the written
+        # config must be VALID TOML (single-quoted literal), not a basic string
+        # that the inner quotes terminate early.
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - py<3.11
+            import tomli as tomllib
+        parsed = tomllib.loads(content)
+        assert json.loads(parsed["language_installs"]) == [
+            {"manager": "pip", "command": "pip install -r requirements.txt",
+             "copy_inputs": ["requirements.txt"]},
+        ]
 
     def test_no_op_on_warm_repo(self, leerie, tmp_path, monkeypatch):
         """When all captured packages are already in setup_packages, no write."""

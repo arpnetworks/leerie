@@ -456,8 +456,12 @@ remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 `stop_machine`, `decide_teardown`, `resume_machine`, and `lib.sh`'s
 `update_run_json` — is tested via bash-harness subprocess tests with
 stubbed `flyctl`. The local per-repo image surface —
-`resolve_repo_image_tag`, `_leerie_repo_id`, `build_repo_image` — is
-tested via bash-harness subprocess tests with stubbed `git` and
+`resolve_repo_image_tag`, `_leerie_repo_id`, `build_repo_image`, and
+`ensure_base_in_buildkit_ns` (copies the base into the `buildkit` containerd
+namespace before the derived build so `FROM $BASE_IMAGE` resolves locally under
+Colima's namespaced buildkit; `tests/test_build_repo_image.py` pins that the copy
+fires and precedes the build, and the idempotent skip when the base is already
+present) — is tested via bash-harness subprocess tests with stubbed `git` and
 `nerdctl`. Worker cgroup containment (DESIGN §6 *Memory containment*) is
 tested in two files: `tests/test_cgroup_helpers.py` covers the
 orchestrator-side broker clients (`_cgroup_probe`/`_cgroup_create`/
@@ -517,14 +521,27 @@ Python-layer `group_id` in `run.json` (`_validate_run_json`,
 `tests/test_group_run_json.py`. State-dir isolation (distinct
 basename-keyed dirs per member, guard rejects `LEERIE_STATE_DIR`/
 `--state-dir`) is in `tests/test_group_state_dir_guard.py`. The
-capture engine (DESIGN §6½) — `_extract_depcap_commands`, `_merge_setup_packages`,
-`capture_repo_deps` (async, with stubbed `claude_p`), the idempotency
-sentinel (`dep_capture_done` state field + `<run_dir>/dep_capture.done`
-file), and `_backstop_capture_prior_runs` (skips runs with sentinel, captures
-runs without) — is tested across four files. `tests/test_dep_capture_budget.py`
-covers the extraction+budget unit (`_extract_depcap_commands`) in focused
-isolation: dedup, newest-first ordering, budget gate (`_DEPCAP_TOTAL_BUDGET`),
-`hit_ceiling` flag semantics, non-Bash filtering, and malformed-line tolerance.
+capture engine (DESIGN §6½) — `_gather_dep_manifests` (the manifests-first
+PRIMARY corpus), `_extract_depcap_commands` (the install-filtered SECONDARY
+command hint), `_is_install_command` (the install-verb filter),
+`_toml_value`/`_dump_language_installs` (single-quote-safe TOML persistence),
+`_merge_setup_packages`, `capture_repo_deps` (async, with stubbed `claude_p`),
+the idempotency sentinel (`dep_capture_done` state field +
+`<run_dir>/dep_capture.done` file), and `_backstop_capture_prior_runs` (skips
+runs with sentinel, captures runs without) — is tested across four files.
+`tests/test_dep_capture_budget.py` covers the extraction+budget unit
+(`_extract_depcap_commands`) in focused isolation: dedup, newest-first ordering,
+budget gate (`_DEPCAP_TOTAL_BUDGET`), `hit_ceiling` flag semantics, non-Bash
+filtering, and malformed-line tolerance. Since DESIGN §6½ moved the worker to a
+manifests-first corpus, `_extract_depcap_commands` now keeps **only
+install-shaped Bash commands** (`_is_install_command`) — the install-verb filter
+and its text-tool-pattern exclusion (e.g. `grep "apt-get install …"` is dropped)
+are pinned in `tests/test_capture_deps.py` (`TestIsInstallCommand`,
+`test_filters_to_install_shaped_only`,
+`test_excludes_install_verb_inside_text_tool_pattern`), alongside
+`_gather_dep_manifests` (`TestGatherDepManifests`) and `_toml_value` /
+`_dump_language_installs` (`TestTomlValue`, including the both-quote
+single-quoted-command TOML-validity regression).
 `tests/test_capture_deps.py` covers the integration against a synthetic
 JSONL fixture in the `_iter_log_tool_use` shape: absence pins
 (`TestRegexPathAbsent`) that assert the four deleted regex-path symbols

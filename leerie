@@ -3898,6 +3898,30 @@ resolve_repo_image_tag() {
   echo "leerie-repo/${repo_id}:${LEERIE_VERSION}"
 }
 
+# Make the base image resolvable by BuildKit for the derived `FROM $BASE_IMAGE`.
+#
+# Colima's buildkitd runs a containerd worker bound to the `buildkit` containerd
+# namespace (`org.mobyproject.buildkit.worker.containerd.namespace=buildkit`),
+# while `nerdctl build`/`inspect`/`run` all operate in the `default` namespace.
+# containerd namespaces are isolated, so a `FROM leerie:$VERSION` in the derived
+# build cannot see the base image (which lives in `default`) and BuildKit falls
+# back to the registry — where the never-pushed tag 401s ("pull access denied,
+# repository does not exist"). Copy the base into the `buildkit` namespace so the
+# `FROM` resolves locally. The derived build still runs in `default` (below), so
+# the built image lands where `nerdctl run` reads it. Idempotent: skip when the
+# base tag is already present in the buildkit namespace (a `save|load` of the
+# multi-GB base is ~15-20s). Best-effort and non-fatal — if the copy fails, the
+# build still attempts and surfaces its own error.
+ensure_base_in_buildkit_ns() {
+  if nerdctl --namespace buildkit image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+    return 0
+  fi
+  remote_log "copying base image into buildkit namespace (one-time; ~15-20s)..."
+  if ! nerdctl save "$IMAGE_TAG" | nerdctl --namespace buildkit load >/dev/null 2>&1; then
+    remote_log "warning: could not copy base image into buildkit namespace — derived build may fail to resolve \`FROM $IMAGE_TAG\`"
+  fi
+}
+
 # Build the per-repo derived image. Caller has already verified the build
 # is needed (image absent, Dockerfile changed, or base version changed).
 build_repo_image() {
@@ -4254,6 +4278,10 @@ PY
     # to apt-only by regenerating without the COPY+RUN lines.
     if [ "$_BAKE_LANGUAGE_DEPS" = "true" ] && \
        grep -q "^COPY " "$_leerie_dockerfile" 2>/dev/null; then
+      # This probe also does `FROM $BASE_IMAGE`; it needs the base in the
+      # buildkit namespace too, else it always fails and silently degrades to
+      # apt-only (defeating the language-dep bake). See ensure_base_in_buildkit_ns.
+      ensure_base_in_buildkit_ns
       if ! nerdctl build \
            --build-arg BASE_IMAGE="$IMAGE_TAG" \
            --build-arg HOST_UID="$(id -u)" \
@@ -4303,6 +4331,10 @@ if [ -f "$_leerie_dockerfile" ]; then
     fi
 
     if [ "$_need_build" = "true" ]; then
+      # BuildKit resolves the derived `FROM $BASE_IMAGE` from the `buildkit`
+      # containerd namespace, not the `default` one the base was built in —
+      # copy it across first (idempotent) or the build 401s against the registry.
+      ensure_base_in_buildkit_ns
       build_repo_image "$REPO_IMAGE_TAG"
       printf '%s\n' "$_cur_hash" > "$_hash_file"
     else
