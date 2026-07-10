@@ -639,7 +639,7 @@ _validate_state_ownership() {
   _basename="$(basename "$dir")"
   if [ -d "$_parent/.git" ] && [ -x "$_parent/leerie" ]; then
     case "$_basename" in
-      chain|commands|docs|orchestrator|prompts|scripts|skills|tests|.claude-plugin|.github)
+      chain|commands|docs|orchestrator|prompts|scripts|skills|tests|.claude-plugin|.github|.leerie)
         echo "leerie: state-dir target $dir is a subdirectory of the leerie install dir at $_parent" >&2
         echo "  (running leerie on a repo named '$_basename' would corrupt the installer clone)." >&2
         echo "refusing to write run state here. pick a different path with one of:" >&2

@@ -7,7 +7,8 @@ Why this matters (DESIGN §6½):
 `.leerie/runs/<id>/mise-overrides.toml` when a polyglot repo needs a
 synthesized go pin (`go.mod` + idiomatic files, no `.go-version`).
 The override file is NOT in the worktree's tracked-file set (it lives
-under `.leerie/`, which is git-ignored). So mise's discovery in the
+under `.leerie/runs/`, which is git-ignored — only `.leerie/config.toml`
+and `.leerie/Dockerfile` are tracked). So mise's discovery in the
 worktree wouldn't see the synth — and `mise exec -- go ...` invoked
 from a worker's Bash tool would fall through to system PATH, where
 Go isn't installed.

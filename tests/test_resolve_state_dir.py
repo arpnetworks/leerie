@@ -568,9 +568,11 @@ def test_install_subtree_list_matches_repo_top_level_dirs():
     drift.
 
     Uses `git ls-tree HEAD` rather than `iterdir` because the
-    installer clones tracked content; local-only dirs (.leerie/,
-    .pytest_cache/, .claude/) are not in the install and don't need
-    protection."""
+    installer clones tracked content; local-only dirs
+    (.pytest_cache/, .claude/) are not in the install and don't need
+    protection. Note: `.leerie/` IS tracked (its committable
+    config.toml/Dockerfile — the run artifacts under it stay
+    git-ignored), so `.leerie` is in the validator list."""
     repo_root = Path(__file__).resolve().parent.parent
     tracked = subprocess.run(
         ["git", "ls-tree", "--name-only", "-d", "HEAD"],
