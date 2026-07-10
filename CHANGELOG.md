@@ -5,6 +5,40 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.51]
+
+### Fixed
+
+- **Runs no longer falsely pause with "out of credits" when the account
+  has plenty of quota** (#44). The out-of-credits mid-stream-kill detector
+  latched on `overageStatus:"rejected"`, which is a *standing config state*
+  emitted by **every** `rate_limit_event` from an org that has extra-usage
+  (overage) disabled at the org level (`overageDisabledReason:
+  "org_level_disabled"`, `status:"allowed"`) — not a moment of credit
+  exhaustion. The latch armed on the first rate-limit event and stayed set,
+  so any later *unrelated* mid-stream truncation (a crash, a kill, a reaped
+  subprocess) was misreported as out-of-credits and routed into a bogus
+  300s "sleeping then auto-resuming" pause. Evidence: one navegando run had
+  96/96 rate-limit events in this shape while workers succeeded. The latch
+  now keys only on `overageDisabledReason ∈ {out_of_credits, out_of_overage}`
+  (actual exhaustion); an `org_level_disabled` truncation takes the ordinary
+  `WorkerError` path (retryable / advisory), never a pause. Pinned by
+  `test_invoke_org_level_disabled_truncation_raises_workererror`.
+
+### Changed
+
+- **A genuine out-of-credits kill now pauses-and-surfaces instead of
+  auto-resuming** (#44). Out-of-credits has no reset clock — it clears only
+  on a top-up or billing cycle, not by waiting — so the fixed 300s
+  auto-resume loop introduced in 0.9.4x (right for *rate limits*, which do
+  reset on a clock) only spun against the wall and burned the worker budget.
+  `RateLimitedExit` gains an `out_of_credits: bool` flag; when set, `main()`
+  runs worktree-only cleanup, prints an `out of credits — leerie --resume
+  <id>` hint, and exits `EXIT_LOCKED` (75). Clock-based rate limits (session
+  limit / terminal `status`) still auto-resume via `_sleep_then_reexec`
+  unchanged. The README rate-limit-recovery section is corrected to describe
+  the current auto-resume behavior and adds a distinct out-of-credits bullet.
+
 ## [0.9.50]
 
 ### Changed
