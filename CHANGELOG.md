@@ -5,6 +5,50 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.55]
+
+### Added
+
+- **Base-tree health baseline (DESIGN §9).** Until now the conformer was
+  the *first* place a repo's build/lint/test suite ran at all — the
+  orchestrator executed no BLT itself. So when the seeded base tree was
+  already red (because the repo's own tests are red, **or** because
+  leerie's container/provisioning couldn't run the suite — a
+  module-not-found, an OOM-killed test process), the conformer observed the
+  failures, correctly labeled them "pre-existing" (they aren't in its diff),
+  and the run shipped a PR on a baseline leerie never established was green.
+  The two causes were indistinguishable. Now `capture_conformance_baseline`
+  runs once at the start of `phase_execute`: the staging worktree is an
+  unmodified snapshot of the base HEAD, so it installs the persisted
+  provision recipe there and runs each resolved build/lint/test command
+  directly, recording the **exit-code verdict** per axis at
+  `state.json`'s `conformance._baseline` (non-zero = RED; 100% reliable, no
+  per-framework output parsing). Deterministic (no LLM), advisory (never
+  raises), idempotent (sentinel-guarded — skipped on `--resume`). A RED base
+  is surfaced **loudly** (a log warning + `run.json.health.base_suite`)
+  rather than laundered as inherited debt — the operator's signal to suspect
+  provisioning / memory / missing deps. The baseline is threaded into every
+  conformer prompt as a `BASELINE:` line so residuals are scoped to the
+  delta the change introduced, not re-derived from scratch each pass.
+- **`--skip-base-baseline`** (also `LEERIE_SKIP_BASE_BASELINE` /
+  `skip_base_baseline` in `leerie.toml`) — opt out of the baseline for repos
+  whose base is known green or where the up-front full-suite-run cost is
+  unwanted. Each baseline BLT command is bounded by the per-command provision
+  recipe timeout.
+- **Run-health surfacing (`run.json.health`).** `latency_ms` and turn-cap
+  truncation were captured in the per-worker logs but never surfaced at run
+  end. At finalize, `_record_run_health` folds the slowest worker
+  (`slowest_worker_sid` / `slowest_worker_min`) and the
+  `truncated_worker_count` (workers cut off at the turn cap,
+  `terminal_reason="max_turns"`) into `run.json.health`, merging with the
+  baseline's `base_suite` record. Pure surfacing of existing data; never
+  gates.
+- **PR-body base-health line.** The `pr_writer` payload now carries a
+  `base_health` block so the PR body can state whether the assembled change
+  builds and passes its tests *relative to the base* — the reviewer's signal
+  for whether a red suite is this run's fault or inherited, without checking
+  out the branch.
+
 ## [0.9.54]
 
 ### Added
