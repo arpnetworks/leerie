@@ -5,6 +5,51 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.54]
+
+### Added
+
+- **Cost and token totals are now surfaced.** Per-run telemetry
+  (`calls.ndjson`, `memory.ndjson`, and the `state.json` `telemetry`
+  block) has always been collected but never shown. Now the end-of-run
+  "run weight" log line includes the run's `cost_usd`, the PR body's Run
+  summary gains a `- Cost: $X.XX (N calls, … in / … out tokens)` line
+  (rendered identically by the Python `compose_pr_body` and the
+  `scripts/host-finalize.sh` bash fallback), and `leerie --list` gains a
+  `cost` column.
+- **`leerie --report <run-id>`** — a new read-only verb that prints a
+  telemetry report for a run: header (status, duration, aggregate calls /
+  `$cost` / tokens), a per-`call_type` breakdown (count, input/output
+  tokens, average latency, failures), a `failures by kind` rollup, and a
+  memory-peak line. Aggregates `calls.ndjson` + `state.json` +
+  `memory.ndjson`; adds no new telemetry. Auto-picks the sole run when
+  the id is omitted.
+- **`failure_kind` on each `calls.ndjson` record** — categorizes *why* a
+  captured `claude -p` call failed (`api_error[:auth|:quota|:overload]` /
+  `incomplete` / `schema_parse_failed`, or `null` on success), classified
+  in Python from the returned envelope. Covers envelope-returning failures
+  only; rate-limit / out-of-credits / hard-crash failures raise past the
+  capture block and are a documented known gap.
+
+### Removed
+
+- **The dead `--telemetry` / `--no-telemetry` / `--telemetry-dir` flags**
+  (and `LEERIE_TELEMETRY` / `LEERIE_TELEMETRY_DIR`) were parsed and
+  resolved but never read — `--no-telemetry` disabled nothing and the
+  documented `events/<run-id>/` NDJSON subdirectory was never written.
+  Telemetry is always on and writes `calls.ndjson` at the run root, exactly
+  as DESIGN §14 specifies. Removed the flags, resolvers, and the stale
+  IMPLEMENTATION.md / README sections; the accurate `calls.ndjson` /
+  `memory.ndjson` documentation stays.
+
+### Changed
+
+- **Shared `_api_error_category` helper** — the `api_error_status` →
+  `{auth, quota, overload}` mapping (401/429/529) is now a single source of
+  truth used by both `_is_auth_or_quota_failure` (the retry classifier) and
+  `_classify_failure_kind`, replacing duplicated inline logic. Behavior is
+  unchanged.
+
 ## [0.9.53]
 
 ### Fixed
