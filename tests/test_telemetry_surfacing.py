@@ -38,8 +38,18 @@ def _make_run(root: Path, run_id: str, state: dict,
 
 
 # ---------------------------------------------------------------------------
-# Part 4 — _classify_failure_kind
+# Part 4 — _api_error_category (shared status→category map) + _classify_failure_kind
 # ---------------------------------------------------------------------------
+
+def test_api_error_category_map(leerie):
+    # The single source of truth shared by _is_auth_or_quota_failure and
+    # _classify_failure_kind.
+    assert leerie._api_error_category(401) == "auth"
+    assert leerie._api_error_category(429) == "quota"
+    assert leerie._api_error_category(529) == "overload"
+    assert leerie._api_error_category(500) is None
+    assert leerie._api_error_category(None) is None
+
 
 def test_failure_kind_success_is_none(leerie):
     assert leerie._classify_failure_kind(

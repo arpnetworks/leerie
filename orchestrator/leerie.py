@@ -6760,6 +6760,21 @@ class WorkerError(RuntimeError):
     pass
 
 
+def _api_error_category(status: int | None) -> str | None:
+    """Map a `claude -p` `api_error_status` to a coarse failure category.
+
+    401→auth (subscription / credential rejection), 429→quota (rate limit),
+    529→overload (transient gateway). None for any other or absent status.
+    `api_error_status` on the result envelope is always a JSON number or null
+    (SDK type `api_error_status?: number | null`), so this numeric set is
+    exhaustive — no string forms ever reach here.
+
+    Single source of truth for the status→category mapping, shared by
+    `_is_auth_or_quota_failure` (which needs the bool) and
+    `_classify_failure_kind` (which needs the category string)."""
+    return {401: "auth", 429: "quota", 529: "overload"}.get(status)
+
+
 def _is_auth_or_quota_failure(envelope: dict) -> bool:
     """True if the `claude -p` envelope looks like a 401/429/529/
     auth-message rejection from the Anthropic gateway.
@@ -6782,12 +6797,11 @@ def _is_auth_or_quota_failure(envelope: dict) -> bool:
     """
     if not envelope.get("is_error"):
         return False
-    status = envelope.get("api_error_status")
-    # `api_error_status` on the claude -p result envelope is always a JSON
-    # number or null (SDK type `api_error_status?: number | null`), so the
-    # numeric set is exhaustive — no string forms ever reach here.
-    if status in (401, 429, 529):
+    if _api_error_category(envelope.get("api_error_status")) is not None:
         return True
+    # No numeric status matched — fall back to text markers on the result
+    # body. This path is specific to the retry classifier (not shared with
+    # `_classify_failure_kind`, which reads only the numeric status).
     msg = str(envelope.get("result") or "").lower()
     return ("invalid authentication" in msg
             or "rate limit" in msg
@@ -6804,8 +6818,9 @@ def _classify_failure_kind(envelope: dict, parsed_ok: bool) -> str | None:
     `terminal_reason`, and the caller's already-computed `parsed_ok`:
 
     - "api_error"        — gateway rejected the request. Split by
-      `api_error_status`: 401→auth, 429→quota, 529→overload; a bare
-      is_error with no numeric status stays "api_error".
+      `_api_error_category` (401→auth, 429→quota, 529→overload — the same
+      map the auth/quota retry path uses); a bare is_error with no matching
+      numeric status stays "api_error".
     - "incomplete"       — the worker stopped mid-work (e.g. --max-turns);
       `terminal_reason` set and not "completed". leerie already warns on
       this at the capture site.
@@ -6824,14 +6839,11 @@ def _classify_failure_kind(envelope: dict, parsed_ok: bool) -> str | None:
     if not envelope.get("is_error") and parsed_ok:
         return None
     if envelope.get("is_error"):
-        status = envelope.get("api_error_status")
-        if status == 401:
-            return "api_error:auth"
-        if status == 429:
-            return "api_error:quota"
-        if status == 529:
-            return "api_error:overload"
-        return "api_error"
+        # Same status→category map the auth/quota retry path keys on
+        # (`_api_error_category`); a bare is_error with no matching numeric
+        # status stays "api_error".
+        cat = _api_error_category(envelope.get("api_error_status"))
+        return f"api_error:{cat}" if cat else "api_error"
     term = envelope.get("terminal_reason") or ""
     if term and term != "completed":
         return "incomplete"
