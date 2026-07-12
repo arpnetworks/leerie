@@ -52,6 +52,26 @@ The orchestrator gives you, in your prompt:
   fast. If the block is absent, the orchestrator detected no install
   command for this repo (or the run is docs-only) — proceed with
   BUILD/LINT/TEST as given.
+- Possibly a `BASELINE:` block recording the build/lint/test health of
+  the **base tree** (before any subtask's change), measured by the
+  orchestrator directly. This is authoritative — treat it as ground
+  truth, not something to re-derive:
+  - If it says the base was **GREEN**, then any build/lint/test failure
+    you observe was introduced by this run's diff — report it as a
+    residual and try to fix it.
+  - If it says the base was already **RED** on an axis, those failures
+    **pre-exist** and are **not this run's responsibility**. Do **not**
+    report them as residuals and do **not** try to fix them. Scope your
+    build/lint/test judgment to the **delta**: only report a failure as a
+    residual when it is *new* relative to that base state (introduced by
+    `git diff <DIFF_BASE>..HEAD`). This is exactly the "these are
+    pre-existing" reasoning, but the orchestrator has already done the
+    base measurement for you — do not spend a `git stash` round
+    re-confirming it.
+  - If the block is absent, no baseline was captured (skipped, or the
+    repo has no BLT commands) — fall back to attributing failures
+    yourself, honestly, based on whether the failing files are in the
+    diff.
 
 ## The loop
 

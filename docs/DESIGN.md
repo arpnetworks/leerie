@@ -3115,6 +3115,59 @@ lands at `st.data["conformance"]["_final"]` and is threaded into the
 `pr_writer` payload so its residuals surface as an advisory section
 in the PR body alongside the wave-by-wave summary.
 
+**Base-tree health baseline.** Until this baseline was added, the
+conformer was *the first place the repo's build/lint/test suite ran
+at all* — the orchestrator itself executed no BLT command. That made a
+whole class of failure invisible until too late: when the seeded base
+tree is already red — because the repo's own tests are red on the
+developer's branch, **or** because leerie's container/provisioning
+cannot run the suite (a missing dependency surfacing as a
+module-not-found, an out-of-memory kill on a heavy test process) — the
+conformer runs the suite, observes the failures, and (correctly, since
+they are not in its diff) labels them *pre-existing technical debt*,
+records an advisory residual, and the run ships a PR on top of a
+baseline leerie never established was green. The two causes are
+indistinguishable to a conformer that has no notion of the base state,
+so a genuine provisioning defect is laundered as inherited debt. In
+chain/group flows the effect compounds: the base is often a prior
+run's branch, so an environment-induced red baseline propagates
+forward.
+
+The fix is a **base-health checkpoint**, code-computed and advisory
+(never a gate — the same §12 reasoning as the conformer's own
+build/lint/test axes). Once per run, after the staging worktree is
+created off the base HEAD but **before any wave mutates it**, the
+orchestrator installs the provision recipe into staging and runs the
+resolved build/lint/test commands there directly. Deps must be present
+for the suite to run, and per §6½ they live only in worktrees (the
+orchestrator never installs into the bind-mounted `repo_root`), so the
+staging worktree — unmodified at this point — is the earliest tree
+where an accurate baseline can be taken. The verdict is **exit-code
+based** (a non-zero exit is RED, zero is GREEN): this is 100% reliable
+and needs no per-framework output parsing, which is deliberate — the
+suite's own summary format varies by tool and cannot be relied on. A
+RED base is surfaced **loudly** (a `log()` warning plus a
+`run.json.health.base_suite` record) rather than silently absorbed,
+because it usually means *leerie could not make this repo green before
+starting* — the operator's signal to suspect provisioning, memory
+limits, or missing deps, distinct from a genuinely red base branch.
+The baseline is then passed to every conformer (per-subtask and
+final-tree) as a `BASELINE:` context line so the conformer scopes its
+build/lint/test judgment to the **delta** — failures the change
+introduced — rather than re-deriving "these are pre-existing" from
+scratch on each pass. The result also feeds a one-line advisory in the
+PR body ("builds ✓/✗; +N test failures vs base, or clean net of
+base") so the human reviewer sees whether the assembled change builds
+and passes its tests relative to the base without checking out the
+branch. None of this gates: the confidence gate (§8) remains the only
+load-bearing signal.
+
+Because the baseline runs the full suite once (the test run, not the
+install, is the cost — measured at tens of seconds to a few minutes on
+real repos), it is **skippable** for operators who know their base is
+green or who don't want the up-front cost, and each BLT command is
+bounded by the same per-command timeout the provision recipe uses.
+
 ---
 
 ## 10. Context management — handoff, not compaction

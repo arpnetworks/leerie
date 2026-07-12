@@ -217,6 +217,7 @@ STATE_FIELDS = (
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
+    "skip_base_baseline",
     # cgroup_containment: recorded by the fail-closed gate
     # (enforce_and_record_cgroup_containment, in _run_phases just before the
     # first worker spawns) (DESIGN §6 *Memory containment*). {enforced: bool, hierarchy:
@@ -580,6 +581,20 @@ SKIP_BUDGET_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 STRICT_CONFORMER_ENV = "LEERIE_STRICT_CONFORMER"
 STRICT_CONFORMER_FILE = SOURCE_OF_TRUTH_FILE
+
+# --skip-base-baseline bypass (DESIGN §9 *Base-tree health baseline*).
+# Suppresses `capture_conformance_baseline()` at the start of
+# `phase_execute` — the once-per-run install-into-staging + BLT pass that
+# records whether the base tree was green before any subtask mutated it.
+# The pass runs the full test suite once (tens of seconds to a few
+# minutes on heavy repos); this flag lets an operator who knows the base
+# is green skip that up-front cost. When skipped, the conformer receives
+# no BASELINE context and falls back to its prior self-judgment of
+# "pre-existing" failures. Resolution order: --skip-base-baseline CLI
+# flag → LEERIE_SKIP_BASE_BASELINE env → skip_base_baseline in
+# leerie.toml → False.
+SKIP_BASE_BASELINE_ENV = "LEERIE_SKIP_BASE_BASELINE"
+SKIP_BASE_BASELINE_FILE = SOURCE_OF_TRUTH_FILE
 
 # capture_deps preference (DESIGN §6½). Controls whether phase_finalize
 # scans logs and writes setup_packages / triggers the language-dep bake.
@@ -3660,6 +3675,24 @@ def resolve_strict_conformer(repo_root: Path, cli_value: bool) -> bool:
         env_var=STRICT_CONFORMER_ENV,
         file_key="strict_conformer",
         file_name=STRICT_CONFORMER_FILE)
+
+
+def resolve_skip_base_baseline(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-base-baseline preference. Order:
+    --skip-base-baseline CLI flag (action='store_true') →
+    LEERIE_SKIP_BASE_BASELINE env var →
+    skip_base_baseline in leerie.toml → False.
+
+    When True, `capture_conformance_baseline` is not run — the once-per-run
+    install-into-staging + build/lint/test pass that records base-tree
+    health (DESIGN §9 *Base-tree health baseline*) is skipped, and the
+    conformer gets no BASELINE context. Use on repos whose base is known
+    green, or to avoid the up-front full-suite-run cost."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_BASE_BASELINE_ENV,
+        file_key="skip_base_baseline",
+        file_name=SKIP_BASE_BASELINE_FILE)
 
 
 def _positive_int(s: str) -> int:
@@ -14678,6 +14711,10 @@ async def run_conformer(sid: str, leerie_dir: Path, worktree: str,
           f"LINT_CMD: {blt_commands.get('lint') or '(none)'}",
           f"TEST_CMD: {blt_commands.get('test') or '(none)'}",
           f"DIFF_BASE: {diff_base} (compare with `git diff {diff_base}..HEAD`)"]
+    baseline_section = _format_baseline_section(
+        (st.data.get("conformance") or {}).get("_baseline"))
+    if baseline_section is not None:
+        up.append(baseline_section)
     recipe_section = _format_provision_recipe_section(
         (st.data.get("provision") or {}).get("recipe") or [],
         audience="conformer")
@@ -15147,6 +15184,169 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     return last_res, warnings, blocked_reason
 
 
+def _format_baseline_section(baseline: dict | None) -> str | None:
+    """Render the base-tree health baseline as a conformer prompt section,
+    or None when there is no baseline (skipped, or not yet captured).
+
+    The section tells the conformer which build/lint/test axes were
+    already RED on the unmodified base tree so it scopes its own
+    build/lint/test judgment to the *delta* — failures the change
+    introduced — instead of re-deriving "these are pre-existing" from
+    scratch (DESIGN §9 *Base-tree health baseline*). Advisory: the
+    mechanical part (which axes were red on base) is code-computed here;
+    the judgment (is a given post-change failure the same one) stays with
+    the worker."""
+    if not baseline:
+        return None
+    axes = baseline.get("axes") or {}
+    red = [a for a in ("build", "lint", "tests")
+           if (axes.get(a) or {}).get("ran")
+           and not (axes.get(a) or {}).get("passed")]
+    lines = ["", "BASELINE:"]
+    if not red:
+        lines.append(
+            "  The base tree (before any subtask's change) was GREEN — "
+            "build, lint, and tests all passed (or were not applicable). "
+            "So ANY build/lint/test failure you observe was introduced by "
+            "this run's diff: report it as a residual and try to fix it.")
+        return "\n".join(lines)
+    lines.append(
+        "  The base tree (before any subtask's change) was already RED on "
+        "the following axis/axes: " + ", ".join(red) + ". These failures "
+        "PRE-EXIST on the base and are NOT this run's responsibility — do "
+        "NOT report them as residuals and do NOT try to fix them. Scope "
+        "your build/lint/test judgment to the DELTA: only report a "
+        "build/lint/test failure as a residual if it is NEW relative to "
+        "this base state (i.e. introduced by the diff). Compare with "
+        "`git diff DIFF_BASE..HEAD` to attribute failures.")
+    for a in red:
+        summ = ((axes.get(a) or {}).get("summary") or "").strip()
+        if summ:
+            lines.append(f"  - {a} (pre-existing): {summ[:200]}")
+    return "\n".join(lines)
+
+
+async def capture_conformance_baseline(
+        leerie_dir: Path, st: State, caps: dict) -> None:
+    """Record base-tree build/lint/test health once per run (DESIGN §9
+    *Base-tree health baseline*).
+
+    Runs at the start of `phase_execute`, after `setup-run.sh` has created
+    the staging worktree off the base HEAD but before any wave mutates it,
+    so the tree is an unmodified snapshot of the base. Installs the
+    provision recipe into staging (deps live only in worktrees — §6½ — so
+    the suite cannot run without this), then runs each resolved
+    build/lint/test command directly via `run_streaming` and records the
+    **exit code** per axis (non-zero ⇒ RED). Exit-code-based on purpose:
+    100% reliable, no per-framework output parsing.
+
+    Deterministic (no LLM). Advisory — never raises; any failure to
+    capture is logged and the run proceeds with no baseline (the conformer
+    then falls back to its prior self-judgment). Idempotent: the presence
+    of `st.data["conformance"]["_baseline"]` is the completion sentinel, so
+    `--resume` does not re-run it.
+
+    A RED base is surfaced loudly (a `log()` warning + a
+    `run.json.health.base_suite` record) because it usually means leerie's
+    container/provisioning could not make the repo green before starting —
+    the operator's signal to suspect provisioning / memory / missing deps,
+    distinct from a genuinely red base branch."""
+    conf = st.data.get("conformance") or {}
+    if conf.get("_baseline") is not None:
+        log("phase 4: base-health baseline already captured — skipping (resume)")
+        return
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        log("phase 4: base-health baseline skipped — staging worktree absent")
+        return
+
+    repo_root = st.repo_root
+    blt = resolve_blt(repo_root)
+    # resolve_blt keys the test axis "test" (singular); the conformer's
+    # structured-output result keys it "tests" (plural). Map the axis name
+    # we store/report ("tests", matching the conformer result + baseline
+    # consumers) to the resolve_blt command key ("test").
+    _AXIS_CMD_KEY = {"build": "build", "lint": "lint", "tests": "test"}
+    if not any(blt.get(_AXIS_CMD_KEY[a]) for a in ("build", "lint", "tests")):
+        log("phase 4: base-health baseline skipped — no build/lint/test "
+            "commands resolved for this repo")
+        return
+
+    log("phase 4: capturing base-tree health baseline on staging")
+    verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
+    log_path = st.run_dir / "logs" / "base-baseline.log"
+    timeout = float(caps.get("worker_timeout_sec") or 5400)
+
+    # Install the provision recipe into staging so the suite can run.
+    # Deps live only in worktrees (§6½); staging starts bare. Failure to
+    # install is non-fatal — a subsequent BLT command that needs deps will
+    # simply exit non-zero, which is itself recorded as a RED axis.
+    recipe = (st.data.get("provision") or {}).get("recipe") or []
+    for e in recipe:
+        if e.get("kind") not in ("install", "build") or not e.get("command"):
+            continue
+        wd = staging / (e.get("working_dir") or ".")
+        try:
+            await run_streaming(
+                e["command"], cwd=str(wd),
+                timeout=float(e.get("timeout_s") or 1800),
+                log_path=log_path, label=f"baseline-install: {' '.join(e['command'])}",
+                verbosity=verbosity)
+        except subprocess.TimeoutExpired:
+            log(f"  base-baseline: install timed out: {' '.join(e['command'])}")
+        except Exception as ex:  # non-fatal: BLT below will show the effect
+            log(f"  base-baseline: install error "
+                f"({type(ex).__name__}): {' '.join(e['command'])}")
+
+    axes: dict[str, dict] = {}
+    for axis in ("build", "lint", "tests"):
+        cmd = (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
+        if not cmd:
+            axes[axis] = {"ran": False, "passed": None, "summary": "",
+                          "command": ""}
+            continue
+        try:
+            rc, tail = await run_streaming(
+                ["bash", "-lc", cmd], cwd=str(staging), timeout=timeout,
+                log_path=log_path, label=f"baseline-{axis}: {cmd}",
+                verbosity=verbosity)
+            axes[axis] = {
+                "ran": True, "passed": rc == 0,
+                "command": cmd,
+                # Keep a short tail for the RED warning / conformer context.
+                "summary": (tail or "").strip()[-400:],
+            }
+        except subprocess.TimeoutExpired:
+            axes[axis] = {"ran": True, "passed": False, "command": cmd,
+                          "summary": f"timed out after {int(timeout)}s"}
+        except Exception as ex:
+            axes[axis] = {"ran": False, "passed": None, "command": cmd,
+                          "summary": f"{type(ex).__name__}: {ex}"}
+
+    red = [a for a in ("build", "lint", "tests")
+           if axes[a].get("ran") and not axes[a].get("passed")]
+    baseline = {"axes": axes, "red_axes": red}
+    conf = st.data.setdefault("conformance", {})
+    conf["_baseline"] = baseline
+    st.save()
+
+    if red:
+        log(f"phase 4: ⚠ base tree is RED on {', '.join(red)} — leerie could "
+            "not confirm this repo is green before starting. Suspect "
+            "provisioning / missing deps / memory limits, or a genuinely "
+            "red base branch. Conformer residuals for these axes will be "
+            "treated as pre-existing (delta-scoped).")
+        _write_run_json(st.run_dir,
+                        health={"base_suite": {"status": "red",
+                                               "red_axes": red}})
+    else:
+        log("phase 4: base tree is GREEN (build/lint/tests) — new "
+            "build/lint/test failures will be attributed to this run.")
+        _write_run_json(st.run_dir,
+                        health={"base_suite": {"status": "green",
+                                               "red_axes": []}})
+
+
 async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                                 models: dict[str, str],
                                 efforts: dict[str, str | None]) -> None:
@@ -15220,6 +15420,10 @@ async def run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             f"DIFF_BASE: {working_branch} (compare with "
             f"`git diff {working_branch}..HEAD`)",
         ]
+        baseline_section = _format_baseline_section(
+            (st.data.get("conformance") or {}).get("_baseline"))
+        if baseline_section is not None:
+            up.append(baseline_section)
         recipe_section = _format_provision_recipe_section(
             (st.data.get("provision") or {}).get("recipe") or [],
             audience="conformer")
@@ -15772,6 +15976,20 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     # `git worktree list --porcelain` in new-worktree.sh.
     await run_proc(["git", "worktree", "prune"])
 
+    # Base-tree health baseline (DESIGN §9): staging now exists off the
+    # base HEAD and no wave has mutated it yet, so this is the earliest
+    # accurate snapshot. Advisory + idempotent (sentinel-guarded), so it
+    # runs once on the fresh path and is skipped on --resume. Opt-out via
+    # skip_base_baseline (the full-suite-run cost).
+    if not st.data.get("skip_base_baseline"):
+        try:
+            await capture_conformance_baseline(leerie_dir, st, caps)
+        except Exception as e:
+            # Defense-in-depth: capture_conformance_baseline is documented
+            # to never raise, but a bug in its glue must not block the run.
+            log(f"phase 4: base-health baseline errored "
+                f"({type(e).__name__}: {e}); proceeding with no baseline")
+
     sem = asyncio.Semaphore(caps["max_parallel"])
 
     async def settle_one(sid: str) -> tuple[str, dict]:
@@ -16005,6 +16223,100 @@ def _truncate_diff_sample(diff_text: str, max_lines: int) -> tuple[str, bool]:
     return ("\n".join(kept), True)
 
 
+def _base_health_payload(st: "State") -> dict | None:
+    """Compact view of the base-tree health baseline (DESIGN §9) for the
+    pr_writer payload. Returns None when no baseline was captured (skipped
+    or a repo with no BLT commands) so the field is simply absent.
+
+    Reports which build/lint/test axes were RED on the unmodified base
+    tree, so the PR body can state whether the assembled change builds and
+    passes its tests *relative to the base* — the reviewer's signal for
+    whether a red suite is this run's fault or inherited, without having to
+    check out the branch. Advisory: informational, never a gate."""
+    baseline = (st.data.get("conformance") or {}).get("_baseline")
+    if not baseline:
+        return None
+    axes = baseline.get("axes") or {}
+    ran = {a: (axes.get(a) or {}) for a in ("build", "lint", "tests")}
+    red = [a for a in ("build", "lint", "tests")
+           if ran[a].get("ran") and not ran[a].get("passed")]
+    return {
+        "base_status": "red" if red else "green",
+        "base_red_axes": red,
+        # Per-axis ran/passed so the pr_writer can phrase "net of base".
+        "axes": {a: {"ran": bool(ran[a].get("ran")),
+                     "passed": ran[a].get("passed")}
+                 for a in ("build", "lint", "tests")},
+    }
+
+
+def _record_run_health(st: "State") -> None:
+    """Compute and persist run-health signals into `run.json.health`
+    (DESIGN §9 / F4). Pure surfacing of data already captured in the
+    per-worker JSONL logs — no new instrumentation:
+
+      - `slowest_worker_sid` / `slowest_worker_min`: the worker whose
+        summed result `duration_ms` was largest, keyed by log basename
+        (the sid). `calls.ndjson` carries `latency_ms` but no sid, so the
+        per-worker log is the authoritative source for both.
+      - `truncated_worker_count`: worker logs that ended a result with
+        `terminal_reason":"max_turns"` — a worker cut off at the turn cap
+        (a mis-sized-subtask signal; see the deferred decomposition work).
+
+    Merges into any existing `health` object (e.g. the `base_suite`
+    record the baseline wrote) rather than clobbering it. Best-effort:
+    malformed log lines are skipped; a missing logs dir is a no-op."""
+    logs_dir = st.run_dir / "logs"
+    if not logs_dir.is_dir():
+        return
+    best_sid: str | None = None
+    best_ms = 0.0
+    truncated = 0
+    for lg in sorted(logs_dir.glob("*.log")):
+        total_ms = 0.0
+        hit_cap = False
+        try:
+            with lg.open() as f:
+                for line in f:
+                    # Cheap pre-filter: skip lines that can't be a result
+                    # record. Tolerant of both compact (`"type":"result"`,
+                    # the live claude -p shape) and spaced JSON.
+                    if '"result"' not in line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("type") != "result":
+                        continue
+                    total_ms += rec.get("duration_ms") or 0
+                    if rec.get("terminal_reason") == "max_turns":
+                        hit_cap = True
+        except OSError:
+            continue
+        if hit_cap:
+            truncated += 1
+        if total_ms > best_ms:
+            best_ms = total_ms
+            best_sid = lg.stem
+    health = {
+        "slowest_worker_sid": best_sid,
+        "slowest_worker_min": round(best_ms / 60000.0, 1) if best_ms else 0.0,
+        "truncated_worker_count": truncated,
+    }
+    # Preserve the baseline's base_suite record if present.
+    existing = {}
+    sidecar = st.run_dir / "run.json"
+    if sidecar.exists():
+        try:
+            existing = (json.loads(sidecar.read_text()) or {}).get("health") or {}
+        except (OSError, ValueError):
+            existing = {}
+    if isinstance(existing, dict) and existing.get("base_suite") is not None:
+        health["base_suite"] = existing["base_suite"]
+    _write_run_json(st.run_dir, health=health)
+
+
 def _final_conformance_payload(st: "State") -> dict | None:
     """Compact view of the final-tree conformer pass for the pr_writer
     payload. Returns None when there is nothing advisory to say —
@@ -16187,6 +16499,9 @@ async def _compose_pr_via_llm(st: "State",
         fc = _final_conformance_payload(st)
         if fc is not None:
             payload["final_conformance"] = fc
+        bh = _base_health_payload(st)
+        if bh is not None:
+            payload["base_health"] = bh
         preconditions = st.data.get("external_preconditions") or []
         if preconditions:
             payload["external_preconditions"] = preconditions
@@ -16350,6 +16665,16 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
         log(f"capture: non-fatal error during dep capture ({_cap_exc}); "
             "continuing")
 
+    # Run-health surfacing (DESIGN §9 / F4): fold the slowest worker and
+    # the turn-cap-truncation count into run.json.health, merging with any
+    # base_suite record the baseline already wrote. Pure surfacing of
+    # data already captured in the per-worker logs; never gates, never
+    # raises (best-effort — a bad log line must not block finalize).
+    try:
+        _record_run_health(st)
+    except Exception as _h_exc:
+        log(f"run-health: non-fatal error ({_h_exc}); continuing")
+
     # LLM-composed PR title/body. Runs only when push will happen and
     # the caller threaded models/efforts/caps through. Fail-open: any
     # error is swallowed and the launcher uses its bash fallback.
@@ -16485,6 +16810,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
         st.data["strict_conformer"] = bool(args.strict_conformer)
+        st.data["skip_base_baseline"] = bool(args.skip_base_baseline)
         st.data["leerie_version"] = _read_version()
         st.save()
         # Fail-closed containment gate + recording, now that st.data is
@@ -16524,6 +16850,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
                    "strict_conformer": bool(args.strict_conformer),
+                   "skip_base_baseline": bool(args.skip_base_baseline),
                    "leerie_version": _read_version()}
         st.save()
         # Fail-closed containment gate + recording, before the first
@@ -16879,6 +17206,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "with --resume after fixing. "
                          f"Also {STRICT_CONFORMER_ENV} env or "
                          "strict_conformer in leerie.toml. Default: off.")
+    ap.add_argument("--skip-base-baseline", action="store_true",
+                    help="skip the base-tree health baseline (DESIGN §9): the "
+                         "once-per-run install-into-staging + build/lint/test "
+                         "pass that records whether the base was green before "
+                         "any subtask ran. The pass runs the full suite once "
+                         "(tens of seconds to a few minutes); skip it when the "
+                         "base is known green or the up-front cost is unwanted. "
+                         f"Also {SKIP_BASE_BASELINE_ENV} env or "
+                         "skip_base_baseline in leerie.toml. Default: off.")
     ap.add_argument("--source-of-truth", choices=SOURCE_OF_TRUTH_VALUES,
                     metavar="VALUE",
                     help=f"source-of-truth preference "
@@ -17181,6 +17517,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     args.strict_conformer = resolve_strict_conformer(
         repo_root, args.strict_conformer)
+
+    args.skip_base_baseline = resolve_skip_base_baseline(
+        repo_root, args.skip_base_baseline)
 
     args.dangerously_allow_uncapped = resolve_dangerously_allow_uncapped(
         repo_root, args.dangerously_allow_uncapped)
