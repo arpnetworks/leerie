@@ -49,6 +49,13 @@ def test_api_error_category_map(leerie):
     assert leerie._api_error_category(529) == "overload"
     assert leerie._api_error_category(500) is None
     assert leerie._api_error_category(None) is None
+    # Edge cases that keep the dict-get swap equivalent to the old
+    # `status in (401,429,529)` tuple check: a Python bool aliases to 0/1
+    # (absent from the map) and a float hash-equals its int. If the map ever
+    # gains a 0/1 key, the first two asserts catch the bool-aliasing break.
+    assert leerie._api_error_category(True) is None   # True == 1, not a key
+    assert leerie._api_error_category(False) is None  # False == 0, not a key
+    assert leerie._api_error_category(401.0) == "auth"  # 401.0 hashes == 401
 
 
 def test_failure_kind_success_is_none(leerie):
