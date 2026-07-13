@@ -5,6 +5,50 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.57]
+
+### Fixed
+
+- **Codebase-grounded recursive decomposition — post-ship gap fixes (ENRIC
+  P6 + P1, DESIGN §5½).** The P6+P1 feature shipped in 0.9.55 (#49) crashed
+  on any real run and missed several of its own design goals; verification —
+  including a live `recursive_decompose` run against a signature-faithful
+  `claude_p` stub — surfaced seven issues that the stubbed unit tests masked
+  (the stub's `**kwargs` swallowed missing required args, so the crash was
+  invisible to `pytest`).
+  - **Hard crash (blocker).** `recursive_decompose` invoked `claude_p()`
+    without the required keyword-only arguments `cwd`/`autonomous`/`caps`,
+    raising `TypeError` on the first `fit_judge` call of every run (the
+    container exited 1 and produced nothing). Both call sites now pass the
+    full signature; a signature-binding regression guard fails if any is
+    dropped.
+  - **Migration chunks now labeled distinctly.** The migration path copied
+    the parent subtask's identical `title`/`success_criteria_seed` onto every
+    chunk (a comment promised a splitter follow-on that never ran).
+    `partition_files` still owns the file→chunk partition; the `splitter`
+    worker is now invoked in **label-only mode** to write a distinct title +
+    criteria per chunk, with a distinct deterministic fallback on splitter
+    failure (§12 code-enforces distinctness).
+  - **Repo-map now reaches the judge/splitter.** The built P6 symbol graph
+    was injected only into the planner context, never into `fit_judge` /
+    `splitter`, despite comments/docstring/CLI claiming otherwise.
+    `recursive_decompose` now re-ranks the map per node and injects the
+    ranked subgraph into each worker prompt.
+  - **`decomposition_quality` demoted to advisory.** The self-scored planner
+    axis was still a `blocked`-gating signal, contradicting DESIGN §5½'s
+    intent that the independent `fit_judge` supersede it. It is retained in
+    the planner schema as an advisory self-report but no longer gates; only
+    `task_understanding` gates. DESIGN's internal contradiction is reconciled.
+  - **Visible P6 degradation (§12).** `build_repo_map` now emits one warning
+    per process when the repo has source files but the symbol graph is empty
+    *and* a functional probe confirms tree-sitter is unavailable/incompatible
+    — surfacing a silent P6 no-op — with no false positive on a legitimately
+    symbol-less repo.
+  - **Test robustness + docs.** Repo-map test modules gate on a functional
+    tree-sitter probe (not mere importability), so an installed-but-
+    incompatible language-pack version skips cleanly instead of failing;
+    dangling `DESIGN §P6`/`§P1` doc anchors normalized to `§5½` tree-wide.
+
 ## [0.9.55]
 
 ### Added
