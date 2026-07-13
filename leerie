@@ -4057,7 +4057,7 @@ if [ "$_leerie_do_gen" = "true" ]; then
     # End the apt layer with the image still at USER root. Do NOT append a
     # trailing `USER leerie`: the base image's ENTRYPOINT (container-entry.sh)
     # is inherited here and MUST run as PID-1 root to set up cgroup containment
-    # and launch the root broker before dropping to leerie via `runuser` (see
+    # and launch the cgroup broker before dropping to leerie via `runuser` (see
     # DESIGN §6; the base Dockerfile omits `USER leerie` for the same reason).
     # A trailing `USER leerie` makes PID 1 run as leerie → cgroup writes, the
     # broker socket bind, and `runuser` all fail EACCES and the container exits 1.
@@ -5955,7 +5955,12 @@ else
   # --cgroupns=host is required alongside the bind-mount: nerdctl's
   # default --cgroupns=private + nsdelegate on the cgroupfs mount
   # blocks non-root process migration to cgroup.procs (the kernel
-  # treats the namespace boundary as a delegation boundary).
+  # treats the namespace boundary as a delegation boundary). It is also
+  # load-bearing for the rootless delegated path (DESIGN §6 *Rootless
+  # exception*): only with cgroupns=host does the container see the true
+  # host cgroup tree at its real path, so the absolute
+  # /sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/ slice
+  # that container-entry.sh anchors leerie.slice under actually resolves.
   # If the host doesn't have cgroup v2 (kernel <5.x or unified hier
   # disabled) the bind-mount no-ops cleanly and the orchestrator's
   # _cgroup_probe returns False, falling back to the pre-fix
@@ -5966,32 +5971,36 @@ else
 
   # On macOS (Darwin), unconditionally set the cgroup bind-mount —
   # Colima's VM always has cgroup v2 with shared propagation, but the
-  # host has no /sys/fs/cgroup to probe. On Linux, probe whether the
-  # container runtime's namespace has /sys/fs/cgroup as shared (required
-  # for rshared bind-propagation). Rootless containerd (rootlesskit
-  # --propagation=rslave) demotes it to master (slave), making the
-  # bind-mount fail. When skipped, the orchestrator's _cgroup_probe
-  # detects the missing mount and falls back to uncapped workers with
-  # one warn line.
+  # host has no /sys/fs/cgroup to probe. On native Linux, rootful
+  # containerd also gets the rshared bind-mount unconditionally.
+  #
+  # Rootless containerd is its own branch: rootlesskit's
+  # --propagation=rslave demotes /sys/fs/cgroup to a slave mount inside
+  # its sandbox, so requesting bind-propagation=rshared here would fail
+  # (or silently no-op, depending on runtime) — but propagation of
+  # *future* mount events is not actually needed for our purpose, only
+  # read/write visibility into the *already-mounted* cgroupfs so
+  # container-entry.sh can create/manage cgroups under the systemd-
+  # delegated user slice (DESIGN §6 *Rootless exception*). A plain bind
+  # mount (no bind-propagation flag) gives exactly that, and — unlike
+  # omitting the mount entirely — avoids falling back to the container
+  # runtime's own default cgroupns=host mount, which is read-only for
+  # unprivileged/rootless containers. When cgroup v2 isn't present at
+  # all (older kernel, disabled unified hierarchy), the mount is skipped
+  # and the orchestrator's _cgroup_probe falls back to uncapped workers
+  # with one warn line, same as before.
   CGROUP_MOUNT_ARG=()
   if [ "$(uname -s)" = "Darwin" ]; then
     # macOS has no /sys/fs/cgroup — the host-side probe below always
     # fails. But Colima's Linux VM runs rootful containerd with cgroup
     # v2 and shared propagation, so the bind-mount works inside the VM.
     CGROUP_MOUNT_ARG=(--mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared")
+  elif [ -f "/run/user/$(id -u)/containerd-rootless/child_pid" ]; then
+    if [ -f /sys/fs/cgroup/cgroup.controllers ]; then
+      CGROUP_MOUNT_ARG=(--mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup")
+    fi
   elif [ -f /sys/fs/cgroup/cgroup.controllers ]; then
-    _cg_shared=true
-    _rl_child="/run/user/$(id -u)/containerd-rootless/child_pid"
-    if [ -f "$_rl_child" ]; then
-      _child_pid=$(cat "$_rl_child" 2>/dev/null)
-      if [ -n "$_child_pid" ] && \
-         ! grep -q ' /sys/fs/cgroup .*shared:' "/proc/$_child_pid/mountinfo" 2>/dev/null; then
-        _cg_shared=false
-      fi
-    fi
-    if [ "$_cg_shared" = "true" ]; then
-      CGROUP_MOUNT_ARG=(--mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared")
-    fi
+    CGROUP_MOUNT_ARG=(--mount "type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,bind-propagation=rshared")
   fi
 
   # Rootless nerdctl: container-entry.sh uses `unshare --user` to remap
