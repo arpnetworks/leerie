@@ -291,6 +291,15 @@ export LEERIE_WORKER_PIDS_MAX=2048
 # per-subtask ratio will come in under the default 2.5 estimate:
 ./leerie "task" --skip-budget-check
 
+# Skip the P6 repo-map structural context (DESIGN §P6 *Codebase
+# structural map*): suppresses build_repo_map() and the ranked
+# subgraph injection into planner/splitter context. The planner
+# degrades gracefully to the prior grep/glob-only path. Use on repos
+# where tree-sitter cannot parse the primary language, or to opt out
+# of structural context. Also LEERIE_SKIP_REPO_MAP=1 or
+# `skip_repo_map = true` in leerie.toml. Default: off.
+./leerie "task" --skip-repo-map
+
 # Make the conformer phase blocking instead of advisory.
 # Residuals cause subtasks to return 'blocked' (fix + --resume).
 # Also LEERIE_STRICT_CONFORMER=1 or `strict_conformer = true` in
@@ -593,6 +602,93 @@ non-fatal `try/except Exception`; `_run_phases()` calls
 `_backstop_capture_prior_runs` before `phase_classify` (the SIGKILL /
 crash recovery path); and the `dep_capture` prompt file exists alongside
 `SCHEMAS['dep_capture']` (the §12 advisory + code-enforces split).
+The P6 ranking contract (DESIGN §P6) is pinned in `tests/test_rank_repo_map.py`
+across three classes: `TestSeedNeighborhoodRanking` (seed-adjacent nodes rank
+above unrelated nodes — direct seed file, 1-hop neighbor, seed symbol biases
+definer, all connected before unrelated, large-graph unrelated cluster at tail);
+`TestTokenBudgetEnforcement` (output fits within explicit budget and within
+`DEFAULT_CAPS["repo_map_tokens"]` when None; `None` budget equals the cap value;
+empty map returns `""`); `TestBinarySearchShrink` (lowering the budget yields
+shorter output and fewer files; increasing budgets yield non-decreasing lengths;
+1-token budget yields empty or a single very-short entry). Fixture is built
+directly (no `build_repo_map`) — isolates ranking. No LLM calls; deterministic.
+The P1 recursive decomposition surface (DESIGN §P1) is tested across four
+files. `tests/test_fit_judge_schema.py` covers `SCHEMAS["fit_judge"]` —
+required fields (`score`, `rationale`, `diffuse`, `confidence`), `score`
+bounds (minimum 0, maximum 1), `confidence` using the `"fit"` axis, valid and
+invalid instance acceptance, JSON serializability, and wiring (`fit_judge` in
+`WORKER_TYPES`, not in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER`
+entry at `"high"`, prompt file exists). `tests/test_splitter_schema.py` covers
+`SCHEMAS["splitter"]` — `children` required with `minItems:1`, child required
+fields (`id`, `title`, `success_criteria_seed`), optional child fields,
+valid/invalid instances, JSON serializability, the same wiring guards, no
+top-level `files` field (splitter never decides partition), and the child
+`requires` array uses the `_REQUIRES_ITEM` shape (tag + extent enum).
+`tests/test_resolve_fit_judge_model.py` and
+`tests/test_resolve_fit_judge_splitter_model.py` cover model and effort
+resolution for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent
+from `MODEL_DEFAULT_PER_WORKER` (opus via global `MODEL_DEFAULT` fallback); both
+in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override
+chains; isolation (override doesn't bleed to other workers); structural wiring
+guards. `tests/test_partition_files.py` is the dedicated test for `partition_files()`:
+44 tests across parametrized invariant sweeps (input sizes 0, 1, 8, 29, 64;
+chunk-size 1, equals-n, larger-than-n, partial-last-chunk) plus named
+telemetry cases — the 29-file migration sweep and 64-file date-fns sweep that
+drove the design (LLM silently dropped 14/29; code-partition is complete by
+construction). Asserts: 100% coverage (sum of chunk lengths == len(input)),
+zero overlap (no file in two chunks), chunks bounded by chunk_size, and order
+preserved. `tests/test_recursive_decompose.py` covers `recursive_decompose()`
+(well-fit subtask is a leaf at score ≥ 0.70, oversized subtask recurses then
+children are judged, depth cap terminates at `decompose_max_depth`, no-progress
+guard terminates after `decompose_noprogress_rounds`, migration path uses
+`partition_files` not the splitter LLM, `st.bump_workers` called before every
+`claude_p`); it also carries a parallel set of structural `partition_files`
+tests for regression coverage within that file.
+`tests/test_recursive_decompose_schedule.py` is the integration test for the
+seam between Layer B and the existing scheduler (DESIGN §P1 end-of-pipeline
+claim): leaf ids from `recursive_decompose` carry a valid domain prefix so
+`schedule()` cross-domain wiring and `validate_plan`'s id-prefix check both
+pass; a ready plan built from stubbed leaves feeds `schedule()` and produces
+the correct topo-sorted wave partition (independent leaves in wave 0, a
+dependent leaf in wave 1); and `validate_plan` accepts the full leaf set
+without errors.
+The four new `DEFAULT_CAPS` values introduced by the F1 P6+P1 work are
+pinned in `tests/test_decompose_caps.py`: `repo_map_tokens==1000`,
+`decompose_max_depth==5`, `decompose_fit_threshold==0.70` (with a comment
+citing F1-build-measure.md — the 0.95 value it replaced over-splits 100% of
+well-fit subtasks), and `decompose_noprogress_rounds==2`. Mirrors the
+`test_default_cap_is_eight` pattern from `test_resolve_confidence_rounds.py`.
+The P6 repo-map builder is pinned in two files.
+`tests/test_repo_map.py` covers `build_repo_map` (symbol/def extraction, class
+methods, ref edges, relative-path keys, empty-repo, skip-.git/node_modules),
+the mtime cache (dir created on first use, unchanged file served from cache
+sentinel, changed file re-parsed, only-changed file re-parsed),
+`rank_repo_map` (string result, token-budget fits, seed-file/seed-symbol bias,
+empty map, determinism, very-tight budget), `_parse_repo_file` (unsupported
+extension, markdown, python defs + refs), `_walk_calls` (bare call extracted,
+attribute call not extracted), and `_pagerank` (dangling node, personalization,
+empty). `tests/test_build_repo_map.py` (added by subtask test-001) provides a
+focused HAS_TREESITTER-gated supplement: symbol graph (defs, class defs, ref
+edge, keys shape, relative-path invariant), mtime cache (cache dir created,
+sentinel cache hit, changed file re-parsed, only-changed file re-parsed with
+sentinel for unchanged), and graceful degrade (empty file, binary file, empty
+repo, skip-.git/node_modules). Uses a `pytestmark` module-level skip gate so
+CI without tree-sitter-language-pack skips all tests cleanly.
+The P6 Layer A wiring — `phase_plan` ctx injection — is tested in
+`tests/test_phase_plan_repo_map_ctx.py`: repo-map enabled path (ctx contains
+`repo_map` string, non-empty, JSON-serializable, contains known symbol names,
+seed_files from `task_file_items` respected); skip path (ctx omits `repo_map`,
+baseline keys present, values match inputs); empty-repo degrade (`rank_repo_map`
+returns `""` → key omitted); exception-swallow degrade (`build_repo_map`
+raises → exception caught, ctx emitted without `repo_map`).
+The P1 Layer C wiring — `phase_plan` recursion expansion — is tested in
+`tests/test_phase_plan_recursion_wiring.py`: source-coupling guard (`phase_plan`
+source contains `recursive_decompose(` at depth=0, reassigns `plan["subtasks"] = leaves`,
+expansion loop precedes final logging); integration — one oversized subtask (stubbed
+`recursive_decompose` → two leaves) → `plan["subtasks"]` has 2 entries; two
+first-pass subtasks → `recursive_decompose` called once per subtask; well-fit
+leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`);
+empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`).
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.

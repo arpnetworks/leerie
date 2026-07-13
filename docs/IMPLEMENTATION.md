@@ -63,6 +63,16 @@ Current runtime deps:
 
 - `tenacity` — exponential backoff for transient `claude -p` envelope
   errors (auth / rate-limit). See §3 *Auth/quota backoff*.
+- `tree-sitter` — incremental parser core, required by the P6 repo-map
+  (`build_repo_map`). Deliberate exception to the stdlib-preferred
+  policy: tree-sitter's mtime-cached symbol/reference graph is the
+  structural foundation that prevents shallow planner splits
+  (DESIGN §5½ *P6 — codebase structural map*). Ships a
+  prebuilt manylinux wheel; no C build needed.
+- `tree-sitter-language-pack` — prebuilt grammar collection (Python,
+  TypeScript, JavaScript, Ruby, Go, Rust, …) for `tree-sitter`. Paired
+  with the `tree-sitter` pin; the `cp310-abi3` ABI tag means one wheel
+  covers Python 3.10 through 3.13 (the container's Debian 13 Python).
 
 `pytest` remains the sole dev dependency, run on the host against the
 bind-mounted source.
@@ -2017,12 +2027,15 @@ pr_writer) — default to Sonnet.
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
 | pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise; throughput-shaped one-shot call |
 | dep_capture  | opus    | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets warrants full-tier reasoning |
+| fit_judge    | opus    | P1 Task-Context Fit scoring is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
+| splitter     | opus    | LLM-driven structural partition (coupled-minority path) is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
 overrides it for specific workers (`implementer`, `conformer`, `judge`,
 `heal`, `pr_writer`, and `satisfied_probe` all default to `sonnet`).
-`dep_capture` is **absent** from `MODEL_DEFAULT_PER_WORKER` — its `opus` default
-comes from the global `MODEL_DEFAULT` fallback.
+`dep_capture`, `fit_judge`, and `splitter` are **absent** from
+`MODEL_DEFAULT_PER_WORKER` — their `opus` defaults come from the global
+`MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2035,7 +2048,7 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Thirteen worker types (plus the global override), each independently overridable:
+Fifteen worker types (plus the global override), each independently overridable:
 
 | Worker             | env var                           | CLI flag                     | TOML key                  |
 |--------------------|-----------------------------------|------------------------------|---------------------------|
@@ -2049,6 +2062,8 @@ Thirteen worker types (plus the global override), each independently overridable
 | implementer        | `LEERIE_MODEL_IMPLEMENTER`      | `--model-implementer`        | `model_implementer`       |
 | integrator         | `LEERIE_MODEL_INTEGRATOR`       | `--model-integrator`         | `model_integrator`        |
 | conformer          | `LEERIE_MODEL_CONFORMER`        | `--model-conformer`          | `model_conformer`         |
+| fit_judge          | `LEERIE_MODEL_FIT_JUDGE`        | `--model-fit_judge`          | `model_fit_judge`         |
+| splitter           | `LEERIE_MODEL_SPLITTER`         | `--model-splitter`           | `model_splitter`          |
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
 | pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
@@ -2113,10 +2128,13 @@ keeps acting workers' reasoning bounded by their own evidence gates
 | heal         | unset   | post-run patch generation; no need to pin |
 | pr_writer    | high    | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
 | dep_capture  | high    | finalize-time dep inference; broad judgment over shell command sets benefits from pinned reasoning depth |
+| fit_judge    | high    | P1 Task-Context Fit score is judgment over scope+context co-minimization; calibrated threshold (0.70) makes pinned depth the reproducibility dial |
+| splitter     | high    | LLM-driven structural partition (coupled-minority path) is judgment over seam detection; wrong split corrupts downstream implementer context |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the six judgment
-workers above and for the finalize-time `pr_writer` and `dep_capture` workers.
+workers above and for the finalize-time `pr_writer` and `dep_capture` workers,
+and for the P1 decomposition workers `fit_judge` and `splitter`.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -2142,6 +2160,8 @@ model selection:
 | implementer        | `LEERIE_EFFORT_IMPLEMENTER`      | `--effort-implementer`        | `effort_implementer`       |
 | integrator         | `LEERIE_EFFORT_INTEGRATOR`       | `--effort-integrator`         | `effort_integrator`        |
 | conformer          | `LEERIE_EFFORT_CONFORMER`        | `--effort-conformer`          | `effort_conformer`         |
+| fit_judge          | `LEERIE_EFFORT_FIT_JUDGE`        | `--effort-fit_judge`          | `effort_fit_judge`         |
+| splitter           | `LEERIE_EFFORT_SPLITTER`         | `--effort-splitter`           | `effort_splitter`          |
 | judge              | *(none)*                         | *(none)*                      | *(none)*                   |
 | heal               | *(none)*                         | *(none)*                      | *(none)*                   |
 | pr_writer          | *(none)*                         | *(none)*                      | *(none)*                   |
@@ -2764,7 +2784,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 9-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive |
 |   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ "Worker-driven install"). Always runs; runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.leerie-setup.sh` hook if present → `synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — workers run install commands themselves in their own worktrees (not the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `run_streaming` so their output is visible live. Skipped on `--resume` (whole fresh-run else-branch is); the env var is re-exported from persisted state on resume. |
 |   • Clarify *(optional)* | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`). Intent questions from the classifier are dropped by default; pass `--clarify` to surface them. With `--clarify` + interactive: collect; with `--clarify` + non-interactive: write `pending-questions.json`, exit code 10 (DESIGN §11) |
-| 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `leerie.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()` |
+| 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `leerie.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()`. After all `plan_one` results are collected, P1 Layer C runs: each first-pass subtask in each plan is expanded through `recursive_decompose(subtask, depth=0, …)` and `plan["subtasks"]` is replaced with the union of all returned leaves (DESIGN §5½ *Wire-in to phase_plan*). A plan with no subtasks is left untouched. The downstream path (reconcile → overlap_judge → schedule → validate_plan → write_plan) receives this expanded flat leaf set unchanged. |
 |   • Reconcile *(when needed)* | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. **Before matching, two mechanical passes run: (a) `_promote_external_collisions(plans)` rewrites any `extent: external` entry whose tag is in some plan's `provides` to `extent: in_plan` (the in-plan producer wins); (b) `_collect_external_preconditions(plans)` extracts every remaining `extent: external` entry into a deduped list `{tag, reasons[], originating_subtasks[]}` that bypasses the reconciler and is persisted by `write_plan`. Both passes are re-run after `_apply_reconciler_output` so any `extent: external` entries on reconciler-added connector subtasks also flow through the same machinery (collision-promoted if a provider now exists; otherwise added to the persisted preconditions list). The second collection idempotently replaces `st.data["external_preconditions"]` — the helper returns the full deduped set so a re-run is a refresh, not an append.** Only `extent: in_plan` entries with no matching `provides` enter the unresolved set. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits eight arrays — five *resolution* (renames / added_provides / added_subtasks / conditional_drops / dropped_requires), two *cycle-breaking-only* (dependency_edges / merged_subtasks; `dropped_requires` also plays a cycle-breaking role), and one *escape hatch* (unresolvable). If `unresolvable` is non-empty, dead-subtask elimination (`_prune_dead_subtasks`) first removes fully-speculative subtasks whose every `in_plan` requires is unresolvable when ≥1 domain has 0 subtasks (see "Phase 2½ checks" below); if entries remain after pruning, `die()` with the reconciler's diagnosis (DESIGN §5). Otherwise, the orchestrator applies the seven action arrays mechanically. After applying, runs an **acyclicity gate** (Tarjan's SCC over the post-mutation graph); on cycle, deep-copies the pre-mutation plans, computes a recommended cycle-resolution per SCC from structural signals, respawns the reconciler once with a structured retry prompt + bounded "must-include" set of acceptable operations, and re-runs the gate. If still cyclic, `die()` with the SCC + offending mutations enumerated. See "Phase 2½ checks" and "Cycle-resolution retry loop" below. |
 |   • Overlap judge *(when 2+ planners)* | `phase_overlap_judge` | spawn one `plan_overlap_judge` worker against the reconciled plan to detect cross-planner **surface collisions** — two subtasks producing the same exported artifact (same component / function / primitive) with incompatible APIs. Schema in `SCHEMAS["plan_overlap_judge"]`. Output: zero or more `collisions`, each with `resolution ∈ {merge, drop_a, drop_b, unresolvable}` and (when `resolution=merge`) a non-empty `merge_feasibility` statement that becomes the merged subtask's unified intent. Orchestrator applies actions mechanically through `_apply_overlap_collisions` with the **anchor-survivor rule**: when one sid appears in 2+ non-`unresolvable` collisions (computed by `_compute_overlap_anchors`), it is the structural anchor of the cluster and survives every merge it participates in — overriding `_apply_overlap_merge`'s default lex-smaller rule (the default is a determinism device with no semantic content). Rationale: the anchor is by construction the broader subtask that overlaps with each partner; absorbing each partner *into* the anchor matches the judge's pairwise intent. Pairs that lack a shared endpoint use the lex-smaller default unchanged. Per-pair: `merge` → `_apply_overlap_merge` (with optional `survivor_hint=anchor_sid` when applicable; union of fields, intent concatenation, downstream `depends_on` rewrites); `drop_*` → `_apply_overlap_drop` (mirrors `conditional_drops` apply step); `unresolvable` → `die()` at plan time with both sids + artifact + judge's reason. The validator also die()s on the drop-of-anchor contradiction (a `drop_*` whose dropped sid is an anchor — judge contradicting itself by asking to delete the subtask other collisions claim absorbs them). **Per-resolution cycle avoidance:** before applying each `merge` / `drop_*`, `_apply_overlap_collisions` tentatively applies it to a copy (`_would_cycle_after`) and, if it would introduce a dependency cycle, skips it (`skipped_would_cycle`) — keeping both subtasks separate for the integrator instead of `die()`ing the run; the final post-merge Tarjan gate is retained only as a never-fires backstop. **Cheap-skip** when fewer than 2 planners produced subtasks, or total subtask count < 2 (no possible cross-planner collision). **Python backstop** asserts every `merge` carries non-empty `merge_feasibility` — caught at `_validate_overlap_judge_output` before any apply. Opt-out via `--skip-overlap-judge` (mirrors `--skip-smoke`; env `LEERIE_SKIP_OVERLAP_JUDGE`; `leerie.toml` `skip_overlap_judge`). Persists full judge output to `state.data["plan_overlap_judge"]` and post-apply mutations to `state.data["plan_overlap_applied"]` for audit. See "Phase 2¾ checks" below. |
 | 3 Schedule | `detect_no_work`, `warn_cross_planner_file_overlap`, `warn_layer_gaps`, `filter_offtree_subtasks`, `filter_satisfied_subtasks`, `schedule`, `validate_plan` | **First: `detect_no_work(plans)` short-circuits when every plan has `status: "ready"` and empty `subtasks` (DESIGN §8 *The cleared-but-empty terminal state*) — `_finish_no_work_run` records `no_work_required=true` + per-domain bases in state.json, writes `finished_at` to state.json + run.json (with `no_push=True` so the host launcher does not attempt to push a non-existent branch), logs the no-work summary, and returns without scheduling. Phases 4–6 are skipped entirely.** Otherwise: warn on cross-planner file overlap; warn on layer gaps (DESIGN §5 *Migration-surface completeness* — DB-without-seed and env-provider-without-template); **soft-drop subtasks whose `files_likely_touched` resolves outside the run's repo root (most commonly into an inspect-dir mount) — recorded in `state.data["dropped_subtasks"]`**; **then `filter_satisfied_subtasks(plans, repo_root, st, caps, models, efforts)` spawns one read-only `satisfied_probe` worker per surviving subtask (bounded by `max_parallel`), each evaluating that subtask's `success_criteria_seed` against the base tree, and soft-drops those the probe marks `satisfied` — recorded in `state.data["dropped_subtasks"]` with `reason: "already_satisfied"` + the probe's evidence (DESIGN §8 *Already-satisfied subtask elimination*). Skipped when `state.data["skip_satisfied_check"]`. If this empties every `status: "ready"` plan, the gate synthesizes a `no_work_map` from the drop evidence and routes to `_finish_no_work_run` (same terminal state as native cleared-but-empty; a `status: "blocked"` plan with 0 subtasks still falls through to `schedule`'s all-blocked `die`). The probe's tool allowlist is a base-tree-only subset (NOT full `INSPECT_TOOLS`), illustratively `Bash(git show HEAD:*)`, `Bash(git diff:*)`, `Bash(git status)`, the `_READ_BASE` read set (`Read`/`Grep`/`Glob`/`WebSearch`/`WebFetch`), and read-only Bash verbs (`ls`/`cat`/`head`/`wc`/`grep`/`rg`/`file`/`stat`/`pwd`/`echo`) — but **no** `git log` / bare `git show:*` / non-HEAD ref, because a worktree shares the repo's full ref DB and history-spanning git false-positives on code present only on other branches. The exact list is `SATISFIED_PROBE_TOOLS` in `orchestrator/leerie.py`. Advisory/soft — subordinate to the `check_branch_has_commits` backstop per DESIGN §12;** merge plans, build the global DAG via `_build_predecessor_graph` (shared with the phase 2½ acyclicity gate), Kahn topological sort into waves. Cycles are expected to be caught upstream by the phase 2½ gate; if one slips through, `die()` with the full SCC report. |
@@ -3480,7 +3500,7 @@ tool-verified feedback, not intrinsic self-review.
 | `_run_checked_loop(invoke, check, name, max_rounds, make_feedback_prompt)` | Generic loop: call → check → feedback → retry. Returns `(result, warnings)`. |
 | `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `settle_subtask`'s implementer confidence check. |
 | `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
-| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by all 8 worker schemas. |
+| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by all 10 worker schemas (including `fit_judge` and `splitter`). |
 
 ### Per-worker mechanical checks
 
@@ -3527,6 +3547,29 @@ DESIGN.md §8 for the distinction).
 | `_MAX_COVERAGE_ITEMS` | 50. A planner with 5–15 subtasks can realistically cover ~50 items; above this the 50% threshold becomes unrealistic. |
 
 No-op when the task doesn't reference files.
+
+### P6 repo-map — `build_repo_map` + `rank_repo_map`
+
+Implements DESIGN §5½ §P6 *Codebase structural map*. Both functions are
+deterministic, lazy-import tree-sitter (so the module loads on a bare host
+Python that lacks the package), and call no LLM.
+
+| Symbol | Purpose |
+|--------|---------|
+| `_repo_map_cache_key(path)` | Returns `"<abs_path>@<mtime_ns>"` — a stable cache key that changes when a file is touched. |
+| `_walk_calls(node)` | Walks a tree-sitter CST recursively, collecting bare-name identifiers from `call` expression function positions. Returns `list[str]`. Attribute callees (e.g. `obj.method`) are skipped — only bare-name callees become ref edges. |
+| `_parse_repo_file(path)` | Parses one source file with `tree_sitter_language_pack.process()` (for defs/structure) and a tree-sitter CST walk (for call-site refs). Returns `(defs: list[str], refs: list[str])`. Returns `([], [])` on unsupported language or any error (graceful degrade). |
+| `build_repo_map(repo_root, leerie_root)` | Walks all source files under `repo_root` (skipping `.git`, `node_modules`, `__pycache__`, etc.), parses each with `_parse_repo_file`, and builds `{"files": {rel_path: [def_sym, ...]}, "refs": {def_sym: {rel_path, ...}}}`. mtime-caches per-file parse results under `<leerie_root>/<REPO_MAP_CACHE_DIR>/<sha256(abs_path)>.pkl` — only files whose `mtime_ns` changed since the last call are re-parsed (Aider diskcache pattern). Cache dir created on first use. Always returns a valid dict; never raises. |
+| `_pagerank(graph, personalization, damping, max_iter, tol)` | Personalized PageRank on a directed `dict[str, set[str]]` graph. Pure stdlib (no networkx). Handles dangling nodes (no out-edges) via a dangling-mass redistribution term. Converges when sum of per-node rank deltas < `tol`. Returns `dict[str, float]` (node → rank score). |
+| `_render_repo_map_subgraph(repo_map, ranked_files, max_files)` | Renders the top `max_files` files from `ranked_files` as a compact text block: one line per file listing its defined symbols (`path: Sym1, Sym2, ...`). Files with no defs are omitted. |
+| `_count_tokens_approx(text)` | Approximate token count: `max(1, len(text.encode()) // 4)` — ~4 bytes per token (GPT/Claude typical). Used by `rank_repo_map`'s binary-search budget fit. |
+| `rank_repo_map(repo_map, seed_files, seed_symbols, token_budget)` | Builds a file→file edge graph via shared symbols (definer → referencing files), runs personalized PageRank biased toward `seed_files` and files that define/reference `seed_symbols`, then binary-searches the largest prefix of the ranked-file list that fits within `token_budget` tokens (default `DEFAULT_CAPS["repo_map_tokens"]`). Returns the ranked subgraph as a plain text string. Returns `""` when the map is empty. |
+
+**Edge direction:** `build_repo_map` tracks `refs[sym] = {files that call sym}`. `rank_repo_map` builds a file→file edge from the definer of `sym` to each file that references it — so widely-referenced utility files accumulate high in-degree and surface as structural backbone.
+
+**Personalization in `rank_repo_map`:** seed files get weight 1.0; files defining a seed symbol get 1.0; files *referencing* a seed symbol get 0.5. When no seed resolves to a known file, uniform personalization is used (scores all files equally, falling back to link structure only).
+
+**Skip flag:** `resolve_skip_repo_map` (see §2 "Skip flags") gates the call; when `True`, `build_repo_map` is not called and the planner degrades to the prior grep/glob-only path.
 
 ### Phantom-path check
 
@@ -3609,10 +3652,51 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | mechanical-feedback rounds for planner (`planner_check_rounds`) | 3 | Same CRITIC pattern, but higher default because the planner has richer checks (phantom paths, dangling deps, intra-domain cycles, protected paths, task-file coverage). |
 | implementer confidence retries (`implementer_confidence_retries`) | 2 | Separate from `subtask_continuations`. Orchestrator checks confidence scores + scope drift + unmet criteria on complete results and re-invokes as a continuation if issues found. |
 | planner samples (`planner_samples`) | 3 | Independent parallel invocations per domain. Mechanical selection: fewest issues, tiebreak on subtask count. Set to 1 to disable. Also `LEERIE_PLANNER_SAMPLES` env or `planner_samples` in `leerie.toml`. CLI: `--planner-samples`. |
+| P6 repo-map token budget (`repo_map_tokens`) | 1000 | Token budget for the personalized-PageRank-ranked subgraph injected into the planner/splitter (DESIGN §P6 *Codebase structural map*). The subgraph is binary-searched to fit within this many tokens. Not user-tunable via CLI / env / toml — internal to `build_repo_map()` / `rank_repo_map()`. |
+| P1 recursive decompose max depth (`decompose_max_depth`) | 5 | Maximum recursion depth for `recursive_decompose()` (DESIGN §P1 *Recursive judge + splitter*). Recursion terminates at depth ≥ 5 even if `fit_judge` still scores below `decompose_fit_threshold`. A depth-5 tree can represent up to 32 leaves from one subtask. Not user-tunable via CLI / env / toml. |
+| P1 fit-judge pass threshold (`decompose_fit_threshold`) | 0.70 | `fit_judge` confidence score at or above which a subtask is accepted as a leaf (well-fit). MEASURED on n=24 telemetry-labeled subtasks: oversized mean 0.26 vs well-fit mean 0.84 — 0.57 separation, 88% accuracy at 0.70. Not user-tunable via CLI / env / toml. |
+| P1 no-progress guard (`decompose_noprogress_rounds`) | 2 | Consecutive recursion rounds that produce no child with a fit score above the parent's before the subtask is accepted as a leaf with a warning. Prevents a degenerate splitter from looping to `decompose_max_depth`. Not user-tunable via CLI / env / toml. |
+
+### P1 recursive decomposition surface (DESIGN §P1)
+
+`partition_files(files: list[str], chunk_size: int) -> list[list[str]]`
+Deterministic chunker for the migration-sweep path. Splits `files` into
+non-overlapping chunks of at most `chunk_size` (default 8). 100% coverage
+and 0 overlap are guaranteed by construction (no LLM). When `chunk_size < 1`,
+returns `[list(files)]` (degenerate guard). Used by `recursive_decompose()`
+when `len(files) > 8` to partition without calling the splitter LLM worker
+(measured correction: LLM splitter dropped 14/29 migration files in testing).
+
+`recursive_decompose(subtask, depth, st, caps, models, efforts, repo_root, *, _parent_score, _noprogress_count) -> list[dict]`
+Async recursive function implementing DESIGN §P1 *Task-Context Fit*. For each
+subtask: calls `fit_judge` to score Task-Context Fit (0–1); returns `[subtask]`
+if score ≥ 0.70 (threshold from `caps["decompose_fit_threshold"]`) or depth ≥
+`caps["decompose_max_depth"]` (5); checks the no-progress guard
+(`caps["decompose_noprogress_rounds"]` consecutive rounds of no improvement
+accept the subtask as leaf); then splits via either:
+  - **Migration path** (≥ 9 files): `partition_files()` — deterministic, no LLM
+  - **Coupled path** (≤ 8 files): `splitter` LLM worker — structural seam detection
+
+Every `fit_judge` and `splitter` invocation calls `st.bump_workers(caps)` before
+calling `claude_p()`. Both workers use `INSPECT_TOOLS` (read-only).
+
+`SCHEMAS["fit_judge"]` — required fields: `score` (number 0–1), `rationale`
+(string), `diffuse` (string, narrates the diffuse coupling when score < 0.70),
+`confidence` (sub-schema via `_confidence_schema(["fit"])`).
+
+`SCHEMAS["splitter"]` — required field: `children` (array, `minItems: 1`). Each
+child mirrors the planner subtask shape: required `id`, `title`,
+`success_criteria_seed`; optional `intent`, `scope_note`, `files_likely_touched`,
+`depends_on`, `requires`, `provides`, `size`, `investigation_notes`.
+
+Both workers are registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER`
+(both default to `"high"`). Both are absent from `MODEL_DEFAULT_PER_WORKER`
+(default opus via the global `MODEL_DEFAULT` fallback).
 
 `--max-turns` by worker: classifier 60, planner 100, reconciler 30,
 plan_overlap_judge 30, provision 30, integrator 60, implementer 120,
-conformer 60, judge 40, heal patch_generator 40, pr_writer 20. For
+conformer 60, judge 40, heal patch_generator 40, pr_writer 20, fit_judge 30,
+splitter 30. For
 the implementer, 120 turns and 90 minutes both apply — whichever trips
 first. The conformer cap is lower than the implementer's because its
 scope is narrower (read a diff, read a small set of rules files, update
@@ -5593,6 +5677,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `skip_satisfied_check` | bool | whether `filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) is suppressed. Resolved from `--skip-satisfied-check` / `LEERIE_SKIP_SATISFIED_CHECK` / `leerie.toml` / default `False`. When set, no `satisfied_probe` worker spawns and every subtask proceeds to `schedule()`; the mechanical `check_branch_has_commits` backstop then still catches an already-satisfied subtask post-execution (as a retryable no-op). Re-resolved fresh on every run; on `--resume` the phase-3 filter is past, so the flag only affects fresh runs. |
 | `strict_conformer` | bool | whether the conformer phase is blocking instead of advisory (DESIGN §9 *Post-work conformance*, "Opt-in strict mode" paragraph). Resolved from `--strict-conformer` / `LEERIE_STRICT_CONFORMER` / `leerie.toml` / default `False`. When True, conformer residuals (failed build/lint/test axes or unresolved rule violations) cause the subtask to return `blocked` instead of `complete`; the final-tree pass also blocks the run if residuals remain. The user fixes the residuals and runs `--resume`. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `skip_base_baseline` | bool | whether the base-tree health baseline (DESIGN §9 *Base-tree health baseline*) is suppressed. Resolved from `--skip-base-baseline` / `LEERIE_SKIP_BASE_BASELINE` / `leerie.toml` / default `False`. When True, `capture_conformance_baseline` does not run at the start of `phase_execute`, so no `conformance._baseline` is recorded and the conformer receives no `BASELINE:` context (falling back to self-judging "pre-existing" failures). Skips the once-per-run install-into-staging + full-suite-run cost. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
+| `skip_repo_map` | bool | whether the P6 repo-map structural context (DESIGN §P6 *Codebase structural map*) is suppressed. Resolved from `--skip-repo-map` / `LEERIE_SKIP_REPO_MAP` / `skip_repo_map` in `leerie.toml` / default `False`. When True, `build_repo_map()` is not called and the planner/splitter receive no ranked-subgraph injection, degrading gracefully to the prior grep/glob-only planning path. Use on repos where tree-sitter cannot parse the primary language, or to opt out of structural context. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `cgroup_containment` | dict | recorded by the fail-closed gate (`enforce_and_record_cgroup_containment`, in `_run_phases` just before the first worker spawns) (DESIGN §6 *Memory containment*): `{enforced: bool, hierarchy: "v2"\|"v1"\|null}`. `enforced` is the result of the root-broker probe round-trip (create+enroll+destroy of a throwaway cgroup); `hierarchy` is the cgroup version the broker detected. When `enforced` is `False` the run only proceeds if `--dangerously-allow-uncapped` was set (else the gate `die()`s). Persisted so the containment state is visible in `state.json` — the crash that motivated the broker left no artifact of the silent containment failure |
 | `verbosity` | str | resolved verbosity level (`quiet` / `normal` / `stream` / `debug`); re-resolved fresh on every run, including `--resume`, so the user can dial up or down without editing state |
 | `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) via `--add-dir`. Resolved from `--inspect-dir` / `LEERIE_INSPECT_DIRS` / `inspect_dirs` in `leerie.toml`; re-resolved fresh on every run, including `--resume`, so the user can add or remove paths without editing state. Empty list when nothing is configured |
@@ -5797,7 +5882,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `<state-root>/runs/` |
-| `call_type` | str | one of the schema keys `claude_p()` accepts: the nine `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the eleven `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
@@ -5868,7 +5953,7 @@ Every `call_type` resolves to a file under `prompts/`. The heal loop's
 patch-generator worker calls
 `resolve_prompt(call_type: str) -> tuple[str, str, str]` to load a
 worker's system prompt: given any member of `WORKER_TYPES` (the
-self-heal target set is the nine main-loop workers, not the post-run
+self-heal target set is the eleven main-loop workers, not the post-run
 workers), it returns `(source_kind, content, location_hint)` where
 `source_kind` is `"file"`, `content` is the prompt body, and
 `location_hint` is the relative path `"prompts/<call_type>.md"`.
@@ -5920,6 +6005,14 @@ enforcement functions:
 | `test_resolve_runtime.py` | `resolve_runtime()` — CLI > env > TOML > default `local` precedence, both valid values, invalid-value die() paths, empty/whitespace env handling |
 | `test_resolve_models.py` | `resolve_models()` — per-worker precedence (CLI > env > TOML), defaults, validation, empty/whitespace handling |
 | `test_resolve_dep_capture_model.py` | `resolve_models()` / `resolve_efforts()` for `dep_capture` — full per-worker and global override precedence chain; `MODEL_DEP_CAPTURE_ENV` constant; `dep_capture` absent from `MODEL_DEFAULT_PER_WORKER` (falls through to `MODEL_DEFAULT`); `dep_capture` in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; isolation (override doesn't bleed to other workers); structural wiring guards |
+| `test_rank_repo_map.py` | `rank_repo_map()` P6 ranking contract: seed-adjacent nodes rank above unrelated nodes (direct seed file, 1-hop neighbor via callee→caller edge, seed symbol biases definer, all connected-chain files before any island file); token-budget enforcement (explicit budget, `DEFAULT_CAPS["repo_map_tokens"]` when `None`, `None` == cap value, empty map returns `""`); binary-search shrink (lower budget → shorter output and fewer files, increasing budgets → non-decreasing lengths, tight budgets respected). Fixture built directly (no `build_repo_map`); no LLM calls; deterministic. |
+| `test_resolve_fit_judge_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — both in `WORKER_TYPES`; both absent from `MODEL_DEFAULT_PER_WORKER` (opus via `MODEL_DEFAULT`); both in `EFFORT_DEFAULT_PER_WORKER` at `"high"`; per-worker CLI/env/TOML override chains; isolation (override doesn't bleed to other workers); structural wiring guards |
+| `test_resolve_fit_judge_splitter_model.py` | `resolve_models()` / `resolve_efforts()` for `fit_judge` and `splitter` — full per-worker and global override precedence chain (CLI > env > TOML > default); default model `opus` (via `MODEL_DEFAULT` fallback, absent from `MODEL_DEFAULT_PER_WORKER`); default effort `high` (via `EFFORT_DEFAULT_PER_WORKER`); both workers in `WORKER_TYPES`; isolation (per-worker override doesn't bleed to planner or implementer) |
+| `test_fit_judge_schema.py` | `SCHEMAS["fit_judge"]` — required fields (`score`, `rationale`, `diffuse`, `confidence`); `score` has `minimum:0`/`maximum:1`; `confidence` uses `"fit"` axis; valid/invalid instances; JSON serializable; wiring (`fit_judge` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["fit_judge"] == "high"`, prompt file exists) |
+| `test_splitter_schema.py` | `SCHEMAS["splitter"]` — `children` required, `minItems:1`, child required fields (`id`, `title`, `success_criteria_seed`), optional child fields; valid/invalid instances; JSON serializable; wiring (`splitter` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["splitter"] == "high"`, prompt file exists); no top-level `files` field (splitter never decides partition — `test_splitter_no_top_level_files_required`); child `requires` array uses `_REQUIRES_ITEM` shape with tag + extent enum (`test_splitter_child_requires_item_shape`) |
+| `test_recursive_decompose.py` | `partition_files()` — empty, single chunk, exact multiple, partial last chunk, 100% coverage, 0 overlap, chunk_size=1, order preserved, chunk_size<1; `recursive_decompose()` — well-fit is leaf (score ≥ 0.70), oversized recurses (split then children judged), depth cap terminates, no-progress guard terminates + emits "no-progress guard" warning to stdout (asserted via capsys), migration path uses partition_files (not splitter LLM), bump_workers called before every claude_p |
+| `test_phase_plan_repo_map_ctx.py` | P6 Layer A wiring (`phase_plan` ctx injection, DESIGN §P6): repo-map enabled path (ctx contains `repo_map` key, non-empty string, JSON-serializable, known symbol names present, seed_files seeded from `task_file_items`); skip_repo_map=True path (ctx omits `repo_map`, baseline keys `task`/`source_of_truth`/`clarification_answers`/`confidence_rounds` present, values match inputs); empty-repo degrade (`rank_repo_map` returns `""` → key omitted); exception-swallow degrade (`build_repo_map` raises → caught silently, ctx emitted without `repo_map`) |
+| `test_phase_plan_recursion_wiring.py` | P1 Layer C wiring (`phase_plan` recursion expansion, DESIGN §5½ *Wire-in to phase_plan*): source-coupling guard (`phase_plan` source contains `recursive_decompose(` at depth=0, reassigns `plan["subtasks"] = leaves`, expansion loop precedes final logging); integration — one oversized subtask (stubbed `recursive_decompose` → two leaves) → `plan["subtasks"]` has 2 entries; two first-pass subtasks → `recursive_decompose` called once per subtask; well-fit leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`); empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`) |
 | `test__read_toml_key.py` | `_read_toml_key()` — the shared `leerie.toml` line parser used by both resolvers |
 | `test_gather_answers_validation.py` | the source-of-truth validation gate in `gather_answers()` |
 | `test_retryable_failure.py` | `_retryable_failure()`, **including a coupling test** that every producer's retryable-path return tags a `failure_kind` in `_RETRYABLE_FAILURE_KINDS` (`validate_result`, `check_branch_has_commits`, the inline dirty-worktree check in `settle_subtask`) |
@@ -5951,6 +6044,8 @@ enforcement functions:
 | `test_group_run_json.py` | `group_id` in run.json Python-layer contract (DESIGN §20): `_validate_run_json` accepts `group_id`-bearing sidecars in every push/pause/kill state; `_write_run_json` persists and preserves `group_id` across incremental writes; `_derive_run_status` produces correct status for `group_id`-tagged runs (local-stub member without `fly_machine_id` and fly-stub member with `fly_machine_id`). |
 | `test_group_state_dir_guard.py` | State-dir isolation for group members (DESIGN §20 *State isolation is free*): two members in repos with distinct basenames resolve to distinct `~/.leerie/<basename>/` dirs even when the parent's `LEERIE_STATE_HOST_DIR` is inherited; `--group` arm rejects `LEERIE_STATE_DIR` env and `--state-dir` CLI arg before any child spawns, preventing the `.owner`-collision failure mode. |
 | `test_host_finalize_sh.py` | `scripts/host-finalize.sh` `host_finalize` contract via a bash-harness with stubbed `git`/`gh`: no-push / already-pushed idempotency, tip-aware re-push vs diverged-origin guard, completion gate (PR-#22), and the LLM-less **⚠ Deploy-ordering** fallback — the bash `jq` renderer emits the section from `state.json.external_preconditions` byte-identically to the Python `compose_pr_body` (DESIGN §20), and nothing when the field is absent/empty. |
+| `test_repo_map.py` | `build_repo_map` (symbol/def extraction, class methods, ref edges, relative-path keys, empty-repo, skip-.git/node_modules), mtime cache (dir created, unchanged served from sentinel, changed re-parsed, only-changed re-parsed), `rank_repo_map` (string result, token-budget fits, seed-file/seed-symbol bias, empty map, determinism, tight budget), `_parse_repo_file` (unsupported extension, markdown, Python defs + refs), `_walk_calls` (bare call extracted, attribute call not extracted), `_pagerank` (dangling node, personalization, empty). |
+| `test_build_repo_map.py` | HAS_TREESITTER-gated supplement to `test_repo_map.py`: symbol graph (defs, class defs, ref edge, keys shape, relative-path invariant), mtime cache (cache dir created, sentinel cache hit, changed file re-parsed, only-changed file re-parsed with sentinel for unchanged), graceful degrade (empty file, binary file, empty repo, skip-.git/node_modules). Uses a `pytestmark` module-level skip gate so CI without tree-sitter-language-pack skips all tests cleanly. |
 
 Run with `pytest tests/` from the repo root. The full suite (~1700
 tests across the deterministic-enforcement, bash-harness, and remote

@@ -200,6 +200,32 @@ DEFAULT_CAPS = {
     # observed worst case while still flagging the truly-unwinnable
     # 29-subtask runs that motivated the preflight.
     "budget_safety_margin": 1.15,
+    # Repo-map token budget for the personalized-PageRank-ranked subgraph
+    # injected into the planner and splitter (DESIGN §P6 *Codebase structural
+    # map*). The subgraph is binary-searched to fit within this many tokens;
+    # ranked so the most task-relevant symbols appear at the prompt extremes.
+    # ~1000 tokens keeps the injection below 5% of typical planner context.
+    "repo_map_tokens": 1000,
+    # Maximum recursion depth for recursive_decompose() (DESIGN §P1 *P1
+    # recursive judge + splitter*). A depth-5 tree can represent up to 2^5=32
+    # leaves from a single subtask, more than enough for the observed 64-file
+    # migration sweeps (target ~8 leaves). Terminates recursion at depth ≥ 5
+    # even if fit_judge still scores below decompose_fit_threshold.
+    "decompose_max_depth": 5,
+    # P1 fit-judge pass threshold for recursive_decompose() (DESIGN §P1).
+    # A subtask scoring ≥ this value is accepted as a leaf (well-fit).
+    # MEASURED on n=24 telemetry-labeled subtasks: oversized mean 0.26 vs
+    # well-fit mean 0.84 — 0.57 separation, 88% accuracy at 0.70. The
+    # originally-planned 0.95 threshold over-splits 100% of well-fit subtasks
+    # (their scores cluster at 0.82–0.93); 0.70 is the empirically-derived
+    # optimum (see F1-build-measure.md).
+    "decompose_fit_threshold": 0.70,
+    # No-progress guard for recursive_decompose(). If this many consecutive
+    # recursion rounds produce no child whose fit score exceeds the parent's,
+    # the subtask is accepted as a leaf with a warning rather than recursing
+    # indefinitely. Prevents a degenerate splitter output from looping to
+    # decompose_max_depth.
+    "decompose_noprogress_rounds": 2,
 }
 
 # Every key the orchestrator writes to `st.data`. Canonical alongside the
@@ -218,6 +244,7 @@ STATE_FIELDS = (
     "skip_budget_check",
     "strict_conformer",
     "skip_base_baseline",
+    "skip_repo_map",
     # cgroup_containment: recorded by the fail-closed gate
     # (enforce_and_record_cgroup_containment, in _run_phases just before the
     # first worker spawns) (DESIGN §6 *Memory containment*). {enforced: bool, hierarchy:
@@ -596,6 +623,22 @@ STRICT_CONFORMER_FILE = SOURCE_OF_TRUTH_FILE
 SKIP_BASE_BASELINE_ENV = "LEERIE_SKIP_BASE_BASELINE"
 SKIP_BASE_BASELINE_FILE = SOURCE_OF_TRUTH_FILE
 
+# --skip-repo-map bypass (DESIGN §P6 *Codebase structural map*). Suppresses
+# `build_repo_map()` and the ranked-subgraph injection into the planner
+# context. Use on repos where tree-sitter cannot parse the primary language,
+# or where the user wants the prior grep/glob-only planning path. When
+# skipped, the planner receives no repo-map context and degrades gracefully
+# to today's behavior. Resolution order: --skip-repo-map CLI flag →
+# LEERIE_SKIP_REPO_MAP env → skip_repo_map in leerie.toml → False.
+SKIP_REPO_MAP_ENV = "LEERIE_SKIP_REPO_MAP"
+SKIP_REPO_MAP_FILE = SOURCE_OF_TRUTH_FILE
+
+# <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
+# the mtime-keyed per-file parse results produced by build_repo_map() so
+# only changed files are re-parsed on subsequent runs (Aider diskcache
+# pattern). Created on first use by build_repo_map().
+REPO_MAP_CACHE_DIR = "repo-map-cache"
+
 # capture_deps preference (DESIGN §6½). Controls whether phase_finalize
 # scans logs and writes setup_packages / triggers the language-dep bake.
 # Default True. Resolution order: LEERIE_CAPTURE_DEPS env →
@@ -686,11 +729,13 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "integrator": "high",
     "pr_writer": "high",
     "dep_capture": "high",
+    "fit_judge": "high",
+    "splitter": "high",
 }
 EFFORT_ENV = "LEERIE_EFFORT"
 WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "satisfied_probe", "provision", "implementer", "integrator",
-                "conformer")
+                "conformer", "fit_judge", "splitter")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -1484,6 +1529,79 @@ SCHEMAS: dict[str, dict] = {
             "checked": {
                 "type": "array",
                 "items": {"type": "string"},
+            },
+        },
+    },
+    "fit_judge": {
+        # Output of the P1 fit-judge worker (DESIGN §P1 *P1 recursive
+        # judge + splitter*). Spawned by recursive_decompose() for each
+        # subtask candidate. The worker scores P1 Task-Context Fit as a
+        # 0–1 confidence value: a subtask scores high when its scope and
+        # context are co-minimized (minimum necessary complexity, maximum
+        # relevance) and forms a single verifiable conceptual unit.
+        #
+        # MEASURED on n=24 telemetry-labeled subtasks: oversized mean 0.26
+        # vs well-fit mean 0.84 — 0.57 separation, 88% accuracy at the
+        # 0.70 threshold (DEFAULT_CAPS["decompose_fit_threshold"]).
+        #
+        # Read-only (INSPECT_TOOLS), fed the subtask spec and its P6
+        # ranked subgraph. Reuses _confidence_schema for the score axis
+        # so the same evidence-gate discipline (falsifiers, contradictions,
+        # gap_to_close) applies.
+        "type": "object",
+        "required": ["score", "rationale", "diffuse", "confidence"],
+        "properties": {
+            # 0–1 Task-Context Fit score. >= decompose_fit_threshold (0.70)
+            # means the subtask is a leaf (well-fit; no further splitting).
+            "score": {"type": "number", "minimum": 0, "maximum": 1},
+            # Human-readable explanation of the score.
+            "rationale": {"type": "string"},
+            # What is diffuse or over-scoped about the subtask (empty
+            # string when score >= 0.70).
+            "diffuse": {"type": "string"},
+            "confidence": _confidence_schema(["fit"]),
+        },
+    },
+    "splitter": {
+        # Output of the P1 splitter worker (DESIGN §P1 *P1 recursive
+        # judge + splitter*). Spawned by recursive_decompose() when
+        # fit_judge scores below decompose_fit_threshold. The worker
+        # receives a pre-computed file partition (from partition_files()
+        # for migration sweeps) or the P6 repo-map subgraph for coupled
+        # cases, and emits child subtasks with titles + success_criteria_seed.
+        #
+        # The worker only LABELS pre-partitioned chunks (it never decides
+        # which files go where for the migration case — that is guaranteed
+        # 100%-coverage by partition_files() by construction). For the
+        # coupled-minority case it emits structural seams backed by the
+        # repo-map, backstopped by _check_migration_surface.
+        "type": "object",
+        "required": ["children"],
+        "properties": {
+            "children": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                    "type": "object",
+                    "required": ["id", "title", "success_criteria_seed"],
+                    "properties": {
+                        "id": {"type": "string"},
+                        "title": {"type": "string"},
+                        "intent": {"type": "string"},
+                        "scope_note": {"type": "string"},
+                        "files_likely_touched": {
+                            "type": "array", "items": {"type": "string"}},
+                        "depends_on": {
+                            "type": "array", "items": {"type": "string"}},
+                        "requires": {
+                            "type": "array", "items": _REQUIRES_ITEM},
+                        "provides": {
+                            "type": "array", "items": {"type": "string"}},
+                        "success_criteria_seed": {"type": "string"},
+                        "size": {"type": "string"},
+                        "investigation_notes": {"type": "string"},
+                    },
+                },
             },
         },
     },
@@ -3695,6 +3813,24 @@ def resolve_skip_base_baseline(repo_root: Path, cli_value: bool) -> bool:
         file_name=SKIP_BASE_BASELINE_FILE)
 
 
+def resolve_skip_repo_map(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-repo-map preference. Order:
+    --skip-repo-map CLI flag (action='store_true') →
+    LEERIE_SKIP_REPO_MAP env var →
+    skip_repo_map in leerie.toml → False.
+
+    When True, `build_repo_map()` is not called — the ranked P6 subgraph
+    injection into the planner/splitter context is skipped and the planner
+    degrades gracefully to the prior grep/glob-only path. Use on repos where
+    tree-sitter cannot parse the primary language, or where the user wants to
+    opt out of the structural context."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_REPO_MAP_ENV,
+        file_key="skip_repo_map",
+        file_name=SKIP_REPO_MAP_FILE)
+
+
 def _positive_int(s: str) -> int:
     """argparse `type=` helper. Rejects non-positive integers with the
     standard argparse error message. Used by --confidence-rounds."""
@@ -4398,6 +4534,176 @@ def _check_migration_surface(
     return issues
 
 
+# ---------------------------------------------------------------------------
+# P1 recursive decomposition (DESIGN §P1)
+# ---------------------------------------------------------------------------
+
+def partition_files(files: list[str], chunk_size: int) -> list[list[str]]:
+    """Partition *files* into non-overlapping chunks of at most *chunk_size*.
+
+    100% coverage + 0 overlap guaranteed by construction: every element of
+    *files* appears in exactly one chunk, and no element appears in more than
+    one chunk. The last chunk may be smaller than *chunk_size*.
+
+    Used by recursive_decompose() for migration sweeps — the exhaustive file
+    list comes from P6 / _grep_old_pattern; the splitter LLM only labels the
+    pre-computed chunks rather than deciding which files go where (the
+    measured LLM-drops-14/29 correction from F1-build-measure.md)."""
+    if not files or chunk_size < 1:
+        return [list(files)] if files else []
+    chunks: list[list[str]] = []
+    for i in range(0, len(files), chunk_size):
+        chunks.append(files[i: i + chunk_size])
+    return chunks
+
+
+async def recursive_decompose(
+    subtask: dict,
+    depth: int,
+    st: "State",
+    caps: dict,
+    models: dict[str, str],
+    efforts: dict[str, str | None],
+    repo_root: Path,
+    *,
+    _parent_score: float | None = None,
+    _noprogress_count: int = 0,
+) -> list[dict]:
+    """Recursively decompose *subtask* until leaves pass the P1 fit threshold.
+
+    Algorithm (DESIGN §P1):
+      1. Judge the subtask's Task-Context Fit via the fit_judge worker.
+      2. If score >= decompose_fit_threshold or depth >= decompose_max_depth:
+         return [subtask] (leaf).
+      3. Split using partition_files (migration) or the splitter worker
+         (coupled minority). Every judge/split call goes through st.bump_workers.
+      4. No-progress guard: if decompose_noprogress_rounds consecutive rounds
+         produce no child whose score exceeds the parent's, accept as leaf with
+         a warning.
+      5. Recurse into each child at depth+1; return flattened leaves.
+
+    Returns a flat list of leaf subtasks ready for schedule()."""
+    max_depth = caps.get("decompose_max_depth",
+                         DEFAULT_CAPS["decompose_max_depth"])
+    threshold = caps.get("decompose_fit_threshold",
+                         DEFAULT_CAPS["decompose_fit_threshold"])
+    noprogress_max = caps.get("decompose_noprogress_rounds",
+                              DEFAULT_CAPS["decompose_noprogress_rounds"])
+
+    # --- judge step ----------------------------------------------------------
+    st.bump_workers(caps)
+    sys_prompt = load_prompt("fit_judge")
+    user_prompt = (
+        "SUBTASK TO JUDGE:\n"
+        f"{json.dumps(subtask, indent=2)}\n\n"
+        "Score this subtask's P1 Task-Context Fit (0–1) and return your verdict."
+    )
+    judge_result = await claude_p(
+        system_prompt=sys_prompt,
+        user_prompt=user_prompt,
+        schema_key="fit_judge",
+        model=models.get("fit_judge", MODEL_DEFAULT),
+        effort=efforts.get("fit_judge"),
+        allowed_tools=INSPECT_TOOLS,
+        max_turns=30,
+        st=st,
+        sid=f"fit-judge-{subtask.get('id', 'x')}-d{depth}",
+    )
+    score: float = judge_result.get("score", 0.0)
+
+    # --- leaf check ----------------------------------------------------------
+    if score >= threshold or depth >= max_depth:
+        if depth >= max_depth and score < threshold:
+            log(
+                f"recursive_decompose: depth cap ({max_depth}) reached for "
+                f"{subtask.get('id', '?')} (score={score:.2f}); accepting as leaf"
+            )
+        return [subtask]
+
+    # --- no-progress guard ---------------------------------------------------
+    if _parent_score is not None and score <= _parent_score:
+        new_noprogress = _noprogress_count + 1
+    else:
+        new_noprogress = 0
+
+    if new_noprogress >= noprogress_max:
+        log(
+            f"recursive_decompose: no-progress guard triggered for "
+            f"{subtask.get('id', '?')} after {noprogress_max} rounds "
+            f"(score={score:.2f}); accepting as leaf with warning"
+        )
+        return [subtask]
+
+    # --- split step ----------------------------------------------------------
+    files = subtask.get("files_likely_touched") or []
+    # Migration path (dominant case, ~84%): code-partition, LLM only labels.
+    # Coupled-minority path: LLM-splitter with repo-map backing.
+    chunk_size = 8
+    if len(files) > chunk_size:
+        # Migration sweep: deterministic partition guarantees 100% coverage.
+        chunks = partition_files(files, chunk_size)
+        children: list[dict] = []
+        base_id = subtask.get("id", "split")
+        for i, chunk in enumerate(chunks):
+            # Each chunk becomes a child with the file subset; titles/criteria
+            # are filled in by the splitter worker in a follow-on call.
+            child: dict = {
+                "id": f"{base_id}-{i + 1}",
+                "title": subtask.get("title", ""),
+                "success_criteria_seed": subtask.get("success_criteria_seed", ""),
+                "files_likely_touched": chunk,
+                "intent": subtask.get("intent", ""),
+                "scope_note": subtask.get("scope_note", ""),
+                "depends_on": subtask.get("depends_on", []),
+                "requires": subtask.get("requires", []),
+                "provides": subtask.get("provides", []),
+                "size": "medium",
+                "investigation_notes": subtask.get("investigation_notes", ""),
+            }
+            children.append(child)
+    else:
+        # Coupled minority: LLM splitter decides the partition using
+        # structural seams from the repo-map; backstopped by
+        # _check_migration_surface at the plan level.
+        st.bump_workers(caps)
+        sys_prompt_s = load_prompt("splitter")
+        user_prompt_s = (
+            "SUBTASK TO SPLIT:\n"
+            f"{json.dumps(subtask, indent=2)}\n\n"
+            "Split this subtask along real structural seams. Return child subtasks."
+        )
+        split_result = await claude_p(
+            system_prompt=sys_prompt_s,
+            user_prompt=user_prompt_s,
+            schema_key="splitter",
+            model=models.get("splitter", MODEL_DEFAULT),
+            effort=efforts.get("splitter"),
+            allowed_tools=INSPECT_TOOLS,
+            max_turns=30,
+            st=st,
+            sid=f"splitter-{subtask.get('id', 'x')}-d{depth}",
+        )
+        children = split_result.get("children") or []
+        if not children:
+            # Splitter produced no children; accept the subtask as a leaf.
+            log(
+                f"recursive_decompose: splitter returned no children for "
+                f"{subtask.get('id', '?')}; accepting as leaf"
+            )
+            return [subtask]
+
+    # --- recurse into children -----------------------------------------------
+    leaves: list[dict] = []
+    for child in children:
+        child_leaves = await recursive_decompose(
+            child, depth + 1, st, caps, models, efforts, repo_root,
+            _parent_score=score,
+            _noprogress_count=new_noprogress,
+        )
+        leaves.extend(child_leaves)
+    return leaves
+
+
 def check_planner_output(
     result: dict, repo_root: Path, domain: str,
 ) -> list[str]:
@@ -4820,6 +5126,366 @@ def _format_task_file_structure(items: list[str]) -> str:
         "each item or explicitly notes why it's out of scope for your "
         "domain."
     )
+
+
+# ---------------------------------------------------------------------------
+# P6 repo-map — build_repo_map + rank_repo_map (DESIGN §5½ §P6)
+# ---------------------------------------------------------------------------
+# tree_sitter and tree_sitter_language_pack are lazy-imported inside each
+# function (same pattern as tenacity inside claude_p) so that orchestrator/
+# leerie.py loads on a bare host python3 that lacks requirements.txt deps.
+# The config --recapture host seam exec_module()s this file on the host where
+# neither tree-sitter package is guaranteed; a module-scope import would crash
+# before the fast-path guards can print their diagnostic.
+
+
+def _repo_map_cache_key(path: Path) -> str:
+    """Return a stable cache key: '<abs_path>@<mtime_ns>'.
+
+    The mtime_ns component means that touching a file produces a new key
+    and forces a re-parse, while leaving it untouched hits the cached
+    result — the Aider diskcache pattern."""
+    return f"{path}@{path.stat().st_mtime_ns}"
+
+
+def _walk_calls(node: "object") -> list[str]:
+    """Collect identifier names from call-expression function positions.
+
+    Walks the tree-sitter CST recursively.  For each `call` node, extracts
+    the function's identifier if the callee is a bare name or the first
+    component of an attribute access (e.g. ``foo(...)`` → ``"foo"``,
+    ``obj.method(...)`` → ``"obj"`` is skipped, only bare-name callees become
+    reference edges).  This approximates cross-file ref edges without requiring
+    a scope resolver."""
+    results: list[str] = []
+
+    def _visit(n: "object") -> None:
+        if n.type == "call":  # type: ignore[attr-defined]
+            func = n.child_by_field_name("function")  # type: ignore[attr-defined]
+            if func and func.type == "identifier":  # type: ignore[attr-defined]
+                text = func.text  # type: ignore[attr-defined]
+                if text:
+                    results.append(
+                        text.decode() if isinstance(text, bytes) else text)
+        for child in n.children:  # type: ignore[attr-defined]
+            _visit(child)
+
+    _visit(node)
+    return results
+
+
+def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
+    """Parse one source file and return ``(defs, refs)``.
+
+    *defs* — list of defined symbol names (functions, classes, methods).
+    *refs* — list of symbol names called/referenced in the file body.
+
+    Uses ``tree_sitter_language_pack.process()`` for definitions (structure)
+    and tree-sitter's CST for call-site references.  Returns ``([], [])``
+    when the language is unsupported or an error occurs (graceful degrade —
+    the file is simply absent from the graph)."""
+    try:
+        import tree_sitter_language_pack as tslp  # noqa: PLC0415
+        from tree_sitter import Parser  # noqa: PLC0415
+    except ImportError:
+        return [], []
+    try:
+        lang = tslp.detect_language(str(path))
+        if not lang:
+            return [], []
+        source = path.read_text(errors="replace")
+        proc_result = tslp.process(
+            source,
+            tslp.ProcessConfig(language=lang, structure=True, imports=False),
+        )
+        defs: list[str] = []
+
+        def _collect_defs(items: list) -> None:
+            for item in items:
+                if item.name:
+                    defs.append(item.name)
+                _collect_defs(item.children)
+
+        _collect_defs(proc_result.structure)
+        py_lang = tslp.get_language(lang)
+        parser = Parser(py_lang)
+        tree = parser.parse(source.encode())
+        refs = _walk_calls(tree.root_node)
+        return defs, refs
+    except Exception:  # graceful degrade; tree-sitter parse errors, IO, etc.
+        return [], []
+
+
+def build_repo_map(
+    repo_root: Path,
+    leerie_root: Path,
+) -> dict:
+    """Build (or update) the repo-map symbol/reference graph for *repo_root*.
+
+    Walks all source files under *repo_root* (skipping ``node_modules``,
+    ``.git``, ``__pycache__``, virtualenvs, and build outputs), parses each
+    with tree-sitter, extracts definition and call-site symbols, and builds a
+    two-sided graph:
+
+    - ``files``   : ``{file_path: [def_symbol, ...]}``
+    - ``refs``    : ``{def_symbol: {file_path, ...}}``
+
+    Parse results are mtime-cached under
+    ``<leerie_root>/repo-map-cache/<sha256(path)>.pkl`` so that only files
+    whose mtime changed since the last call are re-parsed (the Aider diskcache
+    pattern).  The cache directory is created on first use.
+
+    Returns the ``RepoMap`` dict (always; never raises)."""
+    import pickle  # noqa: PLC0415
+    import hashlib  # noqa: PLC0415
+
+    cache_dir = leerie_root / REPO_MAP_CACHE_DIR
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        cache_dir = None  # cache unavailable; proceed without
+
+    _SKIP_DIRS = frozenset({
+        ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
+        ".tox", "dist", "build", ".mypy_cache", ".pytest_cache",
+        ".ruff_cache", "target", "vendor", ".bundle",
+    })
+
+    def _cache_path(abs_path: Path) -> Path | None:
+        if cache_dir is None:
+            return None
+        digest = hashlib.sha256(str(abs_path).encode()).hexdigest()
+        return cache_dir / f"{digest}.pkl"
+
+    def _load_cache(abs_path: Path) -> tuple[list[str], list[str]] | None:
+        cp = _cache_path(abs_path)
+        if cp is None or not cp.exists():
+            return None
+        try:
+            with open(cp, "rb") as fh:
+                entry = pickle.load(fh)  # noqa: S301
+            if entry.get("mtime_ns") == abs_path.stat().st_mtime_ns:
+                return entry["defs"], entry["refs"]
+        except Exception:
+            pass
+        return None
+
+    def _save_cache(
+        abs_path: Path,
+        defs: list[str],
+        refs: list[str],
+    ) -> None:
+        cp = _cache_path(abs_path)
+        if cp is None:
+            return
+        try:
+            with open(cp, "wb") as fh:
+                pickle.dump({
+                    "mtime_ns": abs_path.stat().st_mtime_ns,
+                    "defs": defs,
+                    "refs": refs,
+                }, fh, protocol=4)
+        except Exception:
+            pass
+
+    files_map: dict[str, list[str]] = {}
+    refs_map: dict[str, set[str]] = {}
+
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        # Prune skip dirs in-place so os.walk doesn't descend into them
+        dirnames[:] = [d for d in dirnames if d not in _SKIP_DIRS]
+        for fname in filenames:
+            abs_path = Path(dirpath) / fname
+            rel = str(abs_path.relative_to(repo_root))
+            cached = _load_cache(abs_path)
+            if cached is not None:
+                defs, file_refs = cached
+            else:
+                defs, file_refs = _parse_repo_file(abs_path)
+                _save_cache(abs_path, defs, file_refs)
+            if not defs and not file_refs:
+                continue
+            files_map[rel] = defs
+            for sym in file_refs:
+                if sym not in refs_map:
+                    refs_map[sym] = set()
+                refs_map[sym].add(rel)
+
+    return {"files": files_map, "refs": refs_map}
+
+
+def _pagerank(
+    graph: dict[str, set[str]],
+    personalization: dict[str, float],
+    damping: float = 0.85,
+    max_iter: int = 100,
+    tol: float = 1e-6,
+) -> dict[str, float]:
+    """Personalized PageRank on a directed graph (stdlib-only, no networkx).
+
+    *graph*           : node → set of outgoing neighbors.
+    *personalization* : node → preference weight (unnormalized).
+
+    Returns node → rank score (higher = more task-relevant)."""
+    # Collect all nodes (including those only appearing as targets)
+    nodes: set[str] = set(graph.keys())
+    for neighbors in graph.values():
+        nodes.update(neighbors)
+    if not nodes:
+        return {}
+
+    n = len(nodes)
+    total_pref = sum(personalization.values()) or 1.0
+    pref: dict[str, float] = {
+        nd: personalization.get(nd, 0.0) / total_pref for nd in nodes
+    }
+    rank: dict[str, float] = {nd: 1.0 / n for nd in nodes}
+    dangling: set[str] = {
+        nd for nd in nodes if nd not in graph or not graph[nd]
+    }
+
+    for _ in range(max_iter):
+        dangling_sum = damping * sum(rank[nd] for nd in dangling) / n
+        new_rank: dict[str, float] = {}
+        for nd in nodes:
+            in_score = sum(
+                rank[src] / len(graph[src])
+                for src in nodes
+                if src in graph and nd in graph[src] and graph[src]
+            )
+            new_rank[nd] = (
+                damping * in_score
+                + dangling_sum
+                + (1.0 - damping) * pref.get(nd, 0.0)
+            )
+        err = sum(abs(new_rank[nd] - rank[nd]) for nd in nodes)
+        rank = new_rank
+        if err < tol:
+            break
+    return rank
+
+
+def _render_repo_map_subgraph(
+    repo_map: dict,
+    ranked_files: list[tuple[str, float]],
+    max_files: int,
+) -> str:
+    """Render the top *max_files* files from *ranked_files* as a compact
+    text block: one line per file listing its defined symbols.
+
+    Symbols are shown as a comma-separated list.  The format is:
+
+        path/to/file.py: SymA, SymB, SymC
+
+    Files with no defs are omitted.  Top-ranked files appear first (highest
+    score → most task-relevant); per the recency-bias principle, the most
+    relevant entries appear at the beginning of the block."""
+    files_map: dict[str, list[str]] = repo_map["files"]
+    lines: list[str] = []
+    for rel, _score in ranked_files[:max_files]:
+        syms = files_map.get(rel)
+        if not syms:
+            continue
+        lines.append(f"{rel}: {', '.join(syms[:30])}")
+    return "\n".join(lines)
+
+
+def _count_tokens_approx(text: str) -> int:
+    """Approximate token count: ~4 bytes per token (GPT/Claude typical)."""
+    return max(1, len(text.encode()) // 4)
+
+
+def rank_repo_map(
+    repo_map: dict,
+    seed_files: list[str],
+    seed_symbols: list[str],
+    token_budget: int | None = None,
+) -> str:
+    """Run personalized PageRank on *repo_map* biased toward *seed_files* and
+    *seed_symbols*, and return a compact ranked-subgraph text string that fits
+    within *token_budget* tokens.
+
+    The subgraph is binary-searched to fit the budget: start with all ranked
+    files, halve max_files until the rendered text fits, then return the
+    largest budget-fitting slice.
+
+    When *token_budget* is ``None``, uses ``DEFAULT_CAPS["repo_map_tokens"]``.
+
+    Returns an empty string when the repo-map is empty or no seed is given
+    and the whole map is empty."""
+    if token_budget is None:
+        token_budget = DEFAULT_CAPS["repo_map_tokens"]
+
+    files_map: dict[str, list[str]] = repo_map.get("files", {})
+    refs_map: dict[str, set[str]] = repo_map.get("refs", {})
+
+    if not files_map:
+        return ""
+
+    # Build a file→file edge graph via shared symbols:
+    # file A → file B when a symbol defined in A is referenced in B
+    # (A is a callee; B is a caller).  This direction means high-in-degree
+    # nodes are widely-used utilities — biasing toward them surfaces the
+    # structural backbone of the task neighborhood.
+    graph: dict[str, set[str]] = {}
+    def_to_file: dict[str, str] = {}
+    for rel, syms in files_map.items():
+        for sym in syms:
+            def_to_file[sym] = rel
+
+    for sym, referencing_files in refs_map.items():
+        definer = def_to_file.get(sym)
+        if definer is None:
+            continue
+        if definer not in graph:
+            graph[definer] = set()
+        for ref_file in referencing_files:
+            if ref_file != definer:
+                graph[definer].add(ref_file)
+
+    for rel in files_map:
+        if rel not in graph:
+            graph[rel] = set()
+
+    pref: dict[str, float] = {}
+    seed_set = set(seed_files)
+    for rel in files_map:
+        if rel in seed_set:
+            pref[rel] = pref.get(rel, 0.0) + 1.0
+    for sym in seed_symbols:
+        definer = def_to_file.get(sym)
+        if definer and definer in files_map:
+            pref[definer] = pref.get(definer, 0.0) + 1.0
+        for ref_file in refs_map.get(sym, set()):
+            if ref_file in files_map:
+                pref[ref_file] = pref.get(ref_file, 0.0) + 0.5
+
+    if not pref:
+        pref = {rel: 1.0 for rel in files_map}
+
+    ranks = _pagerank(graph, pref)
+
+    ranked_files: list[tuple[str, float]] = sorted(
+        ((rel, ranks.get(rel, 0.0)) for rel in files_map),
+        key=lambda x: -x[1],
+    )
+
+    total = len(ranked_files)
+    if total == 0:
+        return ""
+
+    lo, hi = 1, total
+    best = ""
+    while lo <= hi:
+        mid = (lo + hi) // 2
+        candidate = _render_repo_map_subgraph(repo_map, ranked_files, mid)
+        if _count_tokens_approx(candidate) <= token_budget:
+            best = candidate
+            lo = mid + 1
+        else:
+            hi = mid - 1
+
+    return best
 
 
 def validate_plan(subtasks: dict) -> None:
@@ -10357,14 +11023,6 @@ async def phase_plan(task: str, st: State, caps: dict,
     answers = st.data.get("answers", {})
     sot = answers.get("source_of_truth", "codebase")
     sys_prompt = load_prompt("planner")
-    # confidence_rounds is the worker-internal evidence-gate bound (DESIGN
-    # §8 planner gate). The orchestrator does not enforce it — the planner
-    # bounds itself — but passing it in the context blob is what makes the
-    # user-visible knob real.
-    ctx = json.dumps({"task": task, "source_of_truth": sot,
-                      "clarification_answers": answers,
-                      "confidence_rounds": caps["confidence_rounds"]},
-                     indent=2)
 
     sem = asyncio.Semaphore(caps["max_parallel"])
 
@@ -10379,6 +11037,36 @@ async def phase_plan(task: str, st: State, caps: dict,
     if task_file_section:
         log(f"  extracted {len(task_file_items)} structural items "
             "from task-referenced files")
+
+    # P6 repo-map injection (DESIGN §P6). Build the ranked subgraph seeded
+    # from the task-referenced files identified above, and inject it into the
+    # planner context.  When skip_repo_map is True the planner degrades
+    # gracefully to the pre-existing grep/glob-only path.
+    ctx_dict: dict = {
+        "task": task,
+        "source_of_truth": sot,
+        "clarification_answers": answers,
+        # confidence_rounds is the worker-internal evidence-gate bound (DESIGN
+        # §8 planner gate). The orchestrator does not enforce it — the planner
+        # bounds itself — but passing it in the context blob is what makes the
+        # user-visible knob real.
+        "confidence_rounds": caps["confidence_rounds"],
+    }
+    if not st.data.get("skip_repo_map"):
+        try:
+            repo_map = build_repo_map(repo_root, st.leerie_root)
+            seed_files = (
+                [str(Path(item.split(": ", 1)[0])) for item in task_file_items]
+                if task_file_items else []
+            )
+            ranked = rank_repo_map(repo_map, seed_files, [])
+            if ranked:
+                ctx_dict["repo_map"] = ranked
+                log(f"  injected ranked repo-map subgraph "
+                    f"({len(ranked.splitlines())} files) into planner ctx")
+        except Exception:
+            pass  # degrade silently; planner runs without repo-map
+    ctx = json.dumps(ctx_dict, indent=2)
 
     async def plan_one(category: str, sample_idx: int = 0) -> dict | None:
         async with sem:
@@ -10475,6 +11163,20 @@ async def phase_plan(task: str, st: State, caps: dict,
             best = _select_best_planner_sample(
                 samples, repo_root, c)
             plans.append(best)
+
+    # DESIGN §5½ *Wire-in to phase_plan*: depth=0 entry so the depth cap
+    # counts from the planner level, not from inside recursive_decompose itself.
+    log("  expanding subtasks via recursive_decompose (P1 Layer C)")
+    for plan in plans:
+        first_pass = plan.get("subtasks", [])
+        if not first_pass:
+            continue
+        leaves: list[dict] = []
+        for subtask in first_pass:
+            expanded = await recursive_decompose(
+                subtask, 0, st, caps, models, efforts, repo_root)
+            leaves.extend(expanded)
+        plan["subtasks"] = leaves
 
     for category, plan in zip(cats, plans):
         n = len(plan.get("subtasks", []))
@@ -16811,6 +17513,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
         st.data["strict_conformer"] = bool(args.strict_conformer)
         st.data["skip_base_baseline"] = bool(args.skip_base_baseline)
+        st.data["skip_repo_map"] = bool(args.skip_repo_map)
         st.data["leerie_version"] = _read_version()
         st.save()
         # Fail-closed containment gate + recording, now that st.data is
@@ -16851,6 +17554,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    "skip_budget_check": bool(args.skip_budget_check),
                    "strict_conformer": bool(args.strict_conformer),
                    "skip_base_baseline": bool(args.skip_base_baseline),
+                   "skip_repo_map": bool(args.skip_repo_map),
                    "leerie_version": _read_version()}
         st.save()
         # Fail-closed containment gate + recording, before the first
@@ -17215,6 +17919,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "base is known green or the up-front cost is unwanted. "
                          f"Also {SKIP_BASE_BASELINE_ENV} env or "
                          "skip_base_baseline in leerie.toml. Default: off.")
+    ap.add_argument("--skip-repo-map", action="store_true",
+                    help="skip the P6 repo-map structural context (DESIGN §P6): "
+                         "suppresses build_repo_map() and the ranked subgraph "
+                         "injection into planner/splitter context. The planner "
+                         "degrades gracefully to the prior grep/glob-only path. "
+                         "Use on repos where tree-sitter cannot parse the "
+                         "primary language, or to opt out of structural context. "
+                         f"Also {SKIP_REPO_MAP_ENV} env or "
+                         "skip_repo_map in leerie.toml. Default: off.")
     ap.add_argument("--source-of-truth", choices=SOURCE_OF_TRUTH_VALUES,
                     metavar="VALUE",
                     help=f"source-of-truth preference "
@@ -17520,6 +18233,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     args.skip_base_baseline = resolve_skip_base_baseline(
         repo_root, args.skip_base_baseline)
+
+    args.skip_repo_map = resolve_skip_repo_map(
+        repo_root, args.skip_repo_map)
 
     args.dangerously_allow_uncapped = resolve_dangerously_allow_uncapped(
         repo_root, args.dangerously_allow_uncapped)
