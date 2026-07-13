@@ -5,6 +5,29 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.58]
+
+### Changed
+
+- **Test-hardening for the P6/P1 tree-sitter gate (#52).** Pins the
+  source coupling that makes the 19 host-sensitive tree-sitter tests skip
+  cleanly (rather than fail) on a host without a compatible
+  `tree-sitter-language-pack`, closing the gap where a regression could
+  silently re-break the gate:
+  - Adds `tests/test_tree_sitter_probe.py` — direct unit tests for the
+    functional `_tree_sitter_extraction_works()` probe: the True branch
+    (real extraction, `HAS_TREESITTER`-gated) and both host-independent
+    False branches (`_parse_repo_file` raising, and returning empty defs).
+  - Adds `tests/test_repo_map_gate_wiring.py` — source-coupling guards
+    that `conftest._has_treesitter()` delegates to the functional probe
+    (not a bare `ImportError` check) and that each of `test_build_repo_map.py`,
+    `test_repo_map.py`, and `test_phase_plan_repo_map_ctx.py` imports and
+    gates on `HAS_TREESITTER`.
+  - Documents both new test files in `CLAUDE.md` and the
+    `IMPLEMENTATION.md` testing table.
+
+  No orchestrator code surface changed; this release is tests + docs only.
+
 ## [0.9.57]
 
 ### Fixed
