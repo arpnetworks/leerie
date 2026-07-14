@@ -5,7 +5,7 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.9.60]
 
 ### Fixed
 
@@ -26,6 +26,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already satisfied on the base tree. §12-compliant: the mechanical gate
   still fires first and the probe only rescues, failing safe to
   not-satisfied on any crash/uncertainty.
+
+- **A worker reaped mid-turn no longer discards its committed
+  deliverable.** A worker killed mid-turn (OOM/timeout/crash) writes no
+  checkpoint, so `validate_result` tags its synthesized result
+  `empty_handoff` and the settle loop `fail()`ed it — resetting the
+  worktree and burning `failed_retries` until the run died, discarding a
+  green committed diff purely because of *how* the worker died. Now
+  `branch_has_commits_ahead` (a positive-polarity check — True only when
+  the worktree exists, git succeeds, and there are commits ahead of the
+  run branch; a gone worktree or git failure is never rescued) gates a
+  rescue: an `empty_handoff` with commits ahead settles `complete` and
+  routes through the advisory conformance phase instead of being
+  discarded (DESIGN §9). The implementer prompt now commits in-scope work
+  *before* running any verification step, so a reaped worker's diff is
+  already committed for the rescue to keep.
+
+- **Auto per-worker memory cap floored at 8 GiB; build OOMs named
+  instead of misreported as missing checkpoints.** In-container
+  measurement showed a build-running worker cgroup holds the build
+  subprocess tree *and* the resident `claude -p` process at once,
+  peaking ~6.3 GiB. The old 4 GiB clamp on `_auto_worker_memory_max`
+  meant no VM size could auto-derive enough headroom, so every
+  build-running worker cgroup-OOMed; the ceiling is replaced with an
+  8 GiB floor (the aggregate `leerie.slice` `memory.max` remains the
+  real VM-OOM backstop). The cgroup broker's `stat` verb now also reports
+  `memory.events` `oom_kill` (widened to `OK cur mx ev oom`), `_cgroup_stat`
+  threads it through as a 4-tuple, and `_invoke` reads the worker cgroup's
+  final stat before destroy — on a no-envelope path with `oom_kill > 0` it
+  raises a `WorkerError` naming the offending command and `memory.max`.
+  `settle_subtask` (both the has-commits rescue and the no-commits
+  `fail()` path) now surfaces that named OOM cause over
+  `validate_result`'s generic "checkpoint does not exist" text, pointing
+  the operator at `--worker-memory-max` / `--max-parallel` (DESIGN §6
+  *Detecting memory OOM*).
 
 ### Added
 
