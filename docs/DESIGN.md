@@ -1504,7 +1504,7 @@ processes sharing one memcg.
 Each `claude -p` worker is therefore enrolled in its own child
 cgroup at `<cgroup-root>/leerie-w-<sid>/` with `memory.max` set to
 `caps["worker_memory_max_bytes"]` (default: VM RAM split across
-`max_parallel + 1` slots, clamped to ≤ 4 GiB) and `pids.max` set
+`max_parallel + 1` slots, floored at 8 GiB) and `pids.max` set
 to `caps["worker_pids_max"]` (default 1024, overridable per-repo via
 `--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in
 leerie.toml). When the worker
@@ -1513,6 +1513,33 @@ cgroup*; sibling workers, the orchestrator, and host-side services
 in different cgroups are not eligible victims. `memory.swap.max=0`
 prevents the kernel from delaying an inevitable OOM by paging out
 worker memory to the Colima swap file.
+
+The per-worker cap must hold **both** the build/test subprocess tree
+*and* the resident `claude -p` process at the same time — `claude`
+stays alive running the build via Bash and streaming its output, so
+it shares the cgroup with whatever it launches. Live in-container
+`memory.peak` measurement on a Next.js/Turbopack build: build alone
+peaks at 4.16 GiB (identical whether the build's own concurrency is
+left at default or pinned to 2 cores — not a parallelism artifact),
+and build + resident claude peaks at 5.6–6.3 GiB. An earlier `4 GiB`
+clamp on the auto-derived value was *below* that combined peak, so no
+VM size could auto-derive a cap sufficient for a build-running
+worker — every such worker was cgroup-OOM-killed regardless of host
+RAM. The fix floors the auto-derive at 8 GiB (`max(even_split, 8
+GiB)`), giving margin over the measured 6.3 GiB peak, and drops the
+upper clamp entirely: the real backstop against a runaway per-worker
+cap is the *aggregate* `leerie.slice/memory.max` cap set by
+`scripts/container-entry.sh` (`MemTotal - max(1 GiB, 12.5%)`), which
+bounds the whole worker fleet regardless of any individual worker's
+`memory.max`. Because that aggregate cap is the real VM-OOM backstop,
+the per-worker floor can be generous without risking host-level
+memory exhaustion — but it does mean **build-heavy waves need a lower
+`--max-parallel`**: five concurrent 8 GiB-capped workers (40 GiB
+aggregate) will not all fit under a ~13.6 GiB slice cap on a 16 GiB
+VM, so the slice cap will itself OOM-kill one of them first. Pair a
+generous per-worker cap with a reduced `--max-parallel` for waves
+expected to run builds, rather than relying on the per-worker cap
+alone to bound concurrency.
 
 **The containment must be performed by an identity that owns (or was
 delegated) the relevant cgroup subtree — it cannot be delegated to the
@@ -1736,6 +1763,48 @@ callers' existing handling: an implementer's PID-exhausted run becomes a
 retryable `incomplete-handoff` (a fresh worker restarts in a new worktree
 with a clean PID table, and the dead worker's leaked PIDs die with it),
 and a conformer's stays advisory (§9).
+
+**Detecting memory OOM — naming the cause instead of a cryptic checkpoint
+error.** A build/test command that overshoots the worker cgroup's
+`memory.max` is killed by the kernel with a bare `Killed` (exit 137, no
+error text of its own) — unlike PID exhaustion, this leaves no failing
+tool-result for `_read_stream`'s window detector to key on: `claude -p`
+is often reaped mid-turn, before it can emit any `result` event at all.
+That symptom lands in `_invoke`'s no-envelope path indistinguishable from
+a session-limit no-op or a `--max-turns` exhaustion; downstream,
+`validate_result` tags it `empty_handoff`, and once a run with no
+committed work burns the retry cap the operator sees only *"checkpoint
+... does not exist on disk"* — no mention of memory. On a real run this
+drove an operator through a default → 6G → 12G → 16G
+`LEERIE_WORKER_MEMORY_MAX` escalation before finding the actual cause.
+
+The broker's `stat <sid>` verb (extended alongside the PID-exhaustion
+counters above) also returns `memory.events`' `oom_kill` counter — the
+kernel increments it once per OOM-kill inside the cgroup, mirroring
+`pids.events`' `max` counter's role for fork denial. `_cgroup_stat`'s
+client widens to a 4-tuple accordingly:
+`(pids.current, pids.max, pids.events.max, oom_kill)`. `_invoke` reads
+the cgroup's stat once more — in its `finally`, immediately before
+`_cgroup_destroy` tears the cgroup down (destroy `rmdir`s it, so this is
+the last point a read is possible) — and, in the no-envelope branch, if
+`oom_kill > 0` it raises a `WorkerError` naming the cause: the last Bash
+command the worker launched (tracked alongside the PID-exhaustion window,
+first line only) and the cgroup's `memory.max` cap, with the same
+actionable suggestion the operator's escalation ladder already
+discovered by hand — *"worker OOM-killed on `<cmd>` (memory.max=N GiB) —
+raise `--worker-memory-max` or lower `--max-parallel`."* That message
+threads through `run_implementer`'s existing `except WorkerError` handler
+into the synthesized `incomplete-handoff` envelope's `summary` field.
+
+`settle_subtask`'s `empty_handoff` handling already branches on whether
+the worktree holds committed work (see the rescue above): when it does,
+the named-OOM `summary` was already preserved verbatim. The remaining
+gap is the no-commits branch, which previously discarded the worker's
+`summary` in favor of `validate_result`'s generic checkpoint-missing
+`message` before calling `fail()`. That branch now prefers the worker's
+own `summary` when present — falling back to the generic message only
+when no worker output exists — so a genuinely OOM-killed build is named
+even when the retry cap is exhausted and the subtask terminates.
 
 The error signal is measured over a **sliding window of the last N
 tool-results**, NOT a run of *consecutive* ones. The stream never places
