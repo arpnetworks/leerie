@@ -219,11 +219,23 @@ export LEERIE_SOURCE_OF_TRUTH=codebase   # or: research, both
 # …or commit a leerie.toml at the repo root with: source_of_truth = codebase
 
 # Select the execution runtime (default: local). `fly` routes each worker
-# through Fly.io machines instead of local nerdctl containers.
-export LEERIE_RUNTIME=local              # or: fly
+# through Fly.io machines instead of local nerdctl containers; `ec2`
+# accepts the enum value and resolves AWS credentials the same way the
+# AWS CLI/SDKs do (env vars > named profile > SSO cached token; see
+# scripts/remote/aws-credentials.sh) — EC2 machine provisioning itself
+# has not shipped yet.
+export LEERIE_RUNTIME=local              # or: fly, ec2
 export LEERIE_FLY_APP=my-leerie-app      # required for --runtime fly (globally unique)
 ./leerie "task" --runtime fly
 # …or commit a leerie.toml at the repo root with: runtime = fly
+
+# ec2 runtime knobs (leerie-level knobs for which AWS region/profile
+# leerie itself uses when provisioning EC2 machines — distinct from the
+# AWS SDK's own AWS_REGION/AWS_PROFILE credential-chain env vars, which
+# resolve independently via the standard AWS precedence order):
+export LEERIE_AWS_REGION=us-east-1       # or: leerie.toml aws_region = us-east-1
+export LEERIE_AWS_PROFILE=my-aws-profile # or: leerie.toml aws_profile = my-aws-profile
+./leerie "task" --runtime ec2
 
 # Choose the model. Without overrides: judgment workers (classifier,
 # planner, reconciler, plan_overlap_judge, provision, integrator)
@@ -455,12 +467,20 @@ export LEERIE_PROGRESS_INTERVAL_S=15
 
 `pytest tests/` from the repo root. Tests cover the deterministic
 enforcement functions (`resolve_leerie_root`, `resolve_source_of_truth`,
-`resolve_runtime`, `gather_answers` validation gate, `_retryable_failure`,
+`resolve_runtime`, `resolve_aws_region`, `resolve_aws_profile`,
+`gather_answers` validation gate, `_retryable_failure`,
 `check_merge_committed`, `validate_result`, `validate_plan`,
 `_validate_run_json`, `_derive_run_status`, `_load_blt_config`,
 `resolve_blt`)
 including a coupling test that the
-retry-policy markers match the live check-function strings. The
+retry-policy markers match the live check-function strings.
+`resolve_aws_region`/`resolve_aws_profile` (the `LEERIE_AWS_REGION`/
+`LEERIE_AWS_PROFILE`/`leerie.toml` knobs for which region/profile leerie
+itself uses when provisioning `--runtime ec2` machines, distinct from the
+AWS SDK's own credential-chain env vars) are covered in
+`tests/test_resolve_aws_prefs.py`, mirroring `test_resolve_runtime.py`'s
+CLI/env/file precedence structure but for the unvalidated free-form-string
+`_resolve_str_pref` machinery (no enum, no `die()` path). The
 remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 `stop_machine`, `decide_teardown`, `resume_machine`, and `lib.sh`'s
 `update_run_json` — is tested via bash-harness subprocess tests with
@@ -839,6 +859,37 @@ not measure," folded into neither GREEN nor RED, by both
 `_format_baseline_section` and `_base_health_payload`), and pins that `measured`
 is a mandatory field with no legacy default (a `passed: False` axis missing
 `measured` is not surfaced RED).
+The standalone AWS credential/profile/region resolution helper
+(`scripts/remote/aws-credentials.sh`, EC2 runtime) is tested in
+`tests/test_aws_credentials.py` by sourcing the real script against a fake
+`$HOME` with fixture `~/.aws/config`/`~/.aws/credentials`/`~/.aws/sso/cache/`
+files (mirroring `tests/test_fetch_branch_sh.py`'s source-and-call pattern):
+explicit env-var credentials winning over a fully-configured SSO profile
+with a valid cached token; `AWS_PROFILE` selecting a named profile over
+`[default]`; region precedence (`AWS_REGION` > `AWS_DEFAULT_REGION` >
+profile `region` > die-with-hint); static credentials in
+`~/.aws/credentials`; both `sso_session`-reference and legacy inline SSO
+config; an expired SSO cache token and a never-logged-in profile both
+producing the `aws sso login --profile <p>` hint rather than a silent
+fallthrough; no `~/.aws` directory at all; `AWS_PROFILE=nonexistent` not
+falling back to `[default]`; and `--profile`/`--region` CLI flags
+overriding their env-var equivalents. Pure file I/O — no network, no `aws`
+binary, no boto3. Not yet wired into the launcher's EC2 runtime path (that
+lands in a separate subtask); this test file covers only the standalone
+helper.
+The EC2 runtime's host-side preflight (`scripts/remote/ec2-lib.sh`'s
+`require_aws()`, modeled on `require_flyctl()` in `scripts/remote/lib.sh`) is
+tested in `tests/test_ec2_lib_sh.py` by sourcing the real script against a
+stubbed `aws` binary on PATH (mirroring `tests/test_ensure_image.py`'s
+stubbed-flyctl pattern): success when `aws` is present and `aws sts
+get-caller-identity` succeeds; an actionable AWS CLI v2 install hint when
+`aws` is absent from PATH; the `aws sso login --profile <profile>` recovery
+hint (reusing `bedrock_preflight()`'s exact vocabulary) when credentials are
+unresolvable; profile resolution precedence (`--profile` passthrough,
+`LEERIE_AWS_PROFILE` over `AWS_PROFILE`, `AWS_PROFILE` as fallback) reflected
+in both the `aws sts get-caller-identity` call and the sso-login hint. Not
+yet wired into the launcher's `RUNTIME=ec2` dispatch branch (that lands in a
+separate subtask); this test file covers only the standalone helper.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
