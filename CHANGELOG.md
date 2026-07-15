@@ -5,6 +5,97 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.64]
+
+### Fixed
+
+- **The zombie reaper no longer steals asyncio's children.** `--runtime fly`
+  runs died at preflight with "git user.email is not configured" on machines
+  whose identity had been seeded correctly seconds earlier. Git was never the
+  problem — the return code was lying. `_zombie_reaper` scanned `/proc` for
+  `state==Z, ppid==getpid()` and `waitpid`'d whatever it found, excluding
+  `_ASYNCIO_MANAGED_PIDS`. That exclusion cannot work: CPython's
+  `PidfdChildWatcher` calls `os.pidfd_open(pid)` *after* the fork, so between
+  `fork()` and that call the pid is in no registry the reaper can consult.
+  Reaping it there makes `_do_wait`'s `os.waitpid` raise `ChildProcessError`
+  and asyncio invents returncode 255 — leerie's own reaper was the
+  "elsewhere" in asyncio's *"may happen if waitpid() is called elsewhere"*.
+  preflight's `git config user.email` is the first subprocess after the reaper
+  starts, so the reaper's first tick landed on it: 40/40 runs on a real Fly
+  performance-16x. The reaper now reaps an **allowlist** (`_REAPABLE_PIDS`,
+  published by `_DescendantTracker._poll_loop`) — correct by construction,
+  since a pid inside its fork→pidfd_open window was never recorded. The
+  `/proc` scan is deleted; the scan *was* the bug. Registering pids, a
+  `waitid(WNOWAIT)` peek, and excluding asyncio-known pids were all measured
+  and rejected. This is a second route to the same fabricated 255 that
+  0.9.61 fixed (inherited `SIGCHLD=SIG_IGN`); that fix is untouched, which is
+  why fixing one changed nothing. Also drops the `and not r.stdout` conjunct
+  from preflight's 255 guard: `git config <key>` succeeds *and prints the
+  value*, so the real failure carries rc=255 **with** output and the conjunct
+  never fired (#64).
+- **`--kill` now reaps the Fly volume in the three shapes where it didn't.**
+  Fly volumes outlive their machines and no platform lifecycle hook destroys
+  them — *"a Machine can be destroyed without destroying its volume"*, leaving
+  a documented unattached volume that keeps billing. Surfaced by a 20GB volume
+  with no machine attached, belonging to a run that died pre-classify
+  (`run_id: null`, no run.json) and had to be destroyed by hand. Every gap was
+  reproduced by execution against a stub `flyctl`, not traced by eye:
+  `destroy_machine` early-returned on an empty `LEERIE_MACHINE_ID`, which made
+  its own volume-destroy block unreachable exactly in the orphan shape (a
+  known volume whose machine already died) — reaping is now a separate
+  `destroy_volume`, callable without a machine id; `--kill --machine-id <id>`
+  gated volume resolution on a run dir existing, so the flag advertised for
+  "an orphan machine without a sidecar" was itself an orphan-maker — added
+  `_resolve_volume_id_from_fly`, reading `config.mounts[].volume` from
+  `machine list --json`; and `_resolve_volume_id_from_run_dir` returned on the
+  first *existing* file rather than the first with a `volume_id`, so a
+  `fly-machine.json` without one blocked the fall-through to `run.json`, where
+  provision always writes it. Ordering is pinned by two opposing platform
+  facts — the association vanishes with the machine, but Fly refuses to
+  destroy an attached volume — so: look up → destroy machine → destroy volume.
+  Verified live end-to-end against a real machine+volume. A volume whose
+  machine is destroyed *and* whose launcher is SIGKILLed before reaping stays
+  out of scope: unattributable from either side (#66).
+
+### Added
+
+- **AWS EC2 is now accepted as an execution runtime alongside Fly.io.**
+  `RUNTIME_VALUES` gains `ec2` (`--runtime ec2`, `LEERIE_RUNTIME=ec2`, or
+  `runtime = ec2` in `leerie.toml`), mirrored into the launcher's own bash-side
+  enum so the value resolves rather than dying before the instance starts. Adds
+  `resolve_aws_region`/`resolve_aws_profile` — leerie-level knobs
+  (`LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE`, `aws_region`/`aws_profile`) for
+  which region and profile leerie itself uses when provisioning, distinct from
+  the AWS SDK's own credential-chain env vars. Adds
+  `scripts/remote/aws-credentials.sh`, resolving credentials in the standard
+  SDK/CLI precedence order (explicit env vars → named profile static/SSO
+  credentials → die-with-hint) and the region in `AWS_REGION` >
+  `AWS_DEFAULT_REGION` > profile `region` > die-with-hint order, backed by
+  python3 stdlib file I/O only — no `aws` binary, no boto3 — so it stays
+  testable and dependency-free; and `scripts/remote/ec2-lib.sh`'s
+  `require_aws()` host-side preflight, mirroring `require_flyctl()`. boto3 and
+  botocore are pinned in `requirements.txt`. **EC2 machine provisioning itself
+  has not shipped yet** — this release lands the enum, the knobs, and the
+  credential/preflight surface it will sit on (#65).
+
+### Changed
+
+- DESIGN.md now states the Fly volume lifecycle in the canonical layer. A
+  post-merge audit of #66 against the three-layer rule found DESIGN silent on
+  the architecture that fix rests on — and worse, asserting teardown routes to
+  "destroy (full reap)", a claim that was **false** in three code paths, from
+  which a reader of the canonical layer would conclude the leak was
+  impossible. *Remote disk policy* documented volume creation, the `/work`
+  rationale, and the pause contract, but never said who destroys the volume;
+  `grep` for `unattached|outlive|orphan volume` returned zero hits. Meanwhile
+  DESIGN names `destroy_machine`/`stop_machine` six times — the machine side of
+  teardown was treated as architecture, the volume side was not, and that
+  asymmetry is the blind spot that let the leak exist. "No platform lifecycle
+  hook exists, therefore leerie owns volume reaping" is a constraint imposed
+  from outside, the same class of fact as §6's "the container PID 1 is not an
+  init", so it belongs in the canonical layer. Docs-only: IMPLEMENTATION and
+  the code already conform to every claim added (#67).
+
 ## [0.9.63]
 
 ### Fixed
