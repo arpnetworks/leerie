@@ -5,6 +5,33 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.65]
+
+### Fixed
+
+- **Documentation and in-code comments brought back into agreement with
+  the orchestrator.** An audit of `docs/DESIGN.md` and
+  `docs/IMPLEMENTATION.md` against `orchestrator/leerie.py` (the canonical
+  three-layer precedence) found the code correct but several doc claims
+  stale: DESIGN §14 said "nine worker types" and asserted "no gap" while
+  `WORKER_TYPES` has eleven (`fit_judge`/`splitter` were missing), and named
+  `heal` in a list of `schema_key`s where the actual key is
+  `patch_generator`; IMPLEMENTATION §9 understated `confidence` as
+  absent/optional for the classifier, implementer, and integrator schemas
+  (it is required in all three); IMPLEMENTATION §1 claimed the launcher's
+  `RUNTIME=ec2` branch calls `require_aws()` when no such branch exists yet
+  (`--runtime ec2` is enum-accepted but falls through to the local path);
+  and IMPLEMENTATION §5½ said `_confidence_schema` is used by "all 10 worker
+  schemas (including `splitter`)" when it is nine and `splitter` carries no
+  confidence axis. Two matching stale count-comments inside `leerie.py` were
+  corrected (`_confidence_schema` "seven occurrences" → nine; the `claude_p`
+  drift-guard "two post-run schemas" → the four it actually admits). Also
+  makes the orphaned `/chain` plugin skill (`commands/chain.md`) reachable
+  from `docs/USAGE.md` and the README, and narrows the README's "every
+  document is reachable" claim to exclude the generated `docs/ANALYSIS.md`
+  build artifact. Comment-only on the code side (no behavior change);
+  `docs/ANALYSIS.md` regenerated to stay in sha256 lockstep (#68).
+
 ## [0.9.64]
 
 ### Fixed
