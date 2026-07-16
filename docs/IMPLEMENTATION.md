@@ -39,13 +39,14 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/remote/seed-auth.sh` | Seeds Claude config + git identity into the provisioned Fly Machine. Tar-pipes the host's `$STAGE` (Keychain-extracted OAuth credentials + projects-stripped `~/.claude.json` + `.claude/` subdirs, with `.claude/local`, `.claude/plugins/cache`, and `.claude/plugins/marketplaces` skipped; `~/.aws/` also included when Bedrock mode is enabled — see `$STAGE/.aws` mount row above; `.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc`, `.ssh`, `.gnupg`, and `.config` are explicitly excluded from the tar — those are git/push auth that lives on the host per DESIGN §6 *Finalization* — ~408 MB host npm install duplicated by the Dockerfile's globally-installed claude binary, plus the bulky plugin cache that's rebuilt on the remote post-tar via `claude plugin marketplace add` + `claude plugin install` from the seeded `installed_plugins.json` / `known_marketplaces.json`) to `/home/leerie/` via `flyctl ssh console -C "tar -xzC /home/leerie"` (gzip on both ends). The tar pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts that have GNU `timeout`; no-op fallback otherwise) so a stalled `flyctl ssh console` session — observed mode where flyctl never exits even though the remote tar made progress — produces a clean rc 124/137 instead of hanging forever. rc 124/137 triggers a one-shot `flyctl agent restart` retry; if the retry also stalls, the function returns 1 and leerie's existing PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*). A background heartbeat (`_seed_progress_bg`) logs "seed_auth: still streaming (Ns elapsed)" every `LEERIE_PROGRESS_INTERVAL_S` seconds (default 10) so the user sees activity rather than a silent multi-minute wait. Writes git identity to `/home/leerie/.gitconfig` (not `--global`, which would land in `/root/.gitconfig` under the ssh-console session's default root user). Pre-warms `claude --version` once as the leerie user so the orchestrator's preflight call hits warm caches (the FIRST claude invocation on a cold Fly machine takes ~17 s — Node + statsig cold start — and would otherwise exceed the orchestrator's preflight timeout). |
 | `scripts/remote/seed-repo.sh` | Two-phase bundle + delta repo seeding helper (sourced by the `leerie` launcher after `provision_machine()` succeeds). Exports `seed_repo_clone` (wipe `/work` contents but preserve the inode; create `git bundle` for the parent and each submodule; pipe each bundle via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"` — `sh -c` is required because bare `cat > ...` fails on flyctl's `-C`; have the machine `git clone` from the parent bundle, wire submodule URLs to their per-submodule bundles, run `git -c protocol.file.allow=always submodule update --recursive` — `protocol.file.allow` is required by git 2.38+ for file://-style submodule URLs per CVE-2022-39253 — then chown to leerie; clean up the bundle tmpfiles), `seed_repo_dirty` (rsync the dirty/untracked delta plus force-included `.claude/`, used by both fresh-seed delta and the Phase 4 `re-seed.sh` flow), and the wrapper `seed_repo`. Bundles sidestep macOS BSD tar's NFC→NFD filename normalization, which corrupted submodule working trees containing non-ASCII filenames on the Linux receiver. No in-machine `git clone` from origin — Fly machines deliberately receive no GitHub credentials. The parent-bundle pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts with GNU `timeout`; no-op fallback otherwise) and surrounded by a `_seed_progress_bg` background heartbeat; on rc 124/137 (timeout fired) the function returns 1 with a "flyctl ssh console likely stalled" diagnosis so leerie's PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*) matching the seed_auth pattern. A second `_seed_progress_bg` covers the submodule-bundle `git submodule foreach --recursive` batch so the user sees activity across multi-submodule transfers instead of a silent pause. **Shallow-seed path (heavy repos, DESIGN §6 *Shallow seeding for heavy repos*):** when the host repo's `.git` exceeds `LEERIE_SEED_SHALLOW_THRESHOLD_MB` (default `200`) AND the resolved seed depth is non-zero, `seed_repo_clone` skips the full `--all` bundle for the *parent* and instead: makes a throwaway `git clone --depth="$LEERIE_SEED_DEPTH" --no-local --branch <cur-branch> "file://$USER_REPO"`; `tar -cf -`s **only that clone's `.git`**; pipes the tar over the identical `$(_seed_timeout_prefix)`-wrapped `flyctl ssh console -C "sh -c 'cat > /tmp/leerie-seed-git.tar'"` channel (same heartbeat, same `PIPESTATUS[1]` + rc 124/137 handling); and the machine-side heredoc script (same pattern as `_seed_one_inspect_dir_clone`) empties `/work` inode-preservingly, untars `.git`, `git checkout -f`s the branch, `git remote remove origin` (the stale `file://<laptop>` origin is inert but removed defensively), runs the **unchanged** per-submodule bundle wiring, and `chown -R leerie: /work` last. Tarring `.git`-only (never the working tree) preserves the NFC→NFD safety property. `git bundle` cannot ship a shallow repo (grafted parents), which is why the shallow path uses tar rather than a shallow bundle. `LEERIE_SEED_DEPTH=0` (or a `.git` under threshold) keeps the full-bundle path. The shallow checkout yields a byte-identical tracked tree to the bundle clone, so `seed_repo_dirty` layers on unchanged. The shallow path additionally requires a shell-safe working-branch name (`_seed_branch_shallow_safe`: `^[A-Za-z0-9/._-]+$`, no placeholder tokens) because the branch is interpolated into the machine-side `git checkout -f <branch>` inside a `sh -c '…'` wrapper; a branch with `'`/`$`/backtick/space falls back to the full-bundle path (which never interpolates the branch). Detached HEAD likewise falls back. |
 | `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.leerie/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry (stderr is captured to a tmpfile, NOT merged via `2>&1`, because `flyctl ssh console`'s "Connecting to ..." stderr would shift parsed-line indices and corrupt the discovered branch name); (2) probes whether the run branch actually exists on the machine via `git rev-parse --verify refs/heads/<branch>` — only then bundles; the bundle includes **all `leerie/subtasks/<run-id>/*` branches** present on the machine alongside the run branch (defense-in-depth: if integration never ran — crash, OOM, or `die()` before integration in older images — the raw subtask work is recoverable on the host; `git for-each-ref` discovers subtask branches dynamically; on any bundle failure the script retries with the run branch alone). A missing run branch is the cleared-but-empty terminal-state case (DESIGN §6); when the run branch is absent but subtask branches exist, they are bundled independently. The `no_push` flag on `run.json` is NOT used as a proxy because it's a mechanism flag the launcher forces (the in-Fly orchestrator can't push), not a user-intent flag; (3) tars `.leerie/runs/<run-id>/` from the machine and extracts it on the host; (4) **defense-in-depth, conditional on branch presence**: when a run branch *was* fetched, strips a stray mechanism-flag `no_push=true` from the host-side `run.json` (defense against in-flight old-image runs that wrote the mechanism flag before the `--host-no-push` intent split). When no branch was fetched (the cleared-but-empty terminal-state case — DESIGN §8), preserves `_finish_no_work_run`'s `no_push=true` intent so `host_finalize` short-circuits cleanly instead of attempting a `git push` against a non-existent ref; (5) **best-effort `.leerie/` stream-back**: iterates `config.toml` and `Dockerfile`; for each, skips if the host target already exists (never clobbers), checks remote existence via `_fetch_machine_exec test -f`, then streams via `_fetch_machine_exec cat` directly to the host target; failure removes any partial write and logs a warning but does not affect the function's return code. The destination root is `$LEERIE_STATE_HOST_DIR` when set, otherwise `$USER_REPO/.leerie`. |
-| `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolution helper for the EC2 runtime. Exports `resolve_aws_credentials [--profile NAME] [--region NAME]`: resolves credentials and region host-side in the same precedence order the AWS CLI/SDKs use — explicit `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`) env vars first, then a named profile (`--profile` / `AWS_PROFILE` / `default`) via static credentials in `~/.aws/credentials` or a cached SSO token in `~/.aws/sso/cache/*.json` (both the modern `sso_session`-reference form and the legacy inline `sso_start_url`/`sso_region` form), ending with an actionable `aws sso login --profile <p>` / `aws configure` hint rather than a silent fallthrough (no IMDS instance-role fallback — this runs on the operator's host, not on an EC2 instance). Region resolves `AWS_REGION` > `AWS_DEFAULT_REGION` > profile `region` > die-with-hint; a `--region`/`--profile` CLI flag is treated as explicit-wins over its env-var equivalent. On success prints `export KEY=value` lines to stdout for sourcing; on failure prints nothing to stdout and an actionable error to stderr, returning 1. Pure file I/O against `~/.aws/config`/`~/.aws/credentials`/`~/.aws/sso/cache/*.json` + bash/python3 stdlib — no `aws` binary or boto3 dependency, mirroring the existing `detect_bedrock_mode()`/`bedrock_preflight()` precedent (see the `$STAGE/.aws` mount row in the Bind-mount table below, "Staged when `detect_bedrock_mode()`..."). Wired into the launcher's `RUNTIME=ec2` branch: the branch sources this file, calls `resolve_aws_credentials` (passing `--profile`/`--region` when `LEERIE_AWS_PROFILE`/`LEERIE_AWS_REGION` are set) and `eval`s its `export` lines into the launcher's environment, *before* sourcing `ec2-lib.sh` and calling `require_aws` — so the resolved identity is what `require_aws`'s `sts get-caller-identity` probe and every subsequent `aws ec2 ...` call inherit. An unresolvable credential chain aborts with this script's own `aws sso login --profile <p>` hint and never reaches `require_aws` (`tests/test_ec2_e2e_provision.py` pins the ordering and the fail-closed abort; `tests/test_ec2_launcher_credentials.py` pins the region axis and the `--profile` argv seam). The branch also resolves the `--aws-region`/`--aws-profile` and `--ec2-*` instance-shape knobs (config-001/002). EC2 *provisioning* dispatch is still absent: after preflight passes, the branch `die()`s with "instance provisioning is not yet wired into the launcher" (`leerie:6105`) rather than dispatching to `ec2-provision.sh`'s `provision_instance()` — that script has since shipped independently (see its row below), but nothing calls it. This credential helper (config-004) and the AWS SDK dependency pin (config-005) have also shipped. |
+| `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolution helper for the EC2 runtime. Exports `resolve_aws_credentials [--profile NAME] [--region NAME]`: resolves credentials and region host-side in the same precedence order the AWS CLI/SDKs use — explicit `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`) env vars first, then a named profile (`--profile` / `AWS_PROFILE` / `default`) via static credentials in `~/.aws/credentials` or a cached SSO token in `~/.aws/sso/cache/*.json` (both the modern `sso_session`-reference form and the legacy inline `sso_start_url`/`sso_region` form), ending with an actionable `aws sso login --profile <p>` / `aws configure` hint rather than a silent fallthrough (no IMDS instance-role fallback — this runs on the operator's host, not on an EC2 instance). Region resolves `AWS_REGION` > `AWS_DEFAULT_REGION` > profile `region` > die-with-hint; a `--region`/`--profile` CLI flag is treated as explicit-wins over its env-var equivalent. On success prints `export KEY=value` lines to stdout for sourcing; on failure prints nothing to stdout and an actionable error to stderr, returning 1. Pure file I/O against `~/.aws/config`/`~/.aws/credentials`/`~/.aws/sso/cache/*.json` + bash/python3 stdlib — no `aws` binary or boto3 dependency, mirroring the existing `detect_bedrock_mode()`/`bedrock_preflight()` precedent (see the `$STAGE/.aws` mount row in the Bind-mount table below, "Staged when `detect_bedrock_mode()`..."). Wired into the launcher's `RUNTIME=ec2` branch: the branch sources this file, calls `resolve_aws_credentials` (passing `--profile`/`--region` when `LEERIE_AWS_PROFILE`/`LEERIE_AWS_REGION` are set) and `eval`s its `export` lines into the launcher's environment, *before* sourcing `ec2-lib.sh` and calling `require_aws` — so the resolved identity is what `require_aws`'s `sts get-caller-identity` probe and every subsequent `aws ec2 ...` call inherit. An unresolvable credential chain aborts with this script's own `aws sso login --profile <p>` hint and never reaches `require_aws` (`tests/test_ec2_e2e_provision.py` pins the ordering and the fail-closed abort; `tests/test_ec2_launcher_credentials.py` pins the region axis and the `--profile` argv seam). The branch also resolves the `--aws-region`/`--aws-profile` and `--ec2-*` instance-shape knobs (config-001/002). After preflight passes, the branch dispatches to `ec2-provision.sh`'s `provision_instance()` / `resume_instance()`, `ec2-seed-auth.sh`'s `ec2_seed_auth()`, `ec2-seed-repo.sh`'s `ec2_seed_repo()`, and `ec2-ssm.sh`'s `ec2_launch_detached()`/`ec2_attach()` — the full create → seed → launch → tail/attach → teardown lifecycle (feat-003; see the "Runtime mode" section below for the dispatch shape). This credential helper (config-004) and the AWS SDK dependency pin (config-005) have also shipped. |
 | `scripts/remote/ec2-lib.sh` | Shared bash helpers for the EC2 lifecycle, parallel to `scripts/remote/lib.sh`'s role for the Fly path. Exports `require_aws()`: the host-side preflight the launcher's `RUNTIME=ec2` branch calls before provisioning, modeled directly on `require_flyctl()`'s two-stage shape (binary-present? → authenticated?). Checks `command -v aws`; if missing, prints an actionable AWS CLI v2 install hint and returns 1 (no auto-install — unlike `require_flyctl`, the AWS CLI's official installers commonly need `sudo`, which is out of scope for an unattended preflight). If present, resolves a profile (`--profile`-equivalent precedence: `LEERIE_AWS_PROFILE` > `AWS_PROFILE` > unset, matching the Python-side `AWS_PROFILE_ENV` knob at `orchestrator/leerie.py:513`) and probes `aws sts get-caller-identity` (with `--profile` when resolved); on failure prints the `aws sso login --profile <profile>` (or bare `aws sso login`) recovery hint and returns 1 — reusing `bedrock_preflight()`'s exact credential-error vocabulary (`leerie:4903-4907`) rather than inventing a second one. Also exports `resolve_ami()` / `resolve_instance_type()` / `resolve_key_name()` / `resolve_security_group()` / `resolve_subnet_id()`, one per `LEERIE_EC2_*` var (see "EC2 instance-lifecycle vars" below): each a thin required-var read (`_resolve_ec2_var`) that prints the value on success, or an actionable error naming the missing var on stderr and returns 1 (not a bare `${VAR:?}`, which would kill the whole sourcing shell with bash's generic "parameter null or not set" message under `set -u`). These stay in `ec2-lib.sh` (shared) rather than `ec2-provision.sh` (lifecycle-specific) because `ec2-ssm.sh`'s transport helpers also need `resolve_key_name`/`resolve_security_group` for the SSH-fallback path (DESIGN §6 "SSH ... remains available as a fallback transport"). |
 | `scripts/remote/ec2-seed-repo.sh` | EC2 counterpart to `scripts/remote/seed-repo.sh` (DESIGN §6 *EC2 runtime lifecycle*, "Seed" row: "same two steps, transport substituted"). The payload logic — `.gitignore`-aware content via the bundle (committed tracked files) plus the porcelain-filtered dirty-delta rsync, unconditional `.leerie/` exclusion except the three whitelisted config files, the shallow-vs-full-bundle decision, submodule bundling — is IDENTICAL to `seed-repo.sh`; only the wire transport differs: `ec2_tar_pipe` (plain `ssh`, from `ec2-lib.sh`) for bulk data (the parent bundle/shallow `.git` tar and each submodule bundle) instead of `flyctl ssh console -C "sh -c 'cat > ...'"`, and `ec2_remote_exec` (SSM Session Manager, the default transport) for small instance-side commands (the `/work` reset, the machine-side clone/checkout script, `chown`) instead of the same `flyctl ssh console -C` calls. Since `ec2_tar_pipe`'s receiver is `tar -xzC <dir>` (not a bare `cat > file`), each bundle/tar payload is wrapped in a one-entry gzipped tar by the private helper `_ec2_pipe_file_via_tar` before going over the wire. Exports `ec2_seed_repo_clone` (same wipe-`/work`-preserve-inode step; full `git bundle create - --all` for the parent, or — above `LEERIE_SEED_SHALLOW_THRESHOLD_MB` with a non-zero `LEERIE_SEED_DEPTH` and a shell-safe branch name, gated by the same `_seed_use_shallow`/`_seed_branch_shallow_safe` functions duplicated verbatim from `seed-repo.sh` — a `git clone --depth=N --no-local` tarred `.git`-only; per-submodule bundles; instance-side `git clone`/untar+`checkout`, submodule URL rewiring, `git -c protocol.file.allow=always submodule update --recursive`, `chown -R leerie: /work`), `ec2_seed_repo_dirty` (the dirty-set computation and `.leerie/`-whitelist/`.claude/`-force-include filter are BYTE-IDENTICAL to `seed_repo_dirty`'s Python filter; transport is plain `rsync -e <ssh-wrapper>` directly against the resolved `LEERIE_EC2_SSH_TARGET` — no `flyctl`-console-tunneled `rsync --server` indirection needed, since SSH is a real, directly-usable transport for EC2 per DESIGN §6), and the wrapper `ec2_seed_repo`. New env var `LEERIE_EC2_SSH_TARGET`: the `ssh`(1) destination for the instance (e.g. `ec2-user@<public-ip>` or an `ssh_config` Host alias) that `ec2_tar_pipe`/the dirty-delta rsync consume verbatim — resolving an `LEERIE_EC2_INSTANCE_ID` to a reachable address is `ec2-provision.sh`'s job, populated by `provision_instance()`. Preflight (`_ec2_seed_repo_preflight`) requires `LEERIE_EC2_INSTANCE_ID`, `LEERIE_EC2_SSH_TARGET`, `USER_REPO`, and `require_aws` (from `ec2-lib.sh`). |
-| `scripts/remote/ec2-provision.sh` | The `provision.sh` counterpart for the EC2 lifecycle (DESIGN §6 *EC2 runtime lifecycle*, "Stage mapping" table). The `leerie` launcher's `RUNTIME=ec2` branch sources `aws-credentials.sh` and `ec2-lib.sh` and gates on `resolve_aws_credentials`/`require_aws()` before anything else, but does not yet source this file or dispatch to `provision_instance()` — the branch `die()`s right after preflight passes (see "Runtime mode" below; that dispatch wiring is a separate subtask). All EC2 API calls in this file go through the **`aws` CLI** (see "boto3 usage boundary" below), mirroring how `provision.sh` shells out to the `flyctl` binary rather than importing a Go SDK; JSON responses are parsed with inline `python3 -c` (not `aws ... --query/--output text`) so the same parsing works uniformly against the real CLI and against test stubs that ignore `--query`. Sources `lib.sh` (for `remote_log`/`update_run_json`/`iso_now`, which are Fly-agnostic pure functions despite `lib.sh`'s file-level Fly-specific docstring) and `ec2-lib.sh` (for `require_aws`/`resolve_*`). Exports, one per DESIGN §6 stage-mapping row: `provision_instance()` (`aws ec2 run-instances` with no explicit block-device mapping — AMI/instance-type/key-name/security-group/subnet from the `resolve_*` helpers in `ec2-lib.sh`; registers the EXIT/INT/TERM teardown trap only *after* a successful create, mirroring `provision.sh:700-704`; writes the crash-recovery sidecar `ec2-instance.json` unconditionally (instance id, region, created-at — the EC2 analog of `provision.sh`'s `fly-machine.json`) plus `ec2_instance_id`/`ec2_ami` onto `run.json` when `LEERIE_RUN_ID` is set, mirroring `provision.sh`'s `fly_machine_id` sidecar-write timing — before any orchestrator code runs, so `--resume` survives a Ctrl-C during seed); `wait_for_instance_ready()` (poll `describe-instances` for `State.Name == running`, then `describe-instance-status` for both `InstanceStatus.Status` and `SystemStatus.Status == ok` — DESIGN §6 is explicit that `running` alone is not SSH/SSM-reachable, unlike Fly's `started`); `stop_instance()` / `terminate_instance()` (`aws ec2 stop-instances` / `terminate-instances`; both idempotent no-ops on an empty `LEERIE_EC2_INSTANCE_ID`); `decide_ec2_teardown()` (the same three-disposition classification `decide_teardown()` in `provision.sh` implements — sync-then-terminate / detach / pause — reusing `LEERIE_REMOTE_EXIT_RC` and the `LEERIE_TEARDOWN_DONE` idempotency guard unchanged, since DESIGN §6 states the exit-code classification table is runtime-agnostic by construction; the clean-exit branch calls `_try_fetch_state_for_ec2_teardown()` — a hook, overridable by tests, that sources `scripts/remote/ec2-fetch-branch.sh` and calls its `fetch_state_ec2()` (fails closed — leaves the instance running — if that file is absent, e.g. an older checkout) — BEFORE `terminate_instance()`, mirroring `provision.sh:262-272`'s one-way-ratchet ordering: destroy-then-fetch would make paid-for LLM work unrecoverable). No auto-finalize (push + PR) integration yet — unlike `provision.sh`'s `decide_teardown`, `decide_ec2_teardown`'s clean-exit branch only syncs-then-terminates or leaves-running-on-sync-failure; wiring `host_finalize` in is deferred to a later subtask. Root-EBS-volume lifecycle needs no dedicated reap function (DESIGN §6 "EBS volume lifecycle" case 1: `DeleteOnTermination=true` is AWS's default and this design adopts it as-is — no `destroy_volume()` counterpart exists or is needed, unlike Fly; a failed `run-instances` call creates nothing to orphan-clean, unlike Fly's pre-create volume window). |
-| `scripts/remote/ec2-resume-instance.sh` | Resume helper for paused EC2 runs (the EC2 counterpart to `scripts/remote/resume-machine.sh`), designed to be sourced by the launcher's `RUNTIME=ec2` resume path alongside `ec2-provision.sh` (for `wait_for_instance_ready`/`_aws_region_profile_args`/`decide_ec2_teardown`) — not yet wired in: like `ec2-provision.sh` (see its row above), the launcher's `RUNTIME=ec2` branch `die()`s right after preflight and never sources this file (that dispatch wiring is a separate subtask). Exports `resume_instance(<instance-id>)`: describes the instance's current state; if already `running`, logs and skips straight to the readiness/ssh-target steps (idempotent — no `start-instances` call); if `stopped`/`stopping`/`pending`, issues `aws ec2 start-instances`; if `terminated`/absent, fails with the same "no longer recoverable" hint `resume_machine()` gives for a destroyed Fly machine. Then calls `wait_for_instance_ready()` (unchanged, from `ec2-provision.sh`) so the same `running` + `InstanceStatus`/`SystemStatus` `ok` gate applies as on first provision. Re-resolves `LEERIE_EC2_SSH_TARGET` from the instance's current `PublicIpAddress` via `describe-instances` — EC2 assigns a new public IP on every stop/start cycle absent an attached Elastic IP, so the address from provision time cannot be reused. Re-arms the `decide_ec2_teardown` EXIT/INT/TERM trap (the launcher process is fresh on resume, mirroring `resume_machine()`'s trap re-arm) and clears `paused_at`/`pause_reason` on the run.json sidecar when one is resolvable. Never calls `terminate-instances` or `delete-volume` on any path — resume is a pure wake path, honoring the one-way-ratchet invariant `decide_ec2_teardown()` already encodes elsewhere. |
+| `scripts/remote/ec2-seed-auth.sh` | EC2 counterpart to `scripts/remote/seed-auth.sh` (DESIGN §6 *EC2 runtime lifecycle*, "Seed" row). The payload logic — what gets seeded (`~/.claude.json`, `~/.claude/` minus `plugins/cache`/`plugins/marketplaces`, the `CLAUDE_CODE_OAUTH_TOKEN` credentials-JSON fallback, git identity, the Claude CLI pre-warm, the plugin-cache rebuild) and why — is IDENTICAL to `seed-auth.sh`; only the wire transport differs, following the same split `ec2-seed-repo.sh` already established: `ec2_tar_pipe` (plain `ssh`, from `ec2-lib.sh`) for the bulk `$STAGE` tar, and `ec2_remote_exec` (SSM Session Manager) for every small remote command (the post-tar `chown -R leerie:`, the token-fallback credentials write, git identity, the CLI pre-warm, the plugin-cache rebuild script). Exports `ec2_seed_auth()`: preflight requires `LEERIE_EC2_INSTANCE_ID`, `LEERIE_EC2_SSH_TARGET`, `STAGE`, and `require_aws` (from `ec2-lib.sh`); the tar-pipe step retries once on a non-timeout transport failure (mirroring `seed-auth.sh`'s tunnel-unavailable retry, minus the Fly-specific `flyctl agent restart`) and is wrapped in `$(_seed_timeout_prefix)` via `ec2_tar_pipe` so a stalled SSH session yields rc 124/137 instead of hanging; the unconditional post-tar `chown -R leerie: /home/leerie` (over `ec2_remote_exec`) exists because, unlike `flyctl ssh console` (always root), `ec2_tar_pipe`'s ssh target may land as the AMI default user. |
+| `scripts/remote/ec2-provision.sh` | The `provision.sh` counterpart for the EC2 lifecycle (DESIGN §6 *EC2 runtime lifecycle*, "Stage mapping" table). The `leerie` launcher's `RUNTIME=ec2` branch sources `aws-credentials.sh` and `ec2-lib.sh` and gates on `resolve_aws_credentials`/`require_aws()` before anything else, then sources this file and dispatches to `provision_instance()` (fresh launch) or `resume_instance()` (a run-id whose sidecar names a resumable instance) — see "Runtime mode" below for the full dispatch shape. All EC2 API calls in this file go through the **`aws` CLI** (see "boto3 usage boundary" below), mirroring how `provision.sh` shells out to the `flyctl` binary rather than importing a Go SDK; JSON responses are parsed with inline `python3 -c` (not `aws ... --query/--output text`) so the same parsing works uniformly against the real CLI and against test stubs that ignore `--query`. Sources `lib.sh` (for `remote_log`/`update_run_json`/`iso_now`, which are Fly-agnostic pure functions despite `lib.sh`'s file-level Fly-specific docstring) and `ec2-lib.sh` (for `require_aws`/`resolve_*`). Exports, one per DESIGN §6 stage-mapping row: `provision_instance()` (`aws ec2 run-instances` with no explicit block-device mapping — AMI/instance-type/key-name/security-group/subnet from the `resolve_*` helpers in `ec2-lib.sh`; the AMI boots straight into a ready-to-seed instance with no per-run image push/pull/build step, per DESIGN §6 "Image delivery"'s bake-into-AMI default — see "EC2 image delivery" below; registers the EXIT/INT/TERM teardown trap only *after* a successful create, mirroring `provision.sh:700-704`; writes the crash-recovery sidecar `ec2-instance.json` unconditionally (instance id, region, created-at — the EC2 analog of `provision.sh`'s `fly-machine.json`) plus `ec2_instance_id`/`ec2_ami` onto `run.json` when `LEERIE_RUN_ID` is set, mirroring `provision.sh`'s `fly_machine_id` sidecar-write timing — before any orchestrator code runs, so `--resume` survives a Ctrl-C during seed); `wait_for_instance_ready()` (poll `describe-instances` for `State.Name == running`, then `describe-instance-status` for both `InstanceStatus.Status` and `SystemStatus.Status == ok` — DESIGN §6 is explicit that `running` alone is not SSH/SSM-reachable, unlike Fly's `started`); `stop_instance()` / `terminate_instance()` (`aws ec2 stop-instances` / `terminate-instances`; both idempotent no-ops on an empty `LEERIE_EC2_INSTANCE_ID`); `decide_ec2_teardown()` (the same three-disposition classification `decide_teardown()` in `provision.sh` implements — sync-then-terminate / detach / pause — reusing `LEERIE_REMOTE_EXIT_RC` and the `LEERIE_TEARDOWN_DONE` idempotency guard unchanged, since DESIGN §6 states the exit-code classification table is runtime-agnostic by construction; the clean-exit branch calls `_try_fetch_state_for_ec2_teardown()` — a hook, overridable by tests, that sources `scripts/remote/ec2-fetch-branch.sh` and calls its `fetch_state_ec2()` (fails closed — leaves the instance running — if that file is absent, e.g. an older checkout) — BEFORE `terminate_instance()`, mirroring `provision.sh:262-272`'s one-way-ratchet ordering: destroy-then-fetch would make paid-for LLM work unrecoverable). `--kill`'s EC2 action (see the "Runtime mode" section above) reuses this same `_try_fetch_state_for_ec2_teardown()` → `terminate_instance()` ordering directly, rather than duplicating it. No auto-finalize (push + PR) integration yet — unlike `provision.sh`'s `decide_teardown`, `decide_ec2_teardown`'s clean-exit branch only syncs-then-terminates or leaves-running-on-sync-failure; wiring `host_finalize` in is deferred to a later subtask. Root-EBS-volume lifecycle needs no dedicated reap function (DESIGN §6 "EBS volume lifecycle" case 1: `DeleteOnTermination=true` is AWS's default and this design adopts it as-is — no `destroy_volume()` counterpart exists or is needed, unlike Fly; a failed `run-instances` call creates nothing to orphan-clean, unlike Fly's pre-create volume window). |
+| `scripts/remote/ec2-resume-instance.sh` | Resume helper for paused EC2 runs (the EC2 counterpart to `scripts/remote/resume-machine.sh`), sourced by the launcher's `RUNTIME=ec2` branch alongside `ec2-provision.sh` (for `wait_for_instance_ready`/`_aws_region_profile_args`/`decide_ec2_teardown`). The launcher resolves a paused instance id from `ec2-instance.json`/`run.json`'s `ec2_instance_id` field when `--run-id`/`LEERIE_RUN_ID` is set and calls `resume_instance()` before falling back to a fresh `provision_instance()` call — unlike Fly's bare-`--resume` PID-record auto-discovery, EC2 resume requires an explicit run-id today (auto-discovery is not yet wired for EC2). `--kill`'s EC2 action (feat-006, see the "Runtime mode" section above) also sources this file, but only for `_resolve_ssh_target_from_instance` — re-resolving `LEERIE_EC2_SSH_TARGET` before the fetch-before-terminate sync — not for `resume_instance()` itself. Exports `resume_instance(<instance-id>)`: describes the instance's current state; if already `running`, logs and skips straight to the readiness/ssh-target steps (idempotent — no `start-instances` call); if `stopped`/`stopping`/`pending`, issues `aws ec2 start-instances`; if `terminated`/absent, fails with the same "no longer recoverable" hint `resume_machine()` gives for a destroyed Fly machine. Then calls `wait_for_instance_ready()` (unchanged, from `ec2-provision.sh`) so the same `running` + `InstanceStatus`/`SystemStatus` `ok` gate applies as on first provision. Re-resolves `LEERIE_EC2_SSH_TARGET` from the instance's current `PublicIpAddress` via `describe-instances` — EC2 assigns a new public IP on every stop/start cycle absent an attached Elastic IP, so the address from provision time cannot be reused. Re-arms the `decide_ec2_teardown` EXIT/INT/TERM trap (the launcher process is fresh on resume, mirroring `resume_machine()`'s trap re-arm) and clears `paused_at`/`pause_reason` on the run.json sidecar when one is resolvable. Never calls `terminate-instances` or `delete-volume` on any path — resume is a pure wake path, honoring the one-way-ratchet invariant `decide_ec2_teardown()` already encodes elsewhere. |
 | `scripts/remote/ec2-fetch-branch.sh` | EC2 counterpart to `scripts/remote/fetch-branch.sh` — the stream-back half of DESIGN §6 "Transport substitution for `flyctl ssh console`", sourced by `ec2-provision.sh`'s `_try_fetch_state_for_ec2_teardown()` hook. Exports `fetch_state_ec2()`, porting `fetch_branch()`'s four steps (run discovery; branch-existence probe + git-bundle stream-back with the same subtask-branch defense-in-depth bundling and run-branch-only retry fallback; `.leerie/runs/<run-id>/` tar stream-back with the same `no_push`-stripper conditional on branch presence; best-effort, never-clobbering `.leerie/config.toml` + `.leerie/Dockerfile` stream-back) verbatim, with the transport substituted: short text commands (run discovery, `git rev-parse --verify`, `git for-each-ref`, `.leerie/` file existence probes) go over `ec2_remote_exec` (SSM, from `ec2-lib.sh`) since their output is small and command-substitution-safe; binary bulk data (the git bundle, the run-state tar, each streamed `.leerie/` file's bytes) goes over a private local helper, `_ec2_fetch_ssh` — a plain `ssh $LEERIE_EC2_SSH_TARGET "<cmd>"` invocation whose raw stdout is redirected straight to a host-side file/pipe, never captured via bash command substitution (unlike `ec2_remote_exec`, which drops trailing newlines/NUL bytes and would silently corrupt a bundle). `ec2_tar_pipe` itself is not reused here because it is upload-only (host stdin → instance `tar -x`); `_ec2_fetch_ssh` is `ec2-fetch-branch.sh`'s own download-direction counterpart, mirroring `fetch-branch.sh`'s `_fetch_machine_exec ... > host_bundle` binary-safety pattern one-for-one. Preflight requires `LEERIE_EC2_INSTANCE_ID`, `LEERIE_EC2_SSH_TARGET`, `USER_REPO`, and `require_aws` (from `ec2-lib.sh`). |
-| `scripts/remote/ec2-ssm.sh` (spec — not yet implemented) | Transport substitution for `flyctl ssh console`'s *launch/attach* roles (DESIGN §6 "Transport substitution for `flyctl ssh console`"; the stream-back role is `ec2-fetch-branch.sh`, already shipped — see above), sourced alongside `ec2-provision.sh`. Default transport is **SSM Session Manager**, not SSH — DESIGN §6 states this explicitly (no inbound security-group rule, no key-pair distribution, no public IP; auth flows through the same AWS credential chain as the rest of the EC2 runtime). Planned exports: `ec2_launch_detached()` (the `aws ssm start-session --target <instance-id> --document-name AWS-StartInteractiveCommand --parameters command="python3 -"` analog of `flyctl ssh console --pty=false -C "python3 -"`, piping the same detached-launch wrapper `render_tail_wrapper()` in `lib.sh` already renders); `ec2_attach()` (same analog with `command="tail -F orchestrator.log"`, or a bare interactive session for `--shell`). An SSH fallback (`LEERIE_EC2_KEY_NAME` + an inbound security-group rule on port 22) is documented in DESIGN §6 as available for operators whose IAM policy disallows SSM, but is not the default and is not required for this spec's baseline. |
+| `scripts/remote/ec2-ssm.sh` | SSM Session Manager transport substitution for `flyctl ssh console`'s *launch/attach* roles (DESIGN §6 "Transport substitution for `flyctl ssh console`"; the stream-back role is `ec2-fetch-branch.sh`, already shipped — see above; the small-command-exec and bulk-upload roles are `ec2-lib.sh`'s `ec2_remote_exec`/`ec2_tar_pipe`, already shipped). Wired into the launcher's `RUNTIME=ec2` dispatch branch: `ec2_launch_detached()` runs the detached-orchestrator Python launch wrapper, and `ec2_attach()` (via the `_attach_to_live_orchestrator_ec2()` helper this file also exports — the EC2 counterpart of `lib.sh`'s `_attach_to_live_orchestrator`, reusing `lib.sh`'s `render_tail_wrapper()` since the wrapper text is transport-agnostic POSIX sh) both tails the orchestrator log on a fresh launch and handles the rc=75 flock-loser smart-resume pivot (`container_rc=130`, mirroring the Fly branch's identical routing) and the early-resume flock probe. Default transport is **SSM Session Manager**, not SSH — DESIGN §6 states this explicitly (no inbound security-group rule, no key-pair distribution, no public IP; auth flows through the same AWS credential chain as the rest of the EC2 runtime). Exports `ec2_launch_detached()` and `ec2_attach()`, both built on a shared `_ec2_ssm_session <interpreter>` helper: `aws ssm start-session --target <instance-id> --document-name AWS-StartInteractiveCommand --parameters command="<wrapper>"` is the SSM analog of `flyctl ssh console --pty=false -C "python3 -"` (`ec2_launch_detached`, `<interpreter>="python3 -"`) or `-C "sh -s"` (`ec2_attach`, `<interpreter>="sh -s"`) — a short, fixed-size bootstrap naming the interpreter, with the caller's actual (potentially multi-KB) payload — e.g. the detached-launch wrapper, or `render_tail_wrapper()`'s output from `lib.sh` — piped through this function's own stdin, which `AWS-StartInteractiveCommand`'s interactive session forwards to the remote interpreter exactly like a normal ssh session would. This is deliberately different from `ec2_remote_exec`'s approach of embedding its whole command inside `--parameters command=[...]`: that document parameter has a ~4 KB ceiling, far under the size of a real launch-wrapper/tail-wrapper script, so only the interpreter name goes in the parameter and the payload travels over stdin instead, where no such ceiling applies. `<wrapper>` (the value actually sent in `--parameters`) is `<interpreter>; __rc=$?; printf "...sentinel..."`, base64-encoded and decoded remotely via `bash <(echo ... | base64 -d)` — a process substitution, not a `... | bash` pipe, since piping the decode into `bash` would consume `bash`'s own stdin as the pipeline's final stage and shadow the interactive session's real stdin (the caller's payload) before `<interpreter>` ever read it. Remote-rc recovery reuses `ec2_remote_exec`'s sentinel convention (`aws ssm start-session` exits 0 itself regardless of the wrapped command's real exit status — the same session-manager-plugin limitation); notably this is how `ec2_launch_detached` propagates rc=75, the flock-loser smart-resume pivot. Both functions fail closed (return 1, actionable stderr, no `aws` call) when `LEERIE_EC2_INSTANCE_ID` is empty. An SSH fallback (`LEERIE_EC2_KEY_NAME` + an inbound security-group rule on port 22) is documented in DESIGN §6 as available for operators whose IAM policy disallows SSM, but is not implemented here — not the default, and not required for this file's baseline. |
 | `scripts/host-finalize.sh` | Host-side push + PR creation block, sourced by three call sites: the local-runtime post-run code path in `leerie`, `decide_teardown` in `scripts/remote/provision.sh` (Fly clean-exit auto-finalize), and the `leerie --finalize <run-id>` recovery fast-path. Exports `host_finalize <run-dir>`: honors `run.json.no_push` (skip — this is the **intent** flag, written by the orchestrator's `phase_finalize` from `push_will_happen(no_push, host_no_push)`, not the launcher-forced mechanism flag), short-circuits when `pushed_at` is already set **by branch position, not mere presence** (DESIGN §6 *Finalization*): compares the local run-branch tip against the pushed origin tip via `git rev-parse` / `git ls-remote` — equal tips → no-op (the idempotent common case, including fully-pushed chain waves); origin a strict ancestor of the local tip via `git merge-base --is-ancestor`, or origin absent (a prior finalize pushed a *partial* branch — e.g. a mid-wave `die()` stamped `finished_at` before the completion gate) → falls through to a fast-forward re-push + re-open PR, still behind the completion gate so only a `completed_waves == len(waves)` run can re-push (the gate itself fails open on a missing/unreadable `state.json`, so that check only applies when the signal exists); a *diverged* origin (has commits the local branch lacks) keeps the idempotent short-circuit instead, since its push could not fast-forward; on success keeps `pushed_at` set and sets `pr_url` (invariant `pr_url ⇒ pushed_at` preserved), **defense-in-depth**: when the run branch named in `run.json` does not exist locally (`git rev-parse --verify refs/heads/<branch>` fails — the cleared-but-empty terminal-state case where no `setup-run.sh` ran), logs "run branch absent locally; treating as no-op" and returns 0 rather than attempting a push that would error with `src refspec ... does not match any`, runs `git push -u origin <run-branch>` (with `--no-verify` if `NO_VERIFY_PUSH=true`). Before PR creation, validates that `working_branch` still exists on origin via `git ls-remote --exit-code --heads`; if deleted (common when a stacked run's parent was squash-merged while this run was in flight), falls back to the repo's default branch. Then `gh pr create` (using `pr_title`/`pr_body` from `run.json` if the pr_writer worker populated them, otherwise the deterministic fallback), wrapped in a bounded retry (`0 5 10 20 30`s backoff, ~68 s total) to ride out GitHub's post-push ref-indexing lag ("No commits between" / "Head sha can't be blank"). PR-creation failure is non-fatal (push already succeeded); the error message suggests a retry command using the resolved base (original or fallback). Replaces ~140 lines of inline launcher code with a single function call so the three callers stay in sync. |
 
 ### Python runtime — provisioned inside the container
@@ -111,7 +112,7 @@ Current runtime deps:
   constraint that puts `flyctl machine run` in the bash launcher rather
   than a Fly Go-SDK import. Since the host cannot run boto3, the code
   surface that actually implements DESIGN §6's stage table
-  (`scripts/remote/ec2-provision.sh` / `ec2-ssm.sh`, spec'd in the Files
+  (`scripts/remote/ec2-provision.sh` / `ec2-ssm.sh`, per the Files
   table above) shells out to the **`aws` CLI** for every host-side EC2 API
   call — mirroring how the Fly path shells out to the `flyctl` binary
   rather than importing a Go SDK, and reusing `require_aws()`'s existing
@@ -120,9 +121,9 @@ Current runtime deps:
   invariant. `boto3`/`botocore` remain reserved for future in-container
   orchestrator-side AWS calls (none exist yet); this pin and the
   credential helper (`aws-credentials.sh`) are the currently-landed
-  pieces, and `scripts/remote/ec2-provision.sh` / `ec2-ssm.sh` are the
-  next ones a provisioning subtask must build per the Files-table spec
-  above.
+  pieces, alongside `scripts/remote/ec2-provision.sh` and
+  `ec2-ssm.sh`; the launcher's `RUNTIME=ec2` branch now dispatches to
+  both (see "Runtime mode" below).
 
 `pytest` remains the sole dev dependency, run on the host against the
 bind-mounted source.
@@ -1681,31 +1682,72 @@ dir. See §0.5 *Bind-mount table* for the full mount specification.
 
 Controls which execution backend runs the per-subtask worker containers.
 `local` uses the local nerdctl/containerd runtime (the existing behavior);
-`fly` routes each worker through Fly.io machines. `ec2` is accepted as a
-resolvable enum value (AWS credentials resolve the same way the AWS
-CLI/SDKs do — see `scripts/remote/aws-credentials.sh` and `ec2-lib.sh`'s
-`require_aws()` preflight); the instance create/wait-ready/teardown
-lifecycle itself has shipped (`scripts/remote/ec2-provision.sh` — see
-the Files table above). The launcher's `RUNTIME=ec2` branch now exists
-and sources both `aws-credentials.sh` and `ec2-lib.sh`, first calling
-`resolve_aws_credentials` (`--profile`/`--region` from
+`fly` routes each worker through Fly.io machines; `ec2` provisions and
+runs the orchestrator on an AWS EC2 instance (AWS credentials resolve the
+same way the AWS CLI/SDKs do — see `scripts/remote/aws-credentials.sh`
+and `ec2-lib.sh`'s `require_aws()` preflight). The launcher's
+`RUNTIME=ec2` branch sources `aws-credentials.sh` and `ec2-lib.sh`, first
+calling `resolve_aws_credentials` (`--profile`/`--region` from
 `LEERIE_AWS_PROFILE`/`LEERIE_AWS_REGION` when set) and exporting its
-resolved credentials/region into the launcher's environment, then
-gating on `require_aws()` — mirroring the `RUNTIME=fly` branch's
-`require_flyctl` sequencing (`tests/test_ec2_e2e_provision.py` pins
-the ordering: `resolve_aws_credentials` precedes `require_aws`'s `sts
+resolved credentials/region into the launcher's environment, then gating
+on `require_aws()` — mirroring the `RUNTIME=fly` branch's
+`require_flyctl` sequencing (`tests/test_ec2_e2e_provision.py` pins the
+ordering: `resolve_aws_credentials` precedes `require_aws`'s `sts
 get-caller-identity` call, which in turn precedes any `ec2
 run-instances` call; a failing credential probe — including an
 unresolvable chain caught by `resolve_aws_credentials` itself, e.g. an
-expired SSO token — aborts with the `aws sso login --profile <p>`
-hint before any AWS resource is created) — but the branch does not yet
-dispatch to `ec2-provision.sh`'s
-`provision_instance()`/instance lifecycle, and the SSM/SSH transport
-(`ec2-ssm.sh`, for seeding and detached-orchestrate) has not shipped —
-DESIGN §6 *EC2 runtime lifecycle* is the canonical architecture, and
-"EC2 instance-lifecycle vars" below is the code-surface spec the
-provisioning-wiring subtask implements against. Default is `local` so
-existing behavior is unchanged for users who have not opted in.
+expired SSO token — aborts with the `aws sso login --profile <p>` hint
+before any AWS resource is created).
+
+After preflight passes, the branch sources `ec2-provision.sh`,
+`ec2-resume-instance.sh`, `ec2-seed-auth.sh`, `ec2-seed-repo.sh`,
+`ec2-fetch-branch.sh`, and `ec2-ssm.sh`, then dispatches through the same
+five DESIGN §6 stage-mapping rows the Fly branch implements, transport
+substituted:
+
+1. **Create/resume.** When `--run-id`/`LEERIE_RUN_ID` names a run whose
+   `ec2-instance.json`/`run.json` sidecar carries an `ec2_instance_id`,
+   `resume_instance()` wakes that instance; otherwise `provision_instance()`
+   creates a fresh one and `LEERIE_RUN_ID` is set to the new instance id
+   (run_id = instance_id, mirroring Fly's run_id = machine_id rule — DESIGN
+   §6 "Run identifier"). Unlike Fly, bare `--resume` with no `--run-id`
+   does not auto-discover an EC2 instance from a PID-record scan yet —
+   the operator passes `--run-id` explicitly.
+2. **Wait-ready** is `provision_instance()`'s/`resume_instance()`'s own
+   `wait_for_instance_ready()` call (already internal to those functions).
+3. **Seed.** `LEERIE_EC2_SSH_TARGET` is resolved from the instance's
+   public IP (via `ec2-resume-instance.sh`'s `_resolve_ssh_target_from_instance`,
+   reused for the fresh-provision path too), then `ec2_seed_auth()`
+   followed by `ec2_seed_repo()` — mirroring `seed_auth`+`seed_repo` on
+   the Fly path. An early flock probe (over `ec2_remote_exec`) mirrors
+   the Fly branch's resume-only optimization: when the run directory's
+   flock is already held, seeding is skipped entirely and the launcher
+   attaches to the live orchestrator instead.
+4. **Orchestrate.** A detached-`Popen` Python launch wrapper (same shape
+   as the Fly launch script, `/opt/leerie-image/orchestrator/leerie.py`
+   under `runuser`-equivalent `user="leerie"`) is piped to
+   `ec2_launch_detached()`. rc=75 (the flock-loser smart-resume pivot)
+   routes to `_attach_to_live_orchestrator_ec2()` (`ec2-ssm.sh`) instead
+   of provisioning a duplicate orchestrator — `container_rc=130` so
+   `decide_ec2_teardown`'s detach arm leaves the instance alone, exactly
+   like the Fly branch's identical rc=75 routing. On a clean launch, the
+   launcher tails the log via `render_tail_wrapper()` (from `lib.sh`,
+   transport-agnostic POSIX sh) piped through `ec2_attach()`.
+5. **Teardown** is `ec2-provision.sh`'s own `decide_ec2_teardown()` EXIT
+   trap, registered by `provision_instance()`/re-armed by
+   `resume_instance()`; the launcher only sets `LEERIE_REMOTE_EXIT_RC`
+   before exiting, same as the Fly branch.
+
+Not yet wired for EC2 (documented gaps, not required for an end-to-end
+run): bare `--resume` PID-record auto-discovery (an explicit `--run-id`
+is required to resume), mid-run re-seed (`--re-seed`/auto-re-seed on
+`--resume`), `--inspect-dir` seeding, chain-wave tagging, and
+auto-finalize token plumbing on the tail/attach path. `--finalize
+--runtime ec2` is also not yet wired — that verb remains Fly-only
+today; `--stop --runtime ec2` and `--kill --runtime ec2` *are* both
+wired (see "Explicit pause and destroy verbs" above). DESIGN §6 *EC2
+runtime lifecycle* is the canonical architecture. Default is `local`
+so existing behavior is unchanged for users who have not opted in.
 
 Resolution order (highest priority first):
 
@@ -1839,6 +1881,45 @@ operator-set provisioning input — resolving an instance id to a
 reachable SSH address is `ec2-provision.sh`'s job (not yet
 implemented); the launcher is expected to set it the same way it sets
 `LEERIE_EC2_INSTANCE_ID`, once provisioning lands.
+
+### EC2 image delivery
+
+DESIGN §6 *EC2 runtime lifecycle* → "Image delivery" settles how the
+leerie image reaches an EC2 instance: **bake into the AMI**, the direct
+analog of Fly's shipped `ensure_image()` push-to-registry answer but for
+a boot-from-snapshot target rather than a pulled container. The operator
+builds a custom AMI, out of the per-run critical path (a Packer / EC2
+Image Builder pipeline, out of scope for leerie itself), with the
+orchestrator source, Python 3.10+, and every OS-level dependency
+`.leerie-setup.sh` would otherwise need root for already present.
+`ec2-provision.sh`'s `provision_instance()` (see the Files table above)
+reflects this today: `run-instances` carries no explicit block-device
+mapping and no per-run build/push/pull step — the instance is ready to
+accept `ec2_seed_repo`/`ec2_remote_exec` calls the moment
+`wait_for_instance_ready()` returns.
+
+**No new `LEERIE_EC2_*` knob.** `LEERIE_EC2_AMI` (already spec'd under
+"EC2 instance-lifecycle vars" above, same CLI > env > `leerie.toml` >
+(no default) precedence) is sufficient to name the chosen artifact: a
+custom AMI under the bake-into-AMI default, or a stock AMI paired with a
+documented user-data fallback script for an operator who has not yet
+built one (DESIGN §6 names and rejects the two alternatives — ECR-push
+and user-data pull-and-build — as the default; user-data pull remains a
+documented manual fallback, not a second code path leerie implements).
+No `resolve_*()` counterpart, no denylist change: `LEERIE_EC2_AMI` is
+already a launcher-only input and already on the container
+env-forwarding deny-list for the same reason the other five
+instance-shape vars are (see "EC2 instance-lifecycle vars" above) — the
+image-delivery decision does not change which side consumes the var.
+
+**Future knob flagged, not added.** DESIGN §6 flags that an instance
+profile (`IamInstanceProfile`, carrying the SSM managed-instance role
+`ssm:StartSession` et al. need) is a `RunInstances` parameter the
+provisioning subtask will have to supply from somewhere, alongside the
+five already-reserved shape vars — shaped like a future
+`LEERIE_EC2_INSTANCE_PROFILE` knob. This design does not add that knob
+now; it is out of scope for image delivery and belongs to whichever
+subtask wires `IamInstanceProfile` into `run-instances`.
 
 ### Fly app name
 
@@ -2535,6 +2616,7 @@ parameters (no env interpolation into Python source).
 | `_wave_branches <chain_id> <wave_idx>` | UUID, integer | Emits one branch-name per line for every matching run. Used by the wave loop to gather wave-N branches for synth-merge (works for both the just-fanned path and the resume path). |
 | `_resolve_volume_id_from_run_dir <run-dir>` | Run directory | Emits the run's `volume_id` (or nothing). Reads `fly-machine.json` then `run.json`, **continuing when a file exists but carries no `volume_id`** — `provision.sh` writes `volume_id` to `fly-machine.json` only conditionally (`if vol_id:`) while always writing it to `run.json`, so returning on mere file existence skipped `run.json` and leaked the volume. |
 | `_resolve_volume_id_from_fly <machine-id> <app>` | Machine id + Fly app | Emits the volume mounted by that machine, by asking Fly: `flyctl machine list --app <app> --json` → `.[] \| select(.id==<mid>) \| .config.mounts[].volume`. The fallback for `--kill --machine-id <id>` when no sidecar exists (the orphan path the usage hint advertises); without it the machine is destroyed and its volume bills forever. **Must be called before `destroy_machine`** — the volume→machine link (`attached_machine_id`, and the machine's own `config.mounts`) vanishes with the machine. Uses `machine list --json` because `machine status` has **no** `--json` flag (only `-d/--display-config`, which embeds JSON in prose); verified to keep reporting mounts while the machine is `stopped` (the `--stop`-then-`--kill` path). Best-effort: any failure emits nothing and returns 0, so `--kill` still destroys the machine. |
+| `_resolve_ec2_instance_id_from_run_dir <run-dir>` | Run directory | Emits the run's `ec2_instance_id` (or nothing). Reads `ec2-instance.json` then `run.json`, same "continue past a file that exists but carries no id" discipline as `_resolve_volume_id_from_run_dir`. Unlike Fly, the run-id is NOT the instance id for EC2 runs, so `--kill`'s EC2 action always resolves it from a sidecar rather than assuming identity. |
 | `_chain_runs_filter <chain_id> <verb>` | UUID, one of `stop`/`kill`/`finalize`/`resume`/`running` | Emits matching run-ids one per line. The `verb` parameter selects a hardcoded filter inside the heredoc (`stop`: machine running; `kill`: not yet destroyed; `finalize`: not yet pushed; `resume`: paused; `running`: active with chain_id, no terminal state). Used by the chain-scoped verb arms (`--stop`/`--kill`/`--finalize`/`--resume`) to enumerate runs for per-run dispatch. Returns rc=2 + `remote_log` error on unknown verb (bash-side assert; Python heredoc has its own `sys.exit(2)` backstop). |
 
 The wave loop's tag-write step (`update_run_json … chain_id "$_ch_id"
@@ -4753,14 +4835,65 @@ Invalid values in env or TOML are rejected immediately with an error
 message and exit 1 before any preflight runs.
 
 **Runtime auto-detection on run-id-bearing verbs:** the shared
-`_auto_detect_fly_runtime(run_id, explicit_runtime)` helper checks for
-`$LEERIE_STATE_HOST_DIR/runs/$run_id/fly-machine.json`. If
-present and `explicit_runtime` is empty, it returns 0 and the caller
-promotes the local runtime variable to `fly`. Applied to `--resume` (which
-also appends `--runtime fly` to `REWRITTEN_ARGS` and tracks the
-`_RUNTIME_EXPLICIT` flag), `--stop`, `--kill`, and `--finalize`. When the
-user explicitly passes `--runtime local` on a Fly-originated run, `--resume`
-warns but respects the choice; the fast-path verbs reject it as before.
+`_auto_detect_run_runtime(run_id, explicit_runtime)` helper checks
+`$LEERIE_STATE_HOST_DIR/runs/$run_id/` for `fly-machine.json` (Fly) then
+`ec2-instance.json` (EC2 — the sidecar `ec2-provision.sh`'s
+`provision_instance()` writes unconditionally on a successful create). If
+`explicit_runtime` is empty and either sidecar is present, it echoes the
+detected runtime (`"fly"` or `"ec2"`) to stdout and returns 0; the caller
+promotes its local runtime variable to that value. `_auto_detect_fly_runtime`
+remains as a thin Fly-only wrapper (returns 0 only when the detected runtime
+is `"fly"`) for call sites not yet migrated to EC2 handling.
+Applied to `--stop`, `--kill`, `--accept-blocked`, and `--finalize` (all four
+now accept `ec2` in their `--runtime` enum validation, alongside `local` and
+`fly`), and to `--resume` (which also appends `--runtime fly` to
+`REWRITTEN_ARGS` and tracks the `_RUNTIME_EXPLICIT` flag). When the user
+explicitly passes `--runtime local` on a Fly-originated run, `--resume` warns
+but respects the choice; the fast-path verbs reject it as before.
+
+`--kill` is the first of the five verbs to wire a real EC2 *action*
+(feat-006 — `--stop`/`--resume` still get a dedicated ec2-provision.sh/
+ec2-resume-instance.sh call site in a later subtask, and
+`--accept-blocked`/`--list` still need EC2 sidecar awareness). Detecting
+or being explicitly passed `--runtime ec2` on `--stop`, `--accept-blocked`,
+or `--finalize` still fails closed with an explicit "does not support EC2
+runs yet" message rather than silently falling through to the Fly path
+(which would misdirect an EC2 instance id to `flyctl`) or defaulting to
+`local` (which would silently mislabel the run). `--resume` fails closed
+the same way rather than promoting `RUNTIME=ec2`, since that would fall
+into the launcher's fresh-provision `RUNTIME=ec2` branch and die with an
+unrelated "not yet wired" message instead of a resume-specific one.
+
+**`--kill`'s EC2 action.** Resolves `ec2_instance_id` from the run dir's
+`ec2-instance.json` (preferred) or `run.json` via the new
+`_resolve_ec2_instance_id_from_run_dir` helper (the EC2 counterpart to
+`_resolve_volume_id_from_run_dir` — unlike Fly, the run-id is NOT the
+instance id for EC2 runs, so it must always be read from a sidecar). Dies
+with "no ec2_instance_id found ..." if neither sidecar carries one. Prompts
+for confirmation (bypassed by `--force`, same convention as the Fly/local
+paths) before sourcing `aws-credentials.sh` + `ec2-lib.sh` +
+`ec2-provision.sh` + `ec2-resume-instance.sh`, resolving credentials via
+`resolve_aws_credentials` (same precedence and `--profile`/`--region`
+passthrough as the `RUNTIME=ec2` fresh-provision branch), and gating on
+`require_aws`. Sets `LEERIE_EC2_INSTANCE_ID` and re-resolves
+`LEERIE_EC2_SSH_TARGET` from the instance's current `PublicIpAddress` via
+`ec2-resume-instance.sh`'s `_resolve_ssh_target_from_instance` (EC2 hands
+out a new public IP on every stop/start cycle). Then calls
+`_try_fetch_state_for_ec2_teardown` — the same hook
+`decide_ec2_teardown`'s clean-exit branch uses, reused rather than
+duplicated — to sync the run branch and state dir back to the host BEFORE
+calling `terminate_instance()`: the one-way-ratchet invariant
+(`ec2-provision.sh:262-272`) that destroy-then-fetch would make paid-for
+LLM work unrecoverable. A failed sync leaves the instance running and dies
+with a "LEFT RUNNING" message pointing at a retry (`leerie --kill <id>
+--force`) rather than escalating to termination. On success, writes
+`killed_at` + `ec2_instance_id` onto the run sidecar (bootstrapping
+`run.json` from `ec2-instance.json` first via the widened `_ensure_run_json`
+helper, which now also handles an EC2-only run dir the same way it already
+handled a Fly-only one). `flyctl` is never invoked on this path. Pinned end
+to end in `tests/test_ec2_launcher_kill.py` against a combined `aws` stub
+(SSM transport for the fetch step, resource-tracking state machine for the
+credentials/lifecycle calls) and a hard-failing `flyctl` stub.
 
 When `RUNTIME=fly`, the launcher skips the per-OS nerdctl preflight, the
 image-build check, the auth/cache mount assembly, and the `nerdctl run`
@@ -5561,18 +5694,48 @@ Two new launcher flags, routed at the top of `leerie` alongside
 `--resume` (line ~63):
 
 - **`leerie --stop <run-id>`** — clean pause. Runtime detection:
-  (1) `_auto_detect_fly_runtime` checks for `fly-machine.json` →
-  Fly path; (2) `_is_local_container` probes `nerdctl inspect
-  <run-id>` → local path; (3) neither → error.
+  (1) `_auto_detect_run_runtime` checks for `fly-machine.json` then
+  `ec2-instance.json` → Fly/EC2 path; (2) `_is_local_container` probes
+  `nerdctl inspect <run-id>` → local path; (3) neither → error.
+  `--runtime` accepts `local`/`fly`/`ec2` explicitly, validated by the
+  launcher (bash). `_auto_detect_fly_runtime` is retained as a
+  back-compat Fly-only wrapper around `_auto_detect_run_runtime` for
+  call sites that have not yet grown EC2 handling.
   - **Fly path:** sources `provision.sh`, exports `LEERIE_MACHINE_ID`
     and `FLY_APP`, calls `stop_machine()`.
+  - **EC2 path:** sources `aws-credentials.sh` + `ec2-lib.sh` +
+    `ec2-provision.sh`, resolves AWS credentials via
+    `resolve_aws_credentials()` and gates on `require_aws()` (same
+    ordering as the `RUNTIME=ec2` dispatch branch — see "Remote
+    execution mode"), resolves `LEERIE_EC2_INSTANCE_ID` from the run's
+    sidecar via `_resolve_ec2_instance_id_from_run_dir` (checks
+    `ec2-instance.json` first, then `run.json` — mirrors
+    `_resolve_volume_id_from_run_dir`'s fallback order), then calls
+    `stop_instance()`. `StopInstances` preserves the root EBS volume
+    (DESIGN §6 *EC2 runtime lifecycle*, "EBS volume lifecycle" case 2
+    — stop-scoped, never `DeleteOnTermination`). Fails closed with an
+    actionable message if no `ec2_instance_id` is found in the
+    sidecar, and via `require_aws`'s existing `aws sso login` hint if
+    credentials don't resolve — before any `aws ec2 ...` call is made.
   - **Local path:** sources `lib.sh`, calls `nerdctl stop <run-id>`
     (SIGTERM first — the orchestrator's `InterruptedBySignal` handler
     saves state before exit — then SIGKILL after grace period; `--rm`
     on the original `nerdctl run` auto-removes the container).
-  - Both paths call `update_run_json` to set `paused_at = <iso_now>`
-    and `pause_reason = "user-requested"` on the sidecar. The run is
-    resumable via `leerie --resume <id>`.
+  - All three paths call `update_run_json` to set `paused_at =
+    <iso_now>` and `pause_reason = "user-requested"` on the sidecar
+    (the EC2 path also writes `ec2_instance_id`, mirroring how the Fly
+    path writes `fly_machine_id`). The run is resumable via `leerie
+    --resume <id>` — the `RUNTIME=ec2` dispatch branch resolves a
+    paused instance id from the sidecar and calls `resume_instance()`
+    (see the `scripts/remote/ec2-resume-instance.sh` row above and
+    `tests/test_ec2_launcher_resume.py`).
+  - **Test coverage:** `tests/test_ec2_launcher_stop.py` — EC2
+    autodetect and explicit `--runtime ec2`, `stop-instances` called
+    and never `terminate-instances`, missing-instance-id and
+    credential-failure fail-closed paths (asserting zero `aws ec2`
+    calls reach the stub), and a regression pin that the local/Fly
+    fallthrough error text still fires unchanged when no sidecar of
+    any kind is present.
 - **`leerie --kill <run-id> [--force]`** — destroy. Same runtime
   detection as `--stop`. Prompts the user to type the run-id to
   confirm (unless `--force` / `LEERIE_FORCE_KILL=1`).
@@ -5652,12 +5815,16 @@ blocks again indefinitely. The `--accept-blocked` verb lets the
 operator acknowledge the external block so `--resume` skips that
 subtask.
 
-- **`leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local]`**
+- **`leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local|ec2]`**
   — sets `subtask_status[sid]` to `"complete"` in state.json and removes
   the sid from the `blocked` dict (if present). On `--resume`,
   `phase_execute`'s wave-skip filters subtasks whose `subtask_status` is
-  `"complete"`, so the accepted subtask never re-dispatches.
-  - **Input validation (both runtimes):** both positionals are checked
+  `"complete"`, so the accepted subtask never re-dispatches. Without an
+  explicit `--runtime`, the verb auto-detects via the shared
+  `_auto_detect_run_runtime` helper (which probes `fly-machine.json`
+  then `ec2-instance.json` — the same sidecar-probe order `--stop`
+  uses), falling back to `local` only when neither sidecar is present.
+  - **Input validation (all runtimes):** both positionals are checked
     against `^[A-Za-z0-9._-]+$` immediately after parsing, before they
     reach any filesystem path or remote shell. The run-id is interpolated
     into the host state-dir path (traversal risk) and, on Fly, into the
@@ -5685,6 +5852,20 @@ subtask.
     paused again (with `paused_at`/`pause_reason`/`fly_machine_id`
     re-written via `update_run_json`) only if this verb woke a stopped
     machine — a machine that was already running is left running.
+  - **EC2 path:** resolves credentials (`resolve_aws_credentials`,
+    `require_aws`) and the instance id via
+    `_resolve_ec2_instance_id_from_run_dir`, failing closed with an
+    actionable message if `ec2_instance_id` is absent from the sidecar.
+    Inspects instance state via `_describe_instance_state`; refuses on
+    `terminated`/`shutting-down`/missing; if not `running`, wakes it
+    (`resume_instance`, fatal on failure) and records that it did so.
+    Pipes the same mutation program over **stdin** to `python3 -` on the
+    instance via `ec2_remote_exec` (SSM — no ssh keypair or hallpass wait
+    needed, unlike Fly) and greps the same `ACCEPTED:`/`NOOP:`/`ERROR:`
+    sentinel. The host-side copy is mirrored best-effort. Teardown is
+    **conditional** the same way as Fly: `stop_instance` +
+    `paused_at`/`pause_reason`/`ec2_instance_id` re-written via
+    `update_run_json`, only if this verb woke a stopped instance.
   - The mutation program validates that the subtask's current status is
     `"blocked"` or `"failed"` before mutating (atomic temp-file +
     `os.replace`). No-ops with a `NOOP:` sentinel if already `"complete"`.
@@ -5693,7 +5874,13 @@ subtask.
     with a stubbed `flyctl` that parses both `-C` positionals and routes
     the stdin-piped `python3 -` to a local fixture, and injection-rejection
     tests asserting a metacharacter-bearing run-id/sid is refused with a
-    nonzero exit and no mutation.
+    nonzero exit and no mutation. `tests/test_ec2_launcher_readonly_verbs.py`
+    covers the EC2 path: runtime auto-detection over the pre-fix silent
+    `local` default, the widened `fly|local|ec2` validator (with a control
+    that a genuinely bogus value is still rejected), the accept-record
+    mutation landing on both the remote (SSM) state.json and the mirrored
+    host copy, the wake/re-pause discipline (and its already-running
+    no-op counterpart), and the missing-`ec2_instance_id` fail-closed path.
 
 Maps to `DESIGN.md`: §5 *`requires.extent` — in-graph vs. external
 prerequisites*, *Accepting external-blocked subtasks*.
@@ -5724,36 +5911,46 @@ filter below, so this keeps working; `seed-failed` is excluded from the
 bare-`--resume` *auto-pick* only (it needs an operator decision first,
 and its rows carry no `started_at` to rank by).
 
-**EC2 counterpart (spec — `discover_runs()` widening not yet
-implemented).** DESIGN §6 *EC2 runtime lifecycle* ("Run identifier")
-flags that `discover_runs()`'s orphan scan is hardcoded to the literal
-filename `fly-machine.json` and will need widening to also check for
-`ec2-instance.json` (the sidecar `ec2-provision.sh`'s
-`provision_instance()` now writes unconditionally — see the Files-table
-row above; this part has shipped) so a crashed pre-`state.json` EC2 run
-is discoverable the same way a crashed Fly run is today. DESIGN §6 is
-explicit that this widening is out of scope for the provisioning
-subtask itself and should not repurpose or rename `fly-machine.json`,
-which stays exactly as-is for Fly runs — a future subtask adds the
-additional `ec2-instance.json` check alongside it, not instead of it.
+**EC2 counterpart (`--list`'s Python-layer view, not `discover_runs()`'s
+orphan scan).** `_collect_run_rows()` (below) now tracks an `is_ec2`
+axis the same way it tracks `is_fly`, so `--runtime ec2`/`--runtime
+local` filter EC2 runs correctly and a plain `--list` renders an EC2
+run's status column without `LEERIE_FLY_APP` set. This is distinct from
+`discover_runs()`'s orphan scan (DESIGN §6 *EC2 runtime lifecycle*, "Run
+identifier"), which is still hardcoded to the literal filename
+`fly-machine.json` and has not yet been widened to also check
+`ec2-instance.json` for pre-`state.json` orphan discovery — that
+remains a separate, not-yet-landed piece of work, and should not
+repurpose or rename `fly-machine.json`, which stays exactly as-is for
+Fly runs.
 
 Changes:
 
-- `_collect_run_rows()` returns a per-run tuple
-  `(run_id, started_at, status, branch, is_fly, cost)`. `is_fly` is a
-  bool derived from `fly_machine_id` in `run.json` or a present
-  `fly-machine.json` — it is **filter-only** (consumed by the
-  `--runtime` filter), never rendered as a column. `cost` is the run's
-  aggregate `$X.XX` from `state.json`'s `telemetry.cost_usd` (present
-  in the state summary `discover_runs` passes through — no extra disk
-  read), or `—` when telemetry is absent (orphans / pre-classify runs).
+- `_collect_run_rows()` returns a per-run tuple `(run_id, started_at,
+  status, branch, is_fly, cost, is_ec2)`. `is_fly` is a bool derived
+  from `fly_machine_id` in `run.json` or a present `fly-machine.json`;
+  `is_ec2` is a bool derived from `ec2_instance_id` in `run.json` or a
+  present `ec2-instance.json` (mirrors `_auto_detect_run_runtime`'s
+  sidecar probe in the launcher). Both are **filter-only** (consumed by
+  the `--runtime` filter), never rendered as columns. `is_fly` stays at
+  index 4 so existing `r[4]` consumers are unaffected; `is_ec2` is
+  appended at index 6, after `cost`. `cost` is the run's aggregate
+  `$X.XX` from `state.json`'s `telemetry.cost_usd` (present in the state
+  summary `discover_runs` passes through — no extra disk read), or `—`
+  when telemetry is absent (orphans / pre-classify runs).
 - `_render_run_table()` renders columns in the order `run_id,
-  started_at, status, cost, branch` (the filter-only `is_fly` is not a
-  column). The `cost` column is right-aligned; widths auto-size.
+  started_at, status, cost, branch` (the filter-only `is_fly`/`is_ec2`
+  are not columns). The `cost` column is right-aligned; widths
+  auto-size.
 - `--status <state>` argparse flag on `--list` filters rows to only
   those whose derived status matches. `<state>` accepts any value in
   `RUN_STATUSES` (see list above). Invalid values produce an
   argparse error listing the allowed set.
+- `--runtime` on `--list` accepts `local`/`fly`/`ec2` (the
+  `RUNTIME_VALUES` enum, validated by argparse `choices=`). `fly`
+  restricts to rows with Fly artifacts; `ec2` restricts to rows with EC2
+  artifacts; `local` restricts to rows with **neither** (not just
+  "not fly").
 - `--list --runtime fly` is intercepted by the launcher (bash) before
   the orchestrator dispatch and queries Fly directly via `flyctl
   machines list --app <FLY_APP> --json`. Renders a `machine_id |
@@ -5762,33 +5959,39 @@ Changes:
   `run_id` is best-effort filled by scanning `<state-root>/runs/*/{fly-
   machine.json,run.json}` for the current repo; machines launched from
   another repo show `run_id=?`. Falls back to the orchestrator-side
-  local-sidecar list when `flyctl` is missing or auth fails. Plain
-  `--list` (no `--runtime fly`) is unchanged.
+  local-sidecar list when `flyctl` is missing or auth fails. Any other
+  `--list --runtime` value (including `ec2`) falls through unchanged
+  into the orchestrator's argparse dispatch above. Plain `--list` (no
+  `--runtime fly`) is unchanged.
 
-Verbs `--stop`, `--kill`, `--finalize` accept an optional
-`--runtime <local|fly>` flag — validated by the launcher (bash)
-against only `local`/`fly`, rejecting any other value (including
-`ec2`) with an error; this is narrower than the `RUNTIME_VALUES`
-enum (`local|fly|ec2` — see "Remote execution mode" below) that
-gates the top-level `--runtime` flag for launching a new run.
-`ec2` machine lifecycle (the `--stop`/`--kill --runtime ec2`
-counterpart) has not shipped — `stop_instance()`/`terminate_instance()`
-exist in `ec2-provision.sh` (see the Files table above) but the
-launcher's `--stop`/`--kill` verbs do not yet dispatch to them, since
-that requires the same launcher-side `RUNTIME=ec2` wiring the "Runtime
-mode" section above notes is still pending; DESIGN §6 *EC2 runtime
-lifecycle*'s teardown row (`decide_ec2_teardown()`, shipped — see the
-Files table above) is the intended `--stop`/`--kill` counterpart once
-that launcher-dispatch subtask lands. `--stop` and
-`--kill` support both `local`/`fly`: Fly runs route to `flyctl
-machine stop`/`flyctl machine destroy`; local runs route to
-`nerdctl stop`/`nerdctl kill` via the `_is_local_container` probe
-(`nerdctl inspect <run-id>`). `--stop`
-uses `nerdctl stop` (SIGTERM first, allowing graceful state save);
-`--kill` uses `nerdctl kill` (immediate SIGKILL). `--finalize
---runtime local` still errors — local finalization is inline. Without
-the flag, the verbs infer the runtime from the sidecar
-(`fly-machine.json` presence for Fly, `nerdctl inspect` for local).
+Verbs `--kill`, `--stop`, and `--accept-blocked` accept an optional
+`--runtime <local|fly|ec2>` flag — validated by the launcher (bash)
+against `local`/`fly`/`ec2`, matching the top-level `RUNTIME_VALUES`
+enum (`local|fly|ec2` — see "Remote execution mode" below) that gates
+the `--runtime` flag for launching a new run. See "Explicit pause and
+destroy verbs" above and "Accept-blocked verb" above for their
+respective EC2 paths. `--finalize` remains narrower: it still
+validates only `local`/`fly` (rejecting `ec2` with an error) since
+`--finalize --runtime ec2` has not shipped.
+
+The launcher's `RUNTIME=ec2` branch dispatches the full create → seed
+→ launch → teardown cycle for *launching* a run (see "Runtime mode"
+above); `--stop --runtime ec2` routes to `stop_instance()` for pausing
+one; and `--kill --runtime ec2` routes to `terminate_instance()` with
+fetch-before-terminate ordering (see "`--kill`'s EC2 action" above).
+`--finalize --runtime ec2` has not shipped. Fly runs route to `flyctl
+machine stop`/`flyctl machine destroy`; EC2 runs route to `aws ec2
+stop-instances`/`terminate-instances` (via `stop_instance()`/
+`terminate_instance()`); local runs route to `nerdctl stop`/`nerdctl
+kill` via the `_is_local_container` probe (`nerdctl inspect
+<run-id>`). `--stop` uses `nerdctl stop` (SIGTERM first, allowing
+graceful state save) or `aws ec2 stop-instances`; `--kill` uses
+`nerdctl kill` (immediate SIGKILL) or `aws ec2 terminate-instances`
+(after the fetch-before-terminate sync). `--finalize --runtime local`
+still errors — local finalization is inline. Without the flag, the
+verbs infer the runtime from the sidecar (`fly-machine.json` presence
+for Fly, `ec2-instance.json` presence for EC2, `nerdctl inspect` for
+local — in that probe order, via `_auto_detect_run_runtime`).
 `--resume` accepts `--runtime` directly (the smart router branches by
 runtime: fly takes the smart-attach path, local takes the inline
 re-exec path).

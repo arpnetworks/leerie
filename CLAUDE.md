@@ -1044,6 +1044,32 @@ merge-base equals the host tip (PR-diff correctness), and
 branch names, including the live `__PARENT_MATERIALIZE__`/
 `__CLEANUP_TMP__` placeholder tokens) invoked against the real function
 rather than a reproduction of it.
+The EC2 counterpart to `scripts/remote/seed-auth.sh` —
+`scripts/remote/ec2-seed-auth.sh`'s `ec2_seed_auth()` — is tested in
+`tests/test_ec2_seed_auth.py`, modeled on `tests/test_seed_auth_sh.py`
+and reusing `tests/test_ec2_seed_repo.py`'s stubbed-`aws`/stubbed-`ssh`
+transport harness (the `aws` stub decodes and locally executes
+`ec2_remote_exec`'s base64-wrapped SSM command, rewriting `/home/leerie`
+into the test's `dest` dir; the `ssh` stub drains `ec2_tar_pipe`'s
+gzipped-tar-of-`$STAGE` payload into the same rewritten dest): a
+`$STAGE` dir containing `.claude/`, `.claude.json`, and `.gitconfig`
+round-trips to the instance's home dir with ownership fixed to
+`leerie:` (asserted via a `chown_log` sink so the test observes the real
+script issuing the call, not just its source text); the
+`CLAUDE_CODE_OAUTH_TOKEN` fallback writing a valid single-token
+`.credentials.json` when `$STAGE` has none; `plugins/cache` and
+`plugins/marketplaces` excluded from the tar (both a positive check that
+the exclude list matches `seed-auth.sh`'s original and a check that
+files outside those dirs are not swept up by the same exclusion);
+preflight failing closed on missing `LEERIE_EC2_INSTANCE_ID` /
+`LEERIE_EC2_SSH_TARGET` / `STAGE` / `aws` on PATH / credentials-or-token
+/ git identity; git identity written to `/home/leerie/.gitconfig`;
+`flyctl` never appearing in the transport log while `aws`/`ssh` both do;
+and a stalled transport (the process-group-killing `_stub_timeout`
+imported from `tests/test_ec2_transport.py` — the local no-op passthrough
+stub would hang for the full sleep, per the CLAUDE.md test-harness trap
+documented above) yielding rc 124/137 rather than hanging, bounded by
+`LEERIE_SEED_TIMEOUT_S`.
 The EC2 instance lifecycle itself (`scripts/remote/ec2-provision.sh`'s
 `provision_instance()`/`wait_for_instance_ready()`/`stop_instance()`/
 `terminate_instance()`/`decide_ec2_teardown()`) is covered across two
@@ -1087,6 +1113,32 @@ conditional as `fetch-branch.sh`); `.leerie/config.toml` and
 clobbered when the host already has one, and are non-fatal when absent
 on the instance; and both `aws` and `ssh` appear in the transport log
 while `flyctl` never does.
+The launch/attach counterpart to `flyctl ssh console` — `scripts/remote/
+ec2-ssm.sh`'s `ec2_launch_detached()`/`ec2_attach()` — is tested in
+`tests/test_ec2_ssm.py` against a stubbed `aws` binary that models
+`ssm start-session`'s two defining quirks: it always exits 0 itself
+regardless of the wrapped remote command's real exit status (the
+documented session-manager-plugin limitation both `ec2_remote_exec` and
+this file work around via an rc-sentinel), and it is a genuinely
+interactive session that drains its own stdin and execs it as the
+bootstrap interpreter's program — unlike `test_ec2_transport.py`'s
+`_stub_aws_ssm`, which only ever inspects the `--parameters` value and
+never touches stdin. Pinned: both functions issue `aws ssm start-session
+--target <id> --document-name AWS-StartInteractiveCommand`; rc=75 (the
+flock-loser smart-resume pivot) and other nonzero remote rcs survive the
+round trip uncorrupted; both fail closed (rc 1, actionable stderr, no
+`aws` call) on an empty `LEERIE_EC2_INSTANCE_ID`; a stalled session
+yields 124/137 via the same `_seed_timeout_prefix` convention
+`ec2_remote_exec` uses; `--profile`/`--region` passthrough; a payload
+well over SSM's ~4 KB `--parameters` ceiling still round-trips cleanly
+since only the interpreter name (`python3 -` / `sh -s`) goes in
+`--parameters` and the real payload travels over the session's stdin;
+`ec2_attach`'s `sh -s` bootstrap is verified by decoding the
+base64-wrapped `command=[...]` value rather than asserting on plaintext
+no longer in the log; and double-sourcing is idempotent and does not
+clobber `ec2_remote_exec`. `flyctl` never appears in the transport log.
+Also added to `tests/test_ec2_bash32_portability.py`'s `_EC2_SCRIPTS`
+list for bash 3.2 sourcing coverage.
 The launcher's `RUNTIME=ec2` dispatch branch itself — the seam none of
 the above can see, since they test `ec2-lib.sh`/`ec2-provision.sh`
 standalone rather than the `leerie` launcher's own dispatch — is
@@ -1226,6 +1278,23 @@ bug reintroduced). It skips cleanly on hosts whose `/bin/bash` is ≥ 4.3,
 so it is a macOS-developer guard, never a CI flake. Paired with a
 source-level `local -n` / `declare -n` ban (namerefs are bash 4.3+;
 echo the tokens instead — see `_aws_region_profile_args`).
+The guard was extended (test-006) to cover every EC2 launcher arm wired
+by test-001..test-005: `_EC2_SCRIPTS` gained `ec2-resume-instance.sh`,
+`ec2-seed-auth.sh`, and `ec2-fetch-branch.sh` (all sourced by the
+launcher's EC2 arms but previously untested here); `_EXPANSION_CALLSITES`
+gained `resume_instance`; and a new
+`test_ec2_launcher_verb_runs_cleanly_under_bash32` runs the real `leerie`
+binary itself (not just `scripts/remote/ec2-*.sh`) under bash 3.2 for
+`--stop`/`--kill`/`--accept-blocked` with `LEERIE_AWS_PROFILE`/
+`LEERIE_AWS_REGION` unset, since each of those arms builds its own
+optional-arg array from those two vars directly in `leerie` before
+calling `resolve_aws_credentials`. This surfaced a real, previously
+unguarded instance of the class: all four call sites
+(`--accept-blocked`, `--stop`, `--kill`, and the main `RUNTIME=ec2`
+dispatch) expanded their creds-args array as a bare `"${arr[@]}"`
+instead of `${arr[@]+"${arr[@]}"}` — fixed in the same change. The
+nameref ban was likewise extended to `leerie` itself
+(`test_no_namerefs_in_launcher`).
 
 **Host-only tests are gated on `jq`** (`HAS_JQ` in `tests/conftest.py`,
 mirroring the `HAS_TREESITTER` pattern). Four modules —
@@ -1335,9 +1404,181 @@ per-instance `public_ip` that's reassigned (via an `_ip_gen` counter)
 on every `start-instances` call, and an optional `status_ok` flag so
 `describe-instance-status` can report "initializing" instead of "ok"
 without an infinite/slow poll in tests.
+The launcher's `--stop` verb EC2 dispatch — the counterpart to
+`_auto_detect_fly_runtime` for EC2 runs, DESIGN §6 "Run identifier" —
+is tested in `tests/test_ec2_launcher_stop.py` by invoking the real
+`leerie` binary (not an extracted block, since `--stop` is an early
+fast-path verb dispatched before container preflight) against the
+same resource-tracking `aws` stub: an `ec2-instance.json` sidecar
+auto-detects the EC2 runtime and `--stop <run-id>` drives the
+stub-tracked instance to `stopped` (never `terminate-instances`) and
+writes `paused_at`/`pause_reason`/`ec2_instance_id` onto `run.json`;
+explicit `--runtime ec2` works without autodetection; the local/Fly
+fallthrough error text is unchanged when no sidecar of any kind is
+present; `--runtime bogus` is still rejected, now with the
+`'local', 'fly', or 'ec2'` wording; a sidecar present but missing
+`ec2_instance_id` fails closed with an actionable error rather than
+silently no-op'ing; and a failing AWS credential probe aborts before
+any `aws ec2 ...` call reaches the stub, leaving the instance
+`running`.
+The `RUNTIME=ec2` dispatch branch continuing past preflight into the
+full create -> seed -> orchestrate -> teardown lifecycle (the old
+`--runtime ec2 preflight passed, but instance provisioning is not yet
+wired` abort is gone) is pinned in
+`tests/test_ec2_launcher_dispatch_e2e.py`, which reuses (rather than
+reimplements) `tests/test_ec2_e2e_provision.py`'s
+`extract_ec2_dispatch_block`/`run_ec2_dispatch`/`stub_aws_env` harness
+and `tests/ec2_stub.py`'s resource-tracking `aws` stub — mirroring
+`tests/test_ec2_launcher_credentials.py`'s harness-sanity convention.
+It pins: a full launch with valid credentials provisions exactly one
+instance, reaches the stubbed `ec2_seed_repo`, and terminates cleanly
+at `decide_ec2_teardown`'s clean-exit arm, leaving zero leaked
+instances and zero leaked volumes; a grep guard that neither `"not yet
+wired"` nor the more specific historical string `"instance
+provisioning is not yet wired"` appears anywhere in `leerie`;
+`require_aws`'s `sts get-caller-identity` still precedes any `ec2
+run-instances` call by call index across the *full* lifecycle path
+(not just the provision-only path `test_ec2_e2e_provision.py` already
+covers); and a failing credential probe still aborts non-zero with the
+`aws sso login --profile <p>` hint and zero tracked resources.
+
+The generalized run-dir sidecar autodetection — `_auto_detect_run_runtime`
+(checks `fly-machine.json` then `ec2-instance.json`, echoing the detected
+runtime) and the `_auto_detect_fly_runtime` back-compat Fly-only wrapper
+built on top of it — is tested in `tests/test_auto_detect_run_runtime.py`.
+The first half extracts both functions verbatim from the launcher (mirroring
+`tests/test_oom_wedge_prevention.py`'s `_reaper_fn_source` approach) and
+exercises them against fixture run dirs: an ec2-instance.json-only run dir
+detects as `ec2`; a fly-machine.json-only run dir still detects as `fly` (no
+regression); neither sidecar present returns nonzero with nothing echoed; an
+explicit runtime short-circuits detection even when a sidecar for a
+different runtime is present; Fly wins when (never expected in practice)
+both sidecars co-exist; and the Fly-only wrapper returns nonzero for an EC2
+run. The second half invokes the real launcher end to end (mirroring
+`tests/test_accept_blocked.py`'s local-path pattern) across `--stop`,
+`--kill`, `--accept-blocked`, and `--finalize`: each accepts `ec2`
+alongside `local`/`fly` in its `--runtime` enum validation (rejects other
+bogus values with the updated three-way message). `--accept-blocked` and
+`--finalize` still fail closed with an explicit "does not support EC2 runs
+yet" message — rather than silently falling through to the Fly path or
+defaulting to `local` — whether `ec2` was passed explicitly or
+auto-detected via the sidecar; the Fly auto-detect regression path (no
+sidecar override, `LEERIE_FLY_APP` unset) still reaches the pre-existing
+Fly-specific error, proving detection promoted to `fly` and reached the
+Fly branch. `--stop` and `--kill` both wire real EC2 actions (test-001 and
+feat-006 respectively — see `tests/test_ec2_launcher_stop.py` and
+`tests/test_ec2_launcher_kill.py` above/below for their end-to-end
+coverage): passing `--runtime ec2` against a run dir with no
+`ec2_instance_id` anywhere dies with "no ec2_instance_id found" instead of
+the old fail-closed message, and auto-detecting the `ec2-instance.json`
+sidecar proceeds past detection into AWS credential resolution (which
+fails in this test's env for unrelated reasons — no `aws` binary/credentials
+set up) rather than hitting the old fail-closed message. `--resume` is
+covered separately: an `ec2-instance.json` sidecar fails closed with a
+resume-specific message instead of promoting `RUNTIME=ec2` (which would
+otherwise fall into the launcher's fresh-provision `RUNTIME=ec2` branch and
+die with an unrelated "not yet wired" message), while a `fly-machine.json`
+sidecar still promotes to `fly` as before. Neither `--accept-blocked` nor
+`--finalize` wire an EC2 verb *action* yet — that is feat-007/feat-008 (and
+a later `--resume` subtask); this subtask's scope for those two remains the
+detection helper and the `--runtime` enum validation it feeds.
+
+`--kill`'s EC2 action — resolving `ec2_instance_id` from the run dir,
+resolving AWS credentials, re-resolving `LEERIE_EC2_SSH_TARGET`, and
+syncing state via `_try_fetch_state_for_ec2_teardown` BEFORE calling
+`terminate_instance()` (the one-way-ratchet invariant
+`ec2-provision.sh:262-272` documents) — is tested end to end in
+`tests/test_ec2_launcher_kill.py` against the real `leerie` launcher
+binary. The `aws` stub combines two behaviors behind one binary since
+`--kill`'s EC2 path exercises both surfaces in a single run: `ssm
+start-session` (the transport `ec2_remote_exec`/`fetch_state_ec2` use)
+decodes and execs the wrapped command locally against a real git repo
+standing in for the instance's `/work` (reusing
+`tests/test_ec2_fetch_branch.py`'s `_make_stub_ssh`/
+`_init_instance_repo_with_run`/`_setup_instance` helpers directly rather
+than reimplementing them, so `fetch_state_ec2` runs for real instead of
+being hand-waved), while `sts`/`ec2 <action>` route to
+`tests/ec2_stub.py`'s resource-tracking state machine (imported and
+reused as the lifecycle backend) so credential/instance-lifecycle calls
+are tracked too — both halves append to the same `aws.log`/`state.json`
+so `tests/ec2_stub.py`'s `read_log`/`read_state`/`leaked_resources` work
+unmodified. Pinned: the fetch step's `ssm start-session` call precedes
+`terminate-instances` by call index (falsified live — reordering the
+launcher's fetch/terminate calls makes this test fail, since
+`terminate_instance()` clears `LEERIE_EC2_INSTANCE_ID` and the
+now-preceding fetch step then errors on a missing instance id); a
+successful kill leaves zero non-terminated instances and zero leaked
+volumes in the stub's tracked state; a failed fetch (no completed run
+committed on the "instance" side, so `fetch_state_ec2`'s discovery step
+fails closed) leaves the instance `running` rather than escalating to
+termination; a hard-failing `flyctl` stub (records invocation, exits
+nonzero) is on PATH throughout and its log stays empty on every path,
+pinning that an EC2 run-id is never handed to `flyctl`; `run.json` gets
+`killed_at` + `ec2_instance_id` on success, bootstrapped from
+`ec2-instance.json` via the widened `_ensure_run_json` when `run.json`
+doesn't exist yet; a sidecar with no resolvable `ec2_instance_id` dies
+with "no ec2_instance_id found" without ever calling `terminate-instances`
+or `flyctl`; and the confirmation prompt (bypassed by `--force`, same
+convention as the Fly/local `--kill` paths) rejects a wrong confirmation
+and proceeds on the correct one.
+
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
+The two read-mostly verbs that still assumed a two-runtime world —
+`--accept-blocked` (validated `--runtime` against only `fly`/`local` and
+defaulted anything non-fly to `local`, silently mislabeling an EC2 run)
+and `--list` (keyed its runtime-aware view on `fly-machine.json`/
+`LEERIE_FLY_APP`, so an EC2 run rendered empty columns) — are pinned in
+`tests/test_ec2_launcher_readonly_verbs.py`. `--accept-blocked` now
+auto-detects EC2 the same way `--stop` already does
+(`_auto_detect_run_runtime`), accepts an explicit `--runtime ec2` (with
+a control that a genuinely bogus value is still rejected), and —
+mirroring the Fly path's wake-mutate-pause dance — wakes a stopped
+instance, mutates state.json over SSM (`ec2_remote_exec`), mirrors the
+mutation onto the host copy if one exists, and re-pauses the instance
+only if this verb woke it (plus an already-running control that proves
+no pause fires when the instance was already up), and fails closed on a
+missing `ec2_instance_id`. The `--accept-blocked` tests invoke the real
+`leerie` launcher binary against a stubbed `aws` that composes
+`tests/ec2_stub.py`'s stateful EC2 instance tracking with an `ssm
+start-session` handler that decodes `ec2_remote_exec`'s base64-wrapped
+command and executes it with the invoking process's stdin drained
+through — the same mechanism the launcher's EC2 branch relies on to
+pipe the multi-line state-mutation Python program to the remote
+`python3 -`. `_collect_run_rows`/`list_runs` in `orchestrator/leerie.py`
+now track an `is_ec2` axis (`ec2_instance_id` in `run.json` or
+`ec2-instance.json` present) alongside the existing `is_fly`, so
+`--list --runtime ec2` filters correctly, `--list --runtime local`
+excludes both Fly and EC2 runs, a plain `--list` renders an EC2 run's
+status column without requiring `LEERIE_FLY_APP`, and an EC2 run is
+still detected via the `ec2-instance.json` sidecar alone when
+`run.json` doesn't exist yet. These `--list` tests exercise
+`list_runs()` directly (no launcher subprocess, no AWS stub), mirroring
+`tests/test_list_runs.py`'s pattern.
+
+`--resume` routing a paused EC2 run through `resume_instance()` — the
+launcher-level seam distinct from `resume_instance()`'s own standalone
+coverage in `tests/test_ec2_resume_instance.py` — is pinned in
+`tests/test_ec2_launcher_resume.py`, reusing
+`tests/test_ec2_e2e_provision.py`'s `extract_ec2_dispatch_block`/
+`run_ec2_dispatch`/`stub_aws_env` harness and `tests/ec2_stub.py`'s
+resource-tracking `aws` stub (mirroring
+`tests/test_ec2_launcher_dispatch_e2e.py`'s import convention), since
+`--resume` for EC2 lives inside the deep `RUNTIME=ec2` elif dispatch
+block rather than the early fast-path verb dispatch `--stop` uses. It
+pins: a stopped instance named by an `ec2-instance.json` sidecar issues
+exactly one `start-instances` call and reaches `running`, with no
+duplicate `run-instances` provisioning a second instance; the
+load-bearing IP-reassignment case — `LEERIE_EC2_SSH_TARGET` is
+re-resolved to the instance's NEW `PublicIpAddress` after resume, not
+the stale provision-time address, since EC2 hands out a new public IP
+on every stop/start cycle absent an attached Elastic IP; `run.json`'s
+`paused_at`/`pause_reason` are cleared and `ec2_instance_id` is
+preserved; an already-`running` instance is an idempotent no-op with
+zero `start-instances` calls; and neither `terminate-instances` nor
+`delete-volume` is ever called, on both the success path and the
+never-ready (`status_ok=False` timeout) failure path.
 
 The worker invocation path is unit-tested only at the `claude_p` layer, via
 a stubbed `_invoke` (`tests/test_no_result_event_retry.py`) — enough to pin

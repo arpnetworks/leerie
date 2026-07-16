@@ -392,6 +392,36 @@ except Exception:
   return 0
 }
 
+# --- _resolve_ec2_instance_id_from_run_dir ------------------------------
+# Read ec2_instance_id from a run's host-side sidecar. ec2-provision.sh
+# persists ec2_instance_id into both ec2-instance.json (unconditional,
+# crash-recovery pointer) and run.json (conditional on LEERIE_RUN_ID being
+# set at provision time). Unlike Fly, the run-id is NOT the instance id
+# for EC2 runs, so --kill/--stop/--resume must read it from a sidecar
+# rather than assuming identity.
+_resolve_ec2_instance_id_from_run_dir() {
+  local run_dir="$1"
+  local candidate iid
+  for candidate in "$run_dir/ec2-instance.json" "$run_dir/run.json"; do
+    if [ -f "$candidate" ]; then
+      iid="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    iid = d.get("ec2_instance_id")
+    print(iid if iid else "")
+except Exception:
+    pass
+' "$candidate")"
+      if [ -n "$iid" ]; then
+        printf '%s' "$iid"
+        return 0
+      fi
+    fi
+  done
+  return 0
+}
+
 # --- _resolve_volume_id_from_fly ---------------------------------------
 # Ask Fly which volume a machine has mounted. The fallback for when no
 # sidecar exists (`--kill --machine-id <id>` on an orphan) — without this
@@ -435,9 +465,9 @@ except Exception:
 }
 
 # --- _ensure_run_json --------------------------------------------------
-# If run_dir has fly-machine.json but no run.json, bootstrap a minimal
-# run.json so subsequent `update_run_json` writes (paused_at,
-# killed_at, etc.) have a file to merge into. Idempotent.
+# If run_dir has fly-machine.json or ec2-instance.json but no run.json,
+# bootstrap a minimal run.json so subsequent `update_run_json` writes
+# (paused_at, killed_at, etc.) have a file to merge into. Idempotent.
 _ensure_run_json() {
   local run_dir="$1"
   local sidecar="$run_dir/run.json"
@@ -445,10 +475,9 @@ _ensure_run_json() {
     return 0
   fi
   local fmj="$run_dir/fly-machine.json"
-  if [ ! -f "$fmj" ]; then
-    return 1
-  fi
-  python3 -c '
+  local eij="$run_dir/ec2-instance.json"
+  if [ -f "$fmj" ]; then
+    python3 -c '
 import json, sys
 fmj = sys.argv[1]
 sidecar = sys.argv[2]
@@ -463,21 +492,66 @@ with open(sidecar, "w") as f:
     json.dump(out, f, indent=2)
     f.write("\n")
 ' "$fmj" "$sidecar"
+    return 0
+  fi
+  if [ -f "$eij" ]; then
+    python3 -c '
+import json, sys
+eij = sys.argv[1]
+sidecar = sys.argv[2]
+try:
+    d = json.load(open(eij))
+except Exception:
+    d = {}
+out = {
+    "ec2_instance_id": d.get("ec2_instance_id"),
 }
-
-# --- _auto_detect_fly_runtime --------------------------------------------
-# When a run-id-bearing verb is invoked without an explicit --runtime and
-# the run directory contains fly-machine.json, the run originated on Fly.
-# Returns 0 (auto-detected) or 1 (not detected / explicit runtime given).
-_auto_detect_fly_runtime() {
-  local run_id="$1" explicit_runtime="$2"
-  if [ -n "$explicit_runtime" ]; then return 1; fi
-  if [ -z "$run_id" ]; then return 1; fi
-  local sidecar="$LEERIE_STATE_HOST_DIR/runs/$run_id/fly-machine.json"
-  if [ -f "$sidecar" ]; then
+with open(sidecar, "w") as f:
+    json.dump(out, f, indent=2)
+    f.write("\n")
+' "$eij" "$sidecar"
     return 0
   fi
   return 1
+}
+
+# --- _auto_detect_run_runtime ---------------------------------------------
+# When a run-id-bearing verb is invoked without an explicit --runtime, probe
+# the run directory's crash-recovery sidecars to find which runtime actually
+# owns the run: fly-machine.json (Fly) or ec2-instance.json (EC2) — DESIGN §6
+# "Run identifier" ("a same-shaped ec2-instance.json sidecar ... plus
+# widening the orphan scan to check for either sidecar file"). Fly is probed
+# first, matching the historical behavior when both happened to be present
+# (never expected in practice — a run has exactly one runtime — but Fly wins
+# ties for backward compatibility with the pre-EC2 helper).
+#
+# On a match, echoes the detected runtime ("fly" or "ec2") to stdout and
+# returns 0. Returns 1 (nothing echoed) when an explicit runtime was given,
+# no run_id was given, or neither sidecar is present.
+_auto_detect_run_runtime() {
+  local run_id="$1" explicit_runtime="$2"
+  if [ -n "$explicit_runtime" ]; then return 1; fi
+  if [ -z "$run_id" ]; then return 1; fi
+  local run_dir="$LEERIE_STATE_HOST_DIR/runs/$run_id"
+  if [ -f "$run_dir/fly-machine.json" ]; then
+    echo "fly"
+    return 0
+  fi
+  if [ -f "$run_dir/ec2-instance.json" ]; then
+    echo "ec2"
+    return 0
+  fi
+  return 1
+}
+
+# --- _auto_detect_fly_runtime ----------------------------------------------
+# Back-compat Fly-only wrapper around _auto_detect_run_runtime, for call
+# sites that only branch on "is this a Fly run?" and have no ec2 handling
+# yet. Returns 0 only when the detected runtime is "fly".
+_auto_detect_fly_runtime() {
+  local _detected
+  _detected="$(_auto_detect_run_runtime "$1" "$2")" || return 1
+  [ "$_detected" = "fly" ]
 }
 
 # --- _is_local_container --------------------------------------------------
@@ -1220,7 +1294,7 @@ PY
     ;;
   --accept-blocked)
     # Mark a blocked/failed subtask as complete so --resume skips it.
-    # Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local]
+    # Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|ec2|local]
     #
     # For local runs: modifies $LEERIE_STATE_HOST_DIR/runs/<id>/state.json
     # directly (bind-mounted into the container).
@@ -1247,7 +1321,7 @@ PY
     done
     if [ -z "$_ab_run_id" ] || [ -z "$_ab_sid" ]; then
       remote_log "--accept-blocked requires <run-id> <subtask-id>"
-      echo "  Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|local]" >&2
+      echo "  Usage: leerie --accept-blocked <run-id> <subtask-id> [--runtime fly|ec2|local]" >&2
       exit 1
     fi
     # Validate both positional args against a strict allowlist BEFORE they
@@ -1268,13 +1342,14 @@ PY
         remote_log "--accept-blocked: invalid subtask-id '$_ab_sid' (allowed chars: A-Za-z0-9._-)"
         exit 1 ;;
     esac
-    if [ -n "$_ab_runtime" ] && [ "$_ab_runtime" != "fly" ] && [ "$_ab_runtime" != "local" ]; then
-      remote_log "--accept-blocked: --runtime must be 'local' or 'fly' (got '$_ab_runtime')"
+    if [ -n "$_ab_runtime" ] && [ "$_ab_runtime" != "fly" ] && [ "$_ab_runtime" != "local" ] && [ "$_ab_runtime" != "ec2" ]; then
+      remote_log "--accept-blocked: --runtime must be 'local', 'fly', or 'ec2' (got '$_ab_runtime')"
       exit 1
     fi
-    if _auto_detect_fly_runtime "$_ab_run_id" "$_ab_runtime"; then
-      _ab_runtime="fly"
-    elif [ "$_ab_runtime" != "fly" ]; then
+    _ab_detected="$(_auto_detect_run_runtime "$_ab_run_id" "$_ab_runtime")" || _ab_detected=""
+    if [ -n "$_ab_detected" ]; then
+      _ab_runtime="$_ab_detected"
+    elif [ "$_ab_runtime" != "fly" ] && [ "$_ab_runtime" != "ec2" ]; then
       _ab_runtime="local"
     fi
     _ab_state_dir="$LEERIE_STATE_HOST_DIR/runs/$_ab_run_id"
@@ -1322,6 +1397,86 @@ with tempfile.NamedTemporaryFile("w", dir=os.path.dirname(path) or ".", delete=F
 os.replace(tmp_path, path)
 print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
 '
+    if [ "$_ab_runtime" = "ec2" ]; then
+      # EC2 counterpart of the Fly branch below: wake the instance if it
+      # is stopped, mutate state.json over SSM (ec2_remote_exec — no ssh
+      # keypair / hallpass wait needed, unlike Fly), mirror the mutation
+      # onto the host copy if one exists, then pause the instance again
+      # only if we were the ones who woke it.
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
+      _ab_aws_creds_args=()
+      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _ab_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
+      [ -n "${LEERIE_AWS_REGION:-}" ] && _ab_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+      _ab_aws_creds_exports="$(resolve_aws_credentials ${_ab_aws_creds_args[@]+"${_ab_aws_creds_args[@]}"})" || exit 1
+      eval "$_ab_aws_creds_exports"
+      unset _ab_aws_creds_args _ab_aws_creds_exports
+      require_aws || exit 1
+      LEERIE_EC2_INSTANCE_ID="$(_resolve_ec2_instance_id_from_run_dir "$_ab_state_dir")"
+      export LEERIE_EC2_INSTANCE_ID
+      if [ -z "$LEERIE_EC2_INSTANCE_ID" ]; then
+        remote_log "--accept-blocked: no ec2_instance_id found for run $_ab_run_id"
+        exit 1
+      fi
+      export LEERIE_RUN_ID="$_ab_run_id"
+      _ab_ec2_state="$(_describe_instance_state "$LEERIE_EC2_INSTANCE_ID")"
+      case "$_ab_ec2_state" in
+        terminated|shutting-down|"")
+          remote_log "--accept-blocked: instance $LEERIE_EC2_INSTANCE_ID is terminated or missing — cannot modify state"
+          exit 1
+          ;;
+      esac
+      _ab_started_instance=false
+      if [ "$_ab_ec2_state" != "running" ]; then
+        remote_log "--accept-blocked: starting stopped instance $LEERIE_EC2_INSTANCE_ID..."
+        if ! resume_instance "$LEERIE_EC2_INSTANCE_ID"; then
+          remote_log "--accept-blocked: instance $LEERIE_EC2_INSTANCE_ID never became ready"
+          exit 1
+        fi
+        _ab_started_instance=true
+      fi
+      _ab_teardown_ec2() {
+        if [ "$_ab_started_instance" = true ]; then
+          stop_instance
+          _ensure_run_json "$_ab_state_dir" || true
+          update_run_json "$_ab_state_dir/run.json" \
+            paused_at "$(iso_now)" \
+            pause_reason "user-requested" \
+            ec2_instance_id "$LEERIE_EC2_INSTANCE_ID" || true
+        fi
+      }
+      _ab_remote_state="/work/.leerie/runs/$_ab_run_id/state.json"
+      _ab_out="$(printf '%s' "$_ab_mutate" \
+        | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 - '$_ab_remote_state' '$_ab_sid'" 2>&1 || true)"
+      _ab_sentinel="$(printf '%s\n' "$_ab_out" | tr -d '\r' \
+                      | grep -E '^(ACCEPTED|NOOP|ERROR):' | tail -1 || true)"
+      case "$_ab_sentinel" in
+        ACCEPTED:*|NOOP:*)
+          remote_log "--accept-blocked: $_ab_sentinel"
+          ;;
+        *)
+          remote_log "--accept-blocked: failed to modify state on instance"
+          [ -n "$_ab_out" ] && remote_log "  output: $_ab_out"
+          _ab_teardown_ec2
+          exit 1
+          ;;
+      esac
+      # Mirror the mutation onto the host copy so --list / audits stay
+      # consistent (best-effort; host copy is optional — EC2 state.json
+      # normally lives only on the instance until fetch-back).
+      if [ -f "$_ab_state_file" ]; then
+        python3 -c "$_ab_mutate" "$_ab_state_file" "$_ab_sid" >/dev/null 2>&1 || true
+      fi
+      _ab_teardown_ec2
+      remote_log "--accept-blocked: done. Resume via: leerie --resume $_ab_run_id"
+      exit 0
+    fi
     if [ "$_ab_runtime" = "fly" ]; then
       if [ -z "${LEERIE_FLY_APP:-}" ]; then
         remote_log "--accept-blocked: LEERIE_FLY_APP is required for Fly runs"
@@ -1539,19 +1694,20 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           ;;
       esac
     done
-    if [ -n "$_stop_runtime" ] && [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "local" ]; then
-      remote_log "--stop: --runtime must be 'local' or 'fly' (got '$_stop_runtime')"
+    if [ -n "$_stop_runtime" ] && [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "local" ] && [ "$_stop_runtime" != "ec2" ]; then
+      remote_log "--stop: --runtime must be 'local', 'fly', or 'ec2' (got '$_stop_runtime')"
       exit 1
     fi
     if [ -z "$_stop_run_id" ]; then
       remote_log "--stop requires a <run-id>"
-      echo "  Usage: leerie --stop <run-id> [--runtime fly|local]" >&2
+      echo "  Usage: leerie --stop <run-id> [--runtime fly|ec2|local]" >&2
       exit 1
     fi
-    if _auto_detect_fly_runtime "$_stop_run_id" "$_stop_runtime"; then
-      remote_log "--stop: auto-detected Fly run; promoting --runtime to fly"
-      _stop_runtime="fly"
-    elif [ "$_stop_runtime" != "fly" ] && _is_local_container "$_stop_run_id"; then
+    _stop_detected="$(_auto_detect_run_runtime "$_stop_run_id" "$_stop_runtime")" || _stop_detected=""
+    if [ -n "$_stop_detected" ]; then
+      remote_log "--stop: auto-detected ${_stop_detected} run; promoting --runtime to ${_stop_detected}"
+      _stop_runtime="$_stop_detected"
+    elif [ "$_stop_runtime" != "fly" ] && [ "$_stop_runtime" != "ec2" ] && _is_local_container "$_stop_run_id"; then
       _stop_runtime="local"
     fi
     _stop_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_stop_run_id"
@@ -1577,8 +1733,42 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
       exit 0
     fi
+    if [ "$_stop_runtime" = "ec2" ]; then
+      # EC2 instance: stop_instance() preserves the root EBS volume
+      # (DESIGN §6 *EC2 runtime lifecycle*, "EBS volume lifecycle" case 2 —
+      # StopInstances is stop-scoped, never DeleteOnTermination). Resumable
+      # via leerie --resume (once the EC2 --resume path lands).
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+      _stop_aws_creds_args=()
+      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _stop_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
+      [ -n "${LEERIE_AWS_REGION:-}" ] && _stop_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+      _stop_aws_creds_exports="$(resolve_aws_credentials ${_stop_aws_creds_args[@]+"${_stop_aws_creds_args[@]}"})" || exit 1
+      eval "$_stop_aws_creds_exports"
+      unset _stop_aws_creds_args _stop_aws_creds_exports
+      require_aws || exit 1
+      LEERIE_EC2_INSTANCE_ID="$(_resolve_ec2_instance_id_from_run_dir "$_stop_run_dir")"
+      export LEERIE_EC2_INSTANCE_ID
+      if [ -z "$LEERIE_EC2_INSTANCE_ID" ]; then
+        remote_log "--stop: no ec2_instance_id found for run $LEERIE_RUN_ID"
+        exit 1
+      fi
+      _ensure_run_json "$_stop_run_dir" || true
+      remote_log "--stop: pausing instance $LEERIE_EC2_INSTANCE_ID (run $LEERIE_RUN_ID)"
+      stop_instance
+      update_run_json "$_stop_sidecar" \
+        paused_at "$(iso_now)" \
+        pause_reason "user-requested" \
+        ec2_instance_id "$LEERIE_EC2_INSTANCE_ID" || true
+      remote_log "--stop: paused. Resume via: leerie --resume $LEERIE_RUN_ID"
+      exit 0
+    fi
     if [ "$_stop_runtime" != "fly" ]; then
-      remote_log "--stop: run $LEERIE_RUN_ID is not a live Fly machine or local container"
+      remote_log "--stop: run $LEERIE_RUN_ID is not a live Fly machine, local container, or EC2 instance"
       echo "  If the container already exited, there is nothing to stop." >&2
       echo "  Check 'leerie --list' for active runs." >&2
       exit 1
@@ -1680,14 +1870,15 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
           ;;
       esac
     done
-    if [ -n "$_kill_runtime" ] && [ "$_kill_runtime" != "fly" ] && [ "$_kill_runtime" != "local" ]; then
-      remote_log "--kill: --runtime must be 'local' or 'fly' (got '$_kill_runtime')"
+    if [ -n "$_kill_runtime" ] && [ "$_kill_runtime" != "fly" ] && [ "$_kill_runtime" != "local" ] && [ "$_kill_runtime" != "ec2" ]; then
+      remote_log "--kill: --runtime must be 'local', 'fly', or 'ec2' (got '$_kill_runtime')"
       exit 1
     fi
-    if _auto_detect_fly_runtime "$_kill_run_id" "$_kill_runtime"; then
-      remote_log "--kill: auto-detected Fly run; promoting --runtime to fly"
-      _kill_runtime="fly"
-    elif [ "$_kill_runtime" != "fly" ] && [ -n "$_kill_run_id" ] && _is_local_container "$_kill_run_id"; then
+    _kill_detected="$(_auto_detect_run_runtime "$_kill_run_id" "$_kill_runtime")" || _kill_detected=""
+    if [ -n "$_kill_detected" ]; then
+      remote_log "--kill: auto-detected ${_kill_detected} run; promoting --runtime to ${_kill_detected}"
+      _kill_runtime="$_kill_detected"
+    elif [ "$_kill_runtime" != "fly" ] && [ "$_kill_runtime" != "ec2" ] && [ -n "$_kill_run_id" ] && _is_local_container "$_kill_run_id"; then
       _kill_runtime="local"
     fi
     [ -n "${LEERIE_FORCE_KILL:-}" ] && _kill_force=1
@@ -1730,6 +1921,104 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
         if [ -f "$_kill_sidecar" ]; then
           update_run_json "$_kill_sidecar" \
             killed_at "$(iso_now)" || true
+        fi
+      fi
+      remote_log "--kill: destroyed. Run is no longer resumable."
+      exit 0
+    fi
+    # --- EC2 instance kill path ---
+    # An EC2 instance id must never fall through to the Fly kill path below:
+    # flyctl would silently no-op against a nonexistent Fly machine and
+    # --kill would report "destroyed" while the instance keeps billing.
+    #
+    # Fetch-before-terminate ordering (DESIGN §6 one-way-ratchet
+    # invariant, mirroring decide_ec2_teardown's clean-exit branch in
+    # ec2-provision.sh): sync the run branch + state dir from the
+    # instance to the host BEFORE calling terminate_instance. Destroy-
+    # then-fetch would make paid-for LLM work unrecoverable.
+    if [ "$_kill_runtime" = "ec2" ]; then
+      if [ -z "$_kill_run_id" ]; then
+        remote_log "--kill: no run-id for EC2 instance"
+        exit 1
+      fi
+      _kill_ec2_instance_id=""
+      if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
+        _kill_ec2_instance_id="$(_resolve_ec2_instance_id_from_run_dir "$_kill_run_dir")"
+      fi
+      if [ -z "$_kill_ec2_instance_id" ]; then
+        remote_log "--kill: no ec2_instance_id found in $_kill_run_dir (ec2-instance.json / run.json)"
+        exit 1
+      fi
+      if [ "$_kill_force" != "1" ]; then
+        printf "This will terminate EC2 instance %s (run %s). Type the run-id to confirm: " \
+          "$_kill_ec2_instance_id" "$_kill_run_id" >&2
+        read -r _kill_confirm
+        if [ "$_kill_confirm" != "$_kill_run_id" ]; then
+          remote_log "--kill: confirmation mismatch; aborted."
+          exit 1
+        fi
+      fi
+      remote_log "--kill: resolving AWS credentials for instance $_kill_ec2_instance_id"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+      # shellcheck disable=SC1091
+      . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
+      _kill_ec2_creds_args=()
+      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _kill_ec2_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
+      [ -n "${LEERIE_AWS_REGION:-}" ] && _kill_ec2_creds_args+=(--region "$LEERIE_AWS_REGION")
+      _kill_ec2_creds_exports="$(resolve_aws_credentials ${_kill_ec2_creds_args[@]+"${_kill_ec2_creds_args[@]}"})"
+      _kill_ec2_creds_rc=$?
+      if [ "$_kill_ec2_creds_rc" -ne 0 ]; then
+        exit 1
+      fi
+      eval "$_kill_ec2_creds_exports"
+      unset _kill_ec2_creds_args _kill_ec2_creds_exports _kill_ec2_creds_rc
+      require_aws || exit 1
+      LEERIE_EC2_INSTANCE_ID="$_kill_ec2_instance_id"
+      export LEERIE_EC2_INSTANCE_ID
+      USER_REPO="${USER_REPO:-$PWD}"
+      export USER_REPO
+      LEERIE_RUN_ID="$_kill_run_id"
+      export LEERIE_RUN_ID
+      # Re-resolve the SSH target from the instance's current public IP —
+      # EC2 hands out a new address on every stop/start cycle, so any
+      # address cached from provision time cannot be trusted (mirrors
+      # ec2-resume-instance.sh's own re-resolution for the same reason).
+      # _try_fetch_state_for_ec2_teardown (ec2-provision.sh) needs
+      # LEERIE_EC2_SSH_TARGET in scope; a failed re-resolution still falls
+      # through to it so the "cannot sync" fail-closed message is uniform
+      # regardless of which step actually failed.
+      if _kill_ec2_ssh_target="$(_resolve_ssh_target_from_instance "$_kill_ec2_instance_id")"; then
+        LEERIE_EC2_SSH_TARGET="$_kill_ec2_ssh_target"
+        export LEERIE_EC2_SSH_TARGET
+      fi
+      # Fetch-before-terminate ordering (DESIGN §6 one-way-ratchet
+      # invariant): reuses decide_ec2_teardown's own hook rather than
+      # duplicating its "source ec2-fetch-branch.sh if present, fail
+      # closed if absent" logic. Must run — and succeed — BEFORE
+      # terminate_instance below.
+      remote_log "--kill: syncing run branch + state from instance $_kill_ec2_instance_id before terminating"
+      if _try_fetch_state_for_ec2_teardown; then
+        remote_log "--kill: run branch + state synced to host"
+      else
+        remote_log "--kill: sync from instance to host FAILED — instance LEFT RUNNING so work is not lost"
+        echo "  Recover manually, then re-run: leerie --kill $_kill_run_id --force" >&2
+        echo "  Instance: $_kill_ec2_instance_id (still running on EC2)" >&2
+        exit 1
+      fi
+      remote_log "--kill: terminating instance $_kill_ec2_instance_id"
+      terminate_instance
+      if [ -n "$_kill_run_dir" ] && [ -d "$_kill_run_dir" ]; then
+        _ensure_run_json "$_kill_run_dir" || true
+        _kill_sidecar="$_kill_run_dir/run.json"
+        if [ -f "$_kill_sidecar" ]; then
+          update_run_json "$_kill_sidecar" \
+            killed_at "$(iso_now)" \
+            ec2_instance_id "$_kill_ec2_instance_id" || true
         fi
       fi
       remote_log "--kill: destroyed. Run is no longer resumable."
@@ -1901,15 +2190,24 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete")
       echo "  Usage: leerie --finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]" >&2
       exit 1
     fi
-    if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ]; then
-      remote_log "--finalize: --runtime must be 'local' or 'fly' (got '$_fin_runtime')"
+    if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ] && [ "$_fin_runtime" != "ec2" ]; then
+      remote_log "--finalize: --runtime must be 'local', 'fly', or 'ec2' (got '$_fin_runtime')"
       exit 1
     fi
     if [ "$_fin_runtime" = "local" ]; then
       remote_log "--finalize --runtime local: no local-runtime equivalent yet (local runs finalize inline)."
       exit 1
     fi
-    if _auto_detect_fly_runtime "$_fin_run_id" "$_fin_runtime"; then
+    if [ "$_fin_runtime" = "ec2" ]; then
+      remote_log "--finalize --runtime ec2: --finalize does not support EC2 runs yet"
+      exit 1
+    fi
+    _fin_detected="$(_auto_detect_run_runtime "$_fin_run_id" "$_fin_runtime")" || _fin_detected=""
+    if [ "$_fin_detected" = "ec2" ]; then
+      remote_log "--finalize: run $_fin_run_id is an EC2 run; --finalize does not support EC2 runs yet"
+      exit 1
+    fi
+    if [ "$_fin_detected" = "fly" ]; then
       remote_log "--finalize: auto-detected Fly run; promoting --runtime to fly"
       _fin_runtime="fly"
     fi
@@ -3443,17 +3741,27 @@ for arg in "$@"; do
   fi
 done
 
-# --- auto-detect Fly runtime on --resume ---------------------------------
-# Uses the shared _auto_detect_fly_runtime helper. The --resume path
+# --- auto-detect runtime on --resume --------------------------------------
+# Uses the shared _auto_detect_run_runtime helper. The --resume path
 # differs from the fast-path verbs: it sets REWRITTEN_ARGS (forwarded to
 # the orchestrator) and uses _RUNTIME_EXPLICIT to distinguish default
-# from user-set.
+# from user-set. EC2 detection is surfaced here so a paused EC2 run gets
+# an accurate message instead of silently defaulting to local — but
+# resuming a paused EC2 instance is a separate, not-yet-implemented
+# subtask, so it fails closed here rather than promoting RUNTIME=ec2 and
+# falling into the fresh-provision branch below, which would otherwise
+# attempt to provision a brand new instance instead of resuming the
+# paused one.
 if [ "$IS_RESUME" = "true" ] && [ "$RUNTIME" = "local" ] && \
    [ "$_RUNTIME_EXPLICIT" = "false" ]; then
-  if _auto_detect_fly_runtime "$LEERIE_RUN_ID" ""; then
+  _resume_detected="$(_auto_detect_run_runtime "$LEERIE_RUN_ID" "")" || _resume_detected=""
+  if [ "$_resume_detected" = "fly" ]; then
     remote_log "--resume: auto-detected Fly run (fly-machine.json present); promoting --runtime to fly"
     RUNTIME=fly
     REWRITTEN_ARGS+=("--runtime" "fly")
+  elif [ "$_resume_detected" = "ec2" ]; then
+    remote_log "--resume: run $LEERIE_RUN_ID is an EC2 run (ec2-instance.json present); --resume does not support EC2 runs yet"
+    exit 1
   fi
 fi
 # When the user explicitly set --runtime local on a Fly-originated run,
@@ -6086,7 +6394,7 @@ elif [ "$RUNTIME" = "ec2" ]; then
   _leerie_aws_creds_args=()
   [ -n "${LEERIE_AWS_PROFILE:-}" ] && _leerie_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
   [ -n "${LEERIE_AWS_REGION:-}" ] && _leerie_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
-  _leerie_aws_creds_exports="$(resolve_aws_credentials "${_leerie_aws_creds_args[@]}")"
+  _leerie_aws_creds_exports="$(resolve_aws_credentials ${_leerie_aws_creds_args[@]+"${_leerie_aws_creds_args[@]}"})"
   _leerie_aws_creds_rc=$?
   if [ "$_leerie_aws_creds_rc" -ne 0 ]; then
     exit 1
@@ -6096,14 +6404,308 @@ elif [ "$RUNTIME" = "ec2" ]; then
   if ! require_aws; then
     exit 1
   fi
-  # Instance provisioning/seed/orchestrate/teardown wiring (DESIGN §6 "EC2
-  # runtime lifecycle") lands in a later subtask — ec2-provision.sh /
-  # ec2-seed-repo.sh are source-and-call-ready but nothing past the
-  # preflight above sources them yet (docs/IMPLEMENTATION.md "Runtime
-  # mode"). Abort explicitly rather than silently falling through to the
-  # local nerdctl path below.
-  remote_log "error: --runtime ec2 preflight passed, but instance provisioning is not yet wired into the launcher"
-  container_rc=1
+
+  # Default LEERIE_REMOTE_EXIT_RC to 130 (SIGINT) so the EXIT/INT trap
+  # registered by ec2-provision.sh routes a Ctrl-C-during-tail to the
+  # `130|143)` detach arm in decide_ec2_teardown — mirrors the Fly
+  # branch's identical default a few dozen lines up.
+  export LEERIE_REMOTE_EXIT_RC=130
+
+  # Communicate the host's launch-time push intent to the in-instance
+  # orchestrator, exactly like the Fly branch above (DESIGN §6
+  # *Finalization*: EC2 instances receive no GitHub credentials either).
+  if [ "$NO_PUSH" = "true" ]; then
+    REWRITTEN_ARGS+=("--host-no-push" "true")
+  else
+    REWRITTEN_ARGS+=("--host-no-push" "false")
+  fi
+
+  EC2_PROVISION_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-provision.sh"
+  EC2_RESUME_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
+  EC2_SEED_AUTH_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-seed-auth.sh"
+  EC2_SEED_REPO_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-seed-repo.sh"
+  EC2_FETCH_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-fetch-branch.sh"
+  EC2_SSM_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-ssm.sh"
+  if [ ! -f "$EC2_PROVISION_SCRIPT" ]; then
+    remote_log "error: $EC2_PROVISION_SCRIPT not found"
+    container_rc=1
+  elif [ ! -f "$EC2_RESUME_SCRIPT" ]; then
+    remote_log "error: $EC2_RESUME_SCRIPT not found"
+    container_rc=1
+  elif [ ! -f "$EC2_SEED_AUTH_SCRIPT" ]; then
+    remote_log "error: $EC2_SEED_AUTH_SCRIPT not found"
+    container_rc=1
+  elif [ ! -f "$EC2_SEED_REPO_SCRIPT" ]; then
+    remote_log "error: $EC2_SEED_REPO_SCRIPT not found"
+    container_rc=1
+  elif [ ! -f "$EC2_FETCH_SCRIPT" ]; then
+    remote_log "error: $EC2_FETCH_SCRIPT not found"
+    container_rc=1
+  elif [ ! -f "$EC2_SSM_SCRIPT" ]; then
+    remote_log "error: $EC2_SSM_SCRIPT not found"
+    container_rc=1
+  else
+    # shellcheck disable=SC1090
+    . "$EC2_PROVISION_SCRIPT"
+    # shellcheck disable=SC1090
+    . "$EC2_RESUME_SCRIPT"
+    # shellcheck disable=SC1090
+    . "$EC2_SEED_AUTH_SCRIPT"
+    # shellcheck disable=SC1090
+    . "$EC2_SEED_REPO_SCRIPT"
+    # shellcheck disable=SC1090
+    . "$EC2_FETCH_SCRIPT"
+    # shellcheck disable=SC1090
+    . "$EC2_SSM_SCRIPT"
+
+    # Resume path: if a run-id was given AND its sidecar names an
+    # instance, resume that instance instead of provisioning a new one.
+    # (DESIGN §6 EC2 runtime lifecycle, "Pause/resume semantics".) Unlike
+    # the Fly branch's PID-record auto-discovery, bare `--resume` with no
+    # `--run-id` is not yet supported for EC2 — the operator passes
+    # `--run-id` explicitly, matching how `--resume <run-id> --runtime
+    # ec2` is documented. `run_id` IS the instance id conceptually (DESIGN
+    # §6 "Run identifier"), but unlike Fly the instance id is not known
+    # until create time on a fresh launch, so the sidecar lookup (not the
+    # run-id string itself) is what names the instance to resume.
+    _ec2_paused_iid=""
+    if [ -n "$LEERIE_RUN_ID" ]; then
+      for _ec2_sidecar in \
+        "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/ec2-instance.json" \
+        "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/run.json"; do
+        [ -f "$_ec2_sidecar" ] || continue
+        _ec2_paused_iid="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print(d.get("ec2_instance_id") or "")
+except Exception:
+    pass
+' "$_ec2_sidecar" 2>/dev/null || true)"
+        [ -n "$_ec2_paused_iid" ] && break
+      done
+    fi
+
+    _ec2_provisioned=false
+    _ec2_resumed=false
+    if [ -n "$_ec2_paused_iid" ]; then
+      if resume_instance "$_ec2_paused_iid"; then
+        _ec2_provisioned=true
+        _ec2_resumed=true
+      elif [ "$IS_RESUME" = "true" ]; then
+        # User explicitly asked to resume and the target instance is
+        # unrecoverable. resume_instance already named the cause on
+        # stderr. Do NOT silently provision a duplicate.
+        container_rc=1
+      fi
+    elif [ "$IS_RESUME" = "true" ] && [ -n "$LEERIE_RUN_ID" ]; then
+      remote_log "--resume: no EC2 instance sidecar found for run $LEERIE_RUN_ID"
+      echo "  Run 'leerie --list' to see known runs, or omit --resume to" >&2
+      echo "  start a fresh run." >&2
+      container_rc=1
+    elif provision_instance; then
+      _ec2_provisioned=true
+      # run_id = instance_id: set LEERIE_RUN_ID now that we know the
+      # instance ID (mirrors the Fly branch's run_id = machine_id rule;
+      # DESIGN §6 "Run identifier"). Pass --run-id to the orchestrator
+      # via REWRITTEN_ARGS.
+      if [ -z "$LEERIE_RUN_ID" ]; then
+        LEERIE_RUN_ID="$LEERIE_EC2_INSTANCE_ID"
+        export LEERIE_RUN_ID
+        REWRITTEN_ARGS+=("--run-id" "$LEERIE_RUN_ID")
+      fi
+    fi
+
+    if [ "$_ec2_provisioned" = "true" ] && [ "$container_rc" = "0" ]; then
+      # Resolve the ssh(1) destination for the tar-pipe transport
+      # (ec2_seed_repo/ec2_seed_auth/ec2-fetch-branch.sh). resume_instance
+      # already resolves LEERIE_EC2_SSH_TARGET on its own path; a fresh
+      # provision needs the same resolution here.
+      if [ "$_ec2_resumed" = "false" ] || [ -z "${LEERIE_EC2_SSH_TARGET:-}" ]; then
+        _ec2_ssh_target=""
+        if _ec2_ssh_target="$(_resolve_ssh_target_from_instance "$LEERIE_EC2_INSTANCE_ID")"; then
+          LEERIE_EC2_SSH_TARGET="$_ec2_ssh_target"
+          export LEERIE_EC2_SSH_TARGET
+        else
+          remote_log "error: could not resolve a public IP for instance $LEERIE_EC2_INSTANCE_ID"
+          container_rc=1
+        fi
+      fi
+    fi
+
+    if [ "$_ec2_provisioned" = "true" ] && [ "$container_rc" = "0" ]; then
+      # Promote the PID-keyed attach pointer to a run-keyed one, mirroring
+      # the Fly branch. provision_instance already writes ec2-instance.json
+      # directly, so this copy is normally a no-op fallback.
+      _ec2_pid_record="$LEERIE_STATE_HOST_DIR/remote/$$.json"
+      mkdir -p "$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID" 2>/dev/null || true
+      _ec2_run_record="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/ec2-instance.json"
+      if [ -f "$_ec2_pid_record" ] && [ ! -f "$_ec2_run_record" ]; then
+        cp "$_ec2_pid_record" "$_ec2_run_record" 2>/dev/null || true
+      fi
+      _ec2_task_record="$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt"
+      if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$_ec2_task_record" ]; then
+        printf '%s' "$LEERIE_TASK_ARG" > "$_ec2_task_record" 2>/dev/null || true
+      fi
+
+      # --- Early flock probe (resume-only optimization) -------------------
+      # Same rationale as the Fly branch: on a resumed instance, probe
+      # whether the orchestrator is still alive BEFORE spending time on
+      # seed_auth + seed_repo. If the run directory's flock is held
+      # (rc=75), skip seeding entirely and attach to the live log stream.
+      _ec2_skip_seed_launch=false
+      if [ "$_ec2_resumed" = "true" ]; then
+        _ec2_early_probe_script="$(cat <<'EARLY_PROBE_PY'
+import fcntl, os, sys
+run_dir = "/work/.leerie/runs/" + sys.argv[1]
+try:
+    fd = os.open(run_dir, os.O_RDONLY)
+except OSError:
+    sys.exit(0)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+except BlockingIOError:
+    sys.exit(75)
+finally:
+    os.close(fd)
+EARLY_PROBE_PY
+)"
+        _ec2_early_probe_rc=0
+        printf '%s' "$_ec2_early_probe_script" \
+          | ec2_remote_exec "$LEERIE_EC2_INSTANCE_ID" "python3 - '$LEERIE_RUN_ID'" \
+              >/dev/null \
+          || _ec2_early_probe_rc=$?
+        if [ "$_ec2_early_probe_rc" = "75" ]; then
+          remote_log "--resume: early probe detected live orchestrator — skipping seed"
+          _attach_to_live_orchestrator_ec2
+          _ec2_skip_seed_launch=true
+        fi
+      fi
+
+      if [ "$_ec2_skip_seed_launch" = "false" ]; then
+        export USER_REPO
+        _ec2_seed_ok=true
+        if ! ec2_seed_auth; then
+          remote_log "error: ec2_seed_auth failed — aborting remote run"
+          container_rc=1
+          _ec2_seed_ok=false
+        elif ! ec2_seed_repo; then
+          remote_log "error: repo seeding failed for instance $LEERIE_EC2_INSTANCE_ID"
+          container_rc=1
+          _ec2_seed_ok=false
+        fi
+
+        if [ "$_ec2_seed_ok" = "true" ]; then
+          remote_log "remote: instance $LEERIE_EC2_INSTANCE_ID seeded — starting orchestrator (detached)"
+
+          _ec2_launch_argv_json="$(python3 -c '
+import json, sys
+print(json.dumps(sys.argv[1:]))
+' "$LEERIE_RUN_ID" "${REWRITTEN_ARGS[@]}")"
+          _ec2_host_tz="$(readlink /etc/localtime 2>/dev/null | sed 's|.*/zoneinfo/||')"
+          _ec2_launch_script="$(cat <<PY
+import fcntl, os, pwd, subprocess, sys, time
+argv = ${_ec2_launch_argv_json}
+run_id = argv[0]
+orch_args = argv[1:]
+run_dir = "/work/.leerie/runs/" + run_id
+os.makedirs(run_dir, exist_ok=True)
+leerie_pw = pwd.getpwnam("leerie")
+for d in ("/work/.leerie", "/work/.leerie/runs", run_dir):
+    try:
+        os.chown(d, leerie_pw.pw_uid, leerie_pw.pw_gid)
+    except OSError:
+        pass
+# Refuse to spawn a second orchestrator on the same run dir — same
+# fast-path probe as the Fly launch wrapper (leerie:5852-5863);
+# State.__init__'s own flock is the real enforcement.
+_probe_fd = os.open(run_dir, os.O_RDONLY)
+try:
+    try:
+        fcntl.flock(_probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(_probe_fd, fcntl.LOCK_UN)
+    except BlockingIOError:
+        sys.stderr.write("orchestrator already running for run " + run_id + "\\n")
+        sys.stderr.write("Tail the existing run instead of spawning a duplicate:\\n")
+        sys.stderr.write("  leerie --resume " + run_id + " --runtime ec2\\n")
+        sys.exit(75)
+finally:
+    os.close(_probe_fd)
+log_path = run_dir + "/orchestrator.log"
+pid_path = run_dir + "/orchestrator.pid"
+child_env = dict(os.environ)
+child_env["HOME"] = "/home/leerie"
+child_env["USER"] = "leerie"
+child_env["LOGNAME"] = "leerie"
+child_env["USER_REPO"] = "$(basename "$USER_REPO")"
+child_env["TZ"] = "${_ec2_host_tz}"
+extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
+if extra_path not in child_env.get("PATH", ""):
+    child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
+with open(log_path, "ab") as log_f:
+    p = subprocess.Popen(
+        ["python3", "/opt/leerie-image/orchestrator/leerie.py", "--no-push", *orch_args],
+        stdin=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=log_f,
+        start_new_session=True,
+        cwd="/work",
+        user="leerie",
+        group=leerie_pw.pw_gid,
+        env=child_env,
+    )
+for _ in range(10):
+    if p.poll() is not None:
+        break
+    time.sleep(0.2)
+if p.poll() == 75:
+    sys.exit(75)
+with open(pid_path, "w") as pid_f:
+    pid_f.write(str(p.pid) + "\n")
+PY
+)"
+          _ec2_launch_rc=0
+          printf '%s' "$_ec2_launch_script" | ec2_launch_detached || _ec2_launch_rc=$?
+          if [ "$_ec2_launch_rc" = "75" ]; then
+            # Smart-resume pivot (DESIGN §6 "Smart resume in remote mode",
+            # same rc=75 semantics as Fly): an orchestrator is already
+            # running for this run_id on the instance. container_rc=130
+            # (not 1, not 75) so decide_ec2_teardown's detach arm leaves
+            # the live instance alone rather than pausing or terminating
+            # it — see the Fly branch's identical comment a few hundred
+            # lines up for the full rc-routing rationale.
+            _attach_to_live_orchestrator_ec2
+          elif [ "$_ec2_launch_rc" != "0" ]; then
+            remote_log "error: failed to start detached orchestrator on instance $LEERIE_EC2_INSTANCE_ID (rc=$_ec2_launch_rc)"
+            container_rc=1
+          else
+            remote_log "remote: tailing orchestrator log (Ctrl-C to detach — orchestrator keeps running)"
+            _ec2_tail_script="$(render_tail_wrapper)"
+            _ec2_tail_invocation="LEERIE_TAIL_RUN_ID='$LEERIE_RUN_ID'; export LEERIE_TAIL_RUN_ID
+$_ec2_tail_script"
+            _ec2_orch_rc=0
+            printf '%s' "$_ec2_tail_invocation" | ec2_attach || _ec2_orch_rc=$?
+            # On a clean tail exit we cannot read the orchestrator's true
+            # exit code — it ran detached. `leerie --finalize` (not this
+            # launcher) does the fetch, same as the Fly branch.
+            container_rc=$_ec2_orch_rc
+          fi
+        fi
+      fi
+    else
+      if [ -z "${container_rc:-}" ] || [ "$container_rc" = "0" ]; then
+        container_rc=1
+      fi
+      remote_log "remote: no EC2 instance is running (resume/provision did not succeed) — aborting"
+    fi
+    # The EXIT trap registered in ec2-provision.sh (decide_ec2_teardown)
+    # reads LEERIE_REMOTE_EXIT_RC to classify the orchestrator's exit code.
+    # Same disposition table as the Fly branch (DESIGN §6 Remote
+    # pause-on-failure; "the exit-code classification table is
+    # runtime-agnostic by construction").
+    export LEERIE_REMOTE_EXIT_RC="$container_rc"
+  fi
 else
   # --- local container execution path ----------------------------------
   # --rm: container is removed on exit. Worktrees persist on the host via
