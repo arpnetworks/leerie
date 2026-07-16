@@ -17490,8 +17490,25 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         return None
 
     while True:
-        res = await run_implementer(sid, leerie_dir, caps, st, models, efforts,
-                                    continuation=continuation, note=note)
+        try:
+            res = await run_implementer(sid, leerie_dir, caps, st, models,
+                                        efforts, continuation=continuation,
+                                        note=note)
+        except WorkerError as e:
+            # Per-subtask infrastructure failure (e.g. `new-worktree.sh`
+            # could not create the worktree). `run_implementer`'s own
+            # `except WorkerError` guard wraps only `claude_p`, so a
+            # `run_script` failure escapes it. Left uncaught here it reaches
+            # `gather_or_cancel`, which cancels the wave and kills the whole
+            # run — discarding every sibling's committed work and skipping
+            # finalize. That contradicts DESIGN §3 *Partial-wave
+            # integration*, where the wave collects `failed`/`blocked` and
+            # integrates the successes first. Route it through the same
+            # per-subtask channel every other failure uses.
+            fail_res = await fail("broken", str(e))
+            if fail_res is not None:
+                return fail_res
+            continue
 
         # cross-field invariant check — catches a worker that lied about
         # status. A self-contradictory result means the worker is malfunctioning
@@ -17590,6 +17607,15 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 note = _format_check_feedback(
                     impl_issues, confidence_retries - 1,
                     caps.get("implementer_confidence_retries", 2))
+                # Record the in-flight attempt before looping. The status
+                # write below is unreachable from here, so a subtask that
+                # commits real work and then loops on a mechanical check is
+                # invisible to state.json — `_run_phases` reads
+                # `subtask_status` to compute a resume's `remaining` list, so
+                # a run that dies mid-continuation resumes as if this subtask
+                # never ran, while its branch still carries the commits.
+                st.data.setdefault("subtask_status", {})[sid] = "in_progress"
+                st.save()
                 continue
 
         st.data.setdefault("subtask_status", {})[sid] = status
