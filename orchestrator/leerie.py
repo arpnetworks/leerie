@@ -1842,10 +1842,30 @@ def _signal_pids(pids: set[int], sig: int) -> None:
             pass
 
 
-def _reparented_orphans(seen: set[int]) -> list[int]:
+# Mid-run reaping thresholds (DESIGN §6 *Mid-run PID reaping*).
+# High-water: arm reaping when pids.current/pids.max reaches this ratio.
+# Low-water: stop killing once pressure drops below this ratio (hysteresis).
+# Min-age: only orphans older than this many seconds are eligible — protects
+# recently-launched background tasks the worker may still be waiting on.
+# Critical-water / critical-age: above this pressure the min-age floor drops
+# (DESIGN §6 *Why a single 60 s floor is not enough — the critical tier*).
+# Measured: leerie's own full suite peaks at 33 concurrent PIDs, so a worker
+# at 90% of a 1024 cap is leaking, not testing — and the young orphans in
+# that state are leaked too. Held as a constant distinct from
+# _PID_REAP_HIGH_WATER despite the equal value: "when do we arm" and "when
+# do we stop trusting youth" are different questions.
+_PID_REAP_HIGH_WATER = 0.90
+_PID_REAP_LOW_WATER = 0.75
+_PID_REAP_MIN_AGE_SEC = 60
+_PID_REAP_CRITICAL_WATER = 0.90
+_PID_REAP_CRITICAL_AGE_SEC = 5
+
+
+def _reparented_orphans(seen: set[int],
+                        min_age: int | None = None) -> list[int]:
     """Return PIDs from `seen` that are currently alive, reparented to
-    init (ppid==1), and older than _PID_REAP_MIN_AGE_SEC seconds —
-    sorted oldest-first (longest-running first, safest to kill first).
+    init (ppid==1), and older than `min_age` seconds — sorted oldest-first
+    (longest-running first, safest to kill first).
 
     These are the leaked background subprocesses that have finished their
     immediate work and been orphaned; unlike a recently-launched background
@@ -1854,8 +1874,28 @@ def _reparented_orphans(seen: set[int]) -> list[int]:
     where `etimes` is a bare elapsed-seconds integer (POSIX extension,
     verified present in the container image).
 
+    `min_age=None` resolves to the normal-tier floor. It is a sentinel
+    rather than a literal `min_age: int = _PID_REAP_MIN_AGE_SEC` default
+    because a default expression binds once at *def* time: patching the
+    constant would then leave the default pinned at its import-time value,
+    so a future test that monkeypatches the floor and calls this bare would
+    silently exercise 60 s and pass for the wrong reason. Reading the global
+    here keeps the two in sync.
+
+    `_poll_loop` lowers it to `_PID_REAP_CRITICAL_AGE_SEC` once pressure
+    reaches `_PID_REAP_CRITICAL_WATER`, because a burst of leaked orphans
+    saturates the cap faster than the 60 s floor lets any of them become
+    eligible — the reaper would otherwise arm and find nothing to kill
+    (DESIGN §6 *Why a single 60 s floor is not enough — the critical tier*).
+
     Returns an empty list on any `ps` failure — same empty-set fallback
-    as `_enumerate_descendants`."""
+    as `_enumerate_descendants`. `check=True` is load-bearing for *how*
+    that happens: without it a failing `ps` returns nonzero with unusable
+    stdout that parses to the same `[]`, indistinguishable from "no orphans
+    to reap"; with it the failure raises into the `except` below and takes
+    the documented path."""
+    if min_age is None:
+        min_age = _PID_REAP_MIN_AGE_SEC
     try:
         out = subprocess.run(
             ["ps", "-eo", "pid,ppid,etimes"],
@@ -1876,7 +1916,7 @@ def _reparented_orphans(seen: set[int]) -> list[int]:
         # init, but after `_become_subreaper` it reparents to the orchestrator
         # itself — accept both so the mid-run reaper still recognizes orphans.
         if (pid in seen and ppid in (1, os.getpid())
-                and etimes >= _PID_REAP_MIN_AGE_SEC):
+                and etimes >= min_age):
             candidates.append((etimes, pid))
     # Oldest-first: killing the longest-running orphans first frees the most
     # slots while touching the fewest recently-launched background processes.
@@ -1885,15 +1925,6 @@ def _reparented_orphans(seen: set[int]) -> list[int]:
 
 
 _DESCENDANT_POLL_SEC = 0.5
-
-# Mid-run reaping thresholds (DESIGN §6 *Mid-run PID reaping*).
-# High-water: arm reaping when pids.current/pids.max reaches this ratio.
-# Low-water: stop killing once pressure drops below this ratio (hysteresis).
-# Min-age: only orphans older than this many seconds are eligible — protects
-# recently-launched background tasks the worker may still be waiting on.
-_PID_REAP_HIGH_WATER = 0.90
-_PID_REAP_LOW_WATER = 0.75
-_PID_REAP_MIN_AGE_SEC = 60
 
 # `_invoke`'s PID-exhaustion detector probes the cgroup once the last
 # _PID_EXHAUSTION_WINDOW tool-results hold ≥_PID_EXHAUSTION_ERROR_THRESHOLD
@@ -1977,7 +2008,18 @@ class _DescendantTracker:
                         if mx > 0 and cur / mx >= _PID_REAP_HIGH_WATER:
                             # Armed: pressure is high — reap oldest reparented
                             # orphans first, stopping once pressure drops.
-                            candidates = _reparented_orphans(self._seen)
+                            # At critical pressure the age floor drops: a leak
+                            # burst saturates the cap in seconds, so every
+                            # orphan in it is younger than the normal 60 s
+                            # floor and the candidate list would be empty
+                            # exactly when it matters most (DESIGN §6 *the
+                            # critical tier*).
+                            min_age = (
+                                _PID_REAP_CRITICAL_AGE_SEC
+                                if cur / mx >= _PID_REAP_CRITICAL_WATER
+                                else _PID_REAP_MIN_AGE_SEC)
+                            candidates = _reparented_orphans(
+                                self._seen, min_age)
                             killed: set[int] = set()
                             for pid in candidates:
                                 recheck = _cgroup_stat(self._cgroup_sid)
@@ -4246,7 +4288,9 @@ def resolve_heal_success_threshold(repo_root: Path,
 
 
 async def run_proc(cmd: list[str], *, cwd: str | None = None,
-                   timeout: float | None = None) -> subprocess.CompletedProcess:
+                   timeout: float | None = None,
+                   env: dict[str, str] | None = None,
+                   ) -> subprocess.CompletedProcess:
     """Async equivalent of `subprocess.run(cmd, capture_output=True, text=True)`.
     On timeout, kills the process and raises `subprocess.TimeoutExpired` — same
     semantics callers already handle. One helper everywhere keeps the asyncio
@@ -4256,10 +4300,16 @@ async def run_proc(cmd: list[str], *, cwd: str | None = None,
     session/process group, distinct from leerie's own. This is what lets
     `_terminate_proc_tree` send `os.killpg(proc.pid, ...)` on the
     cleanup path without accidentally signaling the orchestrator's own
-    group. The flag is a no-op on Windows."""
+    group. The flag is a no-op on Windows.
+
+    `env` defaults to None, which inherits the orchestrator's environment
+    (asyncio's own default) — so every existing call site is unchanged.
+    Callers pass it to scope a variable to one command, e.g.
+    `rescue_integrator_work`'s throwaway `GIT_INDEX_FILE`."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         cwd=cwd,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         start_new_session=True,
@@ -15257,12 +15307,13 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
             "artifact with structurally incompatible APIs (DESIGN §5 "
             "*Cross-domain surface overlap*). Auto-merging would produce "
             "a frankenstein implementer spec the judge correctly "
-            "refused. To unblock:\n"
-            "  • Refine the task description to disambiguate the "
-            "disputed surface (name which API survives, or split it into "
-            "two distinct artifacts), and re-run.\n"
-            "  • Or manually delete one of the colliding subtask specs "
-            "in <state-root>/runs/<run-id>/subtasks/ and `--resume`."
+            "refused. To unblock, refine the task description and re-run "
+            "(this run cannot be resumed — see below):\n"
+            "  • Disambiguate the disputed surface: name which API "
+            "survives, or split it into two distinct artifacts.\n"
+            "  • Or narrow the task so a single planner owns the "
+            "surface. Each category the classifier selects spawns its "
+            "own planner, and only multi-planner runs can collide here."
         )
 
     # Apply merges and drops in input order via the pure helper.
@@ -16512,7 +16563,28 @@ async def _run_checked_loop(
     for rnd in range(max_rounds):
         try:
             last_res = await invoke()
+        except WorkerError as exc:
+            # Infrastructure failure (PID exhaustion, OOM, a killed session),
+            # not a judgment about the work — so spend a round on a fresh
+            # `claude -p` session rather than abandoning the loop. This is the
+            # case the docstring above calls out: "the re-invocation alone, as
+            # a fresh claude -p session, is the value". A PID-exhausted worker
+            # in particular dies with a saturated cgroup that the next
+            # invocation does not inherit.
+            #
+            # Bounded by `max_rounds` (judgment_check_rounds = 3), and each
+            # attempt is already billed via the caller's `st.bump_workers`.
+            # Falling through to `continue` (rather than `break`) is what
+            # makes `_read_stream`'s own PID-cap message honest — it promises
+            # "a fresh worker retries with a clean PID table", which was true
+            # for implementers and false here.
+            warnings.append(f"{name} round {rnd}: worker crashed: {exc}")
+            last_res = None
+            continue
         except Exception as exc:
+            # Anything else is a bug in leerie itself, not a flaky worker:
+            # retrying re-runs the same defect and burns the budget. Keep the
+            # original abandon-the-loop behavior.
             warnings.append(f"{name} round {rnd}: worker crashed: {exc}")
             break
 
@@ -17761,6 +17833,79 @@ async def settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         return res
 
 
+async def rescue_integrator_work(staging: Path, sid: str,
+                                 run_id: str) -> str | None:
+    """Capture a crashed integrator's in-progress resolution before the merge
+    is aborted. Returns the rescue ref name, or None if there was nothing to
+    save (or the capture failed).
+
+    `git merge --abort` discards the working tree unconditionally — verified:
+    a resolved-but-uncommitted file reverts to its pre-merge content, leaving
+    no stash and no reachable object. That work is the most expensive artifact
+    in the run to recreate (it encodes the integrator's reading of every
+    side's intent), so it is captured to a ref before the abort.
+
+    Deliberately NOT gated on `check_merge_committed`: a crashed integrator
+    typically dies mid-resolution with no merge commit at all, which is
+    precisely the case worth rescuing (DESIGN §12).
+
+    Mechanism: a throwaway index (`GIT_INDEX_FILE`) seeded from HEAD, then
+    `git add -A` + `write-tree` + `commit-tree`. Both `git stash push` AND
+    `git stash create` refuse a conflicted tree ("Cannot save the current
+    index state") because the real index still holds unmerged entries — the
+    exact state an integrator crash leaves behind. Staging into a *separate*
+    index sidesteps that: the resolved working-tree content is captured, the
+    real index and working tree are never touched, and untracked files the
+    integrator created come along.
+
+    Best-effort by contract: a rescue failure must never mask the underlying
+    crash, so every git failure degrades to None."""
+    rescue_index = staging / ".git" / f"leerie-rescue-index-{sid}"
+    env = {**os.environ, "GIT_INDEX_FILE": str(rescue_index)}
+    try:
+        seed = await run_proc(["git", "read-tree", "HEAD"],
+                              cwd=str(staging), env=env)
+        if seed.returncode != 0:
+            return None
+        staged = await run_proc(["git", "add", "-A"],
+                                cwd=str(staging), env=env)
+        if staged.returncode != 0:
+            return None
+        tree = await run_proc(["git", "write-tree"], cwd=str(staging), env=env)
+        if tree.returncode != 0 or not tree.stdout.strip():
+            return None
+        tree_sha = tree.stdout.strip()
+        # Nothing to rescue if the captured tree is identical to HEAD's: the
+        # integrator crashed before changing anything. Returning a ref here
+        # would be a lie the caller repeats to the operator ("resolution
+        # rescued to ...") while pointing at an empty diff.
+        head_tree = await run_proc(["git", "rev-parse", "HEAD^{tree}"],
+                                   cwd=str(staging))
+        if (head_tree.returncode == 0
+                and head_tree.stdout.strip() == tree_sha):
+            return None
+        commit = await run_proc(
+            ["git", "commit-tree", tree_sha, "-p", "HEAD",
+             "-m", f"leerie: rescued {sid} integrator resolution"],
+            cwd=str(staging), env=env)
+        if commit.returncode != 0 or not commit.stdout.strip():
+            return None
+        ref = f"refs/leerie/rescue/{run_id}/{sid}"
+        # update-ref deliberately runs WITHOUT the throwaway index env: refs
+        # live in the repo, not the index, and the temp file is about to go.
+        stored = await run_proc(
+            ["git", "update-ref", ref, commit.stdout.strip(),
+             "-m", f"leerie: rescued {sid} integrator resolution"],
+            cwd=str(staging))
+        if stored.returncode != 0:
+            return None
+        return ref
+    except Exception:
+        return None
+    finally:
+        rescue_index.unlink(missing_ok=True)
+
+
 async def integrate_wave(wave: list[str], results: dict[str, dict],
                          leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
@@ -17769,10 +17914,23 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     cherry-pick); resolve conflicts with an integrator worker. Returns the
     list of integrated ids.
 
-    If an integrator cannot resolve a conflict (status other than 'resolved'),
-    the in-progress merge is aborted so the staging worktree is left clean, and
-    the run is terminated with the integrator's diagnosis — an unresolved
-    conflict must not silently proceed onto a corrupt staging tree."""
+    An integrator that does not produce a resolved merge ends the run either
+    way — an unresolved conflict must not silently proceed onto a corrupt
+    staging tree — but *how* depends on whether it reached a verdict or died
+    (DESIGN §12; a verdict is a fact about the work, a crash is a fact about
+    the machine):
+
+    - **Verdict** (`design-conflict` / `failed`): the integrator judged the
+      merge unfit. The in-progress merge is aborted, leaving the staging
+      worktree clean, and the run terminates with its diagnosis. Its partial
+      work is deliberately discarded — it said so itself.
+    - **Crash** (every round raised, so there is no status and no diagnosis):
+      infrastructure, not judgment. `rescue_integrator_work` captures the
+      in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>` *before*
+      the abort — `git merge --abort` destroys it otherwise, and it is the
+      most expensive artifact in the run to recreate. `blocked[sid]` is
+      recorded and the die message names the ref and its recovery command;
+      `--resume` retries the integration."""
     integrated, integrated_so_far = [], []
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     for sid in wave:
@@ -17835,8 +17993,36 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             make_feedback_prompt=_on_integrator_fb,
         )
         if ires is None:
+            # The integrator crashed every round (infrastructure: PID
+            # exhaustion, OOM, a killed session) — NOT a verdict about the
+            # work. Its in-progress resolution is the most expensive artifact
+            # in the run to recreate, and `git merge --abort` destroys it
+            # unconditionally, so capture it first (DESIGN §12 *salvage if
+            # there is something to salvage*). Not gated on a merge commit:
+            # a crashed integrator typically dies mid-resolution having
+            # committed nothing, which is exactly the case worth rescuing.
+            for w in int_warnings:
+                log(f"  integrator-{sid}: {w}")
+            rescue_ref = await rescue_integrator_work(staging, sid, st.run_id)
             await run_proc(["git", "merge", "--abort"], cwd=str(staging))
-            die(f"integrator for {sid} crashed; merge aborted")
+            # Record the block before dying (local convention — see the
+            # neighboring die() site above, which this path used to skip).
+            st.data.setdefault("blocked", {})[sid] = (
+                f"integrator crashed; resolution rescued to {rescue_ref}"
+                if rescue_ref
+                else "integrator crashed before resolving anything")
+            st.save()
+            hint = (
+                f"\nIts in-progress resolution was rescued to "
+                f"{rescue_ref} — inspect with:\n"
+                f"  git -C {staging} show {rescue_ref}\n"
+                f"and apply with:\n"
+                f"  git -C {staging} cherry-pick --no-commit {rescue_ref}"
+                if rescue_ref else
+                "\nIt crashed before resolving anything; there was "
+                "nothing to rescue.")
+            die(f"integrator for {sid} crashed; merge aborted.{hint}\n"
+                f"Re-run with --resume to retry the integration.")
         for w in int_warnings:
             log(f"  integrator-{sid}: {w}")
         if ires.get("status") == "resolved":
