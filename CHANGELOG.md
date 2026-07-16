@@ -5,6 +5,93 @@ All notable changes to Leerie will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **A worker that emits no result event no longer kills the run.**
+  `claude -p` intermittently exits 0 having streamed a full session but
+  never emitting its terminal `result` event (upstream
+  anthropics/claude-code #8126, #1920, #74761 — unresolved, no public
+  repro). `_invoke` raised a bare `WorkerError` there, which propagated
+  past `claude_p`'s corrective retry loop and `die()`d the run
+  non-resumably — discarding a worker's already-completed reasoning
+  because of a transient upstream fault. It now returns a synthetic error
+  envelope, routing into the existing 2-attempt loop for one fresh
+  session; two failures still raise, so the worst case is unchanged. This
+  is deliberately the **last** arm of the no-envelope block: every arm
+  above it (out-of-credits, OOM, nonzero exit code) is a named
+  non-retryable condition and still raises — the nonzero-rc arm in
+  particular covers leerie's own deliberate SIGTERM/SIGKILLs, which must
+  never be retried. The conformer already survived this failure class by
+  degrading to advisory; judgment workers now get the same treatment.
+- **The EC2 runtime's shell surface now runs on macOS.** `ec2-lib.sh` /
+  `ec2-provision.sh` used two bash-4-only constructs, so every EC2 code
+  path failed immediately on a macOS host (`/bin/bash` is 3.2 — Apple has
+  not shipped a newer one since the GPLv3 relicense). CI is
+  `ubuntu-latest` (bash 5.x) and structurally could not catch either:
+  (a) `"${arr[@]}"` on a possibly-empty array is an `unbound variable`
+  error under `set -u` on bash 3.2 — 6 sites now use the repo's existing
+  `${arr[@]+"${arr[@]}"}` idiom (the same one the launcher's nerdctl argv
+  assembly documents); (b) `_aws_region_profile_args()` used a `local -n`
+  nameref (bash 4.3+, `local: -n: invalid option` on 3.2) — it now emits
+  its tokens one per line, which also keeps profile names containing
+  spaces intact. Both arrays are empty exactly when no AWS region/profile
+  is configured, i.e. the default path. Pinned by
+  `tests/test_ec2_bash32_portability.py`, which runs the real scripts
+  under a real bash 3.2 and skips on hosts that only have bash ≥ 4.3.
+- **Worker stderr can no longer trip the auth/quota backoff.** The
+  no-result envelope above interpolates the worker's raw stderr into
+  `result`, and `_is_auth_or_quota_failure` text-matches that field for
+  `Invalid authentication` / `rate limit` / `rate-limit`. A worker whose
+  stderr merely *mentions* auth or rate limiting — without the request
+  ever having been auth-rejected — would divert its retry into the
+  backoff loop and burn the entire `auth_retry_max_sec` budget on a
+  non-auth failure. Envelopes carrying `_leerie_synthetic` are now exempt
+  from the text markers; the numeric `api_error_status` check still runs
+  first and still wins, so a genuine 401/429/529 backs off as before. The
+  markers exist to sniff a *gateway* message out of an envelope of unknown
+  provenance — leerie knows what its own envelopes mean.
+- **Judgment phases no longer destroy the diagnostic that explains why
+  they died.** All four (`classifier`, `provision`, `reconciler`,
+  `plan_overlap_judge`) logged their `_run_checked_loop` warnings — which
+  carry the underlying exception text — *after* `die()`. `die()` calls
+  `sys.exit()`, so those loops were unreachable: the cause was computed
+  and thrown away, leaving only a generic "crashed and produced no
+  result" and no way to tell an OOM from a nonzero exit from a missing
+  result event. The warnings are now logged first.
+- **`./leerie --resume` (no run-id) no longer fails with a run-id the user
+  never typed.** The run_id *is* the local container id, and
+  `container-entry.sh` injected it unconditionally — including on a resume
+  container, which is a *new* container whose id matches no run on disk.
+  `resolve_run_id` fails closed on an unknown explicit id, so bare
+  `--resume` died with "run-id '<fresh-container-id>' does not match any
+  known run". (An explicit `--resume <id>` survived only because the
+  launcher rewrites it to `--run-id <id>` and argparse takes the last
+  occurrence.) The injection is now skipped whenever `--resume` is present.
+
+### Changed
+
+- **Bare `--resume` auto-picks the most recent resumable run** instead of
+  requiring an explicit run-id as soon as a second run exists (DESIGN §6).
+  Candidates are runs whose derived status is `in-progress`, `paused`, or
+  `incomplete`; finished runs have nothing to resume, and
+  `seed-failed`/`sync-failed` need an operator decision first, so both are
+  listed rather than chosen. Recency reads `started_at`, falling back to
+  the state file's mtime when absent — a run with no timestamp must never
+  outrank a real one. An explicit run-id still wins and an unknown one
+  still fails closed. The read-only verbs that share the same selection
+  logic (`--report`, `--phase`) opt out of the resumable filter, since
+  reporting on a finished run is the ordinary case.
+
+  **Behavior change with a UX cost:** bare `--resume` previously
+  auto-picked a *lone* `seed-failed` orphan; it now dies and asks for the
+  explicit id. A seed-failed run aborted before `phase_classify` and needs
+  an operator decision (re-seed vs. kill) — resuming blind can re-trigger
+  the same seed failure. The error names the run, its status, and the
+  explicit-id escape hatch, which remains the documented recovery path
+  (`./leerie --resume <seed-failed-id>` is unchanged).
+
 ## [0.9.65]
 
 ### Fixed
