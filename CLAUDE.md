@@ -155,9 +155,6 @@ scripts/*.sh                Git worktree mechanics (setup, integrate, finalize, 
 commands/leerie.md        Thin plugin skill — launches the orchestrator
 docs/DESIGN.md              Architecture and reasoning
 docs/IMPLEMENTATION.md      Current code surface
-docs/ANALYSIS.md            Derived compiler-frontend analysis (non-canonical; regenerate
-                            via `python3 docs/tools/leerie_extract.py orchestrator/leerie.py`)
-docs/tools/                 Standalone extraction tools (stdlib only)
 chain/                      Laptop-side chain helpers (see DESIGN.md §19). A chain is
                             N parallel `leerie --runtime fly` invocations per wave,
                             sequenced by the launcher's `--chain` arm. `chain/git_ops.py`
@@ -220,10 +217,12 @@ export LEERIE_SOURCE_OF_TRUTH=codebase   # or: research, both
 
 # Select the execution runtime (default: local). `fly` routes each worker
 # through Fly.io machines instead of local nerdctl containers; `ec2`
-# accepts the enum value and resolves AWS credentials the same way the
-# AWS CLI/SDKs do (env vars > named profile > SSO cached token; see
-# scripts/remote/aws-credentials.sh) — EC2 machine provisioning itself
-# has not shipped yet.
+# resolves AWS credentials the same way the AWS CLI/SDKs do (env vars >
+# named profile > SSO cached token; see scripts/remote/aws-credentials.sh)
+# and runs `require_aws()` preflight, but instance provisioning itself
+# (the create/wait-ready/teardown dispatch) has not been wired into the
+# launcher yet — `--runtime ec2` dies with an actionable message right
+# after preflight passes.
 export LEERIE_RUNTIME=local              # or: fly, ec2
 export LEERIE_FLY_APP=my-leerie-app      # required for --runtime fly (globally unique)
 ./leerie "task" --runtime fly
@@ -232,10 +231,33 @@ export LEERIE_FLY_APP=my-leerie-app      # required for --runtime fly (globally 
 # ec2 runtime knobs (leerie-level knobs for which AWS region/profile
 # leerie itself uses when provisioning EC2 machines — distinct from the
 # AWS SDK's own AWS_REGION/AWS_PROFILE credential-chain env vars, which
-# resolve independently via the standard AWS precedence order):
+# resolve independently via the standard AWS precedence order). CLI flag,
+# env var, or leerie.toml — same CLI > env > file precedence as --runtime:
 export LEERIE_AWS_REGION=us-east-1       # or: leerie.toml aws_region = us-east-1
 export LEERIE_AWS_PROFILE=my-aws-profile # or: leerie.toml aws_profile = my-aws-profile
+./leerie "task" --runtime ec2 --aws-region us-east-1 --aws-profile my-aws-profile
+
+# ec2 instance-shape vars (the RunInstances params provision_instance()
+# needs — AWS account resources leerie cannot default on your behalf, so
+# there is no fallback tier: CLI > env > leerie.toml > die() with setup
+# instructions):
+export LEERIE_EC2_AMI=ami-0abcdef1234567890
+export LEERIE_EC2_INSTANCE_TYPE=t3.large
+export LEERIE_EC2_KEY_NAME=my-ec2-keypair
+export LEERIE_EC2_SECURITY_GROUP=sg-0123456789abcdef0
+export LEERIE_EC2_SUBNET_ID=subnet-0123456789abcdef0
 ./leerie "task" --runtime ec2
+# …or commit a leerie.toml at the repo root with:
+#   ec2_ami = ami-0abcdef1234567890
+#   ec2_instance_type = t3.large
+#   ec2_key_name = my-ec2-keypair
+#   ec2_security_group = sg-0123456789abcdef0
+#   ec2_subnet_id = subnet-0123456789abcdef0
+# …or pass them as CLI flags per run:
+./leerie "task" --runtime ec2 \
+  --ec2-ami ami-0abcdef1234567890 --ec2-instance-type t3.large \
+  --ec2-key-name my-ec2-keypair --ec2-security-group sg-0123456789abcdef0 \
+  --ec2-subnet-id subnet-0123456789abcdef0
 
 # Choose the model. Without overrides: judgment workers (classifier,
 # planner, reconciler, plan_overlap_judge, provision, integrator)
@@ -480,7 +502,18 @@ itself uses when provisioning `--runtime ec2` machines, distinct from the
 AWS SDK's own credential-chain env vars) are covered in
 `tests/test_resolve_aws_prefs.py`, mirroring `test_resolve_runtime.py`'s
 CLI/env/file precedence structure but for the unvalidated free-form-string
-`_resolve_str_pref` machinery (no enum, no `die()` path). The
+`_resolve_str_pref` machinery (no enum, no `die()` path). The launcher-side
+EC2 instance-shape vars (`LEERIE_EC2_AMI`/`_INSTANCE_TYPE`/`_KEY_NAME`/
+`_SECURITY_GROUP`/`_SUBNET_ID` — the five `RunInstances` params, distinct
+from the region/profile prefs above) are covered in
+`tests/test_resolve_ec2_vars.py`: the bash `_resolve_ec2_knob` CLI > env >
+`leerie.toml` > (no default) ladder reproduced and pinned against the real
+launcher source (`test_block_present_in_launcher`), per-var isolation,
+`=`-form CLI flags, the env-forwarding denylist guard (these vars must
+never leak into the container), and `ec2-lib.sh`'s `_resolve_ec2_var`
+required-var-read contract (prints on success, actionable
+"not set — required for --runtime ec2" error + rc 1 on an unresolved var,
+never a bare `${VAR:?}`). The
 remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
 `stop_machine`, `decide_teardown`, `resume_machine`, and `lib.sh`'s
 `update_run_json` — is tested via bash-harness subprocess tests with
@@ -1015,6 +1048,25 @@ a hook that asserts the instance is still `running` at the moment
 idempotency surviving a double-fire (INT then EXIT) in both directions
 (clean-exit-then-pause and pause-then-clean-exit) even when
 `LEERIE_REMOTE_EXIT_RC` is clobbered between the two calls.
+The EC2 stream-back counterpart to `fetch-branch.sh` —
+`scripts/remote/ec2-fetch-branch.sh`'s `fetch_state_ec2()` — is tested in
+`tests/test_ec2_fetch_branch.py`, modeled on `tests/test_fetch_branch_sh.py`
++ `tests/test_fetch_branch_leerie_streamback.py` and using
+`tests/test_ec2_seed_repo.py`'s stubbed-`aws`/stubbed-`ssh` transport
+harness (`aws` decodes and locally executes `ec2_remote_exec`'s
+base64-wrapped command; `ssh` streams the private download helper
+`_ec2_fetch_ssh`'s raw remote-command stdout straight back, since
+`ec2_tar_pipe` itself is upload-only): a branch committed on the
+instance round-trips to the host as a fetchable bundle whose tip matches
+the instance-side tip; the run-state tar extracts under
+`LEERIE_STATE_HOST_DIR` (or `USER_REPO/.leerie` by default) and the
+`no_push` mechanism flag is stripped only on the branch-present path
+(preserved as intent on the cleared-but-empty terminal-state path, same
+conditional as `fetch-branch.sh`); `.leerie/config.toml` and
+`.leerie/Dockerfile` stream back when the host has neither, are never
+clobbered when the host already has one, and are non-fatal when absent
+on the instance; and both `aws` and `ssh` appear in the transport log
+while `flyctl` never does.
 The launcher's `RUNTIME=ec2` dispatch branch itself — the seam none of
 the above can see, since they test `ec2-lib.sh`/`ec2-provision.sh`
 standalone rather than the `leerie` launcher's own dispatch — is
@@ -1143,6 +1195,65 @@ anywhere. Only the pattern half escapes. (Do not "fix" the resulting
 `SyntaxWarning` by making that f-string raw — the surrounding bash relies
 on Python collapsing `\\` to `\`, and `rf"""` silently breaks the stub.)
 
+The launcher's credential-resolution wiring within that same `RUNTIME=ec2`
+branch — sourcing `aws-credentials.sh`, calling `resolve_aws_credentials`,
+and `eval`ing its `export` lines before `require_aws` runs — is pinned in
+`tests/test_ec2_e2e_provision.py` (call-index ordering: an SSO-configured
+profile with explicit env-var credentials layered on top resolves via the
+env vars and `require_aws`'s `sts get-caller-identity` is the first `aws`
+CLI call observed, proving credential resolution ran first without
+invoking the `aws` binary itself; explicit env credentials winning over a
+fully-configured SSO profile; `LEERIE_AWS_PROFILE` selecting a named
+profile's static credentials over `[default]`; an expired SSO cached
+token aborting non-zero with `aws-credentials.sh`'s own
+`aws sso login --profile <p>` hint and zero `aws ec2 ...`/`sts
+get-caller-identity` calls) and in the dedicated
+`tests/test_ec2_launcher_credentials.py`, which closes the one part of
+the seam neither that file nor `tests/test_aws_credentials.py` (internal
+precedence, standalone) nor `tests/test_ec2_lib_sh.py` (`require_aws`'s
+own profile precedence, standalone) exercises: region. `require_aws`'s
+`sts get-caller-identity` call never passes a `--region` flag — the
+resolved region reaches it only through the `AWS_REGION` env var the
+dispatch block `eval`s from `resolve_aws_credentials`'s `export` lines —
+so this file's stub records the *effective `AWS_REGION` env value* seen
+at call time (not argv) to pin: `LEERIE_AWS_REGION` (leerie's own knob,
+CLAUDE.md-distinguished from the SDK's `AWS_REGION` credential-chain var)
+winning over an ambient `AWS_REGION`; the ambient `AWS_REGION` reaching
+`require_aws` unchanged when `LEERIE_AWS_REGION` is unset; and an
+unresolvable region (no `AWS_REGION`, no `AWS_DEFAULT_REGION`, no profile
+`region` key) aborting non-zero via `resolve_aws_credentials`'s own
+die-with-hint before `require_aws`'s probe ever runs, with zero `sts
+get-caller-identity` calls reaching the stub's log. It also adds a direct
+argv assertion for the profile seam (`--profile <resolved>` present when
+`LEERIE_AWS_PROFILE` is set, absent entirely when neither var is set) and
+a harness-sanity check that it imports and exercises the same
+verbatim-extracted dispatch block as `tests/test_ec2_e2e_provision.py`
+rather than a hand-copied reproduction.
+The EC2 resume path — `scripts/remote/ec2-resume-instance.sh`'s
+`resume_instance()`, the EC2 counterpart to `resume-machine.sh` — is
+tested in `tests/test_ec2_resume_instance.py` against the same
+resource-tracking `aws` stub: starting a `stopped` instance drives it
+to `running` via a single `start-instances` call; the readiness poll
+does not return early when a seeded `status_ok: False` keeps
+`describe-instance-status` reporting "initializing" (and does return
+promptly once `status_ok: True`); `LEERIE_EC2_SSH_TARGET` is
+re-resolved to the instance's current `PublicIpAddress` rather than
+any address cached from provision time (EC2 assigns a new public IP on
+every stop/start cycle absent an attached Elastic IP); a full
+provision → stop → resume round trip leaves exactly one `running`
+instance with no leaked volumes; resuming an already-`running`
+instance is an idempotent no-op that issues no `start-instances` call;
+resuming an unknown/terminated instance fails with the "no longer
+recoverable" hint and issues no `start-instances` call; the run.json
+sidecar's `paused_at`/`pause_reason` fields are cleared on success; and
+the one-way-ratchet invariant (never `terminate-instances` or
+`delete-volume`) holds both on the success path and the failure path
+(instance never becomes ready), backed by a source-level grep guard on
+the script file. `tests/ec2_stub.py` was extended to model a
+per-instance `public_ip` that's reassigned (via an `_ip_gen` counter)
+on every `start-instances` call, and an optional `status_ok` flag so
+`describe-instance-status` can report "initializing" instead of "ok"
+without an infinite/slow poll in tests.
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
@@ -1160,8 +1271,6 @@ Before marking a change complete:
 - [ ] Update `IMPLEMENTATION.md` if the change affected code surface
       described there.
 - [ ] Update `DESIGN.md` only if the architecture itself changed.
-- [ ] Regenerate `docs/ANALYSIS.md` if `orchestrator/leerie.py` changed
-      (`python3 docs/tools/leerie_extract.py orchestrator/leerie.py`).
 - [ ] `pytest tests/` — all pass.
 - [ ] `python3 -c "import ast; ast.parse(open('orchestrator/leerie.py').read())"`
       as a static check.

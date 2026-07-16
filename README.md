@@ -24,7 +24,7 @@ Leerie inverts the relationship. **The model writes code. The program runs every
 [![tests](https://github.com/enricai/leerie/actions/workflows/test.yml/badge.svg)](https://github.com/enricai/leerie/actions/workflows/test.yml)
 [![syntax](https://github.com/enricai/leerie/actions/workflows/syntax.yml/badge.svg)](https://github.com/enricai/leerie/actions/workflows/syntax.yml)
 [![shellcheck](https://github.com/enricai/leerie/actions/workflows/shellcheck.yml/badge.svg)](https://github.com/enricai/leerie/actions/workflows/shellcheck.yml)
-[![Version](https://img.shields.io/github/v/release/enricai/leerie?color=orange&label=version)](CHANGELOG.md)
+[![Version](https://img.shields.io/github/v/release/enricai/leerie?color=orange&label=version)](https://github.com/enricai/leerie/releases)
 
 ## How it works
 
@@ -514,10 +514,8 @@ wave execution, run-branch review, and merge; and for chain orchestration
 
 ## Documentation
 
-Every Leerie document is reachable from this README (the auto-generated
-`docs/ANALYSIS.md` is a derived build artifact, not a doc to read —
-regenerate it with the tool named in [`CLAUDE.md`](CLAUDE.md), don't
-navigate to it). Architecture and code surface:
+Every Leerie document is reachable from this README. Architecture and code
+surface:
 
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, constraints, phase
   flow, the evidence-gated loop, deterministic enforcement
@@ -534,7 +532,6 @@ Policy and process:
   repo-local guidance for Claude Code)
 - [`SECURITY.md`](SECURITY.md) — threat model and vulnerability reporting
 - [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) — Contributor Covenant
-- [`CHANGELOG.md`](CHANGELOG.md) — release notes
 
 Post-run analysis skills (invoked via Claude Code, not the orchestrator
 itself):
@@ -599,11 +596,13 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `scripts/remote/seed-repo.sh` | Single-channel git-aware repo seeding helper (sourced by the launcher after `provision_machine()` succeeds). Provides `seed_repo()`: wipe `/work` contents (preserving the inode), then tar-pipe a git-aware payload — `git ls-files -z --cached --others --exclude-standard` (honors `.gitignore`) + `.git/` verbatim + the repo's local `.claude/` verbatim (force-included) − `.leerie/` (defensively excluded; run state lives outside the repo at `$LEERIE_STATE_HOST_DIR`, not in-repo) — to `/work` on the machine. No in-machine `git clone`; the host has the repo, and Fly machines deliberately receive no GitHub credentials. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Repo seeding*. |
 | `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Wakes a paused machine, runs a safety check, and re-runs `seed_repo_dirty`. Invoked by `leerie --re-seed <run-id>` and the auto-re-seed step on `--resume --runtime fly`. |
 | `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie --finalize` fast-path). Provides `fetch_branch()`: discovers the completed run-id on the machine, probes whether the run branch actually exists (skipping the bundle for cleared-but-empty terminal-state runs), streams the `leerie/runs/<run-id>` git bundle to the host via `git fetch`, tars `.leerie/runs/<run-id>/` back, and strips the mechanism-flag `no_push` from the host-side run.json (the user's intent lives in `fly-machine.json` as `host_no_push`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Run branch stream-back*. |
-| `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolution helper for the EC2 runtime. Provides `resolve_aws_credentials()`: resolves credentials and region host-side in the same precedence order the AWS CLI/SDKs use — explicit `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, then a named profile (`--profile` / `AWS_PROFILE` / `default`) via static credentials or cached SSO token, ending with an actionable error rather than a silent fallthrough (no IMDS instance-role fallback — this runs on the operator's host, not on an EC2 instance). Pure file I/O against `~/.aws/config`, `~/.aws/credentials`, and `~/.aws/sso/cache/*.json` + bash/python3 stdlib — no `aws` binary or boto3 dependency, mirroring the existing `detect_bedrock_mode()`/`bedrock_preflight()` precedent in the launcher. |
+| `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolution helper for the EC2 runtime. Provides `resolve_aws_credentials()`: resolves credentials and region host-side in the same precedence order the AWS CLI/SDKs use — explicit `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, then a named profile (`--profile` / `AWS_PROFILE` / `default`) via static credentials or cached SSO token, ending with an actionable error rather than a silent fallthrough (no IMDS instance-role fallback — this runs on the operator's host, not on an EC2 instance). Pure file I/O against `~/.aws/config`, `~/.aws/credentials`, and `~/.aws/sso/cache/*.json` + bash/python3 stdlib — no `aws` binary or boto3 dependency, mirroring the existing `detect_bedrock_mode()`/`bedrock_preflight()` precedent in the launcher. Sourced by the launcher's `RUNTIME=ec2` branch, which calls `resolve_aws_credentials` and exports its resolved credentials/region before `ec2-lib.sh`'s `require_aws()` preflight runs. |
 | `scripts/remote/ec2-lib.sh` | Shared bash helpers for the EC2 lifecycle, parallel to `scripts/remote/lib.sh`'s role for the Fly path. Provides `require_aws()`: the host-side preflight the launcher's `RUNTIME=ec2` branch calls before provisioning, modeled on `require_flyctl()`'s two-stage shape (binary present? → authenticated?) — checks `command -v aws` (actionable install hint if missing, no auto-install) and probes `aws sts get-caller-identity` (with a resolved `--profile`), reusing `bedrock_preflight()`'s exact `aws sso login --profile <profile>` recovery-hint vocabulary on failure. Also provides `resolve_ami()`/`resolve_instance_type()`/`resolve_key_name()`/`resolve_security_group()`/`resolve_subnet_id()`, one required-var read per `LEERIE_EC2_*` var. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
 | `scripts/remote/ec2-seed-repo.sh` | EC2 counterpart to `scripts/remote/seed-repo.sh` (DESIGN.md §6 *EC2 runtime lifecycle*, "Seed" row). Same `.gitignore`-aware payload logic (bundle for committed state + porcelain-filtered dirty-delta rsync, `.leerie/` excluded except the three whitelisted config files, shallow-vs-full-bundle threshold) as the Fly path — only the transport differs: `ec2_tar_pipe` (plain `ssh`) for bulk bundle/tar data, `ec2_remote_exec` (SSM Session Manager) for small instance-side commands. Provides `ec2_seed_repo_clone()`, `ec2_seed_repo_dirty()`, and the wrapper `ec2_seed_repo()`. Consumes a new `LEERIE_EC2_SSH_TARGET` env var (the resolved `ssh`-destination for the instance, populated by `ec2-provision.sh`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
 | `scripts/remote/ec2-provision.sh` | The `provision.sh` counterpart for the EC2 lifecycle (DESIGN.md §6 *EC2 runtime lifecycle*). Exports `provision_instance()`, `wait_for_instance_ready()`, `stop_instance()`, `terminate_instance()`, `decide_ec2_teardown()`. Not yet sourced by the launcher (`RUNTIME=ec2` dispatch wiring is a separate subtask). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
-| `scripts/remote/ec2-ssm.sh` (spec — not yet implemented) | SSM Session Manager transport substitution for `flyctl ssh console` (DESIGN.md §6 *EC2 runtime lifecycle*). Planned exports: `ec2_launch_detached()`, `ec2_attach()`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
+| `scripts/remote/ec2-resume-instance.sh` | Resume helper for paused EC2 runs — the EC2 counterpart to `scripts/remote/resume-machine.sh`. Exports `resume_instance()`: starts a `stopped` instance (idempotent no-op if already `running`), waits on `wait_for_instance_ready()`, re-resolves `LEERIE_EC2_SSH_TARGET` from the instance's current public IP (EC2 assigns a new one on every stop/start cycle), re-arms the `decide_ec2_teardown` trap, and clears `paused_at`/`pause_reason` on the run sidecar. Never terminates the instance or deletes its volume on any path. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
+| `scripts/remote/ec2-fetch-branch.sh` | EC2 counterpart to `scripts/remote/fetch-branch.sh`, sourced by `ec2-provision.sh`'s `_try_fetch_state_for_ec2_teardown()` hook before `terminate_instance()`. Exports `fetch_state_ec2()`: same four steps as `fetch_branch()` (run discovery, git-bundle stream-back, run-state tar stream-back, best-effort never-clobbering `.leerie/config.toml`/`Dockerfile` stream-back) — transport substituted to `ec2_remote_exec` (SSM, small commands) plus a private binary-safe `ssh` download helper (`_ec2_fetch_ssh`) for bulk data, since `ec2_tar_pipe` is upload-only. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
+| `scripts/remote/ec2-ssm.sh` (spec — not yet implemented) | SSM Session Manager transport substitution for `flyctl ssh console`'s launch/attach roles (DESIGN.md §6 *EC2 runtime lifecycle*; the stream-back role is `ec2-fetch-branch.sh`, already shipped). Planned exports: `ec2_launch_detached()`, `ec2_attach()`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
 | `commands/leerie.md` | Thin plugin skill — reachable as `/leerie` from Claude Code; relays the `--clarify` Q-and-A flow |
 | `commands/chain.md` | Thin plugin skill — reachable as `/chain` from Claude Code; relays the multi-run chain verbs (submit/status/list/kill/stop/resume/finalize/attach) to `leerie --chain` and the ID-dispatched verbs (DESIGN §19) |
 | `skills/judge-llm-batch/SKILL.md` | Post-run skill — scores captured `claude -p` calls against a 3-dimensional accuracy rubric (schema, factual grounding, hallucination-freeness) |
@@ -614,7 +613,6 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `CONTRIBUTING.md` | Development setup, task-completion checklist, PR conventions |
 | `SECURITY.md` | Threat model, supported versions, vulnerability reporting policy |
 | `CODE_OF_CONDUCT.md` | Contributor Covenant Code of Conduct |
-| `CHANGELOG.md` | Release notes (Keep a Changelog format, SemVer) |
 | `docs/DESIGN.md` | Full design document and rationale (theory) |
 | `docs/IMPLEMENTATION.md` | Current code-surface spec — functions, caps, schemas (mechanism) |
 | `docs/INSTALL.md` | Per-OS container runtime setup and the Fly.io runtime prerequisites |
@@ -766,7 +764,7 @@ MIT — see [`LICENSE`](LICENSE).
 
 ## Status
 
-See [`CHANGELOG.md`](CHANGELOG.md) for the current release. The orchestrator's phase flow, wave scheduling, cross-domain dependency
+See [GitHub Releases](https://github.com/enricai/leerie/releases) for the current release. The orchestrator's phase flow, wave scheduling, cross-domain dependency
 resolution, and git worktree mechanics are all tested. First contact with a live
 `claude -p` session is the remaining verification step. Limitations and planned
 work are in [`docs/DESIGN.md`](docs/DESIGN.md).
