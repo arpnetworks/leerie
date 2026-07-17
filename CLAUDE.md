@@ -800,6 +800,22 @@ installed-but-incompatible language-pack version lacking `process()`) and
 host-independent and always run, since they are the load-bearing proof
 that the probe fails closed regardless of the local tree-sitter install
 state.
+Because the actual G6 warning previously named only two possible causes
+("unavailable or incompatible") with no way to tell which, or to see the
+real underlying error, `_parse_repo_file` now stashes a short diagnostic
+(`f"{type(e).__name__}: {e}"`) in the module-level `_last_parse_error` on
+an actual caught exception (not on a plain unsupported-extension miss),
+and `_warn_repo_map_empty_once()` appends it to the warning as
+`" Probe failure: <type>: <message>"` when present. `test_tree_sitter_probe.py`
+pins that the raising branch populates `_last_parse_error` with the exact
+exception text and that the empty-result branch (no exception at all)
+leaves it `None` — the distinction that keeps the parenthetical from
+appearing on the legitimately-quiet path. `test_repo_map_degrade_warning.py`
+adds the end-to-end pins: `test_warning_includes_probe_exception_detail`
+(a probe-only raise surfaces `"Probe failure:"` plus the exception type and
+message in the logged warning) and
+`test_no_probe_detail_when_empty_result_is_not_an_exception` (the existing
+plain empty-graph path grows no spurious detail).
 The gate *wiring* itself — as opposed to the probe's own runtime
 contract — is pinned in `tests/test_repo_map_gate_wiring.py` via
 source-coupling assertions (mirroring `test_dep_capture_wiring.py`):
