@@ -5621,11 +5621,18 @@ def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
     Uses ``tree_sitter_language_pack.process()`` for definitions (structure)
     and tree-sitter's CST for call-site references.  Returns ``([], [])``
     when the language is unsupported or an error occurs (graceful degrade —
-    the file is simply absent from the graph)."""
+    the file is simply absent from the graph). On an actual exception (not a
+    plain unsupported-extension miss), stashes a short diagnostic in the
+    module-level ``_last_parse_error`` (type + message) — not used to alter
+    this function's own silent-degrade contract, but read by
+    ``_tree_sitter_extraction_works()``'s caller so a broken/incompatible
+    parser leaves an actual cause behind instead of a bare guess."""
+    global _last_parse_error
     try:
         import tree_sitter_language_pack as tslp  # noqa: PLC0415
         from tree_sitter import Parser  # noqa: PLC0415
-    except ImportError:
+    except ImportError as e:
+        _last_parse_error = f"{type(e).__name__}: {e}"
         return [], []
     try:
         lang = tslp.detect_language(str(path))
@@ -5649,8 +5656,10 @@ def _parse_repo_file(path: Path) -> tuple[list[str], list[str]]:
         parser = Parser(py_lang)
         tree = parser.parse(source.encode())
         refs = _walk_calls(tree.root_node)
+        _last_parse_error = None
         return defs, refs
-    except Exception:  # graceful degrade; tree-sitter parse errors, IO, etc.
+    except Exception as e:  # graceful degrade; tree-sitter parse errors, IO, etc.
+        _last_parse_error = f"{type(e).__name__}: {e}"
         return [], []
 
 
@@ -5665,22 +5674,34 @@ _SOURCE_EXTS = frozenset({
 
 _repo_map_empty_warned = False
 
+# Diagnostic for the last exception _parse_repo_file swallowed (None if its
+# last call succeeded or hit a plain unsupported-extension miss). Read by
+# _warn_repo_map_empty_once() right after the probe call below, so it always
+# reflects that call — never a stale error from an earlier real-file parse
+# during build_repo_map's walk (see the reset at the top of
+# _tree_sitter_extraction_works()).
+_last_parse_error: str | None = None
+
 
 def _tree_sitter_extraction_works() -> bool:
     """True only if the tree-sitter stack can actually extract a symbol.
     Parses a trivial snippet through _parse_repo_file so an installed-but-
     incompatible parser (imports fine, extracts nothing) is caught. Used to
     distinguish a broken parser (warn) from a legitimately symbol-less repo
-    (stay quiet) in build_repo_map's empty-graph check."""
+    (stay quiet) in build_repo_map's empty-graph check. Resets
+    _last_parse_error before probing so the result reflects only this call."""
+    global _last_parse_error
     import tempfile  # noqa: PLC0415
 
+    _last_parse_error = None
     try:
         with tempfile.TemporaryDirectory() as d:
             f = Path(d) / "_probe.py"
             f.write_text("def _probe_sym():\n    return 1\n")
             defs, _refs = _parse_repo_file(f)
         return "_probe_sym" in defs
-    except Exception:
+    except Exception as e:
+        _last_parse_error = f"{type(e).__name__}: {e}"
         return False
 
 
@@ -5690,18 +5711,24 @@ def _warn_repo_map_empty_once(source_candidates: int) -> None:
     probe confirms tree-sitter cannot extract symbols — the signal that
     tree-sitter is unavailable or its API is incompatible and P6 has silently
     become a no-op (DESIGN §12). If the probe *works* (so the empty graph is a
-    legitimately symbol-less repo), no warning is emitted."""
+    legitimately symbol-less repo), no warning is emitted. When the probe
+    failed via a caught exception (as opposed to a silent empty-result
+    degrade), appends that exception's type+message so the warning leaves an
+    actual diagnosable cause instead of a bare "unavailable or incompatible"
+    guess."""
     global _repo_map_empty_warned
     if _repo_map_empty_warned:
         return
     if _tree_sitter_extraction_works():
         return  # parser is fine; the repo just has no extractable symbols
     _repo_map_empty_warned = True
+    detail = f" Probe failure: {_last_parse_error}" if _last_parse_error else ""
     log(
         f"WARNING: repo-map is empty despite {source_candidates} source "
         "file(s) — tree-sitter is unavailable or incompatible; P6 structural "
         "context is disabled and planning degrades to grep/glob only. Check "
         "the tree-sitter-language-pack install (see requirements.txt pin)."
+        f"{detail}"
     )
 
 
