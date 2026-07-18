@@ -238,6 +238,7 @@ STATE_FIELDS = (
     "task", "started_at", "finished_at",
     "waves", "completed_waves", "subtask_status",
     "plan_snapshot",
+    "decompose_snapshot",
     "blocked",
     "worker_count", "telemetry",
     "categories", "classifier_questions", "answers",
@@ -1710,6 +1711,32 @@ class RateLimitedExit(BaseException):
         self.reset_at = reset_at
         self.raw_message = raw_message
         self.out_of_credits = out_of_credits
+
+
+class TerminalAuthFailure(BaseException):
+    """Raised when a `claude -p` envelope shows the container's OAuth
+    session has expired or was never logged in — a state that cannot
+    recover without a human running `claude /login` (or the run being
+    restarted with a fresh `CLAUDE_CODE_OAUTH_TOKEN`).
+
+    Distinct from RateLimitedExit's 401/429/529 case: there the gateway
+    rejected an in-flight request and a later retry can succeed once the
+    subscription window clears. Here Claude Code has already failed to
+    renew the login and cleared the credential, so it sends no request at
+    all — every retry fails identically, and the auth/quota backoff loop
+    in claude_p() would burn its full `auth_retry_max_sec` budget for
+    nothing. main()'s handler treats this the same as the out-of-credits
+    RateLimitedExit case: worktree-only cleanup, a --resume hint, and
+    EXIT_LOCKED (state persists; a fresh login can pick the run back up).
+    Inherits BaseException for the same reason as RateLimitedExit — it
+    must propagate through asyncio's gather and broad `except Exception`
+    handlers without being swallowed.
+
+    Carries only raw_message: str — the verbatim envelope `result` text,
+    surfaced to the user on exit."""
+    def __init__(self, raw_message: str):
+        super().__init__(raw_message)
+        self.raw_message = raw_message
 
 
 # Literal Claude Code subscription rate-limit message format, observed
@@ -4989,20 +5016,31 @@ async def recursive_decompose(
         f"{json.dumps(subtask, indent=2)}\n\n"
         "Score this subtask's P1 Task-Context Fit (0–1) and return your verdict."
     )
-    judge_result = await claude_p(
-        system_prompt=sys_prompt,
-        user_prompt=user_prompt,
-        schema_key="fit_judge",
-        cwd=str(repo_root),
-        allowed_tools=INSPECT_TOOLS,
-        max_turns=30,
-        autonomous=False,
-        caps=caps,
-        st=st,
-        model=models.get("fit_judge", MODEL_DEFAULT),
-        effort=efforts.get("fit_judge"),
-        sid=f"fit-judge-{subtask.get('id', 'x')}-d{depth}",
-    )
+    try:
+        judge_result = await claude_p(
+            system_prompt=sys_prompt,
+            user_prompt=user_prompt,
+            schema_key="fit_judge",
+            cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS,
+            max_turns=30,
+            autonomous=False,
+            caps=caps,
+            st=st,
+            model=models.get("fit_judge", MODEL_DEFAULT),
+            effort=efforts.get("fit_judge"),
+            sid=f"fit-judge-{subtask.get('id', 'x')}-d{depth}",
+        )
+    except WorkerError:
+        # Worker crashed mid-judgment (auth failure, killed session, PID
+        # exhaustion) — degrade to leaf, the same disposition the depth cap
+        # and no-progress guard below already reach when they cannot
+        # establish a confident split. Without this, one WorkerError here
+        # would propagate and discard every fit/split decision already paid
+        # for elsewhere in the tree (DESIGN §6 *Credential strategy*).
+        log(f"recursive_decompose: fit_judge crashed for "
+            f"{subtask.get('id', '?')}; accepting as leaf")
+        return [subtask]
     score: float = judge_result.get("score", 0.0)
 
     # --- leaf check ----------------------------------------------------------
@@ -8304,6 +8342,46 @@ def _api_error_category(status: int | None) -> str | None:
     return {401: "auth", 429: "quota", 529: "overload"}.get(status)
 
 
+def _is_terminal_auth_failure(envelope: dict) -> bool:
+    """True when auth cannot recover without a human running `claude
+    /login` (or a fresh `CLAUDE_CODE_OAUTH_TOKEN`).
+
+    Distinct from the 401/429 rolling-cap case `_is_auth_or_quota_failure`
+    covers: Claude Code sends no request at all in this state (it already
+    failed to renew the login and cleared the credential), so routing it
+    through that classifier's backoff loop burns the whole
+    `auth_retry_max_sec` budget and still fails identically every time.
+    claude_p() must check this classifier BEFORE
+    `_is_auth_or_quota_failure` so the terminal case is caught first.
+
+    Measured over 611 historical is_error envelopes: these markers match
+    215 true positives, 0 false positives. Worker prose cannot reach
+    `result` on a successful envelope — only the `_leerie_synthetic`
+    stderr path can, and it is exempted below; max observed is_error
+    result length is 162 chars.
+
+    Do NOT shorten "oauth session expired" to "oauth": that substring
+    appears 2919 times in worker tool_result blocks and would false-match
+    a worker legitimately discussing OAuth in its own correct output.
+
+    Gating discipline mirrors `_is_auth_or_quota_failure` verbatim (see
+    its docstring for the rationale): gated on `is_error` — a successful,
+    schema-valid envelope must never match no matter what its `result`
+    text says — and `_leerie_synthetic` envelopes are exempt, since the
+    no-result-event envelope interpolates the worker's raw stderr into
+    `result`, which can legitimately contain any of these markers without
+    the session's login actually having expired."""
+    if not envelope.get("is_error"):
+        return False
+    if envelope.get("_leerie_synthetic"):
+        return False
+    msg = str(envelope.get("result") or "").lower()
+    return ("failed to authenticate" in msg
+            or "oauth session expired" in msg
+            or "session expired and could not be refreshed" in msg
+            or "not logged in" in msg)
+
+
 def _is_auth_or_quota_failure(envelope: dict) -> bool:
     """True if the `claude -p` envelope looks like a 401/429/529/
     auth-message rejection from the Anthropic gateway.
@@ -10034,6 +10112,17 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 f"\n\nYOUR PREVIOUS ATTEMPT FAILED: {last_problem} "
                 "Return output that conforms exactly to the required schema.")
         envelope = await _spawn(retry_note)
+
+        # Terminal auth failure (expired/absent OAuth session): checked
+        # BEFORE the auth/quota backoff below, and raised immediately —
+        # no tenacity loop. Claude Code has already failed to renew the
+        # login and cleared the credential, so it sends no request at
+        # all; every retry within `auth_retry_max_sec` would fail
+        # identically, burning the whole backoff budget for nothing.
+        # main()'s handler routes TerminalAuthFailure to a resumable
+        # EXIT_LOCKED pause instead of the generic WorkerError exit(1).
+        if _is_terminal_auth_failure(envelope):
+            raise TerminalAuthFailure(str(envelope.get("result") or ""))
 
         # Auth/quota backoff: 401/429/529/auth-message envelopes need
         # waiting, not the immediate corrective retry below. The gateway
@@ -12203,6 +12292,13 @@ async def phase_plan(task: str, st: State, caps: dict,
             if pid and pid not in leaf_ids:
                 expansion[pid] = leaf_ids
             leaves.extend(expanded)
+            # Diagnostic snapshot after each top-level subtask finishes
+            # expanding — mirrors plan_snapshot's ordering (DESIGN §5½ (P1),
+            # §6 *Credential strategy*). A WorkerError from a later subtask's
+            # fit_judge/splitter call no longer discards the fit/split
+            # decisions already paid for on subtasks that finished first.
+            st.data["decompose_snapshot"] = {"leaves": leaves}
+            st.save()
         plan["subtasks"] = leaves
     for plan in plans:
         _remap_vanished_deps(plan.get("subtasks", []), expansion)
@@ -19959,6 +20055,36 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         st.save()
         exit_message = str(e)
         exit_code = 1
+    except TerminalAuthFailure as e:
+        # Expired/absent OAuth session (`claude /login` required) —
+        # unlike the transient 401/429/529 case, Claude Code sends no
+        # further request once it detects this state, so no amount of
+        # waiting or retrying recovers it. This is a resumable pause, not
+        # a hard failure. Copied verbatim from the RateLimitedExit
+        # out_of_credits=True arm just below: worktree-only cleanup
+        # (state + run branch preserved), a --resume hint, and
+        # EXIT_LOCKED — the launcher's preserve-state pause pivot.
+        full_purge = False
+        st.save()
+        log(f"auth session locked — {e.raw_message}")
+        log(f"  run `claude /login` (or refresh CLAUDE_CODE_OAUTH_TOKEN), "
+            f"then resume with: leerie --resume {st.run_id}")
+        abnormal = False
+        try:
+            _cleanup_on_abnormal_exit(st, full_purge=False)
+        except BaseException as cleanup_err:
+            log(f"cleanup failed (non-fatal): {cleanup_err}")
+        # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
+        # Non-fatal. Mirrors the RateLimitedExit post-loop pattern.
+        try:
+            asyncio.run(capture_repo_deps(
+                repo_root, st,
+                caps=caps, models=models, efforts=efforts,
+            ))
+        except Exception as _cap_exc:
+            log(f"capture: non-fatal error during auth-locked pause "
+                f"({_cap_exc})")
+        exit_code = EXIT_LOCKED
     except RateLimitedExit as e:
         # Claude Code session-limit / rate-limit (or out-of-credits mid-stream
         # kill) hit mid-worker. See DESIGN §6 *Rate-limited → auto-resume*.
