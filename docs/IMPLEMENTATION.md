@@ -4199,6 +4199,14 @@ accept the subtask as leaf); then splits via either:
     label (`_deterministic_chunk_label()`), never an identical parent-copy.
   - **Coupled path** (≤ 8 files): `splitter` LLM worker — structural seam detection
 
+Both the `fit_judge` call and the coupled-path `splitter` call are wrapped in
+`try/except WorkerError`, degrading the node to a leaf (`[subtask]`
+unchanged) on a worker crash — DESIGN §5½ (P1), §6 *Credential strategy*. The
+migration-path (label-only) `splitter` call inside `_label_migration_chunks()`
+carries the same guard, falling back to `_deterministic_chunk_label()` per
+chunk instead of a leaf, since the file partition there is already
+code-computed.
+
 After recursing into a generation's children, the function calls
 `_remap_vanished_deps()` over the flattened leaves with `{child_id: [its_leaf_ids]}`
 for every child whose own id did not survive its expansion. This is the only frame
@@ -6371,7 +6379,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `started_at` | ISO-8601 str | wall-clock time at run start |
 | `finished_at` | ISO-8601 str | wall-clock time at successful finalize |
 | `plan_snapshot` | dict | `{subtasks, waves}` captured immediately after `schedule()` returns and **before** `check_budget_feasibility` / `validate_plan` — both of which `die()`. Without it a plan that fails either gate is lost entirely (`write_plan` never runs), discarding the planner/fit_judge/splitter spend that produced it. Diagnostic/audit only: no orchestrator code reads it back, and it is deliberately *not* `write_plan`, which would also emit per-subtask spec files and seed the execution scaffolding for a run that cannot start. |
-| `decompose_snapshot` | dict | `plan_snapshot`'s sibling for §5½ (P1) recursive decomposition: `phase_plan` writes the accumulated leaves after each top-level subtask finishes expanding under `recursive_decompose`, so a mid-decomposition `WorkerError` (a `fit_judge` call, an auth failure, PID exhaustion) does not discard fit/split judgments already paid for on subtasks that already finished expanding — decomposition is routinely a large share of a run's total planning spend (DESIGN §6 *Credential strategy*). Same diagnostic-only caveat as `plan_snapshot`: nothing reads it back in this change; wiring `--resume` to rehydrate mid-decomposition progress from it is separate, not-yet-shipped work. |
+| `decompose_snapshot` | dict | `plan_snapshot`'s sibling for §5½ (P1) recursive decomposition: `phase_plan` writes the accumulated leaves after each top-level subtask finishes expanding under `recursive_decompose`, so a mid-decomposition `WorkerError` (from either the `fit_judge` call or the coupled-minority `splitter` call — an auth failure, PID exhaustion) does not discard fit/split judgments already paid for on subtasks that already finished expanding — decomposition is routinely a large share of a run's total planning spend (DESIGN §6 *Credential strategy*). Same diagnostic-only caveat as `plan_snapshot`: nothing reads it back in this change; wiring `--resume` to rehydrate mid-decomposition progress from it is separate, not-yet-shipped work. |
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
