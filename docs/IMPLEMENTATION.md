@@ -2245,19 +2245,24 @@ warning and falls back to the alphabetical default.
 
 ### PR-writer payload caps
 
-The `pr_writer` worker is invoked by passing its entire user prompt
-(task text, classification, subtask titles, full commit log, diff
+The `pr_writer` worker is invoked with its entire user prompt (task
+text, classification, subtask titles, full commit log, diff
 stat/dirstat, sampled diff, and the PR template body — all serialized
-as one JSON string) as a single argv element to `claude -p`. Linux
-`ARG_MAX` in the leerie container (Debian 13) defaults to ~128 KB; a
-degenerate run with thousands of commits, a huge template, or a
-sprawling diff would silently fail with `E2BIG`.
+as one JSON string) passed as `claude_p`'s `user_prompt`, which
+`_invoke` feeds to `claude -p` over stdin rather than argv (§3 "User
+prompt transport — stdin, not argv") — so this payload is not bound by
+Linux's per-argument `MAX_ARG_STRLEN` (131,071 bytes, `PAGE_SIZE * 32`)
+the way an argv-passed prompt would be. (Before that transport change,
+this section described the payload as a single argv element and the
+limit as the aggregate `ARG_MAX`; both were incorrect even then — the
+relevant per-argument ceiling is `MAX_ARG_STRLEN`, not `ARG_MAX`.)
 
-Three constants in `orchestrator/leerie.py` cap the unbounded fields so
-the total payload stays well under that ceiling. Each capped field
-gets an in-band `... [<label> truncated at ~N KB; remainder omitted —
-rely on the commit log] ...` sentinel so the worker can see the
-truncation and avoid fabricating detail past the cut-off.
+Three constants in `orchestrator/leerie.py` still cap the unbounded
+fields, now purely to bound the worker's LLM context rather than to
+defend an argv ceiling. Each capped field gets an in-band `... [<label>
+truncated at ~N KB; remainder omitted — rely on the commit log] ...`
+sentinel so the worker can see the truncation and avoid fabricating
+detail past the cut-off.
 
 | Constant | Default | Bounds |
 |----------|---------|--------|
@@ -2270,10 +2275,12 @@ These are **module constants, not `DEFAULT_CAPS` entries**, by
 design. `DEFAULT_CAPS` is the surface for run-wide operational caps
 that are intended to be user-tunable through CLI / env / TOML
 (`max_total_workers`, `worker_timeout_sec`, `worker_memory_max_bytes`,
-etc.). The PR-writer caps are internal protocol limits defending a
-single subprocess invocation against an OS-imposed argv ceiling:
-lowering them silently degrades summaries and raising them risks
-`E2BIG`. `tests/test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined`
+etc.). The PR-writer caps are internal protocol limits bounding a
+single worker invocation's LLM context: lowering them silently
+degrades summaries, and raising them risks overwhelming the worker's
+context rather than an OS-imposed argv ceiling (the payload travels
+over stdin, not argv — see above).
+`tests/test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined`
 pins the values so any future change goes through code review.
 
 Multi-byte UTF-8 safety: `_cap_text` slices at the byte boundary,
@@ -2295,9 +2302,9 @@ serialized JSON is bounded by
 `_final_conformance_payload` by trimming `warnings` (then `residuals`)
 from the tail until the field fits; at least one of each is
 preserved and the `truncated` marker is set so the prompt can
-mention the cut-off honestly. The cap defends a payload already
-sized close to the ~128 KB Linux ARG_MAX limit on the leerie
-container.
+mention the cut-off honestly. The cap bounds the worker's LLM context
+alongside the other `PR_WRITER_*` caps above, not an argv-size
+constraint — the payload travels over stdin, not argv.
 
 ### Heal-loop convergence parameters
 
@@ -3005,6 +3012,83 @@ wrapper that resolves the script path and forwards to `run_proc`.
 The validated payload is read from `structured_output` on the envelope. On a
 missing or schema-invalid payload, `claude_p()` retries once with the violation
 quoted into the prompt; a second failure raises `WorkerError`.
+
+#### User prompt transport — stdin, not argv
+
+`build()` emits `["claude", "-p", ...]` with **no positional argument
+after `-p`** — the user prompt (task + subtask_views + any retry note)
+is fed to the child's stdin instead, via `_invoke()`'s `stdin_data`
+param and a concurrent `_feed_stdin` task that writes the payload and
+closes stdin so the CLI sees EOF. `_invoke()` passes `stdin=PIPE` when
+`stdin_data` is given and `stdin=DEVNULL` otherwise (callers with no
+prompt to feed, e.g. the preflight smoke test, are unaffected).
+
+This exists because a single argv element cannot exceed Linux's
+`MAX_ARG_STRLEN` (131,071 bytes, `PAGE_SIZE * 32`, not raisable) —
+independent of the larger aggregate `ARG_MAX` — and reconciler/
+plan_overlap_judge payloads routinely exceed that on their own (measured:
+a 150,063-byte reconciler prompt raised `OSError: [Errno 7] Argument list
+too long` at `execve` time). A positional prompt after `-p` silently wins
+over stdin with no error, so it must be absent, not merely supplemented.
+Pinned by `tests/test_prompt_over_stdin.py`: the argv-length property (no
+`build()`-constructed argv element exceeds `MAX_ARG_STRLEN` for a 150KB+
+prompt), the absent positional, the retry path routing `retry_note`
+through stdin too, `_invoke`'s PIPE-vs-DEVNULL branch, and a real
+subprocess/real-pipe round trip for a 150,063-byte payload proving no
+deadlock between the concurrent feeder and the stdout/stderr readers.
+
+#### Appended system prompt transport — file, with a probe + inline fallback
+
+The appended system prompt (`system_prompt`, e.g. `reconciler.md` at
+~25KB) is the *second* large argv element, and on the overlap judge it
+compounds with the (now stdin-routed) user prompt toward the same
+`MAX_ARG_STRLEN` ceiling above. `claude_p()` writes `system_prompt` to a
+throwaway temp file once per call (not per retry attempt — the value is
+fixed for the whole call) and passes it via `--append-system-prompt-file
+<path>` instead of the inline `--append-system-prompt <text>`, removing
+it from argv the same way the user prompt was removed.
+
+`--append-system-prompt-file` is **undocumented** — it has no entry of
+its own in `claude --help`, appearing only inside `--bare`'s help text
+("Explicitly provide context via: --system-prompt[-file],
+--append-system-prompt[-file], ..."). Because an undocumented flag may
+be renamed or removed in a future CLI release without notice, its use
+is gated behind `_append_system_prompt_file_supported()` — a
+once-per-process probe memoized in the module-level
+`_APPEND_SYSTEM_PROMPT_FILE_SUPPORTED` global (same pattern as
+`_cgroup_probe()`'s `_CGROUP_PROBE_RESULT`) — with an unconditional
+fallback to the inline flag when the probe reports unsupported.
+
+The probe invokes `claude -p --append-system-prompt-file <throwaway
+file>` with stdin closed and no `--output-format`/model dispatch
+requested. Commander.js validates every flag before `-p` reaches "no
+prompt given": an unrecognized flag fails immediately with `error:
+unknown option '--append-system-prompt-file'`, while a recognized flag
+instead reaches the CLI's own "Input must be provided either through
+stdin or as a prompt argument" error. Both exit non-zero, cost nothing
+(no auth, no model call), and return in well under a second — the probe
+distinguishes them by the stderr text (`"unknown option"` means
+unsupported), not by exit code alone, since both paths exit non-zero.
+
+`claude_p()`'s temp file is created before `build()`'s first call, and
+`build()` through the end of the retry loop runs inside a `try/finally`
+that removes it once `claude_p()` returns — on both the success path and
+every exception path out of that block (the terminal-auth raise, either
+auth/quota-exhaustion raise, the final "worker failed schema-valid output
+twice" raise). The schema-key drift guard runs before the temp file is
+created at all, so it never needs cleanup. The retry loop (`_spawn`
+re-invoked with a `retry_note`) reuses the same file across both attempts
+rather than rewriting it, since `system_prompt` never changes between
+retries.
+
+Pinned by `tests/test_append_system_prompt_file.py`: the probe's
+supported/unsupported/fail-closed-on-OSError-or-timeout branches, once-
+per-process memoization, its own throwaway-file cleanup,
+`build()`'s file-flag-vs-inline-flag branch and the temp file's
+contents matching `system_prompt`, the temp file being removed after
+`claude_p()` returns on both the success and exception paths, the retry
+path reusing rather than recreating the file, and a live (unmocked)
+sanity check against the installed `claude` CLI (skipped if absent).
 
 #### No result event
 
@@ -4040,9 +4124,30 @@ DESIGN.md §8 for the distinction).
 | `_expand_braces(pattern)` | Pre-expands `{a,b}` brace groups that Python's `glob.glob` does not handle. Recursive for nested braces. |
 | `glob_task_references(task, repo_root)` | Scans the task string for file-path tokens, expands braces, globs each pattern. Returns deduplicated `list[Path]`. |
 | `extract_task_file_structure(task, repo_root)` | Extracts H3+ headings from `.md`/`.txt` (regex: `#{3,6}`; H1/H2 skipped as structural), numbered items (excluding TOC anchor links `[...](#...)`), list-item IDs from `.yaml`/`.yml` (regex: `^- id:`), and top-level mapping keys. Stdlib-only (no PyYAML). Returns `list[str]` or `None`. |
-| `check_task_file_coverage(extracted, subtasks)` | Checks which extracted items are not referenced by any subtask. Returns `LOW_COVERAGE` issue when >50% uncovered AND item count ≤ `_MAX_COVERAGE_ITEMS` (50). Above the cap, returns empty (too dilute for meaningful gating). |
-| `_format_task_file_structure(items)` | Formats extracted items as a prompt section for the planner. |
+| `_is_uncoverable_convention_item(key)` | True when *key* combines a backtick-quoted span with the marker `MUST` (case-sensitive) — a repo-convention imperative (e.g. ``Run `pnpm run lint:fix` - MUST pass with no errors``) that cannot appear verbatim in a subtask title/intent by construction. |
+| `check_task_file_coverage(extracted, subtasks)` | Checks which extracted items are not referenced by any subtask. Items matching `_is_uncoverable_convention_item` are dropped from both the numerator and denominator before the ratio is computed — they inflate the ratio without ever being coverable. Returns `LOW_COVERAGE` issue when >50% of the remaining (coverable) items are uncovered AND the coverable count is ≤ `_MAX_COVERAGE_ITEMS` (50). Above the cap, or when nothing remains coverable, returns empty. |
+| `_dedup_frozen_coverage_issues(coverage_issues, seen_ratios)` | Drops a `LOW_COVERAGE` issue whose `"N/M"` ratio prefix was already seen (tracked in the caller-owned `seen_ratios` set, one per planner-category feedback loop). A ratio that repeats round-over-round means the gate's feedback isn't moving the planner, so the issue is dropped after its first occurrence rather than re-driving another feedback round on a frozen signal. A ratio that changes (even coincidentally shared across categories, since `seen_ratios` is per-loop) still fires. |
+| `_format_task_file_structure(items)` | Formats extracted items as a prompt section for the planner. Unconditional — runs regardless of `check_task_file_coverage`'s cap or freeze-dedup, since the checklist itself is still useful context even when the gate stays silent. |
 | `_MAX_COVERAGE_ITEMS` | 50. A planner with 5–15 subtasks can realistically cover ~50 items; above this the 50% threshold becomes unrealistic. |
+
+**Freeze guard (2026-07-19 incident, root cause A):** a single incidental
+dotted token (e.g. `CLAUDE.md` mentioned once in a task's Verification
+section) causes `extract_task_file_structure` to harvest the repo's real
+CLAUDE.md as spec items — including coding-standard imperatives like
+``Run `pnpm run lint:fix` - MUST pass with no errors`` that can never
+appear verbatim in a subtask title/intent. Before this fix the
+literal-substring gate fired identically every round (33/33 feedback
+rounds at an unchanged 15/15 ratio in the incident run), burning ~35% of
+the run's spend re-sending a signal that never moved. Two independent
+guards now prevent this: (1) `_is_uncoverable_convention_item` excludes
+items that are uncoverable by construction before the ratio is computed,
+and (2) `_dedup_frozen_coverage_issues` (used by `phase_plan`'s
+per-category `_check_planner` closure) stops re-emitting a `LOW_COVERAGE`
+issue once its ratio has repeated within the same feedback loop, covering
+non-convention files that still fail to converge for other reasons. Both
+guards only silence the *gate* — `_format_task_file_structure`'s prompt
+injection stays unconditional, so the planner still sees the full
+checklist as context.
 
 No-op when the task doesn't reference files.
 
