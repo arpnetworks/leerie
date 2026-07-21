@@ -31,6 +31,7 @@ def test_returns_true_when_parser_extracts_probe_symbol(leerie):
     """On a host with a working tree-sitter stack, the probe's own
     '_probe_sym' snippet round-trips through the real _parse_repo_file."""
     assert leerie._tree_sitter_extraction_works() is True
+    assert leerie._last_parse_error is None
 
 
 def test_returns_false_when_parse_repo_file_raises(leerie):
@@ -44,6 +45,12 @@ def test_returns_false_when_parse_repo_file_raises(leerie):
 
     with patch.object(leerie, "_parse_repo_file", new=_raise):
         assert leerie._tree_sitter_extraction_works() is False
+    # The caught exception must be recoverable by the caller (§ diagnostic
+    # for _warn_repo_map_empty_once), not just swallowed silently.
+    assert leerie._last_parse_error == (
+        "AttributeError: module 'tree_sitter_language_pack' has no "
+        "attribute 'process'"
+    )
 
 
 def test_returns_false_when_parse_repo_file_extracts_nothing(leerie):
@@ -55,3 +62,6 @@ def test_returns_false_when_parse_repo_file_extracts_nothing(leerie):
 
     with patch.object(leerie, "_parse_repo_file", new=_empty_parse):
         assert leerie._tree_sitter_extraction_works() is False
+    # No exception was actually raised here — nothing to report, so the
+    # diagnostic must stay None rather than carrying over stale state.
+    assert leerie._last_parse_error is None

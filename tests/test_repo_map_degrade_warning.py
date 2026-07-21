@@ -79,6 +79,45 @@ def test_warns_only_once_per_process(leerie, tmp_path, capsys):
     assert "repo-map is empty" not in second
 
 
+def test_warning_includes_probe_exception_detail(leerie, tmp_path, capsys):
+    """When the probe's own snippet parse raises (the installed-but-
+    incompatible-parser case), the warning must carry that exception's
+    type+message — not just the generic "unavailable or incompatible" guess
+    — so a future occurrence leaves an actual diagnosable cause."""
+    (tmp_path / "app.py").write_text("def x():\n    pass\n")
+    lr = tmp_path / "leerie-root"
+
+    def _parse(path):
+        if path.name == "_probe.py":
+            raise AttributeError("module 'tree_sitter_language_pack' has no "
+                                  "attribute 'process'")
+        return [], []
+
+    with patch.object(leerie, "_parse_repo_file", new=_parse):
+        rm = leerie.build_repo_map(tmp_path, lr)
+    assert rm["files"] == {}
+    out = capsys.readouterr().out
+    assert "repo-map is empty" in out
+    assert "Probe failure:" in out
+    assert "AttributeError" in out
+    assert "has no attribute 'process'" in out
+
+
+def test_no_probe_detail_when_empty_result_is_not_an_exception(
+        leerie, tmp_path, capsys):
+    """The plain empty-graph degrade path (no exception anywhere) must not
+    grow a spurious "Probe failure:" parenthetical — only an actually caught
+    exception earns one."""
+    (tmp_path / "app.py").write_text("def x():\n    pass\n")
+    lr = tmp_path / "leerie-root"
+    with patch.object(leerie, "_parse_repo_file", new=_empty_parse):
+        rm = leerie.build_repo_map(tmp_path, lr)
+    assert rm["files"] == {}
+    out = capsys.readouterr().out
+    assert "repo-map is empty" in out
+    assert "Probe failure:" not in out
+
+
 def test_no_false_warning_when_parser_works_but_repo_symbolless(
         leerie, tmp_path, capsys):
     """No false positive: if tree-sitter WORKS (functional probe extracts a
