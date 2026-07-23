@@ -1887,7 +1887,9 @@ so the orchestrator wasn't leaking; the cascade was caused by all
 processes sharing one memcg.
 
 Each `claude -p` worker is therefore enrolled in its own child
-cgroup at `<cgroup-root>/leerie-w-<sid>/` with `memory.max` set to
+cgroup at `<cgroup-root>/leerie-w-<sid>/` (where `<sid>` is the
+run-scoped composed sid — see *The per-worker cgroup name is
+run-scoped* below) with `memory.max` set to
 `caps["worker_memory_max_bytes"]` (default: VM RAM split across
 `max_parallel + 1` slots, floored at 8 GiB) and `pids.max` set
 to `caps["worker_pids_max"]` (default 2048, overridable per-repo via
@@ -1898,6 +1900,40 @@ cgroup*; sibling workers, the orchestrator, and host-side services
 in different cgroups are not eligible victims. `memory.swap.max=0`
 prevents the kernel from delaying an inevitable OOM by paging out
 worker memory to the Colima swap file.
+
+**The per-worker cgroup name is run-scoped.** The child cgroup is
+`leerie-w-<run-id-prefix>-<sid>`, not a bare `leerie-w-<sid>`. The
+prefix is the first 12 hex chars of the run id (the container/machine
+id) — ~48 bits, so the probability two concurrent runs share a prefix
+*and* run the same worker sid at overlapping times is negligible (≪
+1e-9 at any realistic concurrency; only local Colima runs share a slice
+at all — Fly/EC2 give each run its own VM). This is
+load-bearing whenever two runs execute concurrently on the *same* VM,
+which is the common case on Colima: the launcher passes `--cgroupns=host`
+(required — see below — so the broker can enroll worker PIDs into
+`leerie.slice/`), so every concurrent container's workers live in the
+**same physical `leerie.slice/` tree**. Worker `sid`s alone are not
+unique across runs — a phase-1 `sid="classifier"`, and every
+conformer/judge `sid` (which repeats identically across two concurrent
+runs of the *same* task, e.g. a multi-repo fan-out), collide by name.
+Absent
+the run-id prefix, two runs both in phase 1 create, enroll into, and tear
+down the *same* `leerie.slice/leerie-w-classifier` cgroup. Teardown on
+cgroup v2 is `cgroup.kill=1` (the broker's `destroy`), which SIGKILLs
+*every* process enrolled in that cgroup — so run B finishing its
+classifier SIGKILLs run A's still-running classifier `claude -p` leader
+mid-stream. The victim leader exits `-9` with no `result` event, no
+`dmesg`/journald record (a `cgroup.kill` is a userspace write, not a
+kernel OOM), and is indistinguishable from a bare crash; leerie's
+`_run_checked_loop` retries it, so it self-heals but wastes the killed
+attempt. Prefixing the cgroup name with a run-id discriminator makes each
+run's worker cgroups unreachable by any other run's teardown. (Reproduced
+live: run `stackpulse`'s classifier leader died at the exact second run
+`summarizer`'s classifier tore down the shared `leerie-w-classifier`.)
+`--cgroupns=private` — which *would* give each container its own
+`leerie.slice` — is not an option: it breaks the broker's cross-scope PID
+enrollment (see the `--cgroupns=host` requirement below), so the name
+must carry the run identity instead.
 
 The per-worker cap must hold **both** the build/test subprocess tree
 *and* the resident `claude -p` process at the same time — `claude`
@@ -1967,7 +2003,10 @@ and detects the cgroup hierarchy: **v2** (Colima) uses the unified
 `leerie.slice/leerie-w-<sid>/{pids,memory}.max`; **v1/hybrid** (observed
 on Fly Firecracker VMs, whose unified mount exposes no controllers) uses
 the split hierarchies (`/sys/fs/cgroup/pids/leerie.slice/...`,
-`/sys/fs/cgroup/memory/leerie.slice/...`). The entrypoint then drops to
+`/sys/fs/cgroup/memory/leerie.slice/...`). The `<sid>` in these path
+templates is the run-scoped composed sid (`<run-id-prefix>-<worker-sid>`,
+see *The per-worker cgroup name is run-scoped* above); the broker treats
+it as an opaque validated string. The entrypoint then drops to
 the leerie user via `runuser -u leerie --` before exec'ing the
 orchestrator (local nerdctl) or sleeping as PID 1 (Fly, where the
 orchestrator is started out-of-band by the launcher's ssh-console wrapper
