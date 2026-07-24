@@ -97,6 +97,37 @@ orchestrator and not used anywhere in this repo.
 - **Worker outputs are JSON-schema-validated.** New worker types must
   define a schema in the `SCHEMAS` dict in `orchestrator/leerie.py` and
   pass it via `--json-schema` in `claude_p()`.
+- **All natural-language interpretation is done by an LLM worker
+  returning schema-validated structured JSON — never by regex or
+  hand-parsing in Python.** This is the input-side companion to the
+  bullet above: Python operates only on already-structured data (JSON
+  fields, typed values) — set/string/arithmetic comparison, never
+  inferring meaning from prose. Regex is permitted only on *mechanical*
+  strings (semver, shell commands, fixed CLI output, file paths) —
+  never on task text, planner/worker prose, README/markdown content, or
+  an LLM's response. If a check needs a fact from natural language, the
+  owning worker must surface it as a JSON field. (`tests/test_capture_deps.py`'s
+  `TestRegexPathAbsent` — dep-capture's migration off a regex path onto
+  LLM-structured output, see below — is prior art for this same
+  principle; see DESIGN.md §"Language-to-JSON: natural-language
+  interpretation is never regex" for the architectural statement.)
+- **Judgment workers default to `opus`; acting/workhorse workers
+  default to `sonnet`.** Any worker that makes a *decision* (classify,
+  plan, reconcile, judge, verify, gate) runs on opus — measured
+  evidence (DESIGN.md §"Opus-judgment, sonnet-workhorse") shows the
+  same judge prompt produces opposite verdicts on the two tiers for the
+  same input, so sonnet is not a reliable judgment tier. Workers that
+  *do* the work (implementer, conformer, pr_writer) run on sonnet for
+  throughput/cost. A new judgment worker MUST be absent from
+  `MODEL_DEFAULT_PER_WORKER` (so it falls through to `MODEL_DEFAULT =
+  "opus"`) and carry `EFFORT_DEFAULT_PER_WORKER = "high"`. Exceptions
+  must be justified in a comment as a deliberate cost trade-off, not an
+  unstated default: `satisfied_probe` stays on sonnet because it runs
+  once per subtask and throughput dominates, with correctness resting
+  on its base-tree-only tool scope rather than model tier (see the
+  comment at its `MODEL_DEFAULT_PER_WORKER` entry); the post-run `judge`
+  worker was found on sonnet by omission and moved to opus for exactly
+  this reason.
 - **Caps are real Python counters in `DEFAULT_CAPS`**, not prompt
   instructions. Adding a new cap means adding a counter and a check, not
   asking a worker to bound itself.
@@ -347,6 +378,14 @@ export LEERIE_WORKER_PIDS_MAX=4096
 # of structural context. Also LEERIE_SKIP_REPO_MAP=1 or
 # `skip_repo_map = true` in leerie.toml. Default: off.
 ./leerie "task" --skip-repo-map
+
+# Skip the instruction-adherence gate: the deterministic prescribed-
+# command-coverage floor and the opus adherence_judge worker in the
+# planner check loop. A plan that diverges from an explicitly
+# prescribed procedure is not caught before phase_execute spends. Also
+# LEERIE_SKIP_ADHERENCE_CHECK=1 or `skip_adherence_check = true` in
+# leerie.toml. Default: off.
+./leerie "task" --skip-adherence-check
 
 # Make the conformer phase blocking instead of advisory.
 # Residuals cause subtasks to return 'blocked' (fix + --resume).
@@ -934,6 +973,96 @@ expansion loop precedes final logging); integration — one oversized subtask (s
 first-pass subtasks → `recursive_decompose` called once per subtask; well-fit
 leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`);
 empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`).
+The plan-instruction-adherence gate's worker registration (schema, prompt,
+model/effort defaults) is tested in two files mirroring the
+`fit_judge`/`splitter` pair above. `tests/test_adherence_judge_schema.py` covers
+`SCHEMAS["adherence_judge"]` — required fields
+(`user_prescribed_a_procedure`, `instruction_adherence`, `violations`,
+`rationale`), `instruction_adherence` bounds (0–10), the deliberate absence
+of a nested `confidence` sub-object (this worker is itself the independent
+check that replaces a self-report, so a self-confidence axis would
+reintroduce the self-grading bias the gate exists to remove), valid/invalid
+instance acceptance, JSON serializability, and wiring (`adherence_judge` in
+`WORKER_TYPES`, absent from `MODEL_DEFAULT_PER_WORKER` so it resolves to
+opus, `EFFORT_DEFAULT_PER_WORKER` entry at `"high"`, prompt file exists).
+`tests/test_resolve_adherence_judge_model.py` covers the model/effort
+resolution precedence chain (mirrors `test_resolve_fit_judge_model.py`),
+explicitly asserting the opus default — empirically required here, not
+merely conventional: calibration testing found sonnet false-positived a
+legitimate plan and an opus *understanding*-framed judge rubber-stamped the
+incident, so only the ADHERENCE frame on opus is validated.
+The deterministic PRIMARY layer of the same gate,
+`check_prescribed_command_coverage(prescribed_procedure, subtasks) ->
+list[str]` (pure JSON→verdict set logic, no NL parsing), is tested in
+`tests/test_prescribed_cmd_coverage.py`: the motivating incident shape
+(prescribed `recon browser`/`recon generate`, no subtask's `runs_commands`
+covers either → both fire), a goal-only task (`is_prescribed=false` or
+`commands=[]`, including `None`/`{}`) staying silent, paraphrase coverage
+(the planner's `runs_commands` wraps the prescribed command's own tokens in
+extra words, e.g. "barnacle recon browser" covers "recon browser", via
+normalized lowercased/stopword-filtered token-SUBSET matching — not exact
+string equality), full and partial coverage, no-subtasks-at-all firing for
+every prescribed command, tolerance of subtasks with missing/empty
+`runs_commands` and of non-string/blank prescribed commands, case-
+insensitivity, and a negative control proving a shared-stopword-only overlap
+does not falsely mark a command covered. The gate's own advisory-vs-gating
+outcome — distinct from the G3 `decomposition_quality`/`task_understanding`
+pair above, which covers the *planner's* self-report axes, not the
+adherence floor — is pinned in `tests/test_check_functions.py`'s
+`TestAdherenceGateAdvisoryVsGating`: a prescribed-and-uncovered command
+gates (`PRESCRIBED_CMD_UNRUN`), a goal-only task and a fully-covered
+command never gate, and `check_planner_output` itself carries no separate
+adherence axis to demote to advisory, since the floor is wired only into
+`phase_adherence_gate`, not the planner check loop.
+The gate wiring itself — `phase_adherence_gate`, the whole-plan "Phase 2⅞"
+gate run after `phase_overlap_judge` and before `schedule()`/`validate_plan`,
+composing the deterministic floor and the opus `adherence_judge` behind
+`_run_checked_loop` — is tested in `tests/test_phase_adherence_gate.py` (22
+tests), split into source-coupling wiring pins (floor+judge both run; a low
+result routes through the retry path via a re-invoked `phase_plan`; a
+`WorkerError` never discards the plan; the call site precedes
+`schedule()`/`validate_plan`, ordered after `phase_overlap_judge`) and
+behavioral integration tests against a stubbed `claude_p` and a stubbed
+`phase_plan` (skip-flag and not-prescribed short-circuits returning `plans`
+unchanged; a clean plan passing without a re-plan; a low-adherence round
+triggering exactly one re-plan that then converges; exhaustion `die()`ing
+with the unresolved violations; and the two `WorkerError`-every-round
+degrade outcomes — a clean floor returning the plan unmodified, a violating
+floor still `die()`ing).
+The two-stage gate's composed end-to-end behavior — deliberately independent
+of `test_phase_adherence_gate.py`'s per-branch wiring pins — is locked as a
+regression fixture in `tests/test_adherence_gate_e2e.py`: a synthetic
+incident shape (prescribed `[foo:build, foo:generate]`, no subtask's
+`runs_commands` covers `foo:generate`) drives `check_prescribed_command_coverage`
+directly (no stubbing) to prove the floor fires before any judge/re-plan
+involvement, then drives the full `phase_adherence_gate` (opus
+`adherence_judge` stubbed to a fixed envelope, mirroring
+`test_dep_capture_worker.py`'s `_invoke` stub) to prove it re-plans exactly
+once via the existing `phase_plan`-retry path and converges on a plan the
+floor accepts; a synthetic ordinary shape (`prescribed_procedure` absent, or
+present with `is_prescribed=false`) proves the gate short-circuits with zero
+`claude_p`/`phase_plan` calls — the corpus-validated 0/21-false-positive
+result this gate exists to protect.
+The empirical incident/legit calibration behind the gate's threshold — real
+opus judge runs against the cruiselines incident plan and a 21-run corpus,
+finding the two-stage composition (`is_prescribed=true AND (floor violation
+OR low adherence)`) fires on the incident and stays silent on ordinary
+goal-only tasks with 0 false positives — is frozen as a deterministic,
+no-live-LLM fixture in `tests/test_adherence_gate_regression.py`, distinct
+from `test_prescribed_cmd_coverage.py` (floor in isolation, synthetic
+cases) and `test_phase_adherence_gate.py` (phase wiring/control-flow, ad
+hoc inline stubs): canned classifier/planner JSON committed under
+`tests/fixtures/adherence_gate/{incident_plan,legit_plan}.json` drives both
+the floor directly and the full two-stage composition through
+`phase_adherence_gate` with `claude_p` stubbed to the fixture's recorded
+`adherence_judge` score. Pinned: the floor's issue count on both fixtures;
+the incident floor naming both unrun commands; the legit floor staying
+silent; the incident fixture driving the gate to `die()` after exhausting
+the re-plan budget on a still-noncompliant plan; the legit fixture never
+invoking `claude_p`/`phase_plan` at all (0 false positives via
+short-circuit); and a frozen-score separation test
+(`test_incident_vs_legit_judge_scores_are_cleanly_separated`) that catches
+threshold drift even when the fire/silent outcome alone doesn't change.
 The id-vanishing `depends_on` rewrite (DESIGN §5 *Id-vanishing operations* — every op
 that removes a subtask id owes the plan a rewrite of inbound references; the tag
 channel self-heals via inherited `provides`, so only the id channel dangles) is tested

@@ -25,7 +25,7 @@ import pytest
 
 WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "satisfied_probe", "provision", "implementer", "integrator",
-           "conformer", "fit_judge", "splitter")
+           "conformer", "fit_judge", "splitter", "adherence_judge")
 
 # The expected default per worker, with no overrides.
 DEFAULTS = {
@@ -40,6 +40,7 @@ DEFAULTS = {
     "conformer":  "sonnet",
     "fit_judge":  "opus",
     "splitter":   "opus",
+    "adherence_judge": "opus",
 }
 
 
@@ -72,10 +73,22 @@ def test_all_unset_defaults_per_worker(leerie, repo_root):
     worker_slice = {w: models[w] for w in WORKERS}
     assert worker_slice == DEFAULTS
     assert leerie.MODEL_DEFAULT == "opus"
-    # implementer, judge and heal are the current per-worker overrides.
+    # implementer and heal are the current per-worker overrides. judge is
+    # a judgment worker and is absent from MODEL_DEFAULT_PER_WORKER so it
+    # resolves to opus via the MODEL_DEFAULT fallback (see
+    # resolve_models()'s dedicated judge_cli/judge_env/... chain below).
     assert leerie.MODEL_DEFAULT_PER_WORKER.get("implementer") == "sonnet"
-    assert leerie.MODEL_DEFAULT_PER_WORKER.get("judge") == "sonnet"
+    assert leerie.MODEL_DEFAULT_PER_WORKER.get("judge") is None
     assert leerie.MODEL_DEFAULT_PER_WORKER.get("heal") == "sonnet"
+
+
+def test_judge_worker_resolves_to_opus(leerie, repo_root):
+    """The post-run judge worker is a judgment worker (scores captured
+    calls against a rubric) and must default to opus, not sonnet — sonnet
+    is measurably unreliable for judgment calls. Regression pin for the
+    removal of MODEL_DEFAULT_PER_WORKER['judge']."""
+    models = leerie.resolve_models(repo_root, ns())
+    assert models["judge"] == "opus"
 
 
 def test_global_env_applies_to_every_worker(leerie, repo_root, monkeypatch):

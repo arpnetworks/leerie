@@ -2205,15 +2205,19 @@ Resolution order (highest priority first):
 ### Judge model
 
 The `claude` model alias used when the judge skill spawns a worker to score a
-batch of captured calls. The judge does not require broad-context judgment like
-the orchestrator's core workers — `sonnet` is the right default for throughput.
+batch of captured calls against a 3-dimensional rubric. This is a judgment
+call (per CLAUDE.md's "judgment workers default to opus" rule), not
+throughput-bound work, so it defaults to `opus` like the orchestrator's core
+judgment workers — `judge` is absent from `MODEL_DEFAULT_PER_WORKER` and
+falls through to the global `MODEL_DEFAULT`.
 
 Resolution order (highest priority first):
 
 1. **`--judge-model MODEL`** CLI flag.
 2. **`LEERIE_MODEL_JUDGE`** environment variable.
-3. **`leerie.toml`**, `model_judge = "sonnet"`.
-4. **Default `"sonnet"`** (`MODEL_DEFAULT_PER_WORKER["judge"]`).
+3. **`leerie.toml`**, `model_judge = "opus"`.
+4. **Default `"opus"`** (`MODEL_DEFAULT`; `judge` is absent from
+   `MODEL_DEFAULT_PER_WORKER`).
 
 ### Heal model
 
@@ -2382,13 +2386,16 @@ judgment work and `sonnet` for high-throughput implementation. Valid values:
 `sonnet` | `opus` | `haiku` (aliases — the `claude` CLI resolves them to the
 current model version).
 
-**Per-worker defaults: Opus for judgment, Sonnet for implementation, post-run analysis, and finalize-time composition.**
-Workers that exercise broad-context judgment (classify the task, decompose
-into subtasks, reconcile cross-domain coupling, detect cross-planner surface
-overlap, resolve merge conflicts behaviorally, check criteria) default to
-Opus. The implementer, conformer, judge, heal, and pr_writer workers —
-which execute concrete tasks with high throughput requirements (implementer,
-conformer) or run as one-shot post-run / finalize calls (judge, heal,
+**Per-worker defaults: Opus for judgment, Sonnet for implementation and
+finalize-time composition.** Any worker that makes a *decision* (classify
+the task, decompose into subtasks, reconcile cross-domain coupling, detect
+cross-planner surface overlap, resolve merge conflicts behaviorally, check
+criteria, score captured calls against a rubric) defaults to Opus —
+measured evidence (a real incident's judge-experiment) shows Sonnet gives
+opposite verdicts from Opus on identical judgment inputs. The implementer,
+conformer, heal, and pr_writer workers — which execute concrete tasks with
+high throughput requirements (implementer, conformer) or run as one-shot
+post-run / finalize calls with no independent-judgment role (heal,
 pr_writer) — default to Sonnet.
 
 | Worker       | Default | Why |
@@ -2397,24 +2404,25 @@ pr_writer) — default to Sonnet.
 | planner      | opus    | decomposition is the load-bearing judgment step |
 | reconciler   | opus    | cross-domain tag equivalence is judgment |
 | plan_overlap_judge | opus | surface-overlap detection over the reconciled plan is judgment (two planners independently extracting the same artifact with incompatible APIs — DESIGN §5 *Cross-domain surface overlap*) |
-| satisfied_probe | sonnet | per-subtask "is this already met on the base tree?" check (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask so throughput/cost dominates — same profile as conformer/judge. The false-positive risk is contained by the base-tree-only tool scope + conservative-default prompt, not by model tier |
+| satisfied_probe | sonnet | per-subtask "is this already met on the base tree?" check (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask so throughput/cost dominates — a **deliberate, documented cost tradeoff** (see the comment at `MODEL_DEFAULT_PER_WORKER["satisfied_probe"]`), not a claim that the check needs no judgment. The false-positive risk is contained by the base-tree-only tool scope + conservative-default prompt, not by model tier |
 | provision    | opus    | fallback when the deterministic lockfile-detection table returns empty (DESIGN §6½); reads README + configs to emit an install recipe — judgment over arbitrary repo shapes |
 | integrator   | opus    | behavioral conflict resolution; a wrong merge silently corrupts integrated state |
 | implementer  | sonnet  | concrete subtask execution; Sonnet's throughput is the right tradeoff |
 | conformer    | sonnet  | reads a diff and runs commands; same throughput-first profile as implementer; the phase is advisory so a borderline judgment call costs at most a warning |
-| judge        | sonnet  | scoring a batch of captured calls; throughput matters more than broad judgment |
+| judge        | opus    | scoring a batch of captured calls against a 3-dimensional rubric is judgment, not throughput-bound work; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
 | pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise; throughput-shaped one-shot call |
 | dep_capture  | opus    | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets warrants full-tier reasoning |
 | fit_judge    | opus    | P1 Task-Context Fit scoring is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
 | splitter     | opus    | LLM-driven structural partition (coupled-minority path) is judgment; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
+| adherence_judge | opus | plan-instruction-adherence scoring is judgment; empirically falsified on sonnet (false-positives on legitimate plans) and on an opus *understanding*-framed judge (rubber-stamps a plan that disobeys a prescribed procedure while still reflecting correct comprehension) — only the ADHERENCE frame + opus model combination is validated; absent from `MODEL_DEFAULT_PER_WORKER` — opus default comes from the global `MODEL_DEFAULT` fallback |
 
 `MODEL_DEFAULT` is the global default (`opus`); `MODEL_DEFAULT_PER_WORKER`
-overrides it for specific workers (`implementer`, `conformer`, `judge`,
-`heal`, `pr_writer`, and `satisfied_probe` all default to `sonnet`).
-`dep_capture`, `fit_judge`, and `splitter` are **absent** from
-`MODEL_DEFAULT_PER_WORKER` — their `opus` defaults come from the global
-`MODEL_DEFAULT` fallback.
+overrides it for specific workers (`implementer`, `conformer`, `heal`,
+`pr_writer`, and `satisfied_probe` all default to `sonnet`).
+`dep_capture`, `fit_judge`, `splitter`, `judge`, and `adherence_judge` are
+**absent** from `MODEL_DEFAULT_PER_WORKER` — their `opus` defaults come from
+the global `MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
 
@@ -2427,7 +2435,7 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`opus`)
 
-Fifteen worker types (plus the global override), each independently overridable:
+Sixteen worker types (plus the global override), each independently overridable:
 
 | Worker             | env var                           | CLI flag                     | TOML key                  |
 |--------------------|-----------------------------------|------------------------------|---------------------------|
@@ -2443,6 +2451,7 @@ Fifteen worker types (plus the global override), each independently overridable:
 | conformer          | `LEERIE_MODEL_CONFORMER`        | `--model-conformer`          | `model_conformer`         |
 | fit_judge          | `LEERIE_MODEL_FIT_JUDGE`        | `--model-fit_judge`          | `model_fit_judge`         |
 | splitter           | `LEERIE_MODEL_SPLITTER`         | `--model-splitter`           | `model_splitter`          |
+| adherence_judge    | `LEERIE_MODEL_ADHERENCE_JUDGE`  | `--model-adherence_judge`    | `model_adherence_judge`   |
 | judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
 | heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
 | pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
@@ -2509,11 +2518,13 @@ keeps acting workers' reasoning bounded by their own evidence gates
 | dep_capture  | high    | finalize-time dep inference; broad judgment over shell command sets benefits from pinned reasoning depth |
 | fit_judge    | high    | P1 Task-Context Fit score is judgment over scope+context co-minimization; calibrated threshold (0.70) makes pinned depth the reproducibility dial |
 | splitter     | high    | LLM-driven structural partition (coupled-minority path) is judgment over seam detection; wrong split corrupts downstream implementer context |
+| adherence_judge | high | plan-instruction-adherence scoring is judgment; empirically calibrated (goal-only task ⇒ ≥8.5, prescribed-and-violated ⇒ ≤3) on opus at `high` effort — pinned depth is part of the validated configuration |
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it to `"high"` for the six judgment
 workers above and for the finalize-time `pr_writer` and `dep_capture` workers,
-and for the P1 decomposition workers `fit_judge` and `splitter`.
+and for the P1 decomposition workers `fit_judge` and `splitter`, and for
+the plan-instruction-adherence worker `adherence_judge`.
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -2541,6 +2552,7 @@ model selection:
 | conformer          | `LEERIE_EFFORT_CONFORMER`        | `--effort-conformer`          | `effort_conformer`         |
 | fit_judge          | `LEERIE_EFFORT_FIT_JUDGE`        | `--effort-fit_judge`          | `effort_fit_judge`         |
 | splitter           | `LEERIE_EFFORT_SPLITTER`         | `--effort-splitter`           | `effort_splitter`          |
+| adherence_judge    | `LEERIE_EFFORT_ADHERENCE_JUDGE`  | `--effort-adherence_judge`    | `effort_adherence_judge`   |
 | judge              | *(none)*                         | *(none)*                      | *(none)*                   |
 | heal               | *(none)*                         | *(none)*                      | *(none)*                   |
 | pr_writer          | *(none)*                         | *(none)*                      | *(none)*                   |
@@ -3324,6 +3336,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 | 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `leerie.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()`. After all `plan_one` results are collected, P1 Layer C runs: each first-pass subtask in each plan is expanded through `recursive_decompose(subtask, depth=0, …)` and `plan["subtasks"]` is replaced with the union of all returned leaves (DESIGN §5½ *Wire-in to phase_plan*). A plan with no subtasks is left untouched. Expansion vanishes each split parent's id, so the loop records `{parent_id: [leaf_ids]}` for every parent absent from its own leaves and then calls `_remap_vanished_deps(all_leaves, expansion)` **once over every plan's leaves after every plan has expanded** — a dependent may live in a different category's plan than the parent it names (DESIGN §5 *Id-vanishing operations*). The downstream path (reconcile → overlap_judge → schedule → validate_plan → write_plan) receives this expanded flat leaf set unchanged. |
 |   • Reconcile *(when needed)* | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. **Before matching, two mechanical passes run: (a) `_promote_external_collisions(plans)` rewrites any `extent: external` entry whose tag is in some plan's `provides` to `extent: in_plan` (the in-plan producer wins); (b) `_collect_external_preconditions(plans)` extracts every remaining `extent: external` entry into a deduped list `{tag, reasons[], originating_subtasks[]}` that bypasses the reconciler and is persisted by `write_plan`. Both passes are re-run after `_apply_reconciler_output` so any `extent: external` entries on reconciler-added connector subtasks also flow through the same machinery (collision-promoted if a provider now exists; otherwise added to the persisted preconditions list). The second collection idempotently replaces `st.data["external_preconditions"]` — the helper returns the full deduped set so a re-run is a refresh, not an append.** Only `extent: in_plan` entries with no matching `provides` enter the unresolved set. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits eight arrays — five *resolution* (renames / added_provides / added_subtasks / conditional_drops / dropped_requires), two *cycle-breaking-only* (dependency_edges / merged_subtasks; `dropped_requires` also plays a cycle-breaking role), and one *escape hatch* (unresolvable). If `unresolvable` is non-empty, dead-subtask elimination (`_prune_dead_subtasks`) first removes fully-speculative subtasks whose every `in_plan` requires is unresolvable when ≥1 domain has 0 subtasks (see "Phase 2½ checks" below); if entries remain after pruning, `die()` with the reconciler's diagnosis (DESIGN §5). Otherwise, the orchestrator applies the seven action arrays mechanically. After applying, runs an **acyclicity gate** (Tarjan's SCC over the post-mutation graph); on cycle, deep-copies the pre-mutation plans, computes a recommended cycle-resolution per SCC from structural signals, respawns the reconciler once with a structured retry prompt + bounded "must-include" set of acceptable operations, and re-runs the gate. If still cyclic, `die()` with the SCC + offending mutations enumerated. See "Phase 2½ checks" and "Cycle-resolution retry loop" below. |
 |   • Overlap judge *(when 2+ planners)* | `phase_overlap_judge` | spawn one `plan_overlap_judge` worker against the reconciled plan to detect cross-planner **surface collisions** — two subtasks producing the same exported artifact (same component / function / primitive) with incompatible APIs. Schema in `SCHEMAS["plan_overlap_judge"]`. Output: zero or more `collisions`, each with `resolution ∈ {merge, drop_a, drop_b, unresolvable}` and (when `resolution=merge`) a non-empty `merge_feasibility` statement that becomes the merged subtask's unified intent. Orchestrator applies actions mechanically through `_apply_overlap_collisions` with the **anchor-survivor rule**: when one sid appears in 2+ non-`unresolvable` collisions (computed by `_compute_overlap_anchors`), it is the structural anchor of the cluster and survives every merge it participates in — overriding `_apply_overlap_merge`'s default lex-smaller rule (the default is a determinism device with no semantic content). Rationale: membership is bare appearance count and carries no semantic claim — a sid the judge dropped twice is an anchor too, it just never survives to use the hint — but a sid the judge kept returning to is a better merge tie-break than alphabetical order. Do **not** read it as "the broader subtask that absorbs each partner": that is false on 20 of the 64 two-collision combinations (DESIGN §5). Pairs that lack a shared endpoint use the lex-smaller default unchanged. Per-pair: `merge` → `_apply_overlap_merge` (with optional `survivor_hint=anchor_sid` when applicable; union of fields, intent concatenation, downstream `depends_on` rewrites); `drop_*` → `_apply_overlap_drop` (mirrors `conditional_drops` apply step); `unresolvable` → `die()` at plan time with both sids + artifact + judge's reason. The validator also die()s on the keep-and-delete contradiction (`_contradictory_drop_sids`: a `drop_*` whose dropped sid *survives* another collision — kept as a merge endpoint or as the non-dropped side of another `drop_*`. One claim deletes it, another keeps it; no apply order satisfies both. Deliberately **not** anchor membership — a sid dropped by several collisions is an anchor by appearance but is coherent multi-drop output, applied as a cluster by `_apply_multidrop`). **Per-resolution cycle avoidance:** before applying each `merge` / `drop_*`, `_apply_overlap_collisions` tentatively applies it to a copy (`_would_cycle_after`) and, if it would introduce a dependency cycle, skips it (`skipped_would_cycle`) — keeping both subtasks separate for the integrator instead of `die()`ing the run; the final post-merge Tarjan gate is retained only as a never-fires backstop. **Cheap-skip** when fewer than 2 planners produced subtasks, or total subtask count < 2 (no possible cross-planner collision). **Python backstop** asserts every `merge` carries non-empty `merge_feasibility` — caught at `_validate_overlap_judge_output` before any apply. Opt-out via `--skip-overlap-judge` (mirrors `--skip-smoke`; env `LEERIE_SKIP_OVERLAP_JUDGE`; `leerie.toml` `skip_overlap_judge`). Persists full judge output to `state.data["plan_overlap_judge"]` and post-apply mutations to `state.data["plan_overlap_applied"]` for audit. See "Phase 2¾ checks" below. |
+|   • Adherence gate *(when prescribed)* | `phase_adherence_gate` | whole-plan instruction-adherence gate (DESIGN §12 sibling — see "Instruction-adherence gate" above for the full mechanism). Cheap-skip when `st.data["skip_adherence_check"]` or `st.data["prescribed_procedure"].is_prescribed` is falsy — the ~90% goal-only common case pays nothing. Otherwise: deterministic `check_prescribed_command_coverage` floor + opus `adherence_judge` worker, fed through the existing `_run_checked_loop` (bounded by `judgment_check_rounds`); a violation's feedback callback re-invokes `phase_plan` in full to actually re-plan. `die()`s on exhaustion; `adherence_judge` `WorkerError` degrades to the floor's own verdict rather than discarding the plan. Persists to `state.data["adherence_gate"]` for audit. |
 | 3 Schedule | `detect_no_work`, `warn_cross_planner_file_overlap`, `warn_layer_gaps`, `warn_provider_subset_subtasks`, `filter_offtree_subtasks`, `filter_satisfied_subtasks`, `schedule`, `validate_plan` | **First: `detect_no_work(plans)` short-circuits when every plan has `status: "ready"` and empty `subtasks` (DESIGN §8 *The cleared-but-empty terminal state*) — `_finish_no_work_run` records `no_work_required=true` + per-domain bases in state.json, writes `finished_at` to state.json + run.json (with `no_push=True` so the host launcher does not attempt to push a non-existent branch), logs the no-work summary, and returns without scheduling. Phases 4–6 are skipped entirely.** Otherwise: warn on cross-planner file overlap; warn on layer gaps (DESIGN §5 *Migration-surface completeness* — DB-without-seed and env-provider-without-template); warn on provider-subset subtasks (DESIGN §5 *Provider-subset subtasks* — a subtask whose entire `files_likely_touched` is a subset of an ordered predecessor's, reusing `_build_predecessor_graph`; advisory only, the mid-run satisfied rescue is the actual safety net); **soft-drop subtasks whose `files_likely_touched` resolves outside the run's repo root (most commonly into an inspect-dir mount) — recorded in `state.data["dropped_subtasks"]`**; **then `filter_satisfied_subtasks(plans, repo_root, st, caps, models, efforts)` spawns one read-only `satisfied_probe` worker per surviving subtask (bounded by `max_parallel`), each evaluating that subtask's `success_criteria_seed` against the base tree, and soft-drops those the probe marks `satisfied` — recorded in `state.data["dropped_subtasks"]` with `reason: "already_satisfied"` + the probe's evidence (DESIGN §8 *Already-satisfied subtask elimination*). Skipped when `state.data["skip_satisfied_check"]`. If this empties every `status: "ready"` plan, the gate synthesizes a `no_work_map` from the drop evidence and routes to `_finish_no_work_run` (same terminal state as native cleared-but-empty; a `status: "blocked"` plan with 0 subtasks still falls through to `schedule`'s all-blocked `die`). Both soft-drop filters vanish subtask ids, so each calls `_remap_vanished_deps(surviving, {sid: [] for sid in dropped})` after rewriting its plan's survivors, pruning any inbound `depends_on` reference to a dropped sid (DESIGN §5 *Id-vanishing operations*). Without it a dependent's edge dangles: `schedule()` drops it silently and `validate_plan` then die()s the run. A drop also orphans the **tag channel** (a dropped subtask's `provides` vanish with no successor to inherit them), so each filter additionally captures the dropped subtasks' `provides` *before* the survivor-filter and, after the per-plan `_remap_vanished_deps` loop, calls `_prune_orphaned_requires(plans, dropped_provides)` **once over all plans** (capability tags are cross-domain, so surviving-provider status is a global property — a per-plan prune would drop a tag another plan still provides), removing inbound `requires` tags whose only provider was dropped (keeping tags a survivor still provides; leaving never-provided tags for `validate_plan` to flag). Without this second prune a consolidation subtask that `requires` a dropped provider's tag dies at `validate_plan` with `requires 'X' but nothing provides it` — after the full planner spend. The probe's tool allowlist is a base-tree-only subset (NOT full `INSPECT_TOOLS`), illustratively `Bash(git show HEAD:*)`, `Bash(git diff:*)`, `Bash(git status:*)`, the `_READ_BASE` read set (`Read`/`Grep`/`Glob`/`WebSearch`/`WebFetch`), and read-only Bash verbs (`ls`/`cat`/`head`/`wc`/`grep`/`rg`/`file`/`stat`/`pwd`/`echo`) — but **no** `git log` / bare `git show:*` / non-HEAD ref, because a worktree shares the repo's full ref DB and history-spanning git false-positives on code present only on other branches. The exact list is `SATISFIED_PROBE_TOOLS` in `orchestrator/leerie.py`. Advisory/soft — subordinate to the `check_branch_has_commits` backstop per DESIGN §12;** merge plans, build the global DAG via `_build_predecessor_graph` (shared with the phase 2½ acyclicity gate), Kahn topological sort into waves. Cycles are expected to be caught upstream by the phase 2½ gate; if one slips through, `die()` with the full SCC report. |
 | 4 Setup | `phase_execute` head → `setup-run.sh` → `capture_conformance_baseline` | create the run branch `leerie/runs/<run-id>` and its worktree (per-run, isolated from any other run). After `setup-run.sh`, `git worktree prune` clears stale `.git/worktrees/` metadata that a prior SIGKILL'd invocation may have left behind (on Fly, `machine stop` SIGKILLs the orchestrator — the `finally`-block cleanup never runs; the stale metadata persists on the volume and crashes `git worktree list --porcelain` in `new-worktree.sh` on the next resume). Then, unless `state.data["skip_base_baseline"]`, `capture_conformance_baseline(leerie_dir, st, caps)` runs once (DESIGN §9 *Base-tree health baseline*): the staging worktree is now an unmodified snapshot of the base HEAD, so it installs the persisted provision recipe into staging and runs each resolved build/lint/test command there directly via `run_streaming`, recording the exit-code verdict per axis at `st.data["conformance"]["_baseline"]`. Each axis records a `measured` bool alongside `ran`/`passed`: a non-zero exit whose output matches `_runner_missing` (`command not found` / `No such file or directory` — the runner itself is absent, e.g. the recipe's `pip install` failed so `pytest` is missing) is recorded `measured: False` and is **excluded from `red_axes`** — it is "could not measure," not "base is RED," and a false-RED here is what provoked the conformer to re-derive the base destructively (`git checkout <base> -- .`). Deterministic (no LLM); advisory (never raises — a glue error logs and proceeds with no baseline); idempotent (the `_baseline` key is the resume sentinel). A RED base logs a loud provisioning warning and writes `run.json.health.base_suite`. Every axis dict carries `measured` (there is no legacy default; `red_axes`, `_format_baseline_section`, and `_base_health_payload` all treat it as mandatory). The baseline is threaded into every conformer prompt (`_format_baseline_section` → `BASELINE:` line, which surfaces unmeasurable axes as an explicit "could not measure — attribute failures yourself" line) so the conformer scopes build/lint/test residuals to the delta rather than re-deriving "pre-existing" |
 | 5 Execute | `phase_execute`, `settle_subtask`, `integrate_wave`, `run_final_conformance` | per wave: subtasks whose `subtask_status` is already `"complete"` are skipped (they were integrated in a prior invocation); when every subtask in a wave is already complete the wave is skipped entirely and `completed_waves` is advanced. Before dispatch, stale `subtask_status` entries for retried subtasks (failed/blocked from the prior invocation) are deleted so `_get_progress` counts them as running (absent = running per the progress-prefix convention above). Remaining implementers are awaited concurrently via `gather_or_cancel` under a fresh `asyncio.Semaphore(max_parallel)` (separate instance from Phase 2's), then integrate, then run a deterministic conflict-marker scan on the integrated worktree. `settle_subtask` runs the **post-work conformance phase** (DESIGN §9 *Post-work conformance*) on the success path before returning — `discover_rules_files` → `run_conformer` loop (≤ `conformance_rounds`) → re-run the per-subtask mechanical-precondition gates (`check_branch_has_commits`, dirty-worktree, `check_diff_scope`) against the conformer's commits → attach `conformance_warnings` to the result. The phase is advisory: residuals, build/lint/test failures, gate violations on conformer commits, and `WorkerError` all surface as warnings, never as `failed`/`blocked`. If any subtask in the wave ends `blocked` or `failed`, `phase_execute` still calls `integrate_wave` for the successful subtasks (partial-wave integration — DESIGN §3) and runs the conflict-marker scan on the staging worktree, then aborts the run — the blocker is recorded in `state.json`, the successful subtasks' work is on the run branch, and the run resumes with `--resume`. There is no LLM wave-level re-validation between waves; the §8 confidence gate is the load-bearing per-subtask signal, and `scan_conflict_markers` is the deterministic post-integration safety net. **Integration-integrity gate**: after `integrate_wave` returns and the conflict-marker scan passes, and only once the wave has no `blocked`/`failed` subtasks (those die() with their own message first), `phase_execute` asserts `len(integrated) == expected`, where `expected` is the count of subtasks that settled `complete` in this wave. `integrate_wave` appends a sid to `integrated` on every path that processes it (rc 0 — including a zero-commit satisfied-rescue subtask, whose `git merge --no-ff` is a rc-0 "Already up to date"), and every other path `die()`s or resolves-via-integrator, so under correct operation the counts match. A shortfall means a subtask that settled complete was silently not merged into the run branch (the run 26fd0fa5 class: 10 complete, 0 integrated, no failure, an empty run branch reaching finalize); the gate `die()`s with the integrated/expected counts before advancing `completed_waves`, so the DESIGN §6 completion signal (`completed_waves == len(waves)`) can never certify an un-integrated wave. It records no `blocked` entry — `--resume` retries this wave via the un-advanced `completed_waves`, not by reading `blocked`, and no consumer reads a wave-level blocked key; the die() message is the complete diagnostic. The subtask work survives on `leerie/subtasks/<run-id>/*` and `--resume` retries integration. **After every wave has integrated**, `_run_phases` calls `run_final_conformance(leerie_dir, st, caps, models, efforts)` once on the staging worktree (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph) — same `run_conformer` loop with `cwd = <state-root>/runs/<id>/worktrees/staging`, `DIFF_BASE = st.data["working_branch"]` (the PR's base, captured by `phase_classify`), no subtask spec / criteria inputs, same `conformance_rounds` cap, same protected-path rollback discipline. Output lands at `st.data["conformance"]["_final"] = {result, warnings}` and is threaded into the `pr_writer` payload as `final_conformance`. Advisory: any failure mode (WorkerError, malformed result, exhausted rounds) surfaces as a warning; `phase_finalize` always runs |
@@ -4124,10 +4137,11 @@ Each returns `list[str]` — empty when clean. Pure Python, no LLM.
 
 | Worker | Check function | Issue codes | Max rounds cap |
 |--------|---------------|-------------|----------------|
-| Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `MANY_CATEGORIES`, `SAME_WORK_RISK`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
+| Classifier | `check_classifier_output(result, repo_root)` | `CATEGORY_NO_DIR`, `EMPTY_WHY`, `EMPTY_EVIDENCE`, `MANY_CATEGORIES`, `SAME_WORK_RISK`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
 | Planner | `check_planner_output(result, repo_root, domain)` | `PHANTOM_PATH`, `DANGLING_DEP`, `EMPTY_CRITERIA`, `OVERSIZED`, `INTRA_DOMAIN_OVERLAP`, `PROTECTED_PATH`, `INTRA_DOMAIN_CYCLE`, `UNCOVERED_MIGRATION_SURFACE`, `LOW_CONFIDENCE` | `planner_check_rounds` (3) |
 | Reconciler | `check_reconciler_output(output, plans)` | `RENAME_TO_NOWHERE`, `BAD_PREFIX`, `SELF_DEP`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
 | Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
+| Adherence gate | `check_prescribed_command_coverage(prescribed_procedure, subtasks)` (deterministic floor) + inline `LOW_ADHERENCE` check on the `adherence_judge` result | `PRESCRIBED_CMD_UNRUN`, `LOW_ADHERENCE` | `judgment_check_rounds` (3) |
 | Provision | `check_provision_output(result, repo_root)` | `WRONG_PM`, `MISSING_WORKDIR`, `EMPTY_RECIPE`, `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
 | Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED`, `UNMET_CRITERION` | `implementer_confidence_retries` (2) |
 | Integrator | `check_integrator_output(result)` | `LOW_CONFIDENCE` | `judgment_check_rounds` (3) |
@@ -4198,6 +4212,76 @@ injection stays unconditional, so the planner still sees the full
 checklist as context.
 
 No-op when the task doesn't reference files.
+
+### Instruction-adherence gate (DESIGN §12 sibling — *Instruction adherence
+is code-enforced*)
+
+Fully shipped. `SCHEMAS["classifier"]` carries `prescribed_procedure`
+(`{is_prescribed, commands, forbid_manual, evidence}`, persisted to
+`st.data["prescribed_procedure"]` — see §3 "Worker output schemas"),
+`SCHEMAS["planner"]` carries the optional per-subtask `runs_commands`
+array, the `adherence_judge` worker is fully registered (schema, prompt,
+`WORKER_TYPES`, opus/`"high"` model-effort defaults — see "The
+`adherence_judge` worker" above), and `phase_adherence_gate` (a
+whole-plan gate, "Phase 2⅞", run once per assembled plan rather than
+per-subtask) wires all of it together.
+
+`phase_adherence_gate(plans, task, st, caps, models, efforts)` runs in
+`_run_phases` immediately after `phase_overlap_judge` and before
+`schedule()`/`validate_plan` (so a re-plan never rebuilds an
+already-scheduled DAG). It short-circuits — free, no worker calls — when
+`st.data["skip_adherence_check"]` is set, and again when
+`st.data["prescribed_procedure"].is_prescribed` is falsy (the ~90%
+goal-only common case never pays for a judge call). Two-stage
+composition (corpus-validated: 0/21 false positives on real runs; do not
+gate on the judge's score alone, which alone false-positived ~12% of
+ordinary runs in isolation):
+
+1. **Deterministic floor (primary, JSON→verdict, no NL):**
+   `check_prescribed_command_coverage(prescribed_procedure, subtasks)`
+   computes `set(prescribed_procedure.commands) − ⋃(subtask.runs_commands
+   for subtask in plan)` using **normalized token-set matching**
+   (lowercase + stopword-filtered token-SUBSET — the planner emits
+   paraphrases of the prescribed command, not always the byte-identical
+   string), not exact string equality. A non-empty result names a
+   prescribed command no subtask runs — a `PRESCRIBED_CMD_UNRUN` issue.
+   Pure set logic over two LLM-emitted structured fields; the check
+   itself does no NL parsing. Silent (and free) when
+   `prescribed_procedure` is absent, `is_prescribed` is false, or
+   `commands` is empty.
+2. **Opus adherence judge (secondary, semantic layer):** spawned only
+   when `is_prescribed=true` (gating the judge call itself behind the
+   classifier signal, not just its score, is what keeps the two-stage
+   composition's false-positive rate at 0/21). Scores
+   `instruction_adherence` (0–10) + `violations[]` for the case the
+   deterministic floor cannot see: every prescribed command runs, but the
+   plan *also* substitutes hand-authored/manual work the user's
+   `forbid_manual` signal prohibited. The gate fires when
+   `instruction_adherence < _ADHERENCE_GATE_THRESHOLD` (5.0 — chosen from
+   the corpus's clean separation: incident plans scored ≤3.0, legitimate
+   plans ≥8.5).
+3. **Gate wiring (shipped).** Either a `PRESCRIBED_CMD_UNRUN` floor issue
+   or a low `instruction_adherence` score is fed to the **existing**
+   `_run_checked_loop` (bounded by `judgment_check_rounds`), exactly like
+   `phase_reconcile` and `phase_overlap_judge`. The retry's
+   `make_feedback_prompt` callback **is** the re-plan action: it
+   re-invokes `phase_plan` in full (fresh planner calls across every
+   category) with the violation text folded into the task string, and
+   the loop's next round re-runs the floor + judge against the new plan.
+   No new pause/resume machinery — `EXIT_NEEDS_ANSWERS` is untouched.
+   Exhaustion `die()`s with the unresolved violations and the
+   `--skip-adherence-check` escape hatch, exactly like every other
+   exhausted planner-adjacent gate. `adherence_judge` `WorkerError`
+   (every round crashes) degrades: the floor's own (still
+   model-independent) verdict is re-checked one final time — a clean
+   floor returns the plan unmodified, a violating floor still `die()`s
+   (the floor's evidence doesn't depend on the judge being alive) — the
+   assembled plan itself is never discarded on a judge crash, mirroring
+   `fit_judge`'s crash-barrier discipline (DESIGN §5½).
+
+On success the gate persists `st.data["adherence_gate"] = {"judge":
+<adherence_judge output>, "floor_issues": []}` for audit (mirroring
+`plan_overlap_judge`'s persist-before-return discipline).
 
 ### P6 repo-map — `build_repo_map` + `rank_repo_map`
 
@@ -4425,6 +4509,39 @@ child mirrors the planner subtask shape: required `id`, `title`,
 Both workers are registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER`
 (both default to `"high"`). Both are absent from `MODEL_DEFAULT_PER_WORKER`
 (default opus via the global `MODEL_DEFAULT` fallback).
+
+### The `adherence_judge` worker (plan-instruction-adherence gate)
+
+`SCHEMAS["adherence_judge"]` — required fields: `user_prescribed_a_procedure`
+(boolean — independently re-derived from the task + plan, not copied from
+the classifier's own `prescribed_procedure.is_prescribed` signal),
+`instruction_adherence` (number 0–10), `violations` (array of strings, each
+naming a prescribed step/command the plan circumvented and how), `rationale`
+(string). Deliberately carries **no** `_confidence_schema` sub-object —
+unlike `fit_judge`/most other judgment workers, this worker *is itself* the
+independent check that replaces a self-report, so a nested self-confidence
+axis would reintroduce the self-grading bias the gate exists to remove.
+
+Registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER` (`"high"`),
+absent from `MODEL_DEFAULT_PER_WORKER` (opus via the global `MODEL_DEFAULT`
+fallback — **required**, not merely preferred: empirically falsified on
+sonnet, which false-positived a legitimate plan). Prompt at
+`prompts/adherence_judge.md` carries the calibration: a goal-only task (no
+prescribed procedure to violate) scores `instruction_adherence >= 8.5`; a
+plan that substitutes hand-authored/manual work for an explicitly
+prescribed procedure scores `<= 3`. The prompt is framed on **ADHERENCE**
+(does the plan obey the prescribed process?), not **understanding** (does
+the plan reflect correct comprehension of the task?) — an
+understanding-framed judge on opus was empirically shown to rubber-stamp a
+plan that disobeys a prescribed procedure while still reflecting correct
+task comprehension (score ~9.0 on the motivating incident's plan).
+
+This worker's `claude_p()` invocation, its position in the plan check loop
+(alongside the deterministic command-coverage floor), and the
+`--skip-adherence-check` flag are gate-wiring concerns — see "Instruction-
+adherence gate" in §5 for the full wiring (fully shipped as
+`phase_adherence_gate`); this section covers only the worker's registration
+(schema, prompt, model/effort defaults).
 
 `--max-turns` by worker: classifier 60, planner 100, reconciler 30,
 plan_overlap_judge 30, provision 30, integrator 60, implementer 120,
@@ -6578,12 +6695,14 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `telemetry` | dict | calls, cost_usd, input_tokens, output_tokens — printed at run end |
 | `categories` | list[str] | classifier output, post-whitelist filtering |
 | `classifier_questions` | list[dict] | intent questions the classifier surfaced |
+| `prescribed_procedure` | dict | classifier's language→JSON signal declaring whether the user prescribed an explicit procedure/command-sequence: `{is_prescribed, commands, forbid_manual, evidence}`. Empty dict when the classifier omitted the field. `phase_plan` injects this dict verbatim into the planner `ctx_dict` under the same key — but only when `is_prescribed` is true, so a goal-only task carries no false framing — mirroring the conditional `repo_map` injection in the same function (the PREVENT half of the instruction-adherence gate; DESIGN §12 sibling) |
 | `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |
 | `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation |
 | `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both`) |
 | `clarify` | bool | whether asking the user is allowed for this run (resolved from `--clarify` / `LEERIE_CLARIFY` / `leerie.toml` / default `False`) |
 | `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / plan_overlap_judge / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). Resolved from `--skip-overlap-judge` / `LEERIE_SKIP_OVERLAP_JUDGE` / `leerie.toml` / default `False`. The cheap-skip on single-planner / <2-subtask runs is automatic and not gated by this field — this flag only affects runs where the worker would otherwise fire. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
+| `skip_adherence_check` | bool | whether the instruction-adherence gate (the deterministic prescribed-command-coverage floor + the opus `adherence_judge` worker in the planner check loop) is suppressed. Resolved from `--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` in `leerie.toml` / default `False`. When True, a plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
 | `skip_budget_check` | bool | whether `check_budget_feasibility()` (DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*) is suppressed. Resolved from `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml` / default `False`. The runtime backstop in `State.bump_workers()` is independent of this field — it always fires when the counter actually exceeds `max_total_workers`; this flag only suppresses the *early* die() that catches mathematically-unwinnable runs at the plan/execute boundary. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state. On `--resume` the preflight is moot regardless — the resume path enters past `schedule()` so the check has nothing to gate |
 | `skip_satisfied_check` | bool | whether `filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) is suppressed. Resolved from `--skip-satisfied-check` / `LEERIE_SKIP_SATISFIED_CHECK` / `leerie.toml` / default `False`. When set, no `satisfied_probe` worker spawns and every subtask proceeds to `schedule()`; the mechanical `check_branch_has_commits` backstop then still catches an already-satisfied subtask post-execution — on a no-commits `complete`, `settle_subtask` re-probes the criteria against the run-branch HEAD (`probe_criteria_satisfied_on_head`) and settles it `complete` if met (DESIGN §8 *The mid-run sibling case*), rather than failing it as a retryable no-op. Re-resolved fresh on every run; on `--resume` the phase-3 filter is past, so the flag only affects fresh runs. |
 | `strict_conformer` | bool | whether the conformer phase is blocking instead of advisory (DESIGN §9 *Post-work conformance*, "Opt-in strict mode" paragraph). Resolved from `--strict-conformer` / `LEERIE_STRICT_CONFORMER` / `leerie.toml` / default `False`. When True, conformer residuals (failed build/lint/test axes or unresolved rule violations) cause the subtask to return `blocked` instead of `complete`; the final-tree pass also blocks the run if residuals remain. The user fixes the residuals and runs `--resume`. Re-resolved fresh on every run, including `--resume`, so the user can flip it without editing state |
@@ -6602,6 +6721,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `speculative_collapse_drops` | list[str] | subtask sids mechanically pruned by dead-subtask elimination (DESIGN §5) — fully-speculative subtasks whose every `in_plan` requires was unresolvable because the provider domain returned 0 subtasks. Recorded before `_check_unresolvable` runs so the audit trail survives even when `die()` fires for remaining unresolvable entries. Absent when no dead-subtask elimination fired. Distinct from `conditional_drops` (LLM-judged, based on conditional prose in intent) and `dropped_subtasks` (off-tree soft drops, phase 3). |
 | `plan_overlap_judge` | dict | full output of the phase 2¾ `plan_overlap_judge` worker (DESIGN §5 *Cross-domain surface overlap*) — `{collisions: [{a_sid, b_sid, artifact, resolution, reason, merge_feasibility?}, …]}`. Persisted before the apply step (so if a `die()` fires on `unresolvable` or the merge-feasibility backstop the audit record survives). Absent when `phase_overlap_judge` cheap-skipped (single-planner / <2-subtask runs / `--skip-overlap-judge`) or when the judge returned `{collisions: []}`. |
 | `plan_overlap_applied` | list[dict] | post-apply mutation summary for the phase 2¾ judge. Each entry is either `{action: merge|drop_a|drop_b, artifact: str, surviving_sid: str, dropped_sid: str, reason: str}` recording a mutation against the plan, or `{action: skipped_redundant, artifact: str, collapsed_to: str, original_a_sid: str, original_b_sid: str, merge_feasibility: str, reason: str}` recording a redundant pair whose endpoints had already collapsed to the same survivor via an earlier resolution (the closing edge of a connected cluster — kept in the audit trail so resume-time inspection sees every collision the judge emitted). The anchor-survivor rule may make the `surviving_sid` differ from `_apply_overlap_merge`'s default lex-smaller pick when the merge participates in a cluster — see "Phase 2¾ checks" above. Useful for resume-time replay debugging — `state.data["plan_overlap_judge"]` records what the judge said, this records what the orchestrator did. Empty list when the judge returned no collisions; absent when the phase cheap-skipped. |
+| `adherence_gate` | dict | audit record from the phase 2⅞ instruction-adherence gate (`phase_adherence_gate` — see "Instruction-adherence gate" above) — `{judge: <adherence_judge output>, floor_issues: list[str]}`. Written once the gate clears (either immediately, or after re-planning). Absent when the gate cheap-skipped (`skip_adherence_check` / no prescribed procedure) or when the judge crashed every round (the degrade path returns without persisting this key). |
 | `no_work_required` | bool | set to `True` by `_finish_no_work_run` when every planner returns `status: "ready"` with `subtasks: []` (DESIGN §8 *The cleared-but-empty terminal state*). When `True`, the orchestrator wrote `finished_at`, skipped phases 3–6, and exited 0 — the task was already satisfied on HEAD, no run branch was materialized, no PR will be opened. `leerie --list` renders the run as `done` (no push, no PR, distinct from `done-pushed-no-pr` and `done-pushed-pr`). Absent on every normal run. |
 | `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. Keys are domain names (e.g. `"bug-fixing"`, `"testing"`); values are the `basis` string the planner emitted explaining why no work was needed. Absent on every normal run. |
 | `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `<state-root>/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
@@ -6666,7 +6786,16 @@ type. Required fields, current shape:
   are required on each question), `source_of_truth_question` (bool). The
   classifier only flags whether the source-of-truth question is relevant;
   the orchestrator's preference resolution (see §2) supplies the value
-  (default `both`).
+  (default `both`). Optional: `prescribed_procedure`
+  (`{is_prescribed (bool), commands (array of strings), forbid_manual
+  (bool), evidence (string)}`) — a language→JSON signal the classifier
+  extracts from the task prose declaring whether the user prescribed an
+  explicit procedure/command-sequence, as opposed to a goal description.
+  `check_classifier_output` enforces non-empty `evidence` whenever
+  `is_prescribed` is true (`EMPTY_EVIDENCE`, mirroring the `EMPTY_WHY`
+  discipline for classifier questions). `phase_classify` persists the
+  field verbatim to `st.data["prescribed_procedure"]` alongside
+  `st.data["categories"]`, defaulting to `{}` when absent.
 - **planner** — required: `domain`, `subtasks`, `status`, `confidence`.
   `status` is the enum `ready` / `blocked` (DESIGN §8 planner gate): when
   the planner's evidence gate could not clear within `confidence_rounds`,
@@ -6686,7 +6815,7 @@ type. Required fields, current shape:
   9.0). Each subtask is `{id, title,
   success_criteria_seed (all required), intent, scope_note,
   files_likely_touched, depends_on, requires, provides, size,
-  investigation_notes}`. **`requires` is an array of objects, not bare
+  investigation_notes, runs_commands}`. **`requires` is an array of objects, not bare
   strings: `{tag (required string), extent (required enum: "in_plan" |
   "external"), reason (string, required and non-empty when extent ==
   "external")}`. `extent: in_plan` is satisfied by another subtask's
@@ -6695,7 +6824,32 @@ type. Required fields, current shape:
   bypasses the reconciler and surfaces in `plan.json` as a `preconditions`
   entry — see DESIGN §5 `requires.extent`.** `provides` remains an array of
   bare strings. `size` is `small` or `medium` — `large` is
-  rejected by `validate_plan`. The schema's required-ness of `confidence`
+  rejected by `validate_plan`. `runs_commands` (array of strings, optional)
+  declares every command the subtask actually invokes, as structured data —
+  populated when the task text prescribes a specific command/script/tool
+  invocation the planner gave its own run-the-command subtask (see
+  `prompts/planner.md`); most subtasks omit it or leave it empty.
+  `check_prescribed_command_coverage(prescribed_procedure, subtasks) ->
+  list[str]` is the deterministic PRIMARY layer of the instruction-adherence
+  gate (DESIGN §12-sibling, "instruction-adherence is code-enforced"): pure
+  JSON→verdict set logic computing `prescribed.commands −
+  ⋃(subtask.runs_commands)` under normalized (lowercased, stopword-filtered)
+  token-SUBSET matching — not exact string equality, since the planner emits
+  `runs_commands` as a paraphrase wrapping the prescribed command's own
+  tokens (e.g. "barnacle recon browser" for "recon browser"). Returns a
+  `PRESCRIBED_CMD_UNRUN: ...` string per uncovered prescribed command;
+  short-circuits to `[]` when `prescribed_procedure` is absent, `is_prescribed`
+  is falsy, or `commands` is empty. Tested in
+  `tests/test_prescribed_cmd_coverage.py`; the advisory-vs-gating outcome
+  (prescribed-and-uncovered gates, goal-only and fully-covered never gate,
+  and `check_planner_output` carries no separate self-graded adherence axis
+  to demote) is additionally pinned in `tests/test_check_functions.py`'s
+  `TestAdherenceGateAdvisoryVsGating`, mirroring the G3
+  `decomposition_quality`/`task_understanding` pair. This function and the
+  `adherence_judge` worker above are wired into `phase_adherence_gate` (a
+  whole-plan gate, not `check_planner_output` — see "Instruction-adherence
+  gate" above for the phase-level wiring and the `--skip-adherence-check`
+  flag's effect on it). The schema's required-ness of `confidence`
   and `status` is the structural part of DESIGN §8's discipline: a worker
   that skipped self-gating fails its own JSON schema before the orchestrator
   reads the payload.
@@ -6801,7 +6955,7 @@ post-run operation performed by the judge and heal skills.
 |-------|------|-------|
 | `call_id` | str (UUID v4) | unique identifier for this invocation; referenced by judge verdicts |
 | `run_id` | str | the run identifier — matches the directory name under `<state-root>/runs/` |
-| `call_type` | str | one of the schema keys `claude_p()` accepts: the eleven `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
+| `call_type` | str | one of the schema keys `claude_p()` accepts: the twelve `WORKER_TYPES` (`classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`) plus the four post-run / finalize workers (`pr_writer`, `judge`, `patch_generator`, `dep_capture`) |
 | `model` | str | the model alias passed to `--model` for this invocation (e.g. `opus`, `sonnet`) |
 | `system_prompt` | str | the full system prompt injected via `--append-system-prompt` |
 | `user_content` | str | the user-turn content passed to the worker |
@@ -6874,7 +7028,7 @@ Every `call_type` resolves to a file under `prompts/`. The heal loop's
 patch-generator worker calls
 `resolve_prompt(call_type: str) -> tuple[str, str, str]` to load a
 worker's system prompt: given any member of `WORKER_TYPES` (the
-self-heal target set is the eleven main-loop workers, not the post-run
+self-heal target set is the twelve main-loop workers, not the post-run
 workers), it returns `(source_kind, content, location_hint)` where
 `source_kind` is `"file"`, `content` is the prompt body, and
 `location_hint` is the relative path `"prompts/<call_type>.md"`.
@@ -6933,6 +7087,7 @@ enforcement functions:
 | `test_splitter_schema.py` | `SCHEMAS["splitter"]` — `children` required, `minItems:1`, child required fields (`id`, `title`, `success_criteria_seed`), optional child fields; valid/invalid instances; JSON serializable; wiring (`splitter` in `WORKER_TYPES`, NOT in `MODEL_DEFAULT_PER_WORKER`, `EFFORT_DEFAULT_PER_WORKER["splitter"] == "high"`, prompt file exists); no top-level `files` field (splitter never decides partition — `test_splitter_no_top_level_files_required`); child `requires` array uses `_REQUIRES_ITEM` shape with tag + extent enum (`test_splitter_child_requires_item_shape`) |
 | `test_recursive_decompose.py` | `partition_files()` — empty, single chunk, exact multiple, partial last chunk, 100% coverage, 0 overlap, chunk_size=1, order preserved, chunk_size<1; `recursive_decompose()` — well-fit is leaf (score ≥ 0.70), oversized recurses (split then children judged), depth cap terminates, no-progress guard terminates + emits "no-progress guard" warning to stdout (asserted via capsys), migration path partitions files via `partition_files()` and invokes the splitter only in label-only mode to title each chunk (distinct titles; distinct deterministic fallback on splitter failure), both `claude_p` call sites pass the full required signature (`cwd`/`autonomous`/`caps` — C0 regression guard), a passed `repo_map` is injected into fit_judge/splitter prompts and omitted when `None` (G2), bump_workers called before every claude_p |
 | `test_phase_plan_repo_map_ctx.py` | P6 Layer A wiring (`phase_plan` ctx injection, DESIGN §5½ (P6)): repo-map enabled path (ctx contains `repo_map` key, non-empty string, JSON-serializable, known symbol names present, seed_files seeded from `task_file_items`); skip_repo_map=True path (ctx omits `repo_map`, baseline keys `task`/`source_of_truth`/`clarification_answers`/`confidence_rounds` present, values match inputs); empty-repo degrade (`rank_repo_map` returns `""` → key omitted); exception-swallow degrade (`build_repo_map` raises → caught silently, ctx emitted without `repo_map`) |
+| `test_phase_plan_prescribed_procedure_ctx.py` | PREVENT-half wiring (`phase_plan` ctx injection of the classifier's `prescribed_procedure` signal, DESIGN §12 sibling): `is_prescribed=True` → ctx carries `prescribed_procedure` verbatim, baseline keys present, JSON-serializable; absent from `st.data` entirely → key omitted; present but `is_prescribed` false, missing, or an empty dict (the `phase_classify` default when the classifier omits the field) → key omitted in every case (no false framing on a goal-only task) |
 | `test_phase_plan_recursion_wiring.py` | P1 Layer C wiring (`phase_plan` recursion expansion, DESIGN §5½ *Wire-in to phase_plan*): source-coupling guard (`phase_plan` source contains `recursive_decompose(` at depth=0, reassigns `plan["subtasks"] = leaves`, expansion loop precedes final logging); integration — one oversized subtask (stubbed `recursive_decompose` → two leaves) → `plan["subtasks"]` has 2 entries; two first-pass subtasks → `recursive_decompose` called once per subtask; well-fit leaf pass-through (stub returns input unchanged → single-element `plan["subtasks"]`); empty-subtasks plan not touched (`recursive_decompose` never called, subtasks stays `[]`) |
 | `test__read_toml_key.py` | `_read_toml_key()` — the shared `leerie.toml` line parser used by both resolvers |
 | `test_gather_answers_validation.py` | the source-of-truth validation gate in `gather_answers()` |
