@@ -268,16 +268,24 @@ RUN set -eux; \
 # PATH order:
 #   1. mise's system shims (mise install --system populates these).
 #   2. LTS Node bin (image-baked claude lives here).
-#   3. (then the pre-existing PATH)
-#   4. /home/leerie/.local/bin — where `pip install --user` puts console
+#   3. mise's user-dir shims (MISE_DATA_DIR/shims, populated at runtime by
+#      `mise install` reading a repo's .tool-versions / .ruby-version /
+#      rust-toolchain.toml — see DESIGN §6½ "Worker-driven install"). A
+#      mise shim resolves the active version from the caller's cwd at
+#      invocation time, so simply being on PATH doesn't hardcode a
+#      version — it just lets a worker's own ad-hoc Bash commands (e.g.
+#      `bin/rails test`) find a runtime that phase_provision already
+#      installed, instead of failing with e.g. `env: 'ruby': No such
+#      file or directory` and having to rediscover `mise exec --` from
+#      scratch every single worker session. Placed after #1/#2 so a
+#      repo pinning its own Node/Python version can never shadow the
+#      baked LTS Node that hosts `claude` itself.
+#   4. (then the pre-existing PATH)
+#   5. /home/leerie/.local/bin — where `pip install --user` puts console
 #      scripts (e.g. pre-commit). Deliberately LAST: image-baked tooling
 #      must win, so a user-installed package can never shadow a baked-in
 #      binary. Pinned by tests/test_dockerfile_path.py.
-# At runtime the user dir's shims at /home/leerie/.local/share/mise/shims
-# don't appear here because they're added by `mise activate` or by
-# wrapping commands with `mise exec --` — both of which the
-# orchestrator does explicitly when invoking install commands.
-ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:$PATH:/home/leerie/.local/bin
+ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-current/bin:/home/leerie/.local/share/mise/shims:$PATH:/home/leerie/.local/bin
 
 # Claude Code CLI. Leerie enforces ≥ 2.1.22 at runtime (leerie.py:1245).
 # Installs globally against the LTS Node — lands at
