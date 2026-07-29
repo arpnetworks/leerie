@@ -1534,12 +1534,19 @@ Resolution order for the opt-out (highest priority first):
 3. **`leerie.toml` at the repo root** with `skip_budget_check = true`.
 4. **Default `False`.** The check runs.
 
-Skipped on `--resume`: the resume path enters `_run_phases` past
-`schedule()` (the `waves` field is loaded from `state.json`), so the
-preflight has nothing to gate. A run that died on the preflight is
-not resumable — `--resume` would re-fire the same check with the same
-inputs and die identically. The user re-runs with the recommended
-`--max-workers` value or splits the task.
+Skipped on a `--resume` that already reached `waves`: the resume path
+enters `_run_phases` past `schedule()` (the `waves` field is loaded from
+`state.json`), so the preflight has nothing left to gate. A run that
+died on the preflight *is* resumable (DESIGN §6 "Budget-check resume"):
+`schedule()` had already returned by the time `check_budget_feasibility`
+ran, so `subtasks`/`waves` are recoverable from `plan_snapshot`, which is
+written immediately after `schedule()` and before this check (DESIGN §6
+"Resumable planning"). `--resume` rehydrates `subtasks`/`waves` from
+`plan_snapshot` and re-runs only the budget check — under a higher
+`--max-workers` or `--skip-budget-check` — instead of dying "Plans are
+not persisted." The user re-runs `--resume` with the recommended
+`--max-workers` value (or `--skip-budget-check`), rather than starting a
+fresh run from scratch.
 
 Exit code `EXIT_BUDGET_INFEASIBLE = 11` on `die()`, distinct from
 `EXIT_NEEDS_ANSWERS = 10` (deferred-clarification structured exit)
@@ -1551,11 +1558,15 @@ the machine back to the host, then takes the `_run_finished_at == ""`
 fallback (the run never reached finalize, so no `host_finalize` is
 attempted) and `destroy_machine` runs cleanly. A code-11-specific
 recovery hint is printed: "re-run with the recommended --max-workers
-value" — distinct from the code-10 hint which suggests `--finalize`,
-because a budget-infeasible run has no work to finalize and `--resume`
-would die at the resume guard (no `waves` field in `state.json`).
-This routing keeps the user from paying for a Fly volume indefinitely
-on a structurally-unrecoverable run.
+value" — distinct from the code-10 hint which suggests `--finalize`.
+The machine is still destroyed rather than paused: even though
+`plan_snapshot` now makes the *host-side* `--resume` recoverable
+(DESIGN §6 "Budget-check resume"), the Fly Machine itself has no
+further use once `decide_teardown` runs — the recommended fix is a
+higher `--max-workers` or `--skip-budget-check` on a fresh remote
+launch, not resuming the same (now-destroyed) machine. This routing
+keeps the user from paying for a Fly volume indefinitely once the
+budget check has already fired.
 
 ### Single-owner-per-run-dir enforcement
 
@@ -3418,7 +3429,7 @@ Maps to `DESIGN.md`: §7 (worker contract), §2 (CLI subprocess form).
 |-------|-------------|--------------|
 | Preflight | `preflight` | git identity, clean working tree, external `leerie` branch collision (DESIGN §3 *External collision hazard*), `claude` CLI version, live `claude -p` smoke test. Run-id collisions are detected at two points: filesystem side in `State.__init__` (the run dir is created at container start since the run-id is the container/machine ID); git side in `setup-run.sh`'s branch-creation step. `setup-run.sh` repeats the external-branch check as defense-in-depth for `--resume`. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `--resume` |
 | 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 9-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive |
-|   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ "Worker-driven install"). Always runs; runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.leerie-setup.sh` hook if present → `synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — workers run install commands themselves in their own worktrees (not the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `run_streaming` so their output is visible live. Skipped on `--resume` (whole fresh-run else-branch is); the env var is re-exported from persisted state on resume. |
+|   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ "Worker-driven install"). Always runs; runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.leerie-setup.sh` hook if present → `synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — workers run install commands themselves in their own worktrees (not the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `run_streaming` so their output is visible live. Skipped on `--resume` when `st.data["provision"]["recipe"]` is already present (key-presence, not truthiness — an empty recipe is a valid completed state; DESIGN §6 "Resumable planning"); the env var is re-exported from persisted state on resume. |
 |   • Clarify *(optional)* | `gather_answers` | source-of-truth is satisfied non-interactively from the resolved preference (default `both`). Intent questions from the classifier are dropped by default; pass `--clarify` to surface them. With `--clarify` + interactive: collect; with `--clarify` + non-interactive: write `pending-questions.json`, exit code 10 (DESIGN §11) |
 | 2 Plan | `phase_plan` | one planner worker per category, awaited concurrently via `gather_or_cancel` (a small wrapper around `asyncio.gather` defined in `leerie.py`) under an `asyncio.Semaphore(max_parallel)`; the first worker exception cancels its siblings and propagates to `main()`. After all `plan_one` results are collected, P1 Layer C runs: each first-pass subtask in each plan is expanded through `recursive_decompose(subtask, depth=0, …)` and `plan["subtasks"]` is replaced with the union of all returned leaves (DESIGN §5½ *Wire-in to phase_plan*). A plan with no subtasks is left untouched. Expansion vanishes each split parent's id, so the loop records `{parent_id: [leaf_ids]}` for every parent absent from its own leaves and then calls `_remap_vanished_deps(all_leaves, expansion)` **once over every plan's leaves after every plan has expanded** — a dependent may live in a different category's plan than the parent it names (DESIGN §5 *Id-vanishing operations*). The downstream path (reconcile → overlap_judge → schedule → validate_plan → write_plan) receives this expanded flat leaf set unchanged. |
 |   • Reconcile *(when needed)* | `phase_reconcile` | compute set of `requires` capability tags with no matching `provides` across merged planner output. **Before matching, two mechanical passes run: (a) `_promote_external_collisions(plans)` rewrites any `extent: external` entry whose tag is in some plan's `provides` to `extent: in_plan` (the in-plan producer wins); (b) `_collect_external_preconditions(plans)` extracts every remaining `extent: external` entry into a deduped list `{tag, reasons[], originating_subtasks[]}` that bypasses the reconciler and is persisted by `write_plan`. Both passes are re-run after `_apply_reconciler_output` so any `extent: external` entries on reconciler-added connector subtasks also flow through the same machinery (collision-promoted if a provider now exists; otherwise added to the persisted preconditions list). The second collection idempotently replaces `st.data["external_preconditions"]` — the helper returns the full deduped set so a re-run is a refresh, not an append.** Only `extent: in_plan` entries with no matching `provides` enter the unresolved set. If empty: short-circuit (no worker spawn, plan unchanged). Else: spawn one reconciler worker that emits eight arrays — five *resolution* (renames / added_provides / added_subtasks / conditional_drops / dropped_requires), two *cycle-breaking-only* (dependency_edges / merged_subtasks; `dropped_requires` also plays a cycle-breaking role), and one *escape hatch* (unresolvable). If `unresolvable` is non-empty, dead-subtask elimination (`_prune_dead_subtasks`) first removes fully-speculative subtasks whose every `in_plan` requires is unresolvable when ≥1 domain has 0 subtasks (see "Phase 2½ checks" below); if entries remain after pruning, `die()` with the reconciler's diagnosis (DESIGN §5). Otherwise, the orchestrator applies the seven action arrays mechanically. After applying, runs an **acyclicity gate** (Tarjan's SCC over the post-mutation graph); on cycle, deep-copies the pre-mutation plans, computes a recommended cycle-resolution per SCC from structural signals, respawns the reconciler once with a structured retry prompt + bounded "must-include" set of acceptable operations, and re-runs the gate. If still cyclic, `die()` with the SCC + offending mutations enumerated. See "Phase 2½ checks" and "Cycle-resolution retry loop" below. |
@@ -3862,9 +3873,16 @@ every prior wave produced. Both must be coherent for resume to be safe.
 
 On `--resume`: asserts `task` is present and non-empty; asserts `waves`,
 `completed_waves`, `subtask_status` are well-formed *if present*. `waves` is
-intentionally optional — a run interrupted before scheduling has none, and
-`main()` handles that case with a clearer message. Rejects corrupt or
-hand-edited state without rejecting a legitimately-early interruption.
+intentionally optional — a run interrupted before scheduling has none. In
+that case `main()` no longer treats the absence of `waves` as unresumable:
+per DESIGN §6 "Resumable planning — a per-phase checkpoint cursor, not a
+`waves` gate," `_run_phases` walks the planning-phase sequence (classify →
+plan → reconcile → overlap-judge → adherence-gate → off-tree/satisfied
+filters → schedule) and re-enters at the first phase whose `plans_after_*`
+checkpoint key is absent, reusing the persisted `plans` from the last
+completed phase as that phase's input rather than re-deriving it from
+scratch. Rejects corrupt or hand-edited state without rejecting a
+legitimately-early interruption.
 
 The `except SystemExit` handler in `main()` guards `st.save()` behind
 `st.data.get("task")` so that a failed `--resume` (which `die()`s before
@@ -4733,9 +4751,12 @@ branch — the second `git worktree add -b` fails with
 
 ## 6½. Per-repo dependency provisioning
 
-Implements DESIGN §6½. The provision phase fires once per fresh run,
-between classify and plan; on `--resume` the whole fresh-run else-branch
-of `orchestrate()` is skipped, so no re-fire check is needed.
+Implements DESIGN §6½. The provision phase fires once per run, between
+classify and plan; on `--resume` it is guarded on the presence of
+`st.data["provision"]["recipe"]` (key-presence, not truthiness — an
+empty recipe is a valid completed state) so a resume that already
+persisted a recipe does not re-fire `mise install` (DESIGN §6
+"Resumable planning").
 
 ### Worker registration
 
@@ -6786,8 +6807,15 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `task` | str | the task description passed on the command line |
 | `started_at` | ISO-8601 str | wall-clock time at run start |
 | `finished_at` | ISO-8601 str | wall-clock time at successful finalize |
-| `plan_snapshot` | dict | `{subtasks, waves}` captured immediately after `schedule()` returns and **before** `check_budget_feasibility` / `validate_plan` — both of which `die()`. Without it a plan that fails either gate is lost entirely (`write_plan` never runs), discarding the planner/fit_judge/splitter spend that produced it. Diagnostic/audit only: no orchestrator code reads it back, and it is deliberately *not* `write_plan`, which would also emit per-subtask spec files and seed the execution scaffolding for a run that cannot start. |
-| `decompose_snapshot` | dict | `plan_snapshot`'s sibling for §5½ (P1) recursive decomposition: `phase_plan` writes the accumulated leaves after each top-level subtask finishes expanding under `recursive_decompose`, so a mid-decomposition `WorkerError` (from either the `fit_judge` call or the coupled-minority `splitter` call — an auth failure, PID exhaustion) does not discard fit/split judgments already paid for on subtasks that already finished expanding — decomposition is routinely a large share of a run's total planning spend (DESIGN §6 *Credential strategy*). Same diagnostic-only caveat as `plan_snapshot`: nothing reads it back in this change; wiring `--resume` to rehydrate mid-decomposition progress from it is separate, not-yet-shipped work. |
+| `plan_snapshot` | dict | `{subtasks, waves}` captured immediately after `schedule()` returns and **before** `check_budget_feasibility` / `validate_plan` — both of which `die()`. Without it a plan that fails either gate is lost entirely (`write_plan` never runs), discarding the planner/fit_judge/splitter spend that produced it. It is deliberately *not* `write_plan`, which would also emit per-subtask spec files and seed the execution scaffolding for a run that cannot start. `--resume` reads this back to rehydrate `subtasks`/`waves` and re-run only the budget check when a run stopped at the post-`schedule()` budget-feasibility gate (DESIGN §6 "Budget-check resume"), instead of dying "Plans are not persisted." |
+| `decompose_snapshot` | dict | `plan_snapshot`'s sibling for §5½ (P1) recursive decomposition: `phase_plan` writes the accumulated leaves after each top-level subtask finishes expanding under `recursive_decompose`, so a mid-decomposition `WorkerError` (from either the `fit_judge` call or the coupled-minority `splitter` call — an auth failure, PID exhaustion) does not discard fit/split judgments already paid for on subtasks that already finished expanding — decomposition is routinely a large share of a run's total planning spend (DESIGN §6 *Credential strategy*). Diagnostic/audit only: mid-decomposition rehydration on `--resume` is out of scope for the per-phase checkpoint cursor (DESIGN §6 "Resumable planning"), which re-enters at `phase_plan` as a whole via `plans_after_plan` rather than resuming inside a single phase's recursive decomposition. |
+| `plans_after_classify` | list[dict] | per-phase planning checkpoint (DESIGN §6 "Resumable planning — a per-phase checkpoint cursor, not a `waves` gate"): the `plans` list as it stood immediately after `phase_classify` completed and `st.save()`'d. `--resume` treats the *presence* of this key — not `current_phase` — as proof the phase's output is safely persisted, and skips re-invoking `phase_classify` when present, reusing this value as the next phase's input. Absent for a run that has not yet completed classification, or has already progressed past this checkpoint to a later `plans_after_*` key / `waves`. |
+| `plans_after_plan` | list[dict] | the per-phase planning checkpoint for `phase_plan` (post-recursive-decompose `plans`, DESIGN §6). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
+| `plans_after_reconcile` | list[dict] | the per-phase planning checkpoint for `phase_reconcile` (reconciled `plans`, DESIGN §6). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
+| `plans_after_overlap_judge` | list[dict] | the per-phase planning checkpoint for `phase_overlap_judge` (post-collision-resolution `plans`, DESIGN §6 *Cross-domain surface overlap*). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
+| `plans_after_adherence_gate` | list[dict] | the per-phase planning checkpoint for `phase_adherence_gate` (post-instruction-adherence-gate `plans`, DESIGN §6, §12 sibling). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
+| `plans_after_filters` | list[dict] | the per-phase planning checkpoint written after the off-tree (`filter_offtree_subtasks`) and already-satisfied (`filter_satisfied_subtasks`) phase-3 filters both complete — the filtered `plans` immediately before `schedule()`. Same absence/presence and resume-cursor semantics as `plans_after_classify`; this is the last `plans_after_*` checkpoint before `plan_snapshot`/`waves` take over as the resume cursor. |
+| `satisfied_probe_cache` | dict[str, dict] | per-subtask `satisfied_probe` verdicts (DESIGN §6 "The satisfied-probe sweep needs finer-than-phase granularity"; §8 *Already-satisfied subtask elimination*), keyed by subtask id. Each value is `{satisfied: bool, evidence: str, checked: [str], base_sha: str}` — `base_sha` is the base commit sha (`git rev-parse HEAD`) recorded at probe time. Written by `probe_one` as soon as its own verdict returns, for both `satisfied` and not-satisfied outcomes — not only in aggregate after the whole sweep's `gather` completes, so a pause mid-sweep does not lose already-decided subtasks. **Correctness-critical:** on `--resume`, a cached entry whose `base_sha` no longer matches the current `HEAD` is treated as absent and that subtask is re-probed — the base tree can move between a pause and a resume (e.g. a sibling run merging its own PR into the same base branch), and a stale hit could wrongly keep a subtask that is no longer satisfied or drop one that now is. A probe that crashes (`WorkerError`) is deliberately never cached — no verdict was actually reached, and caching "kept" for a crash would wrongly skip re-probing a subtask that was never really judged. |
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |

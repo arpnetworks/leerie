@@ -1116,6 +1116,210 @@ leaf count matches `plan["subtasks"]` (nothing silently dropped); and, mirroring
 `phase_plan` (which writes the snapshot) strictly before `check_budget_feasibility`
 and `validate_plan` — the two gates that die() and would otherwise make a discarded
 decomposition unrecoverable.
+The safety-by-construction property the planning-resume checkpoint design rests
+on — that `schedule()` (`:17334`) re-sorts every wave by subtask id
+(`wave = sorted(...)`, `:17374`), making the wave partition a pure function of the
+dependency graph plus lexicographic ids, independent of dict/set iteration order
+and of input plan/subtask order — is pinned directly, with no state/stubs/async,
+in `tests/test_schedule_determinism.py`: a multi-domain fixture with both
+intra-domain `depends_on` and cross-domain `requires`/`provides` edges (so the
+tag channel resolved through `_build_predecessor_graph` is exercised, not just
+`depends_on`) produces identical `waves` and subtask-id sets across a fresh call,
+a JSON round-trip (simulating a checkpoint reload), reversed plan order, and
+reversed per-plan subtask order. A companion test asserts every wave is
+lexicographically sorted directly — the round-trip equality alone does not kill
+a `sorted(...)` removal (within one process, unsorted set iteration is still
+self-consistent across calls, so `waves_fresh == waves_rt` etc. can hold even
+without the sort), so the direct per-wave sortedness check is the test that
+actually fails when `sorted(...)` is removed at `:17374`.
+The resumable-planning checkpoint keys (`plans_after_classify`,
+`plans_after_plan`, `plans_after_reconcile`, `plans_after_overlap_judge`,
+`plans_after_adherence_gate`, `plans_after_filters`, `satisfied_probe_cache`
+— DESIGN §6 "Resumable planning — a per-phase checkpoint cursor, not a
+`waves` gate") are pinned by name in `tests/test_resumable_planning_keys.py`,
+on top of the generic bidirectional parity `tests/test_state_fields.py`
+already enforces for every `STATE_FIELDS` entry: each key is present in
+`leerie.STATE_FIELDS` (mirroring `test_plan_snapshot_wiring.py`'s
+`assert "plan_snapshot" in leerie.STATE_FIELDS` guard-the-guard pattern) and
+has a row in the IMPLEMENTATION.md §8 `state.json` field table, plus a
+regression pin that the field table no longer carries the old "A run that
+died on the preflight is not resumable" claim now that `plan_snapshot`
+makes a budget-check-stopped run resumable. bugfix-002 registered the keys
+and documented them only; resume-rehydration code is separate work
+(bugfix-004). `tests/test_planning_checkpoint_keys.py` adds the one check
+neither `test_state_fields.py` nor `test_resumable_planning_keys.py`
+covers: a real `State.save()` / on-disk JSON reload round-trip with all
+seven checkpoint keys populated at once (mirroring
+`test_plan_snapshot_wiring.py::TestSnapshotRoundTrips`), plus a
+`State.load()` round-trip proving the reloaded in-memory `.data` dict —
+not just the on-disk artifact — reproduces every key byte-equal, since
+that in-memory dict is what the real `--resume` path reads. Deliberately
+its own file rather than folded into either of the above two, per its
+narrow scope: pure state-surface assertions, no phase control flow, no
+stubbed workers, no async.
+**Contributor discipline for adding a new checkpoint/state key:**
+`STATE_FIELDS` (`orchestrator/leerie.py:259`) is a static allowlist
+checked by `tests/test_state_fields.py`, not a runtime filter —
+`State.load()` reads the whole on-disk `state.json` unconditionally, so
+an undeclared key is not silently dropped on `--resume`. What actually
+happens is louder: `test_state_fields.py::test_every_st_data_write_is_declared`
+fails the moment a new `st.data["x"] = ...` write lands without a
+matching `STATE_FIELDS` entry, and `test_state_fields_matches_spec_table`
+fails if the IMPLEMENTATION.md §8 field table and `STATE_FIELDS` drift
+out of sync in either direction. The resumable-planning checkpoint keys
+above additionally get their own named guard-the-guard pins in
+`tests/test_resumable_planning_keys.py` rather than relying solely on
+the generic parity sweep, precisely so a future refactor that drops one
+of these seven keys specifically (versus any arbitrary state key) fails
+with a message naming the checkpoint feature, not just a generic diff.
+The practical rule: any new `st.data[...]` write — checkpoint or
+otherwise — must land in the same commit as its `STATE_FIELDS` entry and
+its IMPLEMENTATION.md §8 table row, or CI catches it immediately; there
+is no scenario where it merely resumes with stale/missing data.
+The checkpoint-writing half — `_run_phases`'s fresh-run branch persisting
+each `plans_after_*` key immediately after its producing phase returns —
+is pinned in `tests/test_plans_after_checkpoints.py` via the same
+`inspect.getsource(leerie._run_phases)` source-coupling approach as
+`tests/test_plan_snapshot_wiring.py` (driving `_run_phases` end-to-end is
+infeasible: it spawns real workers and shells out to git/preflight).
+Pinned: all six `plans_after_*` keys appear as `st.data[...]` assignments;
+each assignment is followed by `st.save()` within 200 chars (an
+in-memory-only write is lost on pause/crash); each key's assignment sits
+strictly *after* its phase's call in source order — never at entry, which
+is the same "`current_phase` is stamped at entry, not completion" trap
+`plan_snapshot`'s own wiring test guards against; `plans_after_reconcile`
+precedes the `detect_no_work` short-circuit and `plans_after_filters`
+precedes both the `satisfied_no_work` short-circuit and `schedule()`, so a
+run that turns out to have work is never left without its checkpoint; the
+six keys' first-occurrence source order matches pipeline order (guards
+against a correctly-individually-ordered but scrambled insertion producing
+a resume cursor that silently skips a phase); and `plans_after_filters`
+precedes `plan_snapshot`, keeping the existing post-schedule checkpoint
+authoritative and undisturbed.
+`tests/test_planning_checkpoint_ordering.py` is a second, independent pin
+of the same write-ordering invariant (call-precedes-checkpoint,
+checkpoint-precedes-`st.save()`, source order matches pipeline order),
+plus the resume-cursor's gating on checkpoint-key presence
+(`"plans_after_<phase>" not in st.data`) rather than `current_phase`, and
+the earliest re-entry gate keying on `waves`/`categories` presence.
+Deliberately overlapping with `test_plans_after_checkpoints.py` rather
+than folded into it: this file is the standalone regression guard for the
+single highest-severity implementation trap in this feature (a checkpoint
+written at phase entry, before the phase spends, would mark an incomplete
+phase done and resume with a half-built plan), kept intentionally small
+and separate so it can't be diluted by unrelated changes to the larger
+checkpoint-writing test file.
+The re-entry (`--resume`-consuming) half of the same mechanism — that a
+`state.json` checkpointed through phase K reloads and re-enters at phase
+K+1 without re-invoking any completed phase's worker — is pinned
+behaviorally in `tests/test_resume_planning_reentry.py`, distinct from
+`test_plans_after_checkpoints.py`'s source-coupling pin of the write side.
+It drives the real `_run_phases` end-to-end with every phase function
+stubbed via call-counting monkeypatches (mirroring
+`test_phase_adherence_gate.py`'s stub discipline), a stubbed `phase_execute`
+that raises a sentinel exception so the test can inspect state without
+touching the unrelated execute/finalize phases, and asserts, per
+`plans_after_*` checkpoint present in the seeded `state.json`, that every
+phase up to and including the checkpointed one is absent from the call log
+and every phase after it ran exactly once. `TestPerPhaseRoundTrip` covers
+all six planning-phase boundaries (classify → plan → reconcile →
+overlap_judge → adherence_gate → filters → schedule). Anti-vacuity per the
+CLAUDE.md checklist: the completed phases are stubbed with counters that
+would fire if called (not merely omitted from the fixture), and the
+fixture never pre-seeds a *downstream* phase's output — only the
+checkpoint(s) up to the resume point are present, so the "not re-invoked"
+assertion is falsifiable by the code, not vacuously true because nothing
+downstream could run anyway. Also pinned: `phase_provision`'s
+key-presence-not-truthiness resume-skip (an empty `recipe: []` is a valid
+completed state, not "resume must redo it"); the reported incident
+directly (`current_phase` naming the satisfied-probe sweep with a partial
+`satisfied_probe_cache` and no `plans_after_filters` resumes through to
+`write_plan` instead of dying "did not reach the scheduling phase");
+post-scheduling resume falling straight through to `phase_execute`
+unchanged when `waves` is already present; budget-check resume rehydrating
+`plan_snapshot` instead of the old "Plans are not persisted" die; the
+`schedule()`-determinism guarantee end-to-end (a fresh `schedule()` call
+and a checkpoint-then-resume of the same `plans` produce byte-identical
+`waves`/`subtasks`); an allowlist guard that every checkpoint key this
+consumer reads is present in `STATE_FIELDS`; that the old
+`"did not reach the scheduling phase"` die() message string is gone from
+the source; and that a state.json with no progress at all (no
+`categories`, no `waves` — never reached the first `st.save()` after
+`phase_classify` started) is the one case that still `die()`s, since there
+is nothing to resume from.
+`tests/test_resume_planning_regression.py` is a narrower, deliberately
+end-to-end regression lock on top of `test_resume_planning_reentry.py`'s
+per-phase stub sweep: rather than stubbing every phase to assert call
+counts, it drives `_run_phases` with only the phases upstream of
+`filter_satisfied_subtasks`/`schedule` stubbed, leaving
+`filter_satisfied_subtasks`, `schedule`, `check_budget_feasibility`, and
+`write_plan` REAL (against a real temp git repo, for the `base_sha`
+scoping `satisfied_probe_cache` needs) — so its four scenarios prove the
+fix composes end-to-end, not merely that each phase's skip-flag is
+individually wired. (a) reproduces the reported incident shape verbatim:
+`current_phase` at the satisfied-probe sweep with a partial
+`satisfied_probe_cache` resumes, re-probes only the uncached sids (via
+`claude_p` call tracking), and reaches scheduling with no die(); a paired
+falsification test replays the retired `"waves" not in st.data` gate
+against the same state shape and confirms it would have died with the
+exact historical message, proving (a) exercises the fixed path rather
+than passing vacuously. (b) reruns a real `check_budget_feasibility` twice
+against the same seeded `plan_snapshot` — once under a low
+`max_total_workers` (dies, as expected) and once under a raised cap on a
+fresh `State` reload (mirroring a real second `--resume` invocation) —
+and asserts `write_plan` runs exactly once and no upstream planning phase
+re-runs. (c) asserts a `waves`-present resume reaches `phase_execute` with
+zero calls to every planning phase, `filter_satisfied_subtasks`,
+`check_budget_feasibility`, `validate_plan`, and `write_plan`. (d) covers
+both early-return guards, including the case where planning checkpoints
+ARE present but `no_work_required` still wins ahead of any rehydration.
+A final grep guard (prior art `tests/test_ec2_launcher_dispatch_e2e.py`)
+asserts neither retired die() string survives as a live `die(...)` call
+in `leerie.py` (a trailing comment referencing the old behavior by name is
+permitted).
+The `satisfied_probe_cache` checkpoint-writing half (bugfix-005) is tested
+in `tests/test_filter_satisfied_subtasks.py`: a cache hit under the
+CURRENT `base_sha` is consulted at the top of `probe_one` — before `async
+with sem:` — and `claude_p` is never invoked for that subtask (dropped on
+a cached `satisfied=True`, kept otherwise); a fresh probe (no cache entry)
+persists its verdict to `satisfied_probe_cache` for BOTH satisfied and
+not-satisfied outcomes, keyed by sid, carrying
+`satisfied`/`evidence`/`checked`/`base_sha`; the `WorkerError` crash-keep
+path writes no cache entry at all (a crashed probe must be re-probed on
+resume, not treated as decided); a cached verdict whose recorded
+`base_sha` differs from the current `HEAD` is invalidated and the
+subtask is re-probed (the mid-run-sibling hazard — DESIGN §6); and THE
+REPORTED FAILURE PINNED — a partial `satisfied_probe_cache` resumes,
+re-probes only the uncached subtasks (asserted by `claude_p` call count),
+and reaches scheduling, where before it would have re-run the whole
+sweep. All 17 pre-existing tests in the file are unchanged (17 + 5 = 22
+passing). `tests/test_satisfied_probe_cache.py` is a dedicated, narrower
+pin for the same `probe_one` cache mechanism in isolation (no resume
+control-flow, no state-surface parity — that stays
+`test_filter_satisfied_subtasks.py`'s job): a cached `satisfied` verdict
+drops the subtask with ZERO `claude_p` calls for that sid, a cached
+not-satisfied verdict keeps it with zero calls, an uncached sid is
+probed exactly once with the verdict persisted for both outcomes
+(asserted per-sid, never in aggregate), and a `WorkerError` crash keeps
+the subtask while asserting the cache KEY is ABSENT rather than merely
+that the subtask survived — the anti-vacuity discipline from the
+zombie-reaper harness lesson.
+`tests/test_satisfied_probe_cache_invalidation.py` is the real-moving-repo
+counterpart to the `base_sha` invalidation case above: rather than a
+synthetic `"deadbeef-not-current"` sha
+(`test_filter_satisfied_subtasks.py`'s `test_stale_sha_invalidates_cache_and_reprobes`),
+it builds a real temp git repo (`git init` + commit) and actually advances
+HEAD from sha A to sha B via a second commit, mirroring a sibling run
+merging (or reverting) the deliverable between a pause and a resume
+(DESIGN §8 "the mid-run sibling case"). Both stale directions are pinned: a
+stale `satisfied=True` entry recorded at A must not silently drop a
+subtask that is no longer satisfied on the tree at B (silent lost work),
+and a stale `satisfied=False` entry must not silently keep a subtask that
+has since become satisfied. A cache entry with a missing or malformed
+(`None`, non-string) `base_sha` is treated as a miss and re-probed. The
+falsifier is verified live: deleting the `cached.get("base_sha") ==
+base_sha` comparison in `probe_one` (`orchestrator/leerie.py:7402`) fails
+4 of the file's 5 tests with a stale drop/keep.
 The conformer/baseline hardening (DESIGN §9 *No clobbering the implementer's
 work* + the base-tree baseline's `measured` field) is tested across three
 files. `tests/test_clobbered_owned_files.py` covers the clobber-survival guard:
