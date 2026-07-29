@@ -1311,7 +1311,85 @@ probed exactly once with the verdict persisted for both outcomes
 (asserted per-sid, never in aggregate), and a `WorkerError` crash keeps
 the subtask while asserting the cache KEY is ABSENT rather than merely
 that the subtask survived — the anti-vacuity discipline from the
-zombie-reaper harness lesson.
+zombie-reaper harness lesson. The same file also pins the fix for a real
+mid-sweep data-loss defect (2026-07-29 root-cause batch, PR #120): `probe_one`
+wrote each verdict to `cache[sid]` in memory with no per-verdict `st.save()` —
+only the post-`gather` aggregate save persisted — contradicting both commit
+750ce33's message and DESIGN §6, which both claim per-verdict persistence.
+A pause mid-sweep silently lost every already-decided verdict.
+`test_verdict_reaches_disk_before_the_sweep_completes` pins the fix (an
+`st.save()` immediately after the `cache[sid] = {...}` write); the falsifier
+is verified live — reverting the added save fails the test.
+The funeralworks half of that same incident batch — a satisfied-probe drop
+blind to a surviving sibling's pending work invalidating the criterion it
+just judged met — is pinned by two new tests in
+`tests/test_filter_satisfied_subtasks.py`:
+`test_probe_payload_carries_surviving_siblings_excluding_self` (the
+`sibling_surface` built once per sweep and handed to each probe's payload as
+`surviving_siblings` contains every other subtask with a non-empty `provides`
+or `files_likely_touched`, and never the probed subtask itself) and
+`test_sibling_invalidation_verdict_keeps_the_dropped_test` (a
+funeralworks-shape regression: a test subtask the base tree already
+satisfies is NOT dropped when the probe, given `surviving_siblings` context,
+judges a sibling's still-pending work would break it). The guidance lives in
+`prompts/satisfied_probe.md`'s "A sibling's pending work can invalidate an
+already-met criterion" section, scoped explicitly to the pre-schedule call
+site (`surviving_siblings` is absent from the post-execution
+`probe_criteria_satisfied_on_head` payload, since HEAD there already reflects
+whatever siblings committed — there is no future left to anticipate).
+The dominant real cause behind that same incident batch — a `test-`-domain
+subtask declaring no `requires`/`depends_on` edge to the feature subtask whose
+not-yet-created output it targets — is pinned in
+`tests/test_warn_test_missing_producer_edge.py`: the new
+`warn_test_subtask_missing_producer_edge` advisory (mirrors
+`warn_provider_subset_subtasks`) fires when a `test-` subtask has empty
+`requires`+`depends_on` while another subtask in the plan is a producer
+(`provides` or `files_likely_touched` non-empty), and stays silent when the
+subtask declares either edge, when no other subtask is a producer, on a
+single-subtask plan, and on a non-`test-` subtask (never the advisory's
+target). `test_navegando_shape_fires` is a regression pin reproducing the
+real navegando failure shape (a coverage-floors test subtask with disjoint
+file paths from the feature subtasks it must register — the case a mechanical
+file-overlap rule would miss, but a declaration-absence check catches). The
+fix is deliberately advisory, not auto-wiring: research proved no mechanical
+signal (exact-path or basename-stem overlap) reliably wires the real failure
+cases, so the wiring gate (`phase_wiring_gate`, see below) remains the actual
+enforcer; the warn only reduces how often a plan reaches it broken. A
+companion `TEST_OWNERSHIP_RISK` advisory in `check_classifier_output`
+(pinned in `tests/test_check_functions.py`) flags when `testing` is selected
+alongside `bug-fixing`/`feature-implementation`/`refactoring` in the same
+category set — a real prior incident where a single category set produced
+both the code change and its own test assertions with no ownership split.
+`tests/test_phase_wiring_gate.py::test_die_message_does_not_recommend_skip_overlap_judge`
+pins the corrected `phase_wiring_gate` die() message: it no longer recommends
+`--skip-overlap-judge` as a bypass (that flag skips the earlier, distinct
+phase 2¾ overlap judge and does not touch this gate — the old wording sent an
+operator on a `--skip-overlap-judge` retry straight back into the same die()).
+The `artifact_registry` worker (DESIGN §5 *Artifact-registry worker*) — a
+new opus pre-planning worker that reads the task plus the global repo-map
+(ranked to fit the token budget only, no task-file seeding) and emits a small
+canonical `{description, tag, path}` vocabulary injected into every planner's
+context, softening (not replacing) the reconciler's tag-drift resolution — is
+tested in `tests/test_artifact_registry.py` (17 tests): schema validity
+(`SCHEMAS["artifact_registry"]`, required `artifacts` array of
+`{description, tag, path}`), worker registration parity
+(`artifact_registry` in `WORKER_TYPES`, absent from
+`MODEL_DEFAULT_PER_WORKER` so it resolves to opus,
+`EFFORT_DEFAULT_PER_WORKER["artifact_registry"] == "medium"`), model/effort
+resolution precedence, phase behavior (`test_phase_returns_artifacts`,
+`test_phase_drops_malformed_items` — items missing `tag`/`path` are dropped
+rather than propagated, `test_phase_degrades_to_empty_on_crash` — a
+`WorkerError` on every `_run_checked_loop` round degrades to `[]` rather than
+dying, since the registry is advisory), `--skip-repo-map` degrade (the worker
+still runs on the task alone and can still return a non-empty list — only the
+`ctx_dict["repo_map"]` build is skipped), ctx-injection wiring
+(`test_phase_plan_injects_registry_into_ctx` — every planner's context gets
+`ctx_dict["artifact_registry"]` when the registry is non-empty), checkpoint
+ordering (`test_run_phases_checkpoints_registry_before_plan` — the
+`if "artifact_registry" not in st.data:` checkpoint runs between
+`gather_answers` and the `plans_after_plan` block, the same key-presence
+resume pattern every other `plans_after_*`/`artifact_registry` checkpoint
+uses), and a `State.save()`/reload round-trip of the state key.
 `tests/test_satisfied_probe_cache_invalidation.py` is the real-moving-repo
 counterpart to the `base_sha` invalidation case above: rather than a
 synthetic `"deadbeef-not-current"` sha

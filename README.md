@@ -337,7 +337,7 @@ Complete reference for every CLI flag, environment variable, and
 | `--ec2-key-name VALUE` | none (required for `--runtime ec2`) | EC2 key-pair name for SSH access. Also `LEERIE_EC2_KEY_NAME` env var or `ec2_key_name` in `leerie.toml`. |
 | `--ec2-security-group VALUE` | none (required for `--runtime ec2`) | Security group id to attach. Also `LEERIE_EC2_SECURITY_GROUP` env var or `ec2_security_group` in `leerie.toml`. |
 | `--ec2-subnet-id VALUE` | none (required for `--runtime ec2`) | Subnet id to launch into. Also `LEERIE_EC2_SUBNET_ID` env var or `ec2_subnet_id` in `leerie.toml`. |
-| `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
+| `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
 | `--model ALIAS` | per-worker (judgment: `opus`; acting workers — implementer, conformer: `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
 | `--model-<worker> ALIAS` | per-worker default (`implementer`, `conformer` → `sonnet`; everything else → `opus`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`. Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
 | `--effort LEVEL` | per-worker (judgment: `medium`; acting workers — implementer, conformer: inherit Claude default) | `low` / `medium` / `high` / `xhigh` / `max`. Reasoning-depth dial forwarded to `claude -p --effort`. Pins judgment workers to a consistent depth across runs to reduce same-job variance (e.g. planner subtask-count drift). IMPLEMENTATION.md §2 "Effort selection". |
@@ -422,7 +422,7 @@ details and sub-flags.
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `medium`, acting workers inherit Claude default. |
 | `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `medium`; acting workers (implementer, conformer) inherit Claude default. |
 | `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
-| `LEERIE_INSPECT_DIRS` | `inspect_dirs` | Extra directories the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) may read; forwarded as `--add-dir`. Env value is colon-separated; TOML value is comma-separated. Overridden by `--inspect-dir` (repeatable). Unset → none. |
+| `LEERIE_INSPECT_DIRS` | `inspect_dirs` | Extra directories the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded as `--add-dir`. Env value is colon-separated; TOML value is comma-separated. Overridden by `--inspect-dir` (repeatable). Unset → none. |
 | `LEERIE_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. Unset → default `stream`. |
 | `LEERIE_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. Unset → default `false` (push + PR happen). |
 | `LEERIE_CLARIFY` | `clarify` | Sticky opt-in to surfacing intent questions to the user (truthy → on). Overridden by `--clarify`. Unset → default `false`. |
@@ -493,17 +493,21 @@ rationale behind these orders and the full validation contract.
 
 ## Worker types
 
-Leerie spawns twelve kinds of `claude -p` worker. Each is a separate
+Leerie spawns sixteen kinds of `claude -p` worker. Each is a separate
 subprocess; there is no in-session agent nesting.
 
 | Worker | Prompt source | Default model | Runs per task | Returns |
 |--------|---------------|---------------|---------------|---------|
 | `classifier` | `prompts/classifier.md` | opus | 1 | category set + intent questions |
+| `classification_judge` | `prompts/classification_judge.md` | opus | 0 or 1 (phase 1½, adversarial re-check of the classifier's category set) | `{covers_task: bool, missing_categories[], rationale}` — independent verification the classifier's category set covers the task. DESIGN §8 *Independent adversarial verification* |
+| `artifact_registry` | `prompts/artifact_registry.md` | opus | 0 or 1 (phase 2, before planning) | canonical `{description, tag, path}` artifact vocabulary shared across every planner |
 | `planner` | `prompts/planner.md` | opus | one per category (parallel) | subtask list with deps |
 | `reconciler` | `prompts/reconciler.md` | opus | 0, 1, or up to 3 (retried up to twice when its first attempt closes a dependency cycle or leaves unresolved tags) | eight arrays — `renames` / `added_provides` / `added_subtasks` / `conditional_drops` / `dropped_requires` (resolution; `conditional_drops` drops a planner-emitted consumer subtask whose own intent declares it conditional on an unresolvable in_plan precondition; `dropped_requires` removes an over-specified `requires` entry — an aggregate or coarser synonym of what the consumer itself provides — and ALSO plays a cycle-breaking role on retry); `dependency_edges` / `merged_subtasks` (cycle-breaking-only, used on retry when leerie's gates detect a cycle); `unresolvable` (escape hatch). DESIGN §5 |
 | `plan_overlap_judge` | `prompts/plan_overlap_judge.md` | opus | 0 or 1 (phase 2¾, multi-planner runs only; auto-skipped on single-planner runs) | cross-domain surface overlap analysis. DESIGN §5 |
 | `satisfied_probe` | `prompts/satisfied_probe.md` | sonnet | 0 or 1 per subtask (phase 3, before scheduling; skipped when `--skip-satisfied-check`) | `{satisfied: bool, evidence: str}` — soft-drops subtasks already met on the base tree. DESIGN §8 |
 | `provision` | `prompts/provision.md` | opus | 0 or 1 (spawned only when the deterministic lockfile-detection table abstains — Java/Gradle, bare `pyproject.toml`, polyglot Makefile) | install recipe (argv-allowlisted) executed via `mise exec --`. See DESIGN §6½ |
+| `provision_judge` | `prompts/provision_judge.md` | opus | 0 or 1 (adversarial re-check of a spawned provision recipe) | `{recipe_would_succeed: bool, defects[], rationale}` — independent verification the recipe would actually install. DESIGN §6½, §8 |
+| `wiring_judge` | `prompts/wiring_judge.md` | opus | 0 or 1 (phase 2¾ or later, "A wiring re-check on the fully-merged plan" — semantic check of the reconciled plan's cross-subtask edges) | `{plan_reviewed: bool, wiring_defects[], rationale}` — independent verification declared edges are the right ones, not just structurally resolvable. DESIGN §5, §8 |
 | `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `leerie/subtasks/<run-id>/<subtask-id>` branch |
 | `conformer` | `prompts/conformer.md` | sonnet | one per subtask, only on the implementer's success path | advisory `conformance_warnings` on the subtask result; doc/test/rule-fix commits prefixed `conformer:` on the same branch (DESIGN §9 *Post-work conformance*) |
 | `integrator` | `prompts/integrator.md` | opus | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
@@ -516,8 +520,9 @@ Additionally, two post-run workers run outside the main orchestrate loop and are
 - `pr_writer` (`prompts/pr_writer.md`, default sonnet) runs at finalize when the run will push — it produces the PR title and body. Overridable via `--pr-writer-model` / `LEERIE_MODEL_PR_WRITER`.
 - `dep_capture` (`prompts/dep_capture.md`, default opus) runs at finalize (and on `--recapture` / next-run backstop) — it reads worker logs, decides what the repo needs across all languages, and writes `setup_packages` / `language_installs` to `.leerie/config.toml`. Overridable via `LEERIE_MODEL_DEP_CAPTURE`. See DESIGN §6½.
 
-**Per-worker model defaults:** judgment workers (classifier, planner,
-reconciler, plan_overlap_judge, provision, integrator, fit_judge, splitter,
+**Per-worker model defaults:** judgment workers (classifier, classification_judge,
+artifact_registry, planner, reconciler, plan_overlap_judge, provision,
+provision_judge, wiring_judge, integrator, fit_judge, splitter,
 adherence_judge) default to Opus; the acting workers (implementer, conformer) and
 `satisfied_probe` default to Sonnet — their job is concrete subtask
 execution or lightweight per-subtask probing where throughput matters more
