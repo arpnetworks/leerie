@@ -368,6 +368,12 @@ STATE_FIELDS = (
     # (skip_adherence_check / no prescribed procedure) or the judge
     # crashed every round (degrade path returns without persisting this).
     "adherence_gate",
+    # coverage_gate: audit record from the phase 2⅞½ task-coverage gate
+    # (phase_planning_coverage_gate) — the final task_coverage_judge output
+    # ({task_covered, coverage_gaps, rationale}). Written once the gate
+    # clears (immediately or after re-planning). Absent when the judge
+    # crashed every round (degrade path returns without persisting this).
+    "coverage_gate",
     # classification_coverage_gate: audit record from phase_classification_gate
     # (DESIGN §8 *Independent adversarial verification*) — the final
     # classification_judge output. Absent when the judge crashed every round.
@@ -426,6 +432,7 @@ STATE_FIELDS = (
     "plans_after_reconcile",
     "plans_after_overlap_judge",
     "plans_after_adherence_gate",
+    "plans_after_coverage_gate",
     "plans_after_filters",
     # satisfied_probe_cache: per-subtask satisfied-probe verdicts (DESIGN
     # §6 "The satisfied-probe sweep needs finer-than-phase granularity"),
@@ -933,6 +940,8 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "classification_judge": "medium",
     "wiring_judge": "medium",
     "provision_judge": "medium",
+    "task_coverage_judge": "medium",
+    "integration_judge": "medium",
     # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
     # worker*). A judgment worker (decides the canonical tag/path per artifact),
     # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
@@ -952,7 +961,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "satisfied_probe", "provision", "implementer", "integrator",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
-                "artifact_registry")
+                "task_coverage_judge", "artifact_registry",
+                "integration_judge")
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -2091,6 +2101,74 @@ SCHEMAS: dict[str, dict] = {
                         "command": {"type": "string"},
                         "concrete_reason": {"type": "string"},
                         "fix": {"type": "string"},
+                    },
+                },
+            },
+            "rationale": {"type": "string"},
+        },
+    },
+    "task_coverage_judge": {
+        # Attacks the reconciled plan's coverage of the task — handed only
+        # the task text plus the reconciled subtask set (titles, intents,
+        # success criteria — not the codebase), it asks whether the union of
+        # subtasks actually addresses what the user asked for. Distinct from
+        # fit_judge (per-subtask sizing) and wiring_judge (inter-subtask
+        # graph correctness): this is the one check for whole-plan-vs-task
+        # coverage. A non-empty `coverage_gaps` gates.
+        "type": "object",
+        "required": ["task_covered", "coverage_gaps", "rationale"],
+        "properties": {
+            # False whenever any coverage_gaps entry is present; True only
+            # when the union of subtasks was judged to cover the task.
+            "task_covered": {"type": "boolean"},
+            "coverage_gaps": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "description", "concrete_evidence"],
+                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["missing_work",
+                                          "off_task_subtask"]},
+                        "description": {"type": "string"},
+                        "concrete_evidence": {"type": "string"},
+                    },
+                },
+            },
+            "rationale": {"type": "string"},
+        },
+    },
+    "integration_judge": {
+        # Attacks the integrator's MERGED RESULT for behavioral breakage the
+        # conflict-marker scan / merge-committed check cannot see -- the
+        # merge can be marker-free and committed and still be behaviorally
+        # wrong (e.g. one side's edit silently dropped, a call site left
+        # pointing at a signature the other side changed). A non-empty
+        # `defects` gates. Carries no confidence sub-object -- this worker
+        # IS the independent check, so a self-confidence axis would
+        # reintroduce the bias it replaces.
+        "type": "object",
+        "required": ["merge_reviewed", "defects", "rationale"],
+        "properties": {
+            # False if there was nothing reviewable (e.g. no merge commit
+            # produced) -> fail-open (advisory), never fabricate a defect.
+            "merge_reviewed": {"type": "boolean"},
+            "defects": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["kind", "concrete_scenario", "location",
+                                 "why_broken"],
+                    "properties": {
+                        "kind": {"type": "string",
+                                 "enum": ["dropped_change",
+                                          "reintroduced_conflict",
+                                          "call_site_mismatch",
+                                          "semantic_regression",
+                                          "incomplete_resolution"]},
+                        "concrete_scenario": {"type": "string"},
+                        "location": {"type": "string"},
+                        "why_broken": {"type": "string"},
                     },
                 },
             },
@@ -6405,14 +6483,13 @@ def check_planner_output(
 
     issues.extend(_check_migration_surface(subtasks, repo_root))
 
-    # `decomposition_quality` is retained in the planner schema as an advisory
-    # self-report, but is NO LONGER a gating axis (DESIGN §5½): the independent
-    # `fit_judge` in recursive_decompose is the authoritative decomposition
-    # gate, which removes the self-grading bias of letting the planner grade
-    # its own decomposition. Only `task_understanding` gates here.
-    issues.extend(_confidence_issues(
-        result.get("confidence") or {},
-        ["task_understanding"]))
+    # `decomposition_quality` and `task_understanding` are retained in the
+    # planner schema as advisory self-reports, but neither is a gating axis
+    # here anymore (DESIGN §5½, §8): the independent `fit_judge` in
+    # recursive_decompose is the authoritative decomposition gate, and the
+    # independent `task_coverage_judge` (phase_planning_coverage_gate) is the
+    # authoritative coverage gate — both remove the self-grading bias of
+    # letting the planner grade its own decomposition/coverage.
     return issues
 
 
@@ -6547,8 +6624,15 @@ def check_overlap_judge_output(
                     f"would remove provides tags {orphaned} that "
                     "other subtasks require")
 
-    issues.extend(_confidence_issues(
-        output.get("confidence") or {}, ["judgment"]))
+    # The overlap judge's `judgment` self-score is NO LONGER a gating axis
+    # (DESIGN §8 *Independent adversarial verification*): this worker IS an
+    # adversarial judge grading its own judgment, the purest self-scoring
+    # case, and a self-score cannot substitute for an independent check. The
+    # authoritative gate is the deterministic PHANTOM_ARTIFACT /
+    # NO_FILE_OVERLAP / DROP_BREAKS_GRAPH checks above plus
+    # `_validate_overlap_judge_output`'s merge-feasibility backstop. The
+    # `confidence` object stays emitted and schema-required, just not gated
+    # on here.
     return issues
 
 
@@ -6600,9 +6684,14 @@ def check_provision_output(
 
 
 def check_integrator_output(result: dict) -> list[str]:
-    """Confidence gate for the integrator."""
-    return _confidence_issues(
-        result.get("confidence") or {}, ["resolution"])
+    """Mechanical checks for the integrator.
+
+    The resolution self-score gate was removed — integration_judge is the
+    authoritative behavioral-integration gate (DESIGN §8). The confidence
+    object is still emitted (§8 falsifier/gap discipline record)."""
+    # No checks — integration_judge is the gate. This function remains as
+    # the check callback slot for _run_checked_loop in integrate_wave.
+    return []
 
 
 def check_implementer_output(
@@ -17929,6 +18018,157 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
     return cur_plans[0]
 
 
+async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
+                                        caps: dict, models: dict[str, str],
+                                        efforts: dict[str, str | None]) -> list[dict]:
+    """Independent adversarial verification of the merged plan's coverage of
+    the task (DESIGN §8 *Independent adversarial verification*). Runs after
+    `phase_adherence_gate` and before the soft-drop filters / `schedule()` —
+    task coverage is a whole-task property of the MERGED plan set, not a
+    per-domain one, so this attacks `plans` after every planner domain has
+    been reconciled and overlap-judged, exactly like `phase_wiring_gate`
+    attacks the merged plan's graph correctness.
+
+    The planner self-grades its own `task_understanding` confidence axis,
+    but that self-grade is anchored to the decomposition the planner already
+    committed to — it cannot see a whole required piece of work that simply
+    never became a subtask, because there is no subtask whose self-review
+    would surface the omission. So an independent `task_coverage_judge`,
+    handed only the task text and the reconciled subtask set (not the
+    codebase), attacks the union of subtasks for missing work or off-task
+    drift and gates on a non-empty `coverage_gaps` array. The self-score is
+    now advisory (`check_planner_output` no longer gates on it).
+
+    The planner CAN mechanically re-plan on a coverage gap (unlike the
+    overlap-judge or integrator's semantic findings), so this gate re-drives
+    `phase_plan` through the *existing* checked-loop feedback path — fresh
+    planner calls per domain with the found gaps folded into the task —
+    bounded by `judgment_check_rounds`, and `die()`s on exhaustion exactly
+    like the adherence/reconciler/wiring gates.
+
+    A `task_coverage_judge` `WorkerError` (infrastructure crash) degrades:
+    the assembled plan is preserved, never discarded, consistent with
+    `_run_checked_loop`'s WorkerError→retry-then-degrade handling.
+
+    Returns the (possibly re-planned) `plans` list, ready for the soft-drop
+    filters and `schedule()`."""
+    log("phase 2⅞½: task-coverage gate")
+    st.data["current_phase"] = "phase 2⅞½: task-coverage-gate"
+    st.save()
+
+    repo_root = Path(os.getcwd())
+    sys_prompt = load_prompt("task_coverage_judge")
+
+    def _build_payload(cur_plans: list[dict]) -> dict:
+        subtasks = [s for plan in cur_plans for s in plan.get("subtasks", []) or []]
+        return {
+            "subtasks": [
+                {
+                    "id": s.get("id", ""),
+                    "title": s.get("title", ""),
+                    "intent": s.get("intent", ""),
+                    "success_criteria_seed": s.get("success_criteria_seed", ""),
+                }
+                for s in subtasks
+            ],
+        }
+
+    # `cur_plans` is mutable closure state: each re-plan round replaces it
+    # wholesale with a fresh `phase_plan()` result, so `_invoke_judge` and
+    # `_check_coverage` always see the round's current plan.
+    cur_plans: list[list[dict]] = [plans]
+
+    async def _invoke_judge() -> dict:
+        st.bump_workers(caps)
+        payload = _build_payload(cur_plans[0])
+        user_prompt = (
+            "TASK:\n" + task + "\n\n"
+            "RECONCILED SUBTASK SET (the plan to attack):\n" +
+            json.dumps(payload, indent=2) +
+            "\n\nReturn only the JSON object per your schema."
+        )
+        return await claude_p(
+            user_prompt=user_prompt,
+            system_prompt=sys_prompt,
+            schema_key="task_coverage_judge", cwd=str(repo_root),
+            allowed_tools=INSPECT_TOOLS, max_turns=30,
+            autonomous=False, caps=caps, st=st,
+            model=models.get("task_coverage_judge", MODEL_DEFAULT),
+            effort=efforts.get("task_coverage_judge"),
+            sid="task_coverage_judge",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    def _check_coverage(judge_result: dict) -> list[str]:
+        issues: list[str] = []
+        for g in judge_result.get("coverage_gaps") or []:
+            if not isinstance(g, dict):
+                continue
+            desc = (g.get("description") or "").strip()
+            ev = (g.get("concrete_evidence") or "").strip()
+            # Anti-gaming: only a gap naming a concrete description AND the
+            # concrete evidence that justifies it gates. A vague entry is
+            # dropped (mirrors the completeness gate's concrete_case rule).
+            if not desc or not ev:
+                continue
+            issues.append(
+                f"COVERAGE_GAP ({g.get('kind', 'coverage_gap')}): "
+                f"{desc} — {ev}")
+        return issues
+
+    async def _on_feedback(fb: str) -> dict:
+        # The re-plan action IS the feedback: re-invoke phase_plan with the
+        # found coverage gaps folded into the task, so every planner sees
+        # why the merged plan was rejected. No new pause/resume machinery —
+        # this reuses `_run_checked_loop`'s existing retry semantics exactly
+        # like the reconciler/adherence/overlap-judge gates do.
+        replan_task = (
+            f"{task}\n\n"
+            "IMPORTANT — an independent review of your previous plan found "
+            f"it does not fully cover the task:\n{fb}\n"
+            "Re-plan so every piece of work the task requires is covered by "
+            "some subtask, and drop any subtask whose work does not serve "
+            "the task."
+        )
+        cur_plans[0] = await phase_plan(
+            replan_task, st, caps, models, efforts)
+        return {}
+
+    judge_result, gate_warnings = await _run_checked_loop(
+        invoke=_invoke_judge,
+        check=_check_coverage,
+        name="coverage_gate",
+        max_rounds=caps["judgment_check_rounds"],
+        make_feedback_prompt=_on_feedback,
+    )
+    for w in gate_warnings:
+        log(f"  coverage-gate: {w}")
+
+    if judge_result is None:
+        # task_coverage_judge crashed every round — degrade: keep the
+        # assembled plan, never discard it.
+        log("  coverage-gate: task_coverage_judge crashed every round; "
+            "degrading to the assembled plan (unchanged)")
+        return cur_plans[0]
+
+    remaining_issues = _check_coverage(judge_result)
+    if remaining_issues:
+        die(
+            "task-coverage gate exhausted "
+            f"{caps['judgment_check_rounds']} re-plan round(s) without "
+            "producing a plan that covers the task's actual work:\n" +
+            "\n".join(f"  • {i}" for i in remaining_issues) +
+            "\nAn independent review found the merged plan still misses "
+            "required work (or includes off-task work). Refine the task "
+            "description so the required work is unambiguous."
+        )
+
+    st.data["coverage_gate"] = judge_result
+    st.save()
+    log("phase 2⅞½: task-coverage gate clean")
+    return cur_plans[0]
+
+
 async def phase_wiring_gate(plans: list[dict], task: str, st: State,
                             caps: dict, models: dict[str, str],
                             efforts: dict[str, str | None]) -> list[dict]:
@@ -21220,6 +21460,119 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 log(f"  ⚠  integrator commit warning for {sid}: {commit_err}")
                 st.data.setdefault("integrator_warnings", {})[sid] = commit_err
                 st.save()
+
+            # Independent behavioral verification of the merged result (DESIGN
+            # §8 *Independent adversarial verification*). The mechanical checks
+            # (conflict markers, merge committed) passed; this gate attacks for
+            # behavioral breakage they cannot see — e.g. a merge that silently
+            # drops one side's change, or keeps side A's signature but side B's
+            # call sites. Detect-and-die, single pass: an integrator cannot
+            # mechanically fix a semantic finding from an independent judge
+            # without a fresh conflict-resolution attempt, so re-driving would
+            # reproduce the same merge.
+            sys_prompt_judge = load_prompt("integration_judge")
+            repo_root = Path(os.getcwd())
+
+            # Build context: the merged diff, both parent subtask intents, and
+            # the list of already-integrated subtasks that were potential
+            # conflict sources.
+            merge_head_sha = (await run_proc(
+                ["git", "rev-parse", "HEAD"], cwd=str(staging)
+            )).stdout.strip()
+            merge_diff = (await run_proc(
+                ["git", "show", "--format=%B", merge_head_sha],
+                cwd=str(staging)
+            )).stdout
+
+            # Get the incoming subtask's details
+            incoming_subtask = results.get(sid, {})
+
+            payload_judge = {
+                "sid": sid,
+                "incoming_intent": incoming_subtask.get("intent", ""),
+                "incoming_criteria": incoming_subtask.get("criteria_results", []),
+                "integrated_so_far": list(integrated_so_far),
+                "merge_commit_sha": merge_head_sha,
+                "merge_diff": merge_diff,
+            }
+
+            async def _invoke_integration_judge() -> dict:
+                st.bump_workers(caps)
+                user_prompt = (
+                    f"CONFLICT RESOLUTION TO REVIEW:\n"
+                    f"Incoming subtask: {sid}\n"
+                    f"Intent: {payload_judge['incoming_intent']}\n\n"
+                    f"Already-integrated subtasks: "
+                    f"{', '.join(payload_judge['integrated_so_far']) or 'none'}\n\n"
+                    f"MERGED RESULT:\n"
+                    f"Commit: {merge_head_sha}\n\n"
+                    f"{merge_diff}\n\n"
+                    f"Attack the merged result for behavioral breakage. "
+                    f"Return only the JSON object per your schema."
+                )
+                return await claude_p(
+                    user_prompt=user_prompt, system_prompt=sys_prompt_judge,
+                    schema_key="integration_judge", cwd=str(repo_root),
+                    allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
+                    caps=caps, st=st,
+                    model=models.get("integration_judge", MODEL_DEFAULT),
+                    effort=efforts.get("integration_judge"),
+                    sid=f"integration_judge-{sid}",
+                    add_dirs=st.data.get("inspect_dirs") or None,
+                )
+
+            def _check_integration(judge_result: dict) -> list[str]:
+                issues: list[str] = []
+                for d in judge_result.get("defects") or []:
+                    if not isinstance(d, dict):
+                        continue
+                    scenario = (d.get("concrete_scenario") or "").strip()
+                    location = (d.get("location") or "").strip()
+                    # Anti-gaming: a defect gates only with concrete scenario
+                    # and location named.
+                    if not scenario or not location:
+                        continue
+                    issues.append(
+                        f"INTEGRATION_DEFECT ({d.get('kind', 'behavioral_defect')}) "
+                        f"{location}: {scenario} — {d.get('why_broken', '')}")
+                return issues
+
+            # No make_feedback_prompt: detect-and-die, single pass. The
+            # integrator cannot mechanically fix a semantic finding without
+            # re-resolving the conflict from scratch.
+            judge_result, judge_warnings = await _run_checked_loop(
+                invoke=_invoke_integration_judge,
+                check=_check_integration,
+                name=f"integration_judge-{sid}",
+                max_rounds=caps["judgment_check_rounds"],
+            )
+            for w in judge_warnings:
+                log(f"  integration-judge-{sid}: {w}")
+
+            if judge_result is None:
+                # The judge crashed every round (infrastructure). The merge is
+                # already committed and passed the mechanical checks, so degrade
+                # rather than undo it.
+                log(f"  ⚠  integration-judge for {sid} crashed every round; "
+                    "degrading (merge preserved, check_merge_committed already ran)")
+            else:
+                remaining_defects = _check_integration(judge_result)
+                if remaining_defects:
+                    # Found behavioral breakage. Unlike the wiring gate (pre-merge),
+                    # we already have a committed merge, so the abort instruction
+                    # differs.
+                    die(
+                        f"integration gate found behavioral defect(s) in the merge "
+                        f"for {sid}:\n" +
+                        "\n".join(f"  • {d}" for d in remaining_defects) +
+                        f"\n\nAn independent review found the merge is textually "
+                        f"clean (no conflict markers, committed) but behaviorally "
+                        f"broken. The merge has been committed to staging. Either "
+                        f"revert it manually and resolve the conflict differently, "
+                        f"or accept the finding and revise one of the conflicting "
+                        f"subtasks' approaches, then re-run with --resume."
+                    )
+
             integrated.append(sid)
             integrated_so_far.append(sid)
         else:
@@ -22439,6 +22792,24 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             st.save()
         else:
             plans = st.data["plans_after_adherence_gate"]
+
+        if "plans_after_coverage_gate" not in st.data:
+            # Phase 2⅞½: task-coverage gate — independent adversarial
+            # verification of the MERGED plan's coverage of the task
+            # (DESIGN §8). Runs after the adherence gate (so re-planning
+            # doesn't waste that gate's spend if it doesn't need to fire)
+            # and before the soft-drop filters/schedule() (so a re-plan
+            # never rebuilds an already-scheduled DAG). Replaces the
+            # planner's self-graded `task_understanding` confidence axis.
+            plans = await phase_planning_coverage_gate(
+                plans, task, st, caps, models, efforts)
+            # Resumable-planning checkpoint: post-task-coverage-gate
+            # `plans`, persisted so --resume can skip re-invoking
+            # phase_planning_coverage_gate (DESIGN §6).
+            st.data["plans_after_coverage_gate"] = plans
+            st.save()
+        else:
+            plans = st.data["plans_after_coverage_gate"]
 
         if "plans_after_filters" not in st.data:
             # Surface cross-planner file-claim overlaps. Warning only —

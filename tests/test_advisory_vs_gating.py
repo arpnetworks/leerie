@@ -66,6 +66,67 @@ class TestDemotedSelfScoresDoNotGate:
         issues = leerie.check_reconciler_output(output, [{"subtasks": []}])
         assert not any("LOW_CONFIDENCE" in i for i in issues)
 
+    def test_overlap_judge_low_self_score_does_not_gate(self, leerie, tmp_path):
+        """The overlap judge is itself an adversarial check on the plan; a
+        second self-score gate on ITS OWN judgment would be self-scoring one
+        level removed. Its deterministic validators (PHANTOM_ARTIFACT,
+        NO_FILE_OVERLAP, DROP_BREAKS_GRAPH) remain the sole gate."""
+        output = {"collisions": [],
+                  "confidence": {"judgment": 1.0, "basis": "",
+                                 "falsifiers_tested": [],
+                                 "contradictions_reconciled": [],
+                                 "gap_to_close": {}}}
+        issues = leerie.check_overlap_judge_output(
+            output, [{"subtasks": []}], tmp_path)
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
+
+    def test_overlap_judge_deterministic_violation_still_gates(
+            self, leerie, tmp_path):
+        """Even with a demoted self-score, a genuine deterministic violation
+        (here: a collision naming two subtasks with no shared
+        files_likely_touched) still gates."""
+        output = {"collisions": [{
+            "a_sid": "feat-001", "b_sid": "feat-002",
+            "artifact": "some thing", "resolution": "merge",
+            "reason": "overlap"}],
+            "confidence": {"judgment": 9.9, "basis": "",
+                           "falsifiers_tested": [],
+                           "contradictions_reconciled": [],
+                           "gap_to_close": {}}}
+        plans = [{"subtasks": [
+            {"id": "feat-001", "files_likely_touched": ["src/a.ts"]},
+            {"id": "feat-002", "files_likely_touched": ["src/b.ts"]},
+        ]}]
+        issues = leerie.check_overlap_judge_output(output, plans, tmp_path)
+        assert any("NO_FILE_OVERLAP" in i for i in issues)
+
+    def test_planner_low_self_score_does_not_gate(self, leerie, tmp_path):
+        """The planner's `task_understanding` self-score is NO LONGER a
+        gating axis — the independent task_coverage_judge is authoritative. A
+        low self-score must NOT produce LOW_CONFIDENCE."""
+        plan = {"subtasks": [], "status": "ready", "domain": "testing",
+                "confidence": {"task_understanding": 2.0,
+                               "decomposition_quality": 9.5,
+                               "basis": "",
+                               "falsifiers_tested": [],
+                               "contradictions_reconciled": [],
+                               "gap_to_close": {}}}
+        issues = leerie.check_planner_output(plan, tmp_path, "testing")
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
+
+    def test_integrator_low_self_score_does_not_gate(self, leerie):
+        """The integrator's `resolution` self-score is NO LONGER a gating
+        axis — the independent integration_judge is authoritative. A low
+        self-score must NOT produce LOW_CONFIDENCE."""
+        result = {"confidence": {"resolution": 7.5,
+                                 "basis": "",
+                                 "falsifiers_tested": [],
+                                 "contradictions_reconciled": [],
+                                 "gap_to_close": {}}}
+        issues = leerie.check_integrator_output(result)
+        assert not any("resolution" in i.lower() for i in issues)
+        assert not any("LOW_CONFIDENCE" in i for i in issues)
+
     def test_provision_low_self_score_does_not_gate(self, leerie, tmp_path):
         result = {"recipe": [{"kind": "install", "command": ["true"],
                               "working_dir": "."}],
