@@ -63,6 +63,13 @@ flag it.
   *files* but produce *different* artifacts.
 - **Doc-syncs touching the same documentation file** with different
   sections.
+- **Same `_cofile_cluster` value.** Two or more subtasks sharing the same
+  non-null `_cofile_cluster` value are, by construction, disjoint-region
+  siblings of one deliberate sub-file split — the orchestrator
+  code-computed this partition (their line ranges are pre-verified
+  non-overlapping and their union covers the whole file); it is never
+  LLM-decided. Do NOT flag any pair sharing a `_cofile_cluster` value as
+  a collision, regardless of how similar their `intent` text reads.
 
 ## Input
 
@@ -77,7 +84,8 @@ The orchestrator gives you, in your prompt, a JSON payload:
      "files_likely_touched": [...],
      "provides": [...],
      "requires": [...],
-     "depends_on": [...]},
+     "depends_on": [...],
+     "_cofile_cluster": "feat-001" or null},
     ...
   ]
 }
