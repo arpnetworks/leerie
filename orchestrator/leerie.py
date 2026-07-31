@@ -8858,6 +8858,52 @@ def resolve_capture_deps(repo_root: Path) -> bool:
     return True  # default: enabled
 
 
+def _filter_residual_deps(language_installs: list[dict]) -> list[dict]:
+    """Filter language_installs to only the residual that cannot be baked.
+
+    Per DESIGN §6½ and the out-of-repo bake redesign: Python/Ruby/Rust/Go deps
+    bake entirely to /opt/venv, /opt/bundle, CARGO_HOME, GOMODCACHE — workers
+    resolve them with zero install. Node/pnpm's store is baked read-only, but
+    the in-repo node_modules symlink tree must be recreated per worktree
+    (irreducible ~223ms offline-relink). So config.toml holds ONLY that Node
+    offline-relink residual; everything else is filtered out.
+
+    Returns a filtered copy; the input is unchanged.
+    """
+    # Managers whose installs bake entirely (no residual)
+    BAKEABLE_MANAGERS = frozenset([
+        "pip", "pip3", "uv",        # Python → /opt/venv
+        "bundle", "gem",             # Ruby → /opt/bundle
+        "cargo",                     # Rust → CARGO_HOME/CARGO_TARGET_DIR
+        "go",                        # Go → GOMODCACHE/GOCACHE
+    ])
+    # Node managers: keep only offline-relink commands
+    NODE_MANAGERS = frozenset(["pnpm", "npm", "yarn"])
+
+    residual = []
+    for entry in language_installs:
+        manager = entry.get("manager", "")
+        command = entry.get("command", "") or ""  # Guard against explicit None
+
+        # Filter out bakeable managers entirely
+        if manager in BAKEABLE_MANAGERS:
+            continue
+
+        # For Node managers, keep only offline-relink commands
+        if manager in NODE_MANAGERS:
+            # The irreducible residual is the offline/frozen-lockfile relink
+            # (e.g., "pnpm install --offline --frozen-lockfile")
+            # Filter out full network installs
+            if "--offline" in command or "--frozen-lockfile" in command:
+                residual.append(entry)
+            continue
+
+        # Unknown managers: preserve as-is (conservative)
+        residual.append(entry)
+
+    return residual
+
+
 async def capture_repo_deps(
         repo_root: Path,
         st: object,
@@ -8887,21 +8933,6 @@ async def capture_repo_deps(
     log_dir = Path(log_dir) / "logs"
     if not log_dir.is_dir():
         return
-    # Skip when a committed .leerie/Dockerfile exists; it is authoritative
-    # (DESIGN §6½) and setup_packages / language_installs are ignored.
-    dockerfile = repo_root / ".leerie" / "Dockerfile"
-    if dockerfile.is_file():
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(repo_root), "ls-files", "--error-unmatch",
-                 ".leerie/Dockerfile"],
-                capture_output=True)
-            if result.returncode == 0:
-                log("capture: .leerie/Dockerfile is committed — skipping "
-                    "dep_capture (Dockerfile is authoritative)")
-                return
-        except Exception:
-            pass
     # Manifests-first corpus (DESIGN §6½): manifest files are primary ground
     # truth; install-filtered commands are only a hint for system/native deps.
     manifests_text = _gather_dep_manifests(repo_root)
@@ -8955,7 +8986,25 @@ async def capture_repo_deps(
         sid="dep-capture",
     )
     setup_packages: list[str] = result.get("setup_packages") or []
-    language_installs: list[dict] = result.get("language_installs") or []
+    language_installs_captured: list[dict] = result.get("language_installs") or []
+
+    # Filter to residual-only (DESIGN §6½): the worker captures everything, but
+    # config.toml holds only deps that cannot be baked (Node offline-relink).
+    # Python/Ruby/Rust/Go bake entirely; their installs are filtered out.
+    language_installs = _filter_residual_deps(language_installs_captured)
+
+    # Log what was captured vs. what will be written (makes filtering observable)
+    if language_installs_captured:
+        filtered_count = len(language_installs_captured) - len(language_installs)
+        if filtered_count > 0:
+            log(f"capture: captured {len(language_installs_captured)} language installs, "
+                f"filtered {filtered_count} bakeable (writing {len(language_installs)} residual)")
+        else:
+            log(f"capture: captured {len(language_installs_captured)} language installs "
+                f"(all residual, none filtered)")
+    if setup_packages:
+        log(f"capture: captured {len(setup_packages)} setup_packages")
+
     cfg_path = repo_root / ".leerie" / "config.toml"
     updates: dict[str, str] = {}
     if setup_packages:
@@ -19143,6 +19192,61 @@ def write_plan(leerie_dir: Path, task: str, st: State,
     st.save()
 
 
+def _is_baked_ecosystem_command(command: list[str]) -> bool:
+    """Return True if this install command is for an ecosystem whose
+    dependencies are baked into the image at `/opt/*`, making the per-run
+    install unnecessary (DESIGN §6½ "Persistent out-of-repo dependency bake").
+
+    Ecosystems with zero per-run install:
+      - Python (pip, uv, poetry, pipenv) → baked to /opt/venv
+      - Ruby (bundle) → baked to /opt/bundle
+      - Rust (cargo) → baked to CARGO_HOME + CARGO_TARGET_DIR
+      - Go (go) → baked to GOMODCACHE + GOCACHE
+
+    Ecosystems with irreducible residual:
+      - Node/pnpm → requires offline relink (NOT filtered here; handled separately)
+      - npm/yarn → full offline install (still network-free, kept for now)
+    """
+    if not command:
+        return False
+
+    cmd0 = command[0]
+
+    # Python: pip, pip3, python -m pip, uv, poetry, pipenv
+    if cmd0 in ("pip", "pip3", "uv", "poetry", "pipenv"):
+        return True
+    if cmd0 in ("python", "python3") and len(command) >= 3 and command[1:3] == ["-m", "pip"]:
+        return True
+
+    # Ruby: bundle
+    if cmd0 == "bundle":
+        return True
+
+    # Rust: cargo
+    if cmd0 == "cargo":
+        return True
+
+    # Go: go
+    if cmd0 == "go":
+        return True
+
+    return False
+
+
+def _is_node_offline_relink(command: list[str]) -> bool:
+    """Return True if this is the Node/pnpm offline relink command —
+    the single irreducible residual for Node repos (DESIGN §6½).
+
+    Pattern: `pnpm install --offline --frozen-lockfile`
+    """
+    if not command or command[0] != "pnpm":
+        return False
+    # Must have "install" subcommand and both --offline and --frozen-lockfile
+    return ("install" in command and
+            "--offline" in command and
+            "--frozen-lockfile" in command)
+
+
 def _format_provision_recipe_section(recipe: list[dict],
                                       *, audience: str) -> str | None:
     """Render the persisted provision recipe as a prompt section, or
@@ -19157,6 +19261,12 @@ def _format_provision_recipe_section(recipe: list[dict],
     function is the prompt-injection helper that hands the recipe to
     workers verbatim — no per-worker variation, same string in every
     prompt.
+
+    For repos with baked dependencies (Python to /opt/venv, Ruby to /opt/bundle,
+    Rust/Go with warmed caches), install commands for those ecosystems are
+    filtered out — workers inherit the bake with zero install cost. Only Node/pnpm
+    retains the offline relink residual (DESIGN §6½ "Persistent out-of-repo
+    dependency bake").
     """
     install_entries = [e for e in recipe
                        if e.get("kind") in ("install", "build")
@@ -19164,34 +19274,49 @@ def _format_provision_recipe_section(recipe: list[dict],
     if not install_entries:
         return None
 
+    # Filter out baked ecosystem installs (Python, Ruby, Rust, Go).
+    # Keep Node offline relink and any other commands (npm/yarn, build steps).
+    filtered_entries = []
+    for e in install_entries:
+        cmd = e.get("command", [])
+        if e.get("kind") == "install" and _is_baked_ecosystem_command(cmd):
+            # Baked ecosystem — skip this install
+            continue
+        # Keep: build commands, Node offline relink, npm/yarn, anything else
+        filtered_entries.append(e)
+
+    if not filtered_entries:
+        return None
+
     lines = ["", "PROVISION_RECIPE:"]
     if audience == "implementer":
         lines.append(
-            "  The orchestrator detected the following install (and "
-            "follow-on build) commands for this repo. Your worktree "
-            "starts with NO installed dependencies and no build "
-            "outputs. Decide whether your subtask needs them — if yes, "
-            "run them via Bash in the order shown. The package-manager "
-            "caches (pnpm store, pip wheel cache, go module cache, cargo "
-            "registry) are warm and shared across worktrees, so "
-            "re-running these is fast. These are advisory: skip them if "
-            "your subtask is purely documentation, config, or otherwise "
+            "  The following residual install/build commands could not be "
+            "baked into the image and may need to run in your worktree. "
+            "Most ecosystems (Python, Ruby, Rust, Go) are fully baked — "
+            "their deps are already at /opt/venv, /opt/bundle, etc. — so "
+            "you inherit them with zero install. This list holds only what "
+            "remains: Node's offline relink, build steps, or other unbaked "
+            "commands. Decide whether your subtask needs them — if yes, run "
+            "them via Bash in the order shown. These are advisory: skip them "
+            "if your subtask is purely documentation, config, or otherwise "
             "doesn't touch buildable code."
         )
     elif audience == "conformer":
         lines.append(
-            "  Your worktree starts with NO installed dependencies "
-            "(or only those the implementer chose to install) and no "
-            "build outputs. Before running BUILD_CMD / LINT_CMD / "
-            "TEST_CMD, ensure deps and any required build artifacts are "
-            "present — either run the install (and follow-on build) "
-            "command(s) yourself first, in the order shown, or react to "
-            "a failing test/build that diagnoses missing deps and run "
-            "them then. The caches are warm so re-running is fast."
+            "  Most ecosystems (Python, Ruby, Rust, Go) are fully baked — "
+            "their deps are already at /opt/venv, /opt/bundle, etc. — so "
+            "your worktree inherits them with zero install. The following "
+            "residual commands are what could not be baked (Node offline "
+            "relink, build steps, etc.). Before running BUILD_CMD / "
+            "LINT_CMD / TEST_CMD, ensure any residual deps and build "
+            "artifacts are present — either run these command(s) first, "
+            "in the order shown, or react to a failing test/build that "
+            "diagnoses what's missing and run them then."
         )
     else:
         raise ValueError(f"unknown audience {audience!r}")
-    for i, e in enumerate(install_entries, 1):
+    for i, e in enumerate(filtered_entries, 1):
         cmd_str = " ".join(e["command"])
         wd = e.get("working_dir", ".")
         timeout = e.get("timeout_s") or 1800
