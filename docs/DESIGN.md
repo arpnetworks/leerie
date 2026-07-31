@@ -341,6 +341,27 @@ It is reconciled by the orchestrator with three mechanisms:
   the consumer-side half the artifact registry (a producer/name-agreement aid)
   does not by itself supply.
 
+  **Transitive-chain wiring is not producer wiring.** A narrower,
+  repeatedly-observed failure inside the discipline above: a test subtask
+  `T` that *does* declare an edge — `depends_on: [B]`, where `B` is the
+  subtask immediately before it in the plan's chain — but `B` is not the
+  actual producer of everything `T`'s assertions exercise. If `T` also
+  exercises a fixture, UI state, or directive that an earlier subtask `A`
+  (upstream of `B`, or in a different domain's chain entirely) produces
+  directly, chaining to `B` alone is not equivalent to wiring to `A` — the
+  wiring gate has no way to see that `T` depends on `A`'s specific output
+  unless `T` declares that edge itself, because `A`'s output is not
+  guaranteed to survive as `B`'s own `provides` if `B` is later merged,
+  dropped, or re-scoped. Two real incidents (barnacle, 2026-07-31) hit this
+  exact shape: an acceptance-test subtask correctly wired to the last
+  subtask in its own chain while its assertions exercised a capability two
+  or three subtasks upstream (once within the same domain, once across a
+  different domain's chain), and the wiring gate correctly rejected both
+  plans. The planner is instructed to trace every subtask whose *output*
+  (not just its position in the chain) the test's assertions touch, and
+  wire to each directly — a chain of `depends_on` edges is not a substitute
+  for enumerating actual producers.
+
   **Dead-subtask elimination (code-enforced).** A planner can emit
   `requires: {tag, extent: in_plan}` for a capability it expects another
   domain to produce. If that domain returns 0 subtasks, the requires is

@@ -191,6 +191,25 @@ The orchestrator gives you, in your prompt:
    its producer fails; the wiring gate will reject the plan, wasting the whole
    planning spend.
 
+   **Chaining to the immediately-preceding subtask is not the same as wiring
+   to every producer your assertions actually exercise.** A real, repeated
+   failure: an acceptance-test subtask `T` depends on subtask `B`, and `B`
+   depends on subtask `A` — `T` declares `depends_on: [B]` (or `requires` on
+   `B`'s tag) and stops there, on the theory that `A` is covered transitively.
+   It is not, whenever `T`'s own assertions exercise a capability `A` produces
+   directly (a fixture `A` establishes, a UI state `A` creates, a directive `A`
+   defines) rather than a capability `B` produces. If `B` is later merged,
+   dropped, or re-scoped, that edge to `A` silently vanishes — the wiring gate
+   cannot see it because it was never declared, only assumed. Before finalizing
+   a test subtask's `requires`/`depends_on`, list every subtask whose output
+   the test's assertions actually touch (read their success criteria, not just
+   their id in your own chain) and wire to **each of them directly** — not only
+   the last link before your subtask. This applies across domains too: if your
+   test's "confirm the flow ends correctly" step depends on a directive or
+   criterion a *different* domain's subtask adds (not the one your own chain's
+   last subtask happens to produce), require that subtask's tag explicitly,
+   even though it feels like a detail two links removed from your own work.
+
    **`infrastructure` ↔ `configuration-build` arrow.** When both
    categories are in scope, the dependency arrow goes
    `infrastructure → configuration-build`, not the reverse.
