@@ -414,6 +414,26 @@ STATE_FIELDS = (
     # both halves of the two-worker agreement (classifier claim + judge
     # verification). Written only when the no_work_judge confirms.
     "no_work_confirmation",
+    # no_work_dispute: the disagreement record when the no_work_judge does
+    # NOT confirm the claim — written only on a dispute with non-empty
+    # judge evidence, consumed by phase_plan's planner ctx so the plan
+    # targets the disputed residual instead of re-deriving the task
+    # (DESIGN §8 *A dispute's evidence is planning input, not log noise*).
+    "no_work_dispute",
+    # defect_scope: the defect-scope audit's result on a defect-fix task
+    # (DESIGN §5 *Defect-scope audit*): sites sharing the defective
+    # decision idiom + chokepoint verdict. Presence-keyed resume
+    # checkpoint mirroring artifact_registry; injected into planner ctx
+    # when applicable with non-empty sites.
+    "defect_scope",
+    # delivery_gate: audit record of the finalize-side required-items
+    # verification on the integrated staging tree (DESIGN §8 *The
+    # delivery gate*): {unmet_before[], unmet_after[], samples_before,
+    # samples_after}. unmet_after == [] means every confirmed-unmet item
+    # was remedied by the final-conformer round it was routed into;
+    # non-empty unmet_after is the persisted residual the operator (and
+    # the next run's planner, via the classifier) can see.
+    "delivery_gate",
     # declared_unrun_warnings: per-sid record of declared runs_commands an
     # empty_handoff-rescued subtask never executed. The rescue settles
     # complete (blocking would strand the kept commits — see the rescue
@@ -1292,7 +1312,11 @@ SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # rejected again until the round budget ran out. The `deferred` field on
 # `required_items` fixes that specific cause; this flag exists because a
 # judgment worker will always be able to produce a false positive the
-# operator needs to push past. Resolution order:
+# operator needs to push past. Since the phase-5 delivery gate landed,
+# ONE FLAG GOVERNS BOTH SIDES of required-items checking: this flag also
+# suppresses the finalize-side delivery_judge verification
+# (_run_delivery_prejudge/_run_delivery_recheck — DESIGN §8 *The
+# delivery gate*). Resolution order:
 # --skip-coverage-check CLI flag → LEERIE_SKIP_COVERAGE_CHECK env →
 # skip_coverage_check in leerie.toml → False.
 SKIP_COVERAGE_CHECK_ENV = "LEERIE_SKIP_COVERAGE_CHECK"
@@ -1474,6 +1498,15 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # measured duration corpus and a new worker has no measurements — it
     # falls to the global worker_timeout_sec backstop until it does.
     "no_work_judge": "medium",
+    # Verifies the integrated staging tree against required_items before
+    # finalize (DESIGN §8 *The delivery gate*). Same adversarial-verifier
+    # tier; same TIMEOUT_DEFAULT_PER_WORKER absence rationale as
+    # no_work_judge (no measured duration corpus yet).
+    "delivery_judge": "medium",
+    # Pre-planning defect-shape site enumeration on defect-fix tasks
+    # (DESIGN §5 *Defect-scope audit*). Judgment tier; same
+    # TIMEOUT_DEFAULT_PER_WORKER absence rationale as its siblings.
+    "defect_scope_auditor": "medium",
     # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
     # worker*). A judgment worker (decides the canonical tag/path per artifact),
     # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
@@ -1606,7 +1639,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
-                "integration_judge", "no_work_judge", "rebaser")
+                "integration_judge", "no_work_judge", "delivery_judge",
+                "defect_scope_auditor", "rebaser")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1632,6 +1666,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "artifact_registry", "planner", "fit_judge", "splitter", "reconciler",
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
     "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
+    "delivery_judge", "defect_scope_auditor",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2930,6 +2965,98 @@ SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "items": {"type": "string"},
             },
+        },
+    },
+    "delivery_judge": {
+        # Verifies the INTEGRATED staging tree against the run's
+        # required_items just before finalize (DESIGN §8 *The delivery
+        # gate*). The measured gap it closes: a standing deliverable
+        # constraint carried in required_items was enforced by the NEXT
+        # run's no_work_judge (which vetoed no-work over it) but by
+        # nothing in the run that shipped the violation — enforcement
+        # asymmetry that guarantees at least one extra run per violation.
+        # Verdicts align to the payload's numbered items by `item_index`
+        # (mechanical integer alignment — never prose matching), and the
+        # consumer applies a majority vote across samples before calling
+        # any item unmet (single-trial LLM judging is measurably noisy;
+        # most recoverable reliability arrives by 3 votes).
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["verdicts"],
+        "properties": {
+            "verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_index", "met", "evidence"],
+                    "properties": {
+                        # Index into the numbered REQUIRED ITEMS list the
+                        # judge was handed. Integer, not the item text —
+                        # the consumer tallies votes per index.
+                        "item_index": {"type": "integer"},
+                        # met=true only with cited on-tree evidence; on
+                        # cannot-verify the prompt biases met=false (a
+                        # false unmet costs one fix round; a false met
+                        # ships the violation).
+                        "met": {"type": "boolean"},
+                        "evidence": {"type": "string"},
+                    },
+                },
+            },
+            "rationale": {"type": "string"},
+        },
+    },
+    "defect_scope_auditor": {
+        # Pre-planning defect-shape enumeration (DESIGN §5 *Defect-scope
+        # audit*). Measured pathology it closes: a multi-site defect
+        # re-planned as "the one remaining gap" run after run — 7 of 11
+        # commits re-editing the same ~120-line region — because no one
+        # was asked to enumerate the sites before the plan was cut,
+        # though two greps would have surfaced all of them on day one.
+        # Sites carry a typed `role`; `bypass` exists because the path
+        # that skips the shared logic entirely is historically the site
+        # a fix campaign never looks at.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["applicable", "sites"],
+        "properties": {
+            # False when the task is not a defect-shape fix (a feature,
+            # a doc change, a symptom with a single obvious location) —
+            # the common case; everything else is then ignored.
+            "applicable": {"type": "boolean"},
+            # One sentence naming the repeated decision/idiom — the
+            # SHAPE, not the symptom.
+            "defect_shape": {"type": "string"},
+            "sites": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["file", "symbol", "role"],
+                    "properties": {
+                        "file": {"type": "string"},
+                        "symbol": {"type": "string"},
+                        "line_hint": {"type": "integer"},
+                        "role": {"type": "string",
+                                 "enum": ["decision_site", "producer",
+                                          "consumer", "bypass"]},
+                        "note": {"type": "string"},
+                    },
+                },
+            },
+            "chokepoint": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["exists"],
+                "properties": {
+                    "exists": {"type": "boolean"},
+                    "file": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "rationale": {"type": "string"},
+                },
+            },
+            "rationale": {"type": "string"},
         },
     },
     "wiring_judge": {
@@ -6740,10 +6867,14 @@ def resolve_skip_coverage_check(repo_root: Path, cli_value: bool) -> bool:
     LEERIE_SKIP_COVERAGE_CHECK env var →
     skip_coverage_check in leerie.toml → False.
 
-    When True, `phase_planning_coverage_gate` is not run — neither the
-    advisory `task_coverage_judge` review — so a plan that omits a required item is
-    not caught before `phase_execute` spends. Off by default; use when the
-    gate is demanding work the task does not actually want built."""
+    When True, required-items checking is suppressed on BOTH sides:
+    `phase_planning_coverage_gate` (the advisory `task_coverage_judge`
+    review) does not run, so a plan that omits a required item is not
+    caught before `phase_execute` spends — and the phase-5 delivery gate
+    (`_run_delivery_prejudge`/`_run_delivery_recheck`, DESIGN §8 *The
+    delivery gate*) does not verify the integrated tree either. Off by
+    default; use when the judges are demanding work the task does not
+    actually want built."""
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_COVERAGE_CHECK_ENV,
@@ -7484,6 +7615,20 @@ def _diff_repo_state(before: dict, after: dict, *,
     return out
 
 
+def _tripwire_operator_overlap(deltas: list[str]) -> bool:
+    """True when EVERY delta is a newly-appeared untracked file (porcelain
+    `??`) — the measured signature of the operator dropping task/report
+    files into the checkout for another run while this one executes, not
+    of a worker escape (the measured overlap incident added exactly one
+    untracked report `.md`; escapes show tracked-file modifications).
+    Mechanical string comparison on `_diff_repo_state`'s fixed delta
+    prefixes and git porcelain codes only — never on prose. Deliberately
+    narrow: any tracked-file delta, HEAD move, or ref delta returns False
+    and keeps the full worker-escape framing (DESIGN §12 L4)."""
+    return bool(deltas) and all(
+        d.startswith("working tree changed: ?? ") for d in deltas)
+
+
 async def _assert_repo_unchanged(st: "State", phase: str, *,
                                  porcelain_only: bool = False) -> None:
     """The §12 guarantee: verify no worker has touched the user's checkout.
@@ -7523,6 +7668,24 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
     deltas = _diff_repo_state(before, after, porcelain_only=porcelain_only)
     if not deltas:
         return
+    if _tripwire_operator_overlap(deltas):
+        # Same stop, different framing: the measured cost of blaming a
+        # worker escape here was a from-scratch re-run (full replan)
+        # because the message put resume behind a restore step the
+        # operator's own files never needed (DESIGN §12 L4).
+        die("your real checkout changed during " + phase + ".\n  "
+            + "\n  ".join(deltas)
+            + "\n\nEvery delta above is a newly-added untracked file — the "
+              "signature of operator activity in this checkout (dropping a "
+              "task or report file for another run) rather than a worker "
+              "escape, which shows up as tracked-file modifications. The "
+              "run still stops, because its planning baseline moved. If "
+              "those files are yours, no restore is needed — resume "
+              "directly:\n"
+              f"  ./leerie resume {st.run_id}\n"
+            "If they are NOT yours, treat this as an escape:\n"
+            f"  git -C {st.repo_root} status\n"
+            f"  git -C {st.repo_root} clean -i")
     die("a worker modified your real checkout during " + phase + ".\n  "
         + "\n  ".join(deltas)
         + "\n\nleerie runs judgment workers in a disposable worktree "
@@ -20703,6 +20866,19 @@ async def _confirm_no_work_on_converged_gate(
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence})
         return True
+    if judge_evidence:
+        # The dispute names exactly which claimed deliverables the judge
+        # verified and why completion still fails — the densest planning
+        # signal the run has produced. Persist it for phase_plan's ctx;
+        # dropping it here reproduced a measured cross-run loop (the next
+        # plan carried zero subtasks addressing the dispute's reason, so
+        # the following run's judge disputed identically).
+        st.data["no_work_dispute"] = {
+            "classifier_evidence": evidence,
+            "judge_evidence": judge_evidence,
+            "checked": list(out.get("checked", []) or []),
+        }
+        st.save()
     log("  no_work_judge did not confirm the claim "
         f"(evidence: {judge_evidence[:200]!r}); proceeding to planning")
     return False
@@ -21694,6 +21870,119 @@ async def phase_artifact_registry(
     return artifacts
 
 
+async def phase_defect_scope_audit(
+        task: str, st: State, caps: dict, models: dict[str, str],
+        efforts: dict[str, str | None]) -> dict:
+    """Pre-planning defect-shape enumeration (DESIGN §5 *Defect-scope
+    audit*). Runs ONCE after the artifact registry, before any planner,
+    and only when classification includes `bug-fixing` — every other
+    task pays nothing.
+
+    A single read-only `defect_scope_auditor` states the task's defect
+    SHAPE (the repeated decision/idiom), enumerates every site on the
+    base tree implementing it (decision sites, producers, consumers,
+    and bypasses), and says whether a chokepoint exists where one fix
+    covers all of them. `phase_plan` injects the result into every
+    planner's ctx; `_warn_defect_sites_uncovered` is the mechanical
+    floor. Best-effort and non-fatal on the artifact-registry model:
+    any failure returns `{"applicable": False}` and the run proceeds as
+    it did before the audit existed. Never die()s."""
+    if "bug-fixing" not in (st.data.get("categories") or []):
+        return {"applicable": False}
+    st.data["current_phase"] = "phase 2: defect-scope audit"
+    st.save()
+    sys_prompt = _load_prompt("defect_scope_auditor")
+
+    async def _invoke() -> dict:
+        st.bump_workers(caps)
+        user_prompt = (
+            "TASK:\n" + task +
+            "\n\nAudit the defect scope per your instructions: name the "
+            "defect shape, enumerate every site on this tree that "
+            "implements it (including bypasses), and give the chokepoint "
+            "verdict. `applicable: false` is the correct answer when the "
+            "task is not a defect-shape fix."
+        )
+        return await claude_p(
+            user_prompt=user_prompt, system_prompt=sys_prompt,
+            schema_key="defect_scope_auditor", cwd=_judgment_cwd(st),
+            allowed_tools=INSPECT_TOOLS, max_turns=40, autonomous=False,
+            caps=caps, st=st,
+            model=models.get("defect_scope_auditor", MODEL_DEFAULT),
+            effort=efforts.get("defect_scope_auditor"),
+            sid="defect_scope_auditor",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    result, _warnings = await _run_checked_loop(
+        invoke=_invoke, check=lambda _r: [], name="defect_scope_auditor",
+        max_rounds=caps["judgment_check_rounds"],
+    )
+    if result is None:
+        log("  defect-scope audit: worker crashed every round; degrading "
+            "(planners run without the site enumeration) — non-fatal")
+        return {"applicable": False}
+    if not result.get("applicable"):
+        log("  defect-scope audit: task not defect-shaped — no enumeration")
+        return {"applicable": False}
+    sites = [s for s in (result.get("sites") or [])
+             if isinstance(s, dict) and s.get("file") and s.get("symbol")]
+    scope = {
+        "applicable": True,
+        "defect_shape": result.get("defect_shape") or "",
+        "sites": sites,
+        "chokepoint": result.get("chokepoint") or {"exists": False},
+    }
+    chokepoint = scope["chokepoint"]
+    log(f"phase 2: defect-scope audit — {len(sites)} site(s) share the "
+        "defect shape"
+        + (f"; chokepoint: {chokepoint.get('symbol') or chokepoint.get('file')}"
+           if chokepoint.get("exists") else "; no single chokepoint"))
+    return scope
+
+
+def _warn_defect_sites_uncovered(plans: list[dict],
+                                 defect_scope: dict) -> None:
+    """Mechanical floor for the defect-scope audit (DESIGN §5
+    *Defect-scope audit*): warn on every audited site whose FILE appears
+    in no subtask's `files_likely_touched`. Pure set comparison on paths
+    — never on prose (a scope_note naming a deliberate exclusion still
+    warns; that noise is accepted, since parsing the note would be
+    exactly the Language-to-JSON violation the repo forbids). Advisory
+    only: the audit is judgment, and a hallucinated site must not be
+    able to block a run."""
+    if not defect_scope.get("applicable"):
+        return
+    sites = defect_scope.get("sites") or []
+    if not sites:
+        return
+    def _norm(path: str) -> str:
+        # removeprefix, not lstrip: lstrip("./") strips a CHARACTER SET,
+        # so "/abs/x.py" and "abs/x.py" would conflate (review round 1 —
+        # suppressed a warning). Peel only literal "./" prefixes.
+        while path.startswith("./"):
+            path = path[2:]
+        return path
+
+    claimed: set[str] = set()
+    for p in plans:
+        for s in (p.get("subtasks") or []):
+            for f in (s.get("files_likely_touched") or []):
+                claimed.add(_norm(str(f)))
+    uncovered = [s for s in sites
+                 if _norm(str(s.get("file", ""))) not in claimed]
+    if not uncovered:
+        return
+    log("  WARNING: defect-scope audit sites not claimed by any subtask's "
+        "files_likely_touched — a plan that leaves a same-shape site "
+        "unfixed is how the same defect ships partially fixed run after "
+        "run (advisory; scope a subtask to each, or name the exclusion "
+        "in a scope_note):")
+    for s in uncovered:
+        log(f"    • {s.get('file')} :: {s.get('symbol')} "
+            f"({s.get('role', '?')})")
+
+
 def _replan_domain_closure(plans: list[dict], targets: set[str]) -> set[str]:
     """Domains that must be re-planned together with `targets`.
 
@@ -21853,6 +22142,26 @@ async def phase_plan(task: str, st: State, caps: dict,
     required_items = st.data.get("required_items") or []
     if required_items:
         ctx_dict["required_items"] = required_items
+    # Converged-gate dispute residual (DESIGN §8 *A dispute's evidence is
+    # planning input, not log noise*): when the no_work_judge disputed an
+    # already-satisfied claim, its evidence names exactly what is already
+    # present and exactly why completion still fails. Handing it to every
+    # planner is what lets the plan target that residual instead of
+    # re-deriving the task from scratch — a prompt cannot act on a signal
+    # the orchestrator never delivered. Omitted when no dispute occurred,
+    # so the common case carries no false framing.
+    no_work_dispute = st.data.get("no_work_dispute") or {}
+    if no_work_dispute.get("judge_evidence"):
+        ctx_dict["no_work_dispute"] = no_work_dispute
+    # Defect-scope audit result (DESIGN §5 *Defect-scope audit*): the
+    # enumerated sites sharing the defect shape plus the chokepoint
+    # verdict. The planner must cover every site or scope it out by
+    # name; a chokepoint-shaped defect should get a single-point fix,
+    # not per-site patches. Omitted when inapplicable or empty, so the
+    # common case carries no false framing.
+    defect_scope = st.data.get("defect_scope") or {}
+    if defect_scope.get("applicable") and defect_scope.get("sites"):
+        ctx_dict["defect_scope"] = defect_scope
     # Shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*).
     # A pre-planning canonical {description, tag, path} list, injected into
     # EVERY planner's ctx (built once, shared across all plan_one calls) so
@@ -30786,9 +31095,279 @@ async def _capture_conformance_baseline(
                                                "red_axes": []}})
 
 
-async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
+def _format_unmet_required_items_section(unmet: list[dict]) -> str:
+    """The final-conformer prompt section that routes confirmed-unmet
+    required items into the existing fix loop (DESIGN §8 *The delivery
+    gate*). Pure, so the exact text the conformer receives is testable —
+    the value delivered, not just a key present."""
+    lines = [
+        "UNMET REQUIRED ITEMS (delivery gate): an independent read-only "
+        "judge verified this integrated tree against the task's explicit "
+        "required items and found the following NOT met, with evidence. "
+        "Remedy each one in this worktree and commit the fixes alongside "
+        "your conformance work — these are task requirements, not style "
+        "rules, and a post-pass recheck verifies them again:",
+    ]
+    for u in unmet:
+        lines.append(f"  - [{u.get('item_index')}] {u.get('item', '')}")
+        ev = (u.get("evidence") or "").strip()
+        if ev:
+            lines.append(f"    evidence: {ev}")
+    return "\n".join(lines)
+
+
+def _delivery_unmet_majority(samples: list[dict], n_items: int) -> list[int]:
+    """Item indices unmet by strict majority across judge samples.
+
+    Mechanical tally only (Language-to-JSON): votes align by the
+    schema's integer `item_index`, never by matching item prose. Within
+    one sample the LAST verdict for an index wins (defensive against a
+    duplicated entry); an index a sample never mentions is a MET vote —
+    only an affirmative unmet counts, so a truncated verdict list fails
+    open toward shipping, the same direction as every other
+    already-satisfied mechanism. Threshold is a strict majority of ALL
+    samples taken (1 of 1, 2 of 3), per the measured reliability curve
+    for single-trial LLM judging (DESIGN §8 *The delivery gate*)."""
+    threshold = len(samples) // 2 + 1
+    votes = [0] * n_items
+    for s in samples:
+        seen: dict[int, bool] = {}
+        for v in (s.get("verdicts") or []):
+            idx = v.get("item_index")
+            # `not isinstance(idx, bool)`: bool subclasses int, so a
+            # schema-escaping `true` would otherwise tally as index 1
+            # (review round 1 — defense in depth; the schema types the
+            # field integer, but the tally must not rest on that).
+            if (isinstance(idx, int) and not isinstance(idx, bool)
+                    and 0 <= idx < n_items
+                    and isinstance(v.get("met"), bool)):
+                seen[idx] = v["met"]
+        for idx, met in seen.items():
+            if not met:
+                votes[idx] += 1
+    return [i for i in range(n_items) if votes[i] >= threshold]
+
+
+async def _delivery_judge_unmet(
+        task: str, items: list[dict], staging: Path, st: "State",
+        caps: dict, models: dict[str, str],
+        efforts: dict[str, str | None],
+        phase_label: str) -> tuple[list[dict], int]:
+    """Run the delivery_judge over the staging tree; return
+    (confirmed_unmet, samples_used).
+
+    Confirm-on-first-pass: one sample, and only when it flags something
+    do two more run, with an item confirmed unmet only on a 2-of-3
+    majority — single-trial LLM judging is measurably noisy, majority
+    over 3 samples recovers most of the reliability, and voting on
+    DISPUTES only keeps the clean-pass common case at one spawn.
+    Exceptions (WorkerError / timeout) propagate; the callers treat the
+    whole gate as advisory."""
+    # Normalize BEFORE numbering (review rounds 1–2): required_items
+    # can reach state as plain strings (an existing test seeds that
+    # shape, and pre-gate consumers all tolerate it), and a dict item
+    # could carry its own item_index — the classifier schema does not
+    # set additionalProperties, so that key is schema-legal and, spread
+    # after the literal, would override the positional index and make
+    # the item unvotable (every vote for it lands out of range). The
+    # literal goes LAST so the positional index always wins. Every
+    # normalized entry also carries a guaranteed-STR "item": the
+    # conformer section and the persisted delivery_gate record need
+    # printable text, and the recheck's residual log slices it — a
+    # nested non-string value there raised TypeError into the advisory
+    # wrapper, losing the residual line (round 2).
+    def _norm_item(item: object) -> dict:
+        if not isinstance(item, dict):
+            return {"item": str(item)}
+        if "item" not in item:
+            # No text field at all: the whole entry is the only
+            # description this requirement has, so serialize it — an
+            # empty string here handed the conformer a blank
+            # requirement, unchanged from pre-normalization behavior
+            # (round 4: that made the no-item-key test
+            # non-discriminating). A stray item_index key is excluded
+            # from the text: the positional index is authoritative, and
+            # echoing a contradicting number into the judge payload
+            # invites misaligned verdicts (round 5).
+            body = {k: v for k, v in item.items() if k != "item_index"}
+            return {**item, "item": json.dumps(body, sort_keys=True)}
+        text = item["item"]
+        if not isinstance(text, str):
+            text = "" if text is None else json.dumps(text, sort_keys=True)
+        return {**item, "item": text}
+
+    normalized = [_norm_item(item) for item in items]
+    numbered = [{**item, "item_index": i}
+                for i, item in enumerate(normalized)]
+    user_prompt = (
+        "TASK:\n" + task + "\n\n"
+        "REQUIRED ITEMS (verify each against the CURRENT tree — your cwd "
+        "is the integrated staging worktree, the exact tree this run is "
+        "about to ship):\n"
+        + json.dumps(numbered, indent=2) +
+        "\n\nReturn one verdict per item_index per your schema. met=true "
+        "only with cited on-tree evidence; when you cannot verify, "
+        "met=false with evidence saying what you could not verify."
+    )
+
+    async def _sample(k: int) -> dict:
+        st.bump_workers(caps)
+        return await claude_p(
+            user_prompt=user_prompt,
+            system_prompt=_load_prompt("delivery_judge"),
+            schema_key="delivery_judge", cwd=str(staging),
+            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=30,
+            autonomous=False, caps=caps, st=st,
+            model=models.get("delivery_judge", MODEL_DEFAULT),
+            effort=efforts.get("delivery_judge"),
+            sid=f"delivery_judge-{phase_label}-s{k}",
+        )
+
+    samples = [await _sample(0)]
+    if not _delivery_unmet_majority(samples, len(items)):
+        return [], 1
+    for k in (1, 2):
+        samples.append(await _sample(k))
+    unmet_idx = _delivery_unmet_majority(samples, len(items))
+    confirmed: list[dict] = []
+    for i in unmet_idx:
+        evidence = ""
+        for s in reversed(samples):
+            for v in (s.get("verdicts") or []):
+                if v.get("item_index") == i and v.get("met") is False:
+                    evidence = (v.get("evidence") or "").strip()
+                    break
+            if evidence:
+                break
+        confirmed.append({"item_index": i,
+                          "item": normalized[i].get("item", ""),
+                          "evidence": evidence})
+    return confirmed, len(samples)
+
+
+async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
+                                 models: dict[str, str],
+                                 efforts: dict[str, str | None],
+                                 ) -> list[dict]:
+    """First half of the delivery gate (DESIGN §8 *The delivery gate*):
+    verify the integrated staging tree against `required_items` BEFORE
+    the final-conformer pass, so confirmed-unmet items route into that
+    existing fix loop instead of needing one of their own.
+
+    Returns the confirmed-unmet list (possibly empty) and persists the
+    `before` half of `st.data["delivery_gate"]`. Advisory throughout:
+    no required items, the shared `skip_coverage_check` flag (one flag
+    governs required-items checking, plan-side and finalize-side),
+    a missing staging worktree, or a judge crash all return [] — the
+    gate must never become a new way to stop a run."""
+    if st.data.get("skip_coverage_check"):
+        return []
+    items = st.data.get("required_items") or []
+    if not items:
+        return []
+    # Mirror _run_final_conformance's own guard (review rounds 1–2):
+    # with working_branch missing the conformer pass will skip, so
+    # spending judge samples buys a recheck that then reports "still
+    # unmet after the final-conformer pass" for a pass that never ran.
+    # Sits ABOVE the resume early-returns — a resume that recorded
+    # unmet_before and then lost working_branch must not hand the
+    # caller a truthy list that triggers the recheck (round 2).
+    if not st.data.get("working_branch"):
+        log("phase 5: delivery gate skipped — working_branch not in "
+            "state (the final-conformer pass it routes into would skip "
+            "for the same reason)")
+        return []
+    existing = st.data.get("delivery_gate") or {}
+    if "unmet_after" in existing:
+        log("phase 5: delivery gate already complete — skipping (resume)")
+        return []
+    if "unmet_before" in existing:
+        # Resumed between the two halves: reuse the recorded verdict so
+        # the recheck still runs without re-spending the pre-judge.
+        return list(existing.get("unmet_before") or [])
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        log("phase 5: delivery gate skipped — staging worktree absent")
+        return []
+    log(f"phase 5: delivery gate — verifying {len(items)} required "
+        "item(s) against the integrated tree (DESIGN §8)")
+    st.data["current_phase"] = "phase 5: delivery gate"
+    st.save()
+    try:
+        unmet, n = await _delivery_judge_unmet(
+            st.data.get("task", ""), items, staging, st, caps, models,
+            efforts, phase_label="pre")
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        log(f"  delivery_judge crashed ({_brief_worker_exc(e)}); "
+            "gate skipped (advisory)")
+        return []
+    st.data["delivery_gate"] = {"unmet_before": unmet,
+                                "samples_before": n}
+    st.save()
+    if unmet:
+        log(f"  delivery gate: {len(unmet)} required item(s) confirmed "
+            f"unmet by majority over {n} sample(s); routing into the "
+            "final-conformer pass")
+    else:
+        log("  delivery gate: every required item verified met on the "
+            "integrated tree")
+    return unmet
+
+
+async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
                                 models: dict[str, str],
                                 efforts: dict[str, str | None]) -> None:
+    """Second half of the delivery gate: after the final-conformer pass
+    was handed the confirmed-unmet items, mechanically re-verify — never
+    trust the fixer's self-report (the same discipline as
+    `check_rebaser_worktree_state`). Records `unmet_after` either way;
+    a non-empty residual ships anyway (fail-open toward shipping) but
+    loudly, and the record is what the operator and the next run's
+    classifier can see."""
+    gate = st.data.get("delivery_gate") or {}
+    unmet_before = gate.get("unmet_before") or []
+    if not unmet_before or "unmet_after" in gate:
+        return
+    # Own copy of the working_branch guard (round 2): this function
+    # consults gate state directly, so it must not rely on the prejudge
+    # having filtered the resume path in the same invocation.
+    if not st.data.get("working_branch"):
+        log("  delivery gate recheck skipped — working_branch not in "
+            "state (no final-conformer pass ran to re-verify against)")
+        return
+    items = st.data.get("required_items") or []
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not items or not staging.is_dir():
+        log("  delivery gate recheck skipped — items or staging absent")
+        return
+    try:
+        unmet, n = await _delivery_judge_unmet(
+            st.data.get("task", ""), items, staging, st, caps, models,
+            efforts, phase_label="recheck")
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        log(f"  delivery_judge recheck crashed ({_brief_worker_exc(e)}); "
+            "residual unrecorded (advisory)")
+        return
+    gate["unmet_after"] = unmet
+    gate["samples_after"] = n
+    st.data["delivery_gate"] = gate
+    st.save()
+    if unmet:
+        log(f"  delivery gate residual: {len(unmet)} required item(s) "
+            "still unmet after the final-conformer pass — finalize "
+            "proceeds (fail-open), residual recorded in state.json "
+            "delivery_gate.unmet_after: "
+            + "; ".join((i.get("item") or "")[:80] for i in unmet))
+    else:
+        log("  delivery gate: all previously-unmet required items "
+            "verified remedied")
+
+
+async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
+                                models: dict[str, str],
+                                efforts: dict[str, str | None],
+                                unmet_required_items:
+                                list[dict] | None = None) -> None:
     """Whole-tree conformance pass on the integrated staging worktree
     (DESIGN §6 *Worktree and integration model*, final-tree pass).
 
@@ -30904,6 +31483,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             f"DIFF_BASE: {working_branch} (compare with "
             f"`git diff {working_branch}..HEAD`)",
         ]
+        # Delivery-gate routing (DESIGN §8 *The delivery gate*): the
+        # confirmed-unmet required items ride the existing fix loop
+        # rather than getting one of their own; the gate's recheck is
+        # the mechanical verification that they were actually remedied.
+        if unmet_required_items:
+            up.append(_format_unmet_required_items_section(
+                unmet_required_items))
         _append_conformer_context_sections(up, pre, "full", st)
         if blt_feedback is not None:
             up.append(blt_feedback)
@@ -33914,6 +34500,26 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 task, st, caps, models, efforts)
             st.save()
 
+        # Defect-scope audit (DESIGN §5 *Defect-scope audit*): same
+        # presence-keyed checkpoint pattern as the registry above —
+        # computed once, persisted, skipped on resume; best-effort, and
+        # {"applicable": False} is a valid completed state. The extra
+        # plans_after_plan gate covers a resume of a run whose state
+        # PREDATES this key: with planning already checkpointed, the
+        # audit's PLANNER-side consumer (phase_plan's ctx injection)
+        # has run, so spawning the auditor there would spend a worker
+        # (and bump worker_count on a re-entry that must be free — CI
+        # caught exactly that) to steer a plan already cut. The
+        # DOWNSTREAM consumer, _warn_defect_sites_uncovered, then reads
+        # {} and degrades to a no-op on that resume shape — an accepted
+        # trade: an advisory warning against a worker spawn, on a
+        # window only pre-feature states can enter (round 5).
+        if ("defect_scope" not in st.data
+                and "plans_after_plan" not in st.data):
+            st.data["defect_scope"] = await phase_defect_scope_audit(
+                task, st, caps, models, efforts)
+            st.save()
+
         if "plans_after_plan" not in st.data:
             plans = await phase_plan(task, st, caps, models, efforts)
             # Resumable-planning checkpoint: post-recursive-decompose
@@ -34049,6 +34655,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # empty condition cannot see. The wiring gate's constrained repair
             # is what closes that class (DESIGN §5).
             _warn_test_subtask_missing_producer_edge(plans)
+            # Mechanical floor for the defect-scope audit (DESIGN §5
+            # *Defect-scope audit*): file-set comparison of the audited
+            # sites against the plans' files_likely_touched union.
+            _warn_defect_sites_uncovered(
+                plans, st.data.get("defect_scope") or {})
             # Drop subtasks whose files_likely_touched leak into
             # inspect-dir mounts (read-only) or other off-tree paths. Soft
             # drop so the surviving subtasks proceed; the drop is
@@ -34204,12 +34815,24 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         _write_plan(leerie_dir, task, st, subtasks, waves)
 
     await phase_execute(leerie_dir, st, caps, models, efforts)
+    # Delivery gate, first half (DESIGN §8 *The delivery gate*): verify
+    # the integrated tree against required_items and hand any
+    # confirmed-unmet items to the final-conformer pass below. Advisory
+    # at this call site for the same reason as the conformance pass.
+    unmet_delivery: list[dict] = []
+    try:
+        unmet_delivery = await _run_delivery_prejudge(
+            leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        log(f"delivery gate (pre) raised {type(e).__name__}: {e} — "
+            "surfaced as advisory, continuing")
     # Final-tree conformance pass on the integrated staging worktree
     # (DESIGN §6 *Worktree and integration model*, final-tree pass).
     # Advisory — never raises; failure modes surface in
     # st.data["conformance"]["_final"].
     try:
-        await _run_final_conformance(leerie_dir, st, caps, models, efforts)
+        await _run_final_conformance(leerie_dir, st, caps, models, efforts,
+                                     unmet_required_items=unmet_delivery)
     except Exception as e:
         # Defense-in-depth: _run_final_conformance is documented to
         # never raise, but a bug in its glue (e.g. a future state
@@ -34222,6 +34845,16 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         )["warnings"].append(
             f"orchestrator-side exception: {type(e).__name__}: {e}")
         st.save()
+    # Delivery gate, second half: mechanically re-verify the items the
+    # conformer was handed — never trust a fixer's self-report. Only
+    # spawned when the first half confirmed something unmet.
+    if unmet_delivery:
+        try:
+            await _run_delivery_recheck(leerie_dir, st, caps, models,
+                                        efforts)
+        except Exception as e:
+            log(f"delivery gate (recheck) raised {type(e).__name__}: {e} "
+                "— surfaced as advisory, finalize proceeds")
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False),
@@ -34484,12 +35117,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          f"Also {SKIP_ADHERENCE_CHECK_ENV} env or "
                          "skip_adherence_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-coverage-check", action="store_true",
-                    help="skip the phase 2⅞½ task-coverage gate: the "
-                         "advisory task_coverage_judge review. The gate no "
-                         "longer gates (its floor passed 0 of 102 items and "
-                         "was deleted; its judge's findings do not reproduce "
-                         "across re-samples), so this only suppresses the "
-                         "review and its worker call. "
+                    help="skip required-items checking on BOTH sides: the "
+                         "phase 2⅞½ advisory task_coverage_judge review "
+                         "(which no longer gates — its floor passed 0 of "
+                         "102 items and was deleted; its judge's findings "
+                         "do not reproduce across re-samples) AND the "
+                         "phase-5 delivery gate that verifies required "
+                         "items on the integrated tree before finalize. "
                          f"Also {SKIP_COVERAGE_CHECK_ENV} env or "
                          "skip_coverage_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-completeness-check", action="store_true",

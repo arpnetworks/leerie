@@ -5,7 +5,8 @@
 # `leerie finalize <run-id>` fast-path. Both code paths share the same
 # push/PR mechanics — the discovery of *which* run to finalize differs.
 #
-# Exports: host_finalize <run-dir>
+# Exports: host_finalize <run-dir>, host_prepush_preflight <repo> <branch>,
+#          host_base_freshness_check <repo>
 #
 # Inputs (env or args):
 #   $1                — absolute path to .leerie/runs/<run-id>/
@@ -274,6 +275,133 @@ $out"
   echo "  Fix the hook's complaint, or run with --no-verify to bypass hooks at push time." >&2
   echo "  Set LEERIE_SKIP_PREPUSH_PREFLIGHT=1 to skip this probe." >&2
   return 1
+}
+
+# host_base_freshness_check <repo> — refuse to start a fresh run on a
+# checkout that is strictly BEHIND its upstream.
+#
+# A run-START check, not a finalize step — it lives here because this file
+# is the launcher's home for host-side git helpers (the host has the ssh /
+# gh credentials a `git fetch` needs; the container does not — DESIGN §6
+# *Finalization*).
+#
+# Why it exists (measured, 2026-09-26): an operator merged a run's PR on
+# the forge and re-ran the same task ONE MINUTE later, before the merge
+# reached the local checkout. The new run planned against the pre-merge
+# tree, re-solved the same findings from scratch, and its finalize rebase
+# landed a WEAKER variant over the just-merged fix — a regression the
+# following run had to re-fix. `repo_state_before_planning.head` for the
+# two runs was identical; the whole wasted cycle hinged on HEAD being
+# behind origin at t=0, which this probe detects mechanically.
+#
+# Returns 0 (silently) when: HEAD equals its upstream, HEAD is ahead,
+# HEAD and upstream have diverged (local commits exist — the operator is
+# doing something deliberate, and "behind" is not the signature), the
+# upstream is LOCAL (branch.<name>.remote = "." — being behind a local
+# base is not the merge→re-run race signature, slashed branch names
+# included), the branch has no upstream (or an unresolvable one — the
+# configured-but-gone case) and origin has no same-named branch, the
+# repo has no origin, or HEAD is detached. Returns 1 — the
+# launcher dies — only on the one measured signature: HEAD is a strict
+# ancestor of its REMOTE upstream (or, when the upstream is absent or
+# unresolvable, of the same-named origin branch). DESIGN §6 *A fresh run refuses a stale
+# base* is the canonical statement of both sets.
+#
+# The fetch is best-effort: offline or credential-less must never block
+# run start (GIT_TERMINAL_PROMPT=0 keeps HTTPS from prompting; a warning
+# notes the comparison then runs against the last-fetched state, which
+# still catches fetched-but-not-pulled). `timeout 30` bounds a hung
+# network when GNU timeout exists (absent on stock macOS — the prompt
+# suppression covers the common hang there).
+host_base_freshness_check() {
+  local repo="$1"
+  [ -n "$repo" ] || return 0
+  git -C "$repo" remote get-url origin >/dev/null 2>&1 || return 0
+  local branch
+  branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+    return 0
+  fi
+  # Resolve the upstream as a FULL ref, never an abbreviated name: only
+  # refs/remotes/<remote>/<branch> is a remote upstream. A LOCAL
+  # upstream (branch.<name>.remote = ".", e.g. `git branch
+  # --set-upstream-to=<local-branch>`) resolves under refs/heads/ —
+  # slashed or not — and is out of this guard's remit: being behind a
+  # local base is not the merge→re-run race signature. The predicate
+  # must be "local vs remote", not "has a slash": the round-1 fix
+  # guarded the abbreviated name against slashlessness, and a local
+  # upstream NAMED with a slash (`team/base` — this repo's own branch
+  # convention) sailed through it, "fetching" a branch name as a remote
+  # and refusing run start against a local base (round-2 review).
+  # Known residual (fail-open, exotic): a REMOTE whose own name contains
+  # a slash (`git remote add a/b <url>` is legal) makes the
+  # remote/branch split below wrong — the fetch fails and the check
+  # degrades to the last-fetched state with a spurious offline warning.
+  local upstream_ref upstream
+  upstream_ref="$(git -C "$repo" rev-parse --symbolic-full-name \
+                  "@{u}" 2>/dev/null || true)"
+  case "$upstream_ref" in
+    refs/remotes/*/*)
+      upstream="${upstream_ref#refs/remotes/}" ;;
+    refs/heads/*)
+      # A local upstream (branch.<name>.remote = "."), slashed or not:
+      # being behind a local base is not the race signature.
+      return 0 ;;
+    *)
+      # No upstream, or an unresolvable one — a configured-but-gone
+      # tracking ref makes rev-parse echo the literal `@{u}` on stdout
+      # at rc 128 (round 4), so this arm must not require an empty
+      # string. Fall back to a same-named origin branch.
+      if git -C "$repo" show-ref --verify --quiet \
+          "refs/remotes/origin/$branch"; then
+        upstream="origin/$branch"
+      else
+        return 0
+      fi ;;
+  esac
+  local remote_name="${upstream%%/*}"
+  local remote_branch="${upstream#*/}"
+  local _fetch_rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    GIT_TERMINAL_PROMPT=0 timeout 30 git -C "$repo" fetch --quiet \
+        "$remote_name" "$remote_branch" >/dev/null 2>&1 || _fetch_rc=$?
+  else
+    GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet \
+        "$remote_name" "$remote_branch" >/dev/null 2>&1 || _fetch_rc=$?
+  fi
+  if [ "$_fetch_rc" -ne 0 ]; then
+    echo "leerie: warning: could not refresh $upstream (offline, or no" >&2
+    echo "  credentials for a non-interactive fetch); the freshness check" >&2
+    echo "  runs against the last-fetched state." >&2
+  fi
+  local head_sha up_sha
+  head_sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+  up_sha="$(git -C "$repo" rev-parse "$upstream" 2>/dev/null || true)"
+  if [ -z "$head_sha" ] || [ -z "$up_sha" ] \
+     || [ "$head_sha" = "$up_sha" ]; then
+    return 0
+  fi
+  if git -C "$repo" merge-base --is-ancestor "$head_sha" "$up_sha" \
+      2>/dev/null; then
+    local behind
+    behind="$(git -C "$repo" rev-list --count \
+              "${head_sha}..${up_sha}" 2>/dev/null || echo '?')"
+    echo "leerie: error: your checkout ($branch) is $behind commit(s) BEHIND $upstream." >&2
+    echo "  A fresh run plans against the tree it sees. Started on a stale base, it" >&2
+    echo "  re-solves work that already merged — and its finalize rebase can land the" >&2
+    echo "  older solution OVER the newer one (measured: a re-run started one minute" >&2
+    echo "  after its predecessor's PR merged, before the local pull, and regressed" >&2
+    echo "  that PR's fix). Pull first:" >&2
+    # Name remote and branch explicitly: on the no-upstream fallback arm
+    # a bare `git pull --ff-only` fails with "There is no tracking
+    # information for the current branch" — a refusal whose only printed
+    # working exit would otherwise be the skip env var (round 8).
+    echo "    git -C $repo pull --ff-only $remote_name $remote_branch" >&2
+    echo "  Or, to deliberately run on this older base:" >&2
+    echo "    LEERIE_SKIP_FRESHNESS_CHECK=1 ./leerie ..." >&2
+    return 1
+  fi
+  return 0
 }
 
 host_finalize() {

@@ -270,6 +270,12 @@ def test_judgment_workers_pinned_set(leerie):
         # Confirms the classifier's likely_already_satisfied claim on the
         # converged-gate path (DESIGN §8 *The healthy-path consumer*).
         "no_work_judge",
+        # Verifies the integrated staging tree against required_items at
+        # finalize (DESIGN §8 *The delivery gate*).
+        "delivery_judge",
+        # Pre-planning defect-shape site enumeration on defect-fix tasks
+        # (DESIGN §5 *Defect-scope audit*).
+        "defect_scope_auditor",
         # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
         # worker*) — a judgment worker (decides tag/path per artifact).
         "artifact_registry",

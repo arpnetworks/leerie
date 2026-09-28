@@ -255,6 +255,43 @@ subtask it tests). Three mechanisms reconcile that coupling:
   only raises the *rate* at which two blind planners land on the same
   string; a planner must still *declare* the edge.
 
+  **Defect-scope audit (advisory, upstream of the planner).** The
+  companion enumeration for defect-fix tasks. Measured pathology (one
+  repo's corpus, eleven production commits over four days): a defect
+  whose decision idiom was implemented at multiple sites in one dense
+  file was re-planned run after run as "the one remaining gap" — each
+  run's planner scoped a single call site, each implementer faithfully
+  delivered that narrow intent, seven of the eleven commits re-edited
+  the same ~120-line region, and the live symptom survived every one of
+  them. The enumeration that would have prevented it was mechanical to
+  produce on day one: two greps over the file surfaced all eight
+  same-idiom comparison sites plus the two upstream causes, and the
+  eventually-correct fix was a single-point refactor two of the runs
+  each performed *partially*. The failure was never that the sites were
+  unfindable — it was that no one was asked to find them before the
+  plan was cut.
+
+  So when classification includes a defect-fix category, a read-only
+  `defect_scope_auditor` runs once before planning: given the task and
+  the base tree, it states the defect *shape* (the repeated
+  decision/idiom, not the symptom), enumerates every site implementing
+  that shape — decision sites, producers, consumers, and **bypasses**
+  (the path that skips the shared logic entirely is historically the
+  site the campaign never looks at) — and says whether a chokepoint
+  exists where one fix covers all of them. The result is injected into
+  every planner's context: the planner must cover every listed site or
+  scope it out by name, and when a chokepoint exists it is told to
+  prefer the single-point fix over per-site patches — which is also
+  what operator prompts asking to "fix the root cause at its source"
+  have been requesting all along. Advisory throughout, on the
+  artifact-registry model: the audit can be wrong (it is judgment, and
+  a hallucinated site must not be able to block a run), so nothing
+  gates on it — but a mechanical floor,
+  `_warn_defect_sites_uncovered`, compares the audited sites' *files*
+  (set comparison on paths — never prose) against the plan's
+  `files_likely_touched` union and warns loudly on any audited file no
+  subtask claims. A task that is not a defect fix pays nothing.
+
   **Test subtasks must wire to their producers.** An edge only forms when
   the consumer *declares* it. Recurring shape: a `testing`-domain subtask
   exercises what another subtask creates but declares neither a
@@ -2096,6 +2133,47 @@ chain probes once per *wave* (its jobs share one checkout, so N probes would
 compute one answer N times concurrently); a group probes per member, since
 its members are separate repositories. Same "fail fast at the cheapest
 moment" reasoning as §13's budget feasibility.
+
+**A fresh run refuses a stale base.** The complementary t=0 hazard is the
+checkout being *behind* its upstream. The operator loop that leerie's
+convergence story assumes — run, merge the PR on the forge, re-run — has
+a race in it: the merge lands on the remote, and nothing guarantees the
+local checkout saw it before the re-run starts. Measured on one repo's
+corpus: a re-run started one minute after its predecessor's PR merged,
+planned against the pre-merge tree (`repo_state_before_planning.head`
+identical across the two runs), re-solved the same findings from
+scratch, and its finalize rebase-onto-base landed the older, weaker
+solution OVER the just-merged fix — a regression the following run had
+to re-fix. Three runs' spend for negative progress, invisible to every
+in-run gate because each run was self-consistent against the tree it
+saw.
+
+So host preflight ends with a freshness check
+(`host_base_freshness_check`, host-side because the fetch needs the
+host's credentials — the container has none): a best-effort
+`git fetch` of the current branch's upstream, then a mechanical
+ancestry comparison. It refuses to start — with the pull command and
+the env escape hatch (`LEERIE_SKIP_FRESHNESS_CHECK=1`) in the message —
+on exactly the measured signature: HEAD a strict ancestor of its
+upstream. Equal, ahead, and diverged pass silently (equal has
+nothing to be behind; ahead/diverged mean local commits exist and
+the operator is doing something deliberate — "behind" is the
+signature).
+Beyond the trivially clean cases above (equal, ahead, diverged), the
+degrade-to-permissive set is exactly: a local (same-repo) upstream, no
+origin remote, detached HEAD, no upstream (or an unresolvable,
+configured-but-gone one) when origin has no same-named branch, and a
+failed fetch when the last-fetched state
+shows nothing behind — because a guard that blocks offline work gets
+switched off. Two cases that look permissive are deliberately NOT:
+a branch with no usable upstream (none configured, or a
+configured-but-gone one) still refuses when a
+**same-named origin branch** exists and is ahead (the merge→re-run
+race does not care whether tracking was configured), and a failed
+fetch still refuses when the **last-fetched** tracking ref already
+shows the checkout behind (the staleness is proven by information
+already on disk; going offline must not erase it). Fresh runs only —
+a resume deliberately continues its recorded baseline.
 
 **Push and PR are honest about failure.** A push or PR step that fails does
 not pretend the run failed: the local work is intact on the run branch. The
@@ -4959,7 +5037,29 @@ commits, tests, and required items against the tree it can see. Only a
 `confirmed: true` with evidence routes to `_finish_no_work_run`; a
 dispute, a crash, or a timeout falls through to planning unchanged
 (fail-open toward doing work — the same direction every other
-already-satisfied mechanism fails). The exhaustion arm is untouched: when
+already-satisfied mechanism fails).
+
+**A dispute's evidence is planning input, not log noise.** The judge's
+dispute is the single most information-dense artifact the run has
+produced by that point: it names exactly which claimed deliverables it
+verified as present and exactly why completion still fails. Discarding
+it and replanning from the raw task reproduces the loop this consumer
+exists to close, from the other side — measured on one repo's corpus: a
+run whose judge confirmed every functional deliverable on HEAD and
+disputed solely over an unmet standing instruction (a constraint on the
+deliverable stated in the task text) then produced a plan with **zero**
+subtasks addressing the dispute's stated reason, re-verifying the
+already-confirmed work instead, guaranteeing the next run's judge would
+dispute identically. So a dispute with non-empty evidence persists both
+halves of the disagreement to `state.data["no_work_dispute"]`
+(classifier claim, judge evidence, `checked[]`), and `phase_plan`
+injects it into every planner's context the same way `required_items`
+travels: the planner is told to plan the residual the dispute names and
+not to re-plan work the dispute's own evidence confirms as present.
+Advisory at the prompt layer (the planner can still judge the evidence
+stale against the tree it sees), but the *delivery* of the evidence is
+mechanical and unconditional — a prompt cannot act on a signal the
+orchestrator never handed it. The exhaustion arm is untouched: when
 classification cannot converge, the un-double-checked claim remains
 sufficient, because the alternative there was dying, not planning.
 `--skip-satisfied-check` suppresses this consumer along with the phase-3
@@ -4980,6 +5080,54 @@ auto-finalize scan can't distinguish from a crash before `phase_classify`
 completed. The identity write is therefore hoisted to run start, before
 `phase_classify`, so every early-exit path sees a correctly-identified
 `run.json`.
+
+**The delivery gate: required items are verified on the tree that
+ships.** The no-work judge above enforces `required_items` against the
+tree — but only at the START of the run AFTER the one that shipped.
+Measured cost of that asymmetry: a run shipped deliverables violating a
+standing constraint carried in its own required items (an explicit
+"never reference X in the code" instruction), every in-run gate passed
+them, and the next run's no-work judge — correctly — refused to declare
+the task done over exactly that violation. Fail-open sent it to
+planning, and the cycle was structurally able to repeat: whatever the
+terminal gate checks that the shipping gates don't is a guaranteed
+extra run per violation.
+
+So the same standard runs at finalize, in the run that ships. After the
+last wave integrates and before the final-conformer pass, a
+**`delivery_judge`** (read-only, SATISFIED_PROBE_TOOLS, cwd = the
+integrated staging worktree — the exact tree the PR will carry)
+verifies each required item and returns one typed verdict per item,
+aligned by integer `item_index` — mechanical alignment, never prose
+matching (Language-to-JSON). Two reliability rules shape the consumer:
+
+- **Majority vote on disputes only.** Single-trial LLM judging is
+  measurably noisy (the demoted `task_coverage_judge` returned a
+  different finding set 85% of the time on identical input), and the
+  published reliability curves show most recoverable agreement arriving
+  by 3–5 votes. A clean first pass confirms at one spawn; only when the
+  first sample flags something do two more run, and an item is
+  confirmed unmet only at 2-of-3. Voting cannot fix an error the judge
+  makes consistently — that residual is accepted and covered by the
+  fail-open below.
+- **Route into the existing fix loop; re-check mechanically.**
+  Confirmed-unmet items ride the final-conformer pass as a prompt
+  section (`_format_unmet_required_items_section`) rather than getting
+  a fix loop of their own — the conformer already edits, commits, and
+  is bounded, clobber-checked, and rollback-protected on staging. After
+  that pass, the judge runs again (same vote rules): the fixer's
+  self-report is never trusted, same discipline as
+  `check_rebaser_worktree_state`.
+
+A residual after the recheck ships anyway — fail-open toward shipping,
+recorded loudly in `state.data["delivery_gate"].unmet_after` — because
+a blocking gate with a noisy judge gets switched off, and the cross-run
+backstop now exists (*A dispute's evidence is planning input*: the next
+run's no-work judge vetoes and its evidence steers the next plan at the
+residual). One flag governs required-items checking on both sides:
+`--skip-coverage-check` suppresses the plan-side advisory coverage
+judge and this gate alike. A run whose classifier extracted no
+`required_items` pays nothing.
 
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
@@ -6382,7 +6530,18 @@ on any delta — same discipline as `check_rebaser_worktree_state` (trust the
 worker, then mechanically re-check the claim), run per-phase so it fires
 within one worker of the damage. Untracked files are compared deliberately,
 since a worker *creating* files is exactly what a clean-tree `??`-filtered
-gate cannot see.
+gate cannot see. The die message classifies the delta signature
+mechanically: when every delta is a newly-appeared untracked file, the
+likely cause is the *operator* dropping task/report files into the
+checkout for another run while this one executes (measured: a run died
+mid-phase-5 over exactly one untracked report `.md` the operator had just
+created for the next run, and the operator then re-ran from scratch —
+a full replan — because the message blamed a worker escape and framed
+resume behind a restore step). The run still stops either way — its
+baseline moved — but the operator-signature message leads with
+`resume` and says no restore is needed if the files are the operator's
+own; any tracked-file, HEAD, or ref delta keeps the full worker-escape
+framing.
 
 This does **not** achieve kernel-level confinement: `/work` is a read-write
 bind mount in the same container for the whole run, and nothing short of a
@@ -6757,18 +6916,21 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the twenty worker types in
+Every main-loop LLM call in Leerie passes through one of the twenty-two worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
-`artifact_registry`, `integration_judge`, `no_work_judge`, or `rebaser`
+`artifact_registry`, `integration_judge`, `no_work_judge`,
+`delivery_judge`, `defect_scope_auditor`, or `rebaser`
 (`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
-`integration_judge`, and `no_work_judge` are the independent adversarial
+`integration_judge`, `no_work_judge`, and `delivery_judge` are the
+independent adversarial
 verifiers — see §8; `artifact_registry` is the pre-planning
-shared-vocabulary worker — see §5; `rebaser` is the finalize-time rebase
+shared-vocabulary worker and `defect_scope_auditor` the pre-planning
+defect-shape enumerator — see §5; `rebaser` is the finalize-time rebase
 worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
