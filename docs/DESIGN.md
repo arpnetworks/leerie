@@ -274,7 +274,10 @@ subtask it tests). Three mechanisms reconcile that coupling:
   So when classification includes a defect-fix category, a read-only
   `defect_scope_auditor` runs once before planning: given the task and
   the base tree, it states the defect *shape* (the repeated
-  decision/idiom, not the symptom), enumerates every site implementing
+  decision/idiom, not the symptom — or, when the cause is not yet
+  diagnosed, the violated behavioral contract; see *The applicability
+  trigger includes unconfirmed-cause reports* below), enumerates every
+  site implementing
   that shape — decision sites, producers, consumers, and **bypasses**
   (the path that skips the shared logic entirely is historically the
   site the campaign never looks at) — and says whether a chokepoint
@@ -291,6 +294,58 @@ subtask it tests). Three mechanisms reconcile that coupling:
   (set comparison on paths — never prose) against the plan's
   `files_likely_touched` union and warns loudly on any audited file no
   subtask claims. A task that is not a defect fix pays nothing.
+
+  **The applicability trigger includes unconfirmed-cause reports.**
+  Measured on the audit's first two live runs (one task, 2026-09-28):
+  the auditor declined both, each reasoning inside the carve-out's
+  framing (the second decline's rationale: "the report is an open
+  investigation, not a diagnosed defect with a repeated wrong idiom";
+  the first: "explicitly non-diagnostic", "not yet a defect-shape
+  fix") — while the report named multiple candidate mechanisms and
+  each run's plan carried at most one of them: the first run's fix
+  covered a sub-shape (an intent of "generic action-button controls"
+  against a reported contract covering any submit-shaped element
+  regardless of tag or role), and the next run's plan re-targeted the
+  residual and died at the wiring gate. A symptom
+  report with an unconfirmed cause and multiple candidate mechanisms is
+  where enumeration helps MOST, not least: the shape is then the
+  *violated behavioral contract* the report describes (what should
+  happen and does not), and the sites are the candidate mechanisms —
+  the report's own hypotheses and the ones the auditor finds, limited
+  to locations the auditor actually read (a hypothesis with no
+  locatable code site belongs in `rationale` as an open question,
+  never as an invented file/symbol).
+  Not-applicable is reserved for tasks that are not defect fixes at
+  all, and for defects with a single obvious location and no repeated
+  or multi-candidate structure.
+
+  **The audited shape rides in the criteria, as visibility — not a
+  gate.** The second measured failure mode is a covering subtask
+  quietly narrowing the shape: a plan can claim the audited site while
+  its intent names a sub-shape of the contract, and a faithful
+  implementer then ships the sub-shape (measured on a run where no
+  shape had been carried — "score generic action-button controls above
+  zero" at a site whose gate excludes every non-button-like element).
+  The planner is therefore instructed to state, in each covering
+  subtask's success criteria, that subtask's own site-scoped
+  done-state AND the audit's `defect_shape` wording as the
+  campaign-level contract the subtask serves, naming which part —
+  which sites or mechanisms, never a behavioral sub-type — it
+  covers. Per-subtask criteria stay individually satisfiable: a
+  full-contract criterion on a per-site subtask would be formally
+  unmeetable, would read as bundling to the fit judge, and could be
+  settled as already-met by the satisfied-probe once a sibling's fix
+  lands (the probe judges a subtask's criteria against HEAD on its
+  settle paths — a no-op completion or a provider-subset check).
+  The quoted contract riding alongside a site-scoped criterion still
+  puts the contract's text in front of that probe; that smaller
+  exposure is the accepted residual of this design. Criteria remain
+  informational per §9 — the shape in the criteria makes narrowing
+  *visible* (the implementer states the contract it serves; the
+  criteria record shows what was and wasn't covered), it does not
+  block a ship. Prompt-level (§12: the floor stays mechanical
+  and file-scoped; shape coverage is semantic and cannot be
+  regex-checked without violating Language-to-JSON).
 
   **Test subtasks must wire to their producers.** An edge only forms when
   the consumer *declares* it. Recurring shape: a `testing`-domain subtask

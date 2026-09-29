@@ -422,7 +422,8 @@ STATE_FIELDS = (
     "no_work_dispute",
     # defect_scope: the defect-scope audit's result on a defect-fix task
     # (DESIGN §5 *Defect-scope audit*): sites sharing the defective
-    # decision idiom + chokepoint verdict. Presence-keyed resume
+    # decision idiom — or, for an unconfirmed-cause report, the
+    # candidate mechanisms — + chokepoint verdict. Presence-keyed resume
     # checkpoint mirroring artifact_registry; injected into planner ctx
     # when applicable with non-empty sites.
     "defect_scope",
@@ -3021,12 +3022,17 @@ SCHEMAS: dict[str, dict] = {
         "additionalProperties": False,
         "required": ["applicable", "sites"],
         "properties": {
-            # False when the task is not a defect-shape fix (a feature,
-            # a doc change, a symptom with a single obvious location) —
-            # the common case; everything else is then ignored.
+            # False only when the task is not a defect fix at all (a
+            # feature, a doc change) or the defect has a single obvious
+            # location with no competing candidate mechanisms;
+            # everything else is then ignored. An unconfirmed-cause
+            # symptom report with multiple candidates IS applicable
+            # (DESIGN §5 *The applicability trigger includes
+            # unconfirmed-cause reports*).
             "applicable": {"type": "boolean"},
             # One sentence naming the repeated decision/idiom — the
-            # SHAPE, not the symptom.
+            # SHAPE, not the symptom — or, for an unconfirmed cause,
+            # the violated behavioral contract.
             "defect_shape": {"type": "string"},
             "sites": {
                 "type": "array",
@@ -21879,13 +21885,15 @@ async def phase_defect_scope_audit(
     task pays nothing.
 
     A single read-only `defect_scope_auditor` states the task's defect
-    SHAPE (the repeated decision/idiom), enumerates every site on the
-    base tree implementing it (decision sites, producers, consumers,
-    and bypasses), and says whether a chokepoint exists where one fix
-    covers all of them. `phase_plan` injects the result into every
-    planner's ctx; `_warn_defect_sites_uncovered` is the mechanical
-    floor. Best-effort and non-fatal on the artifact-registry model:
-    any failure returns `{"applicable": False}` and the run proceeds as
+    SHAPE (the repeated decision/idiom — or the violated behavioral
+    contract, for an unconfirmed-cause report), enumerates every site
+    on the base tree implementing it (decision sites, producers,
+    consumers, and bypasses — or the candidate mechanisms), and says
+    whether a chokepoint exists where one fix covers all of them.
+    `phase_plan` injects the result into every planner's ctx;
+    `_warn_defect_sites_uncovered` is the mechanical floor.
+    Best-effort and non-fatal on the artifact-registry model: any
+    failure returns `{"applicable": False}` and the run proceeds as
     it did before the audit existed. Never die()s."""
     if "bug-fixing" not in (st.data.get("categories") or []):
         return {"applicable": False}
@@ -21898,10 +21906,14 @@ async def phase_defect_scope_audit(
         user_prompt = (
             "TASK:\n" + task +
             "\n\nAudit the defect scope per your instructions: name the "
-            "defect shape, enumerate every site on this tree that "
-            "implements it (including bypasses), and give the chokepoint "
-            "verdict. `applicable: false` is the correct answer when the "
-            "task is not a defect-shape fix."
+            "defect shape (the violated behavioral contract, when the "
+            "cause is not yet diagnosed), enumerate every site on this "
+            "tree that implements it (including bypasses — or the "
+            "candidate mechanisms, for an unconfirmed-cause report), and "
+            "give the chokepoint verdict. `applicable: false` is the "
+            "correct answer only when the task is not a defect fix at "
+            "all, or the defect has a single obvious location with no "
+            "competing candidate mechanisms."
         )
         return await claude_p(
             user_prompt=user_prompt, system_prompt=sys_prompt,
@@ -21923,7 +21935,7 @@ async def phase_defect_scope_audit(
             "(planners run without the site enumeration) — non-fatal")
         return {"applicable": False}
     if not result.get("applicable"):
-        log("  defect-scope audit: task not defect-shaped — no enumeration")
+        log("  defect-scope audit: not applicable — no enumeration")
         return {"applicable": False}
     sites = [s for s in (result.get("sites") or [])
              if isinstance(s, dict) and s.get("file") and s.get("symbol")]
