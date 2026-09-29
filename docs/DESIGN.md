@@ -5184,6 +5184,46 @@ residual). One flag governs required-items checking on both sides:
 judge and this gate alike. A run whose classifier extracted no
 `required_items` pays nothing.
 
+**The judge's turn budget scales with the item count.** A verifier's
+workload is proportional to what it verifies, and a fixed cap converts
+a thorough judge into a crashed one: measured on the gate's first two
+outings (one task, 2026-09-29, 9- and 6-item lists), all four judge
+attempts across both runs died at `error_max_turns` one turn over the
+fixed cap, mid-list, while verifying conscientiously — so the gate
+whose whole purpose is catching an unmet item was skipped (advisory)
+in a run where a bench replay of the same payload flags an item
+unmet. The budget is therefore derived per call — a setup base plus
+a per-item allowance approximating the measured thorough pace (the
+live traces show ~5–6 turns per item, measured as total turns over
+items covered at death; an efficient batched style finishes far
+under the base) — with a ceiling, which binds from ten items, so a
+runaway list cannot buy unbounded turns. The ceiling is an honest
+trade: the further past ten items a list runs, the further the
+budget falls behind the measured pace, so a long list (roughly a
+dozen items and beyond) can again exhaust the cap and skip the gate
+— an accepted, bounded residual, preferred over an uncapped budget.
+The same failure hit the satisfied-probe
+(§ *satisfied-probe* below). Both of its call sites judge the same
+single criterion (the HEAD-probe helper — serving the no-commit
+rescue and the provider-subset pre-spawn check — sends the same one
+`success_criteria_seed` payload the pre-schedule probe sends); what
+balloons the cost, at either site, is a criterion that is met or
+audit-shaped on the judged tree, because a probe cannot say
+"satisfied" without verifying every part. Measured in one run: the
+pre-schedule sweep's confirming probes ran 14–21 turns, two of
+twelve first attempts died at `error_max_turns` one turn over the
+cap and were recovered by `claude_p`'s retry — while every
+HEAD-probe attempt for one genuine no-op subtask (two pre-spawn and
+four rescue attempts, six in all) died the same way, and no rescue
+means retryable-failure, so the retry cap turned a correct no-op
+into `wave has unresolved subtasks`. The asymmetric caps are therefore
+justified by CONSEQUENCE, not workload shape: a HEAD-probe cap-out
+had no recovery below the run level, so that helper carries the
+larger cap; a pre-schedule cap-out is retried, and a double cap-out
+merely fail-safe-keeps the subtask — one wasted implementer round
+whose resulting no-op then lands on the larger-capped rescue — so
+the small cap stays acceptable there.
+
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
 classification-gate, reconciler, provision, overlap-judge, and integrator

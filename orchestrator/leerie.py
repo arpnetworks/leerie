@@ -1577,6 +1577,15 @@ _TIMEOUT_RETRY_MAX = 1
 
 TIMEOUT_DEFAULT_PER_WORKER: dict[str, int] = {
     "fit_judge": 1875,             # p99 624.8
+    # satisfied_probe's corpus predates the HEAD-probe's 40-turn cap
+    # (every measured call ran capped at 20; per-call turn counts were
+    # not recorded). The corpus max implies AT LEAST ~52.6 s/turn
+    # (1051.0 / the 20-turn cap — a call that used fewer turns ran
+    # slower per turn), so at that pace or worse the wall clock bites by
+    # turn ~35 or earlier, and the linearly scaled p99 (~1236 s) fits
+    # only under the same all-20-turns assumption. Either way it fails
+    # safe (a timeout declines a rescue exactly like a turn-cap death).
+    # Re-derive this entry once a 40-turn HEAD-probe corpus exists.
     "satisfied_probe": 1854,       # p99 617.9
     "classifier": 1236,            # p99 411.7
     "splitter": 1992,              # p99 663.7
@@ -12660,7 +12669,22 @@ async def _probe_criteria_satisfied_on_head(
             user_prompt=user_prompt,
             system_prompt=_load_prompt("satisfied_probe"),
             schema_key="satisfied_probe", cwd=worktree,
-            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=20,
+            # 40, not the pre-schedule probe's 20 — justified by
+            # consequence, not workload shape: both sites judge the same
+            # single criterion, and either can exhaust its cap when the
+            # criterion is met or audit-shaped on the judged tree
+            # (confirming costs a verify-every-part pass). A cap-out HERE
+            # had no recovery below the run level: every HEAD-probe
+            # attempt for a genuine no-op (an audit-shaped subtask whose
+            # implementer correctly committed nothing) — two pre-spawn
+            # and four rescue attempts — died at error_max_turns
+            # turns=21, the fail-safe declined to rescue, and the retry
+            # cap turned a correct no-op into "wave has unresolved
+            # subtasks". A pre-schedule cap-out, by contrast, is retried
+            # and at worst fail-safe-keeps the subtask, whose no-op then
+            # lands back on this larger-capped site (DESIGN §8 *The
+            # judge's turn budget scales with the item count*).
+            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=40,
             autonomous=False, caps=caps, st=st,
             model=models["satisfied_probe"],
             effort=efforts["satisfied_probe"],
@@ -31222,13 +31246,32 @@ async def _delivery_judge_unmet(
         "met=false with evidence saying what you could not verify."
     )
 
+    # The verifier's workload scales with the item count, so a fixed cap
+    # converts a thorough judge into a crashed one: with max_turns=30, all
+    # four live attempts across the gate's first two outings (9- and
+    # 6-item lists) died at error_max_turns (turns=31) mid-list, and the
+    # gate was skipped in a run where a bench replay of the same payload
+    # flags an item unmet (DESIGN §8 *The judge's turn budget scales
+    # with the item count*). 30 is the setup base — the gate never runs
+    # on an empty list, so the smallest real budget is 36 at one item,
+    # above the old fixed 30. 6/item approximates the measured thorough
+    # pace: the live traces show ~5-6 turns per item, measured as total
+    # turns over items covered at death (setup included), so treating it
+    # as a pure per-item allowance above the base errs generous at small
+    # counts. The 90 ceiling binds from 10 items; the further past that
+    # a list runs, the further the budget falls behind the measured
+    # pace, so a long list (roughly a dozen items and beyond) can again
+    # exhaust the cap and skip the gate — an accepted, bounded residual,
+    # preferred over an uncapped budget.
+    judge_max_turns = min(30 + 6 * len(numbered), 90)
+
     async def _sample(k: int) -> dict:
         st.bump_workers(caps)
         return await claude_p(
             user_prompt=user_prompt,
             system_prompt=_load_prompt("delivery_judge"),
             schema_key="delivery_judge", cwd=str(staging),
-            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=30,
+            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=judge_max_turns,
             autonomous=False, caps=caps, st=st,
             model=models.get("delivery_judge", MODEL_DEFAULT),
             effort=efforts.get("delivery_judge"),
