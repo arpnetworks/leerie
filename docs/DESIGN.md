@@ -283,8 +283,11 @@ subtask it tests). Three mechanisms reconcile that coupling:
   site the campaign never looks at) — and says whether a chokepoint
   exists where one fix covers all of them. The result is injected into
   every planner's context: the planner must cover every listed site or
-  scope it out by name, and when a chokepoint exists it is told to
-  prefer the single-point fix over per-site patches — which is also
+  scope it out by name, and when a chokepoint exists the planner is
+  told to prefer the single-point fix over per-site patches; at
+  finalize the delivery gate re-verifies the audited contract against
+  the integrated tree (§8 *The gate judges the finding, not only the
+  items*) — which is also
   what operator prompts asking to "fix the root cause at its source"
   have been requesting all along. Advisory throughout, on the
   artifact-registry model: the audit can be wrong (it is judgment, and
@@ -5223,6 +5226,71 @@ larger cap; a pre-schedule cap-out is retried, and a double cap-out
 merely fail-safe-keeps the subtask — one wasted implementer round
 whose resulting no-op then lands on the larger-capped rescue — so
 the small cap stays acceptable there.
+
+**The gate judges the finding, not only the items.** Measured across
+three reports' repeat-run loops (14 of the 17 v0.32.x runs,
+2026-09-28..30): every run that shipped a fix shipped an
+internally-consistent narrowed one — each satisfying the
+items-level gate, shipping fail-open past it with its residual
+recorded, or (three runs) shipping after a judge crash skipped the
+gate entirely; where the gate judged, every residual it shipped
+past the recheck was a standing no-regressions constraint,
+recorded fail-open (in one run that residual was a concrete
+reopened regression, not a mere cannot-verify) — while the
+*reported finding* stayed open, costing one full run per
+sub-shape (the create-account tag/role campaign, then a
+classification predicate re-fixed across
+four PRs, the last two at sites an earlier run's audit had already
+enumerated). Items are necessary but not sufficient: they verify
+what the classifier extracted, not what the report demanded. So
+when the run carries an applicable defect audit (§5:
+`defect_scope.applicable` with non-empty `sites`), the same
+delivery-judge call also returns a typed **contract verdict** —
+`met`, `unmet`, or `conflict` — judging whether the audited
+`defect_shape` (the violated behavioral contract) holds on the
+integrated tree and whether every audited site is either fixed or
+ruled out with recorded evidence. A flagged contract buys the same
+3-sample dispute vote as a flagged item (an absent contract object on
+an asked call escalates as a flag but tallies as a no-vote; no
+verdict reaching 2 of 3 resolves to met, the items' own fail-open
+direction), and the asked call carries a +12-turn allowance under
+the unchanged 90 ceiling — which the combined budget then reaches
+from eight items instead of ten. `unmet` rides the final-conformer
+pass and its recheck exactly like unmet items; `conflict` — two
+pinned contracts contradicting at one decision site, the measured
+shape where one subtask's fix was reverted by another protecting a
+prior bug's guards — is persisted and logged with both contracts
+named, because it needs an operator or a discriminating-predicate
+design, not another fix loop. Fail-open stands unchanged: a residual
+ships, recorded in `delivery_gate.contract_after`; what closes the
+cross-run loop is that a fresh run's planners receive the most
+recent COMPLETED same-task run's residual as ctx
+(`prior_delivery_residual` — completion means the orchestrator's
+own exit code 0; `finished_at` is a discovery sentinel the die()
+path also writes and does not qualify — the *dispute's evidence is
+planning input* discipline extended across runs), so run N+1 plans
+at the recorded gap instead of rediscovering it.
+
+**Execution-shaped items are judged from the run's own records.**
+Measured on three of the gate's completed outings: the dominant
+unmet item was "no regressions", with evidence citing the sandbox's
+command-approval gate — the judge is deliberately read-only
+(SATISFIED_PROBE_TOOLS), so an item demanding an executed suite is
+unverifiable *by construction* from inside the gate, and every such
+run paid the 3-sample dispute vote plus conformer routing for a
+verdict that could never change. The evidence already exists: every
+worker's per-run JSONL log carries structured `tool_use` records of
+each command it actually ran, with results. The gate's payload now
+includes an executed-commands digest (the run's build/lint/test
+invocations with verbatim result tails, extracted mechanically by
+BLT-verb token match — command strings are mechanical, and the
+JUDGE interprets the result prose, never Python), and the judge is
+directed to verify execution-shaped items against that record,
+citing it. The record contains only what the run actually ran —
+conformers execute targeted falsifiers, not necessarily a full
+suite — so an item whose commands appear nowhere remains honestly
+unmet, and its remediation is the routed conformer RUNNING them,
+which the recheck's fresh record then shows.
 
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
