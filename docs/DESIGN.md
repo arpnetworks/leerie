@@ -348,6 +348,40 @@ subtask it tests). Three mechanisms reconcile that coupling:
   post-hoc telemetry investigation, ten runs in, after the host copy
   of the archive had also been lost.
 
+  **Resolution is the auditor's judgment; existence is the
+  orchestrator's check.** A report names its inputs in the
+  operator's coordinate system (host paths); the run sees them, if
+  at all, where the container mounted them (an `--inspect-dir`
+  lands read-only at `/inspect/<basename>`, and an operator may
+  stage a *copy* of a named file inside a mount). Whether a mounted
+  location IS the report's named input is semantic identity — not
+  derivable from path strings, and any Python heuristic for it
+  (basename matching, suffix guessing) would be prose-inference by
+  another name, rejected for the same reason the Language-to-JSON
+  rule exists. Measured on the first run that had the data mounted:
+  the verbatim-path check marked both inputs ABSENT while six
+  workers were actively reading the mounted archive, so the gate's
+  payload told the judge no worker could read data the tree's own
+  evidence was visibly informed by, and the downgrade below fired
+  on a false premise (its logic was correct; its input was not). So
+  each `ground_truth` input also carries `resolved_path` — the
+  in-container location where the AUDITOR verified the named input
+  is reachable (the verbatim path itself when it exists; a mounted
+  location it confirmed; null when unfound) — under the same
+  no-fabrication bar as sites: a resolution the auditor did not
+  verify by reading is never invented. The field is
+  schema-REQUIRED, as is `repro_command` beside the inputs: both
+  are attestations the gate's presence check and repro-decides rule
+  depend on, and an attestation a gate depends on must not be
+  skippable by omission (the `change_shape` precedent) — null is
+  the honest answer for unfound and for a report that gives no
+  repro, so requiring the field costs the auditor nothing. Python
+  then stays purely
+  mechanical: existence is checked at the resolved path first,
+  falling back to the verbatim path, at audit time and again at the
+  gate's refresh, and the gate's payload names the resolved
+  location ("PRESENT at …") instead of asserting absence.
+
   **An applicable audit with zero sites is re-asked once.**
   `applicable: true` with an empty `sites` list disarms both
   consumers of the audit — planner injection and the gate's contract
@@ -5343,7 +5377,31 @@ evidence instead, because asserting a data-absence narrative the
 run's own audit does not support would put an unverified claim on
 exactly the channel this verdict exists to keep truthful. The
 operator learns the gap on run one, not from a post-hoc telemetry
-investigation ten runs in. Fail-open stands unchanged: a residual
+investigation ten runs in. The present case is the converse duty,
+and it closes a measured gap: on the first run with the data
+mounted, workers read the archive extensively — host
+distributions, capture ordering, the real declarations — and still
+verified every fix against run-authored synthetic fixtures; zero
+end-to-end executions of the report's repro appear in its records,
+because the acceptance test was nobody's assigned work (the only
+worker that evaluates the finding is read-only, and nothing tasked
+an acting worker with running it). So, in the §12 shape — prompts
+assign, records verify, the gate enforces: planners, whose
+`defect_scope` ctx already carries the audit's `ground_truth`, are
+directed that resolved-present inputs plus a repro command mean
+the plan CARRIES a subtask that executes the repro against them
+and records its outcome — the campaign's acceptance check, owned
+like any other subtask; that execution lands in the per-worker
+logs and therefore in the executed-commands digest; and the judge
+is directed that with inputs PRESENT the record's repro evidence
+decides the contract — a met resting only on synthetic fixtures
+while the repro was never run must state why in-tree evidence
+suffices, else return an ACTIONABLE unmet naming exactly that
+(bench-measured on the live run's verbatim recheck payload: 2/2
+replicates return unmet leading with the unexecuted repro), which
+rides the ordinary final-conformer route — an acting worker with
+execution rights, whose repro run then shows in the recheck's
+fresh digest. Fail-open stands unchanged: a residual
 ships, recorded in `delivery_gate.contract_after`; what closes the
 cross-run loop is that a fresh run's planners receive the most
 recent COMPLETED same-task run's residual as ctx
@@ -5366,7 +5424,14 @@ each command it actually ran, with results. The gate's payload now
 includes an executed-commands digest (the run's build/lint/test
 invocations with verbatim result tails, extracted mechanically by
 BLT-verb token match — command strings are mechanical, and the
-JUDGE interprets the result prose, never Python), and the judge is
+JUDGE interprets the result prose, never Python — with the verb set
+widened by the lead verbs of the audit's own `repro_command` when
+one exists: measured on the motivating repository, the report's
+repro was node-led while the repo's BLT verbs were all pnpm-led, so
+a record the judge is told is exhaustive would never have contained
+the acceptance run it is directed to look for, and the
+repro-decides rule would have produced a false, unclearable unmet
+that the conformer's own re-run could not clear), and the judge is
 directed to verify execution-shaped items against that record,
 citing it. The record contains only what the run actually ran —
 conformers execute targeted falsifiers, not necessarily a full

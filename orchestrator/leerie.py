@@ -425,7 +425,9 @@ STATE_FIELDS = (
     # decision idiom — or, for an unconfirmed-cause report, the
     # candidate mechanisms — + chokepoint verdict, + the report's
     # ground_truth evidence basis with per-input audit-time `present`
-    # flags (DESIGN §5 *Report-named ground truth*). Presence-keyed
+    # flags and `resolved_path` (the auditor's verified in-container
+    # location, or the winning probe — DESIGN §5 *Report-named ground
+    # truth* / *Resolution is the auditor's judgment*). Presence-keyed
     # resume checkpoint mirroring artifact_registry; injected into
     # planner ctx when applicable with non-empty sites.
     "defect_scope",
@@ -3121,7 +3123,12 @@ SCHEMAS: dict[str, dict] = {
             "ground_truth": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["data_dependent", "inputs"],
+                # repro_command required for the same reason as
+                # resolved_path below: this branch made it load-bearing
+                # for the repro-decides loop (null = the report gives
+                # none).
+                "required": ["data_dependent", "inputs",
+                             "repro_command"],
                 "properties": {
                     "data_dependent": {"type": "boolean"},
                     "inputs": {
@@ -3129,12 +3136,35 @@ SCHEMAS: dict[str, dict] = {
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "required": ["path", "kind", "role"],
+                            # resolved_path is REQUIRED (null = the
+                            # honest unfound answer): it is an
+                            # attestation the gate's presence check
+                            # depends on, and an attestation a gate
+                            # depends on must not be skippable by
+                            # omission — the change_shape precedent.
+                            # An omitting audit would silently degrade
+                            # to the verbatim-only probe and resurrect
+                            # the measured false-absent downgrade.
+                            "required": ["path", "kind", "role",
+                                         "resolved_path"],
                             "properties": {
                                 "path": {"type": "string"},
                                 "kind": {"type": "string",
                                          "enum": ["file", "directory"]},
                                 "role": {"type": "string"},
+                                # The in-container location the auditor
+                                # VERIFIED this input reachable at (the
+                                # verbatim path when it exists; a
+                                # mounted /inspect location it read;
+                                # null when unfound). Identity between
+                                # a host path and a mounted copy is
+                                # semantic judgment — the auditor's,
+                                # never a Python path heuristic
+                                # (DESIGN §5 *Resolution is the
+                                # auditor's judgment*). Never invented:
+                                # the sites' no-fabrication bar.
+                                "resolved_path": {
+                                    "type": ["string", "null"]},
                             },
                         },
                     },
@@ -31386,11 +31416,27 @@ def _check_ground_truth_inputs(ground_truth: object,
         if not (isinstance(i, dict) and i.get("path")):
             continue
         path = str(i["path"])
-        present = os.path.exists(os.path.expanduser(path))
+        # resolved_path is the AUDITOR's verified in-container
+        # location (DESIGN §5 *Resolution is the auditor's
+        # judgment*): Python probes it first and falls back to the
+        # verbatim path, but never derives a resolution itself —
+        # measured incident: the verbatim-only check marked both
+        # inputs ABSENT while six workers were reading the data at
+        # its /inspect mount, and the §8 downgrade then fired on a
+        # false premise. A dangling resolution is kept on the
+        # record when nothing is present (the gate's refresh
+        # re-probes it; a winning probe replaces it), never trusted
+        # as presence.
+        rp = i.get("resolved_path")
+        rp = str(rp) if rp else None
+        present_at = next(
+            (c for c in (rp, path)
+             if c and os.path.exists(os.path.expanduser(c))), None)
         inputs.append({"path": path,
                        "kind": i.get("kind") or "file",
                        "role": str(i.get("role") or ""),
-                       "present": present})
+                       "present": present_at is not None,
+                       "resolved_path": present_at or rp})
     gt = {"data_dependent": bool(ground_truth.get("data_dependent")),
           "inputs": inputs,
           "repro_command": ground_truth.get("repro_command") or None}
@@ -31412,12 +31458,20 @@ def _check_ground_truth_inputs(ground_truth: object,
 
 def _format_ground_truth_availability(ground_truth: dict | None) -> str:
     """The judge payload's GROUND-TRUTH AVAILABILITY section, or ""
-    when there is nothing to say (no ground_truth, or every input
-    present — an all-present basis needs no caveat; the judge probes
-    the inputs itself under its own tool scope)."""
+    when there is nothing to say: no ground_truth, or every input
+    present WITHOUT a repro command (an all-present basis with
+    nothing to execute needs no caveat; the judge probes the inputs
+    itself under its own tool scope). All-present WITH a repro is
+    the §8 converse duty — the section then names the repro, states
+    presence at the shown locations (never executability, which the
+    orchestrator does not check — see the comment at the sentence),
+    and the record's repro evidence decides (bench-measured 2/2 on
+    the live recheck payload: the verdict flips to an actionable
+    unmet naming the unexecuted repro)."""
     gt = ground_truth or {}
     inputs = gt.get("inputs") or []
-    if not inputs or all(i.get("present") for i in inputs):
+    all_present = bool(inputs) and all(i.get("present") for i in inputs)
+    if not inputs or (all_present and not gt.get("repro_command")):
         return ""
     lines = ["GROUND-TRUTH AVAILABILITY (mechanically checked by the "
              "orchestrator before this call): the report names these "
@@ -31425,14 +31479,34 @@ def _format_ground_truth_availability(ground_truth: dict | None) -> str:
              + (" and states the defect is data-triggered by them"
                 if gt.get("data_dependent") else "") + ":"]
     for i in inputs:
+        loc = ""
+        if i.get("present") and i.get("resolved_path") \
+                and i.get("resolved_path") != i.get("path"):
+            loc = f" at {i.get('resolved_path')}"
         lines.append(f"- {i.get('kind')}: {i.get('path')} -- "
-                     + ("PRESENT" if i.get("present") else "ABSENT")
+                     + (f"PRESENT{loc}" if i.get("present") else "ABSENT")
                      + (f" ({i.get('role')})" if i.get("role") else ""))
-    lines.append(
-        "An ABSENT input could not be read by any worker in this run, "
-        "so no fixture or test archive on this tree derives from it; "
-        "evidence resting only on run-authored fixtures cannot decide "
-        "what an ABSENT input contains.")
+    if all_present:
+        # State only what the orchestrator checked: presence at the
+        # shown locations. Executability of the VERBATIM command is
+        # not checked — when presence came via a resolution, the
+        # command's embedded paths are the report's originals and a
+        # runner must map them to the locations shown (round-1
+        # review: asserting unverified executability on this channel
+        # is the same class as the unverified data-absence narrative
+        # the logger was stripped of).
+        lines.append(
+            "Every report-named input is PRESENT at the location "
+            "shown. The report's own repro command is: "
+            + str(gt.get("repro_command"))
+            + " — where its input paths differ from the locations "
+            "shown, a run of it must map them to those locations.")
+    else:
+        lines.append(
+            "An ABSENT input could not be read by any worker in this "
+            "run, so no fixture or test archive on this tree derives "
+            "from it; evidence resting only on run-authored fixtures "
+            "cannot decide what an ABSENT input contains.")
     return "\n".join(lines)
 
 
@@ -31610,21 +31684,44 @@ def _prior_delivery_residual(st: "State") -> dict | None:
     return None
 
 
+def _repro_verbs(repro_command: str | None) -> set[str]:
+    """Lead verbs of the audit's repro command, segment by segment —
+    the same lead-strip/first-token idiom as `_blt_verbs` (command
+    strings are mechanical). Widens the digest's verb set so the
+    acceptance run is admissible to the record the repro-decides rule
+    reads: measured on the motivating repository, the report's repro
+    was node-led while every BLT verb was pnpm-led, so the digest the
+    judge is told is exhaustive could never contain the repro, and the
+    actionable unmet would have been unclearable by the very conformer
+    re-run meant to clear it."""
+    if not repro_command or not isinstance(repro_command, str):
+        return set()
+    verbs: set[str] = set()
+    for seg in _BLT_SEG_RE.split(repro_command):
+        seg = seg[_BLT_SEG_LEAD_RE.match(seg).end():].strip()
+        toks = seg.split()
+        if toks:
+            verbs.add(toks[0])
+    return verbs
+
+
 def _executed_commands_digest(leerie_dir: Path, repo_root: Path,
                               max_entries: int = 40,
-                              tail_chars: int = 300) -> str:
+                              tail_chars: int = 300,
+                              repro_command: str | None = None) -> str:
     """The run's build/lint/test executions, extracted from per-worker
     logs for the delivery judge (DESIGN §8 *Execution-shaped items are
     judged from the run's own records*). Mechanical extraction only
     (Language-to-JSON): a command is included when its first token per
     shell segment matches a BLT verb (`_blt_verbs` — command strings
-    are mechanical), and the paired tool_result's TAIL is included
+    are mechanical) or a lead verb of the audit's `repro_command`
+    (`_repro_verbs`), and the paired tool_result's TAIL is included
     verbatim for the JUDGE to interpret — Python never reads pass/fail
     out of the prose. Empty string when nothing matched; caps bound a
     log-heavy run (newest workers first, so the final-conformer's and
     late conformers' runs — the ones that verify the shipping tree —
     survive truncation)."""
-    verbs = set(_blt_verbs(repo_root))
+    verbs = set(_blt_verbs(repo_root)) | _repro_verbs(repro_command)
     if not verbs:
         return ""
     logs_dir = leerie_dir / "logs"
@@ -31753,7 +31850,9 @@ async def _delivery_judge_unmet(
     if exec_digest:
         sections.append(
             "EXECUTED COMMANDS RECORD (every build/lint/test command "
-            "this run's workers actually ran, with verbatim result "
+            "this run's workers actually ran — and, when the defect "
+            "audit names a repro command, every command led by that "
+            "repro's own verbs — with verbatim result "
             "tails, extracted from their structured logs): for any item "
             "that requires a command to have been EXECUTED (a test "
             "suite, a typecheck), verify it against THIS record and "
@@ -31959,7 +32058,8 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
             ds.get("ground_truth"), log_missing=False)
     try:
         exec_digest = _executed_commands_digest(
-            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
+            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())),
+            repro_command=(ground_truth or {}).get("repro_command"))
     except Exception as e:
         # The record is an optional add-on: a torn log or stat race
         # must degrade to items-only judging, never take the whole
@@ -32049,7 +32149,8 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
             ds.get("ground_truth"), log_missing=False)
     try:
         exec_digest = _executed_commands_digest(
-            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
+            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())),
+            repro_command=(ground_truth or {}).get("repro_command"))
     except Exception as e:
         log(f"  delivery gate recheck: executed-commands digest failed "
             f"({type(e).__name__}) — judging without the record")
