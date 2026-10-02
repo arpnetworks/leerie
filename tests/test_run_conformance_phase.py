@@ -1271,8 +1271,9 @@ def test_protected_path_rollback_neutralizes_repair_records(env):
 # Every porcelain-arm pin below asserts the porcelain arm's OWN warning,
 # not just the flag: the committed-by-this-pass arm also sets the
 # flag for any wholly-uncommitted citation, so a flag-only assertion
-# passes even with the porcelain arm broken (measured post-merge: 5 of 7
-# porcelain mutants survived flag-only pins). The round-8 arm is skipped
+# passes even with the porcelain arm broken (measured after S-6, #274,
+# merged: 5 of 7 porcelain mutants survived flag-only pins in this file
+# and test_risk_register.py). The committed-by-this-pass arm is skipped
 # once the flag is set, so its different warning appears only when the
 # porcelain arm failed to fire.
 _PORCELAIN_ARM_WARNING = "references the uncommitted path"
@@ -1404,6 +1405,12 @@ def _evasion_nonascii(wt: Path):
     (wt / "test_café.py").write_text("def test_c(): pass\n")
 
 
+def _evasion_one_char(wt: Path):
+    # The record walk skips records shorter than "XY p" (4 chars); a
+    # 1-character path is exactly that minimum and must still be read.
+    (wt / "t").write_text("def test_t(): pass\n")
+
+
 def _evasion_staged_rename(wt: Path):
     (wt / "test_orig.py").write_text("def test_o(): pass\n")
     _run(["git", "add", "test_orig.py"], cwd=wt)
@@ -1419,7 +1426,8 @@ import pytest as _pytest
     (_evasion_space, "test my feature.py"),
     (_evasion_nonascii, "test_café.py"),
     (_evasion_staged_rename, "test_renamed.py"),
-], ids=["space-path", "non-ascii", "staged-rename"])
+    (_evasion_one_char, "t"),
+], ids=["space-path", "non-ascii", "staged-rename", "one-char"])
 def test_porcelain_evasion_shapes_are_caught(env, setup, claimed):
     """The line-form porcelain never printed these paths verbatim
     (quoted, octal-escaped, rename-arrow) — each evasion let a phantom
@@ -1446,12 +1454,14 @@ def test_noncanonical_cited_path_is_still_caught(env):
     c = env["leerie"]
 
     def _leave_uncommitted(wt: Path):
+        (wt / "tests_new").mkdir(exist_ok=True)
         (wt / "test_dot.py").write_text("def test_d(): pass\n")
 
     for claimed in ("./test_dot.py",
                     str(env["worktree"] / "test_dot.py"),
                     "test_dot.py ",      # trailing space: the validator
-                    "\ttest_dot.py"):    # strips, so canon must too
+                    "\ttest_dot.py",     # strips, so canon must too
+                    "tests_new/../test_dot.py"):  # only .resolve() folds ..
         result = _clean_result()
         result["tests_updates"] = [{"path": claimed, "reason": "covers d"}]
         result["file_updates"] = [{"kind": "tests", "path": claimed,
@@ -1619,3 +1629,128 @@ def test_partially_committed_directory_citation_is_caught(env):
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
     _assert_porcelain_arm_fired(warnings)
+
+
+def test_sibling_prefix_path_not_flagged(env):
+    """NEGATIVE control with a dirty worktree, the direction no other
+    porcelain pin covers: a committed repair under `tests_new`, cited as
+    `tests_new`, beside an unrelated untracked `tests_new_scratch.txt`. A
+    string-prefix sibling is not a descendant, so the porcelain arm must
+    stay silent and the repair must count. A predicate loosened from
+    `startswith(c + "/")` to `startswith(c)` neutralizes this legitimate
+    repair (measured)."""
+    c = env["leerie"]
+
+    def _commit_with_sibling(wt: Path):
+        (wt / "tests_new").mkdir()
+        (wt / "tests_new" / "test_a.py").write_text("def test_a(): pass\n")
+        _run(["git", "add", "tests_new/test_a.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: a"], cwd=wt)
+        (wt / "tests_new_scratch.txt").write_text("x\n")
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "tests_new", "reason": "covers a"}]
+    result["file_updates"] = [{"kind": "tests", "path": "tests_new",
+                               "reason": "covers a"}]
+    _stub_run_conformer(c, [result], commits={0: _commit_with_sibling})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
+    assert not any(_PORCELAIN_ARM_WARNING in w for w in warnings), warnings
+
+
+def test_staged_rename_origin_under_cited_directory_is_caught(env):
+    """The rename ORIGIN as the only evidence: a test moved out of the
+    cited directory by an uncommitted `git mv`. Porcelain reports the
+    destination (outside the citation) and the origin (inside it); the
+    other pins only ever match destinations, so the line that adds the
+    origin to the uncommitted set had no pin. `keep.py` is touched and
+    committed so the directory appears in the phase diff, leaving the
+    porcelain arm as the sole catcher."""
+    c = env["leerie"]
+
+    def _move_out_uncommitted(wt: Path):
+        (wt / "tests_old").mkdir()
+        (wt / "tests_old" / "test_x.py").write_text("def test_x(): pass\n")
+        (wt / "tests_old" / "keep.py").write_text("\n")
+        _run(["git", "add", "tests_old"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: old"], cwd=wt)
+        (wt / "tests_old" / "keep.py").write_text("# touched\n")
+        _run(["git", "add", "tests_old/keep.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: touch"], cwd=wt)
+        _run(["git", "mv", "tests_old/test_x.py", "test_x_moved.py"], cwd=wt)
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "tests_old", "reason": "covers x"}]
+    result["file_updates"] = [{"kind": "tests", "path": "tests_old",
+                               "reason": "covers x"}]
+    _stub_run_conformer(c, [result], commits={0: _move_out_uncommitted})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    _assert_porcelain_arm_fired(warnings)
+
+
+def test_rename_origin_is_not_reread_as_a_record(env):
+    """NEGATIVE: a staged rename's origin field must be consumed, not
+    re-read as a record of its own. If the walk fails to advance past
+    `xx_tests/test.py`, slicing it as a record yields the junk path
+    `tests/test.py`, which then falsely matches a cited `tests` holding a
+    real committed repair (measured: that mutant neutralized this
+    repair)."""
+    c = env["leerie"]
+
+    def _repair_plus_unrelated_rename(wt: Path):
+        (wt / "tests").mkdir()
+        (wt / "tests" / "test_real.py").write_text("def test_r(): pass\n")
+        (wt / "xx_tests").mkdir()
+        (wt / "xx_tests" / "test.py").write_text("x = 1\n")
+        _run(["git", "add", "tests", "xx_tests"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: repair + other"],
+             cwd=wt)
+        _run(["git", "mv", "xx_tests/test.py", "moved.py"], cwd=wt)
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "tests", "reason": "covers r"}]
+    result["file_updates"] = [{"kind": "tests", "path": "tests",
+                               "reason": "covers r"}]
+    _stub_run_conformer(c, [result],
+                        commits={0: _repair_plus_unrelated_rename})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
+    assert not any(_PORCELAIN_ARM_WARNING in w for w in warnings), warnings
+
+
+def test_trailing_space_sibling_not_flagged(env):
+    """NEGATIVE: porcelain record paths are compared verbatim. An
+    uncommitted file named `test_x.py ` (trailing space) is a different
+    file from the cited, committed `test_x.py`, so stripping the record
+    path would falsely match it and discard the real repair (measured:
+    that mutant did)."""
+    c = env["leerie"]
+
+    def _repair_plus_space_named_file(wt: Path):
+        (wt / "test_x.py").write_text("def test_x(): pass\n")
+        _run(["git", "add", "test_x.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: x"], cwd=wt)
+        (wt / "test_x.py ").write_text("unrelated\n")
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "test_x.py", "reason": "covers x"}]
+    result["file_updates"] = [{"kind": "tests", "path": "test_x.py",
+                               "reason": "covers x"}]
+    _stub_run_conformer(c, [result],
+                        commits={0: _repair_plus_space_named_file})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
+    assert not any(_PORCELAIN_ARM_WARNING in w for w in warnings), warnings
