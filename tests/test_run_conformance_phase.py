@@ -240,10 +240,16 @@ def test_malformed_result_breaks_loop_with_warning(env):
 
     assert state["i"] == 1  # loop did not retry on malformed output
     assert any("malformed" in w for w in warnings)
-    # Everything except the build/lint/test axes is the worker's payload
-    # verbatim — the malformed result is still what gets surfaced.
-    assert {k: v for k, v in res.items() if k not in ("build", "lint", "tests")} \
-        == {k: v for k, v in bad.items() if k not in ("build", "lint", "tests")}
+    # Everything except the orchestrator-added keys is the worker's
+    # payload verbatim — the malformed result is still what gets
+    # surfaced. The orchestrator additions are the measured BLT axes
+    # and `conformer_repair_rolled_back` (a result that failed the
+    # honesty validator has no trustworthy repair records; see
+    # test_malformed_result_neutralizes_repair_records).
+    _orch_keys = ("build", "lint", "tests", "conformer_repair_rolled_back")
+    assert {k: v for k, v in res.items() if k not in _orch_keys} \
+        == {k: v for k, v in bad.items() if k not in _orch_keys}
+    assert res.get("conformer_repair_rolled_back") is True
     # The axes, however, are the ORCHESTRATOR's measurement, not the worker's
     # claim — this path `break`s before the tail apply, so it used to carry
     # self-reported axes into _summarize_residuals, the persisted entry, and
@@ -1137,3 +1143,430 @@ def test_a_completed_round_reports_the_post_measurement(env):
 
     assert res["tests"]["passed"] is True, (
         "the tail apply no longer refreshes the axes after the round")
+
+
+# --- self-reported risk challenge threading (DESIGN §9 *Self-reported ---
+# risk is routed, not read*) ------------------------------------------------
+
+def test_impl_risks_thread_into_the_conformer_call(env):
+    """Behavioral probe on the consumer, not its source: drive
+    _run_conformance_phase with an implementer result carrying risks and
+    assert the challenge TEXT (the detail values, not just a key) reaches
+    the `_run_conformer` call."""
+    c = env["leerie"]
+    captured = {}
+
+    async def _stub(sid, leerie_dir, worktree, caps, st, models, efforts,
+                    **kw):
+        captured.update(kw)
+        return _clean_result()
+
+    c._run_conformer = _stub
+    _stub_measure_axes(c, {})
+    impl_res = {
+        "subtask_id": env["sid"], "status": "complete",
+        "production_evidence": {"exercised": False,
+                                "unexercisable_reason":
+                                    "needs a live provider API"},
+        "self_reported_risks": [
+            {"kind": "untested_change",
+             "detail": "no test exercises the new branch"}],
+    }
+    asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"],
+        impl_res=impl_res))
+
+    block = captured.get("risk_challenge")
+    assert block, "no risk_challenge kwarg reached _run_conformer"
+    assert "needs a live provider API" in block
+    assert "no test exercises the new branch" in block
+
+
+def test_no_risks_means_no_challenge_block(env):
+    """CONTROL: a clean implementer result threads None — no empty block
+    cluttering every conformer prompt."""
+    c = env["leerie"]
+    captured = {}
+
+    async def _stub(sid, leerie_dir, worktree, caps, st, models, efforts,
+                    **kw):
+        captured.update(kw)
+        return _clean_result()
+
+    c._run_conformer = _stub
+    _stub_measure_axes(c, {})
+    impl_res = {"subtask_id": env["sid"], "status": "complete",
+                "production_evidence": {"exercised": True, "how": "ran",
+                                        "observed": "ok"}}
+    asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"],
+        impl_res=impl_res))
+    assert captured.get("risk_challenge") is None
+
+
+def test_risk_challenge_lands_in_the_conformer_user_prompt(env, monkeypatch):
+    """The second consumer: the REAL _run_conformer must render the block
+    into the worker's user prompt (execute the consumer, don't read its
+    source)."""
+    c = env["leerie"]
+    seen = {}
+
+    async def _fake_claude_p(*args, **kwargs):
+        seen.update(kwargs)
+        return _clean_result()
+
+    monkeypatch.setattr(c, "claude_p", _fake_claude_p)
+    asyncio.run(c._run_conformer(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
+        env["st"], env["models"], {"conformer": None}, rules_files=[],
+        blt_results={}, blt_scope="off", diff_base=env["run_branch"],
+        risk_challenge="SELF_REPORTED_RISKS\n  0. [untested_change] "
+                       "no test exercises the new branch"))
+    assert "no test exercises the new branch" in seen["user_prompt"]
+
+
+def test_protected_path_rollback_neutralizes_repair_records(env):
+    """Round-3 pin (executed as the finding was): a round whose commits
+    the protected-path arm reverted must carry
+    `conformer_repair_rolled_back`, so its fixed:true/tests records
+    never count as a mitigation act for `_collect_subtask_risks`."""
+    c = env["leerie"]
+
+    def _commit_protected_and_tests(wt: Path):
+        (wt / "test_f.py").write_text("def test_f():\n    pass\n")
+        leerie_dir = wt / ".leerie"
+        leerie_dir.mkdir(exist_ok=True)
+        (leerie_dir / "scribble").write_text("x\n")
+        _run(["git", "add", "-A", "-f"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: tests + scribble"],
+             cwd=wt)
+
+    result = _clean_result(
+        file_updates=None,  # placeholder; replaced below
+    )
+    result.pop("file_updates", None)
+    result["tests_updates"] = [{"path": "test_f.py",
+                                "reason": "covers f()"}]
+    _stub_run_conformer(c, [result],
+                        commits={0: _commit_protected_and_tests})
+    _stub_measure_axes(c, {})
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert any("protected-path" in w for w in warnings), warnings
+    assert res.get("conformer_repair_rolled_back") is True, res
+    risks = c._collect_subtask_risks(
+        {"production_evidence": {"exercised": False,
+                                 "unexercisable_reason": "r"}},
+        dict(res, risk_dispositions=["mitigated"],
+             file_updates=[{"kind": "tests", "path": "test_f.py",
+                            "reason": "covers f()"}]))
+    assert risks[0]["addressed"] is False
+
+
+def test_uncommitted_tests_entry_neutralizes_repair(env):
+    """The dirty-worktree sibling: a `kind:"tests"` file_updates entry
+    whose path was left UNCOMMITTED records a repair integration will
+    lose — flagged, not counted."""
+    c = env["leerie"]
+
+    def _leave_tests_uncommitted(wt: Path):
+        (wt / "test_g.py").write_text("def test_g():\n    pass\n")
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "test_g.py", "reason": "covers g"}]
+    # Production results keep the WIRE `file_updates` array alongside the
+    # expanded tests_updates (_expand_conformer_output copies the dict);
+    # the phase's dirty-path check reads the wire key.
+    result["file_updates"] = [{"kind": "tests", "path": "test_g.py",
+                               "reason": "covers g"}]
+    _stub_run_conformer(c, [result],
+                        commits={0: _leave_tests_uncommitted})
+    _stub_measure_axes(c, {})
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    assert any("uncommitted path" in w for w in warnings), warnings
+
+
+def test_uncommitted_tests_file_in_new_directory_is_caught(env):
+    """The porcelain LINE form prints `?? dir/` for an untracked new
+    directory — the file path never appears and the phantom repair
+    counted (executed evasion). The `-z -uall` parse must catch it."""
+    c = env["leerie"]
+
+    def _new_dir_uncommitted(wt: Path):
+        (wt / "tests_new").mkdir()
+        (wt / "tests_new" / "test_g.py").write_text("def test_g(): pass\n")
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "tests_new/test_g.py",
+                                "reason": "covers g"}]
+    result["file_updates"] = [{"kind": "tests",
+                               "path": "tests_new/test_g.py",
+                               "reason": "covers g"}]
+    _stub_run_conformer(c, [result], commits={0: _new_dir_uncommitted})
+    _stub_measure_axes(c, {})
+    res, warnings, _ = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+
+
+def test_malformed_result_neutralizes_repair_records(env):
+    """A result the honesty validator rejected (here: a tests_updates
+    path that does not exist) has no trustworthy repair records — the
+    validator caught the lie; the risk pipeline must not reward it."""
+    c = env["leerie"]
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "test_phantom.py",
+                                "reason": "covers nothing"}]
+    result["file_updates"] = [{"kind": "tests", "path": "test_phantom.py",
+                               "reason": "covers nothing"}]
+    _stub_run_conformer(c, [result])
+    _stub_measure_axes(c, {})
+    res, warnings, _ = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert any("malformed result" in w for w in warnings), warnings
+    assert res.get("conformer_repair_rolled_back") is True, res
+    risks = c._collect_subtask_risks(
+        {"production_evidence": {"exercised": False,
+                                 "unexercisable_reason": "r"}},
+        dict(res, risk_dispositions=["mitigated"]))
+    assert risks[0]["addressed"] is False
+
+
+def test_strict_clobber_rollback_neutralizes_repair_records(env):
+    """The fourth producer arm, previously pinned only consumer-side
+    (hand-setting the flag — structurally blind to the producer):
+    strict mode rolls a clobbering round back to implementer HEAD and
+    must mark the result so its repair records never count."""
+    c = env["leerie"]
+    env["caps"]["strict_conformer"] = True
+
+    def _clobber_and_record_tests(wt: Path):
+        (wt / "test_h.py").write_text("def test_h(): pass\n")
+        # Revert the implementer-owned file to base: the clobber.
+        (wt / "src.py").write_text("")
+        _run(["git", "add", "-A"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: tests + clobber"],
+             cwd=wt)
+        _run(["git", "rm", "-q", "src.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: delete src"],
+             cwd=wt)
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "test_h.py", "reason": "covers h"}]
+    result["file_updates"] = [{"kind": "tests", "path": "test_h.py",
+                               "reason": "covers h"}]
+    _stub_run_conformer(c, [result], commits={0: _clobber_and_record_tests})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert any("strict mode" in w for w in warnings), warnings
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    risks = c._collect_subtask_risks(
+        {"production_evidence": {"exercised": False,
+                                 "unexercisable_reason": "r"}},
+        dict(res, risk_dispositions=["mitigated"]))
+    assert risks[0]["addressed"] is False
+
+
+def _evasion_space(wt: Path):
+    (wt / "test my feature.py").write_text("def test_m(): pass\n")
+
+
+def _evasion_nonascii(wt: Path):
+    (wt / "test_café.py").write_text("def test_c(): pass\n")
+
+
+def _evasion_staged_rename(wt: Path):
+    (wt / "test_orig.py").write_text("def test_o(): pass\n")
+    _run(["git", "add", "test_orig.py"], cwd=wt)
+    _run(["git", "commit", "-q", "-m", "conformer: orig"], cwd=wt)
+    _run(["git", "mv", "test_orig.py", "test_renamed.py"], cwd=wt)
+    # staged rename, never committed: the repair integration loses
+
+
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("setup,claimed", [
+    (_evasion_space, "test my feature.py"),
+    (_evasion_nonascii, "test_café.py"),
+    (_evasion_staged_rename, "test_renamed.py"),
+], ids=["space-path", "non-ascii", "staged-rename"])
+def test_porcelain_evasion_shapes_are_caught(env, setup, claimed):
+    """The line-form porcelain never printed these paths verbatim
+    (quoted, octal-escaped, rename-arrow) — each evasion let a phantom
+    repair count. The `-z -uall` parse must flag all of them."""
+    c = env["leerie"]
+    result = _clean_result()
+    result["tests_updates"] = [{"path": claimed, "reason": "covers it"}]
+    result["file_updates"] = [{"kind": "tests", "path": claimed,
+                               "reason": "covers it"}]
+    _stub_run_conformer(c, [result], commits={0: setup})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+
+
+def test_noncanonical_cited_path_is_still_caught(env):
+    """The validator RESOLVES cited paths, porcelain prints canonical
+    relative ones — `./x.py` and the absolute worktree spelling both
+    passed validation yet never string-matched (executed evasions).
+    Canonicalization closes both."""
+    c = env["leerie"]
+
+    def _leave_uncommitted(wt: Path):
+        (wt / "test_dot.py").write_text("def test_d(): pass\n")
+
+    for claimed in ("./test_dot.py",
+                    str(env["worktree"] / "test_dot.py"),
+                    "test_dot.py ",      # trailing space: the validator
+                    "\ttest_dot.py"):    # strips, so canon must too
+        result = _clean_result()
+        result["tests_updates"] = [{"path": claimed, "reason": "covers d"}]
+        result["file_updates"] = [{"kind": "tests", "path": claimed,
+                                   "reason": "covers d"}]
+        _stub_run_conformer(c, [result], commits={0: _leave_uncommitted})
+        _stub_measure_axes(c, {})
+        res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+            env["sid"], env["run_dir"], str(env["worktree"]),
+            env["subtask"], env["caps"], env["st"], env["models"],
+            env["efforts"]))
+        assert res.get("conformer_repair_rolled_back") is True, \
+            (claimed, res, warnings)
+
+
+def test_worktree_rename_origin_desync_does_not_swallow_records(env):
+    """The discriminating shape for the two-sided R/C parse (the one-
+    sided `_rec[0]` form passes every other test): a WORKTREE-side
+    rename (` R new\\0old\\0`) whose origin itself starts with `R`,
+    followed by the claimed untracked path. One-sided parsing misreads
+    the origin as a record and swallows the next record as its bogus
+    origin — the claimed path never enters `unclean` and the phantom
+    repair counts (executed under the mutant)."""
+    import shutil
+    c = env["leerie"]
+
+    def _setup(wt: Path):
+        (wt / "R_orig.py").write_text("x = 1\n")
+        _run(["git", "add", "R_orig.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: orig"], cwd=wt)
+        shutil.move(str(wt / "R_orig.py"), str(wt / "a_new.py"))
+        _run(["git", "add", "-N", "a_new.py"], cwd=wt)
+        (wt / "test_x.py").write_text("def test_x(): pass\n")
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "test_x.py", "reason": "covers x"}]
+    result["file_updates"] = [{"kind": "tests", "path": "test_x.py",
+                               "reason": "covers x"}]
+    _stub_run_conformer(c, [result], commits={0: _setup})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+
+
+@_pytest.mark.parametrize("claimed", ["tests_new", "tests_new/", "."],
+                          ids=["dir", "dir-slash", "dot"])
+def test_directory_citation_does_not_mask_uncommitted_tests(env, claimed):
+    """The validator accepts a DIRECTORY citation (exists(), never
+    is_file()), while `-uall` porcelain prints only the files beneath
+    it — a bare intersection matched nothing and the phantom counted
+    (executed, all three spellings). Ancestor-prefix matching closes
+    it."""
+    c = env["leerie"]
+
+    def _new_dir_uncommitted(wt: Path):
+        (wt / "tests_new").mkdir(exist_ok=True)
+        (wt / "tests_new" / "test_d.py").write_text("def test_d(): pass\n")
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": claimed, "reason": "covers d"}]
+    result["file_updates"] = [{"kind": "tests", "path": claimed,
+                               "reason": "covers d"}]
+    _stub_run_conformer(c, [result], commits={0: _new_dir_uncommitted})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+
+
+def test_zero_commit_pass_citing_committed_path_is_neutralized(env):
+    """The repair must be committed BY THIS PASS: a conformer that
+    commits nothing and cites the implementer's own pre-existing
+    committed file passes the validator (exists, in-tree) and is
+    invisible to porcelain (clean tree) — yet records no repair
+    (executed: rendered 'addressed (mitigated)')."""
+    c = env["leerie"]
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "src.py", "reason": "claims it"}]
+    result["file_updates"] = [{"kind": "tests", "path": "src.py",
+                               "reason": "claims it"}]
+    _stub_run_conformer(c, [result])  # no commits action
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    assert any("does not appear in this phase's own commits" in w
+               for w in warnings), warnings
+
+
+def test_zero_commit_fixed_claim_is_neutralized(env):
+    """The twin hole: a fixed:true solution_defects entry has no path to
+    check, so a pass that committed NOTHING cannot have fixed anything."""
+    c = env["leerie"]
+    result = _clean_result()
+    result["solution_defects"] = [
+        {"kind": "missing_guard", "concrete_case": "c", "where": "w",
+         "why_ships_a_defect": "y", "fixed": True}]
+    _stub_run_conformer(c, [result])
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+
+
+def test_committed_cited_repair_is_not_neutralized(env):
+    """POSITIVE CONTROL for the whole neutralization stack: a pass that
+    really commits the cited tests file must keep its act — no flag,
+    and the mitigation clears at the collector."""
+    c = env["leerie"]
+
+    def _commit_tests(wt: Path):
+        (wt / "test_real.py").write_text("def test_r(): pass\n")
+        _run(["git", "add", "test_real.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: add test_real"],
+             cwd=wt)
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "test_real.py", "reason": "r"}]
+    result["file_updates"] = [{"kind": "tests", "path": "test_real.py",
+                               "reason": "r"}]
+    _stub_run_conformer(c, [result], commits={0: _commit_tests})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
+    risks = c._collect_subtask_risks(
+        {"production_evidence": {"exercised": False,
+                                 "unexercisable_reason": "r"}},
+        dict(res, risk_dispositions=["mitigated"]))
+    assert risks[0]["addressed"] is True
