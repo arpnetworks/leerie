@@ -4167,3 +4167,389 @@ rejected as unaffordable (an item object, an enum on the disposition
 strings) are recorded in `_risk_dispositions_schema`'s docstring; the
 value set is enforced in Python instead, which is also why
 `risk_dispositions` carries no enum for the parity sweep to require.
+
+## Leaked tool-call markup and the strict-output CLI floor (2026-10-04)
+
+On CLI 2.1.280 with `--dangerously-force-strict-output`, strict decoding
+absorbed the model's own tool-call markup into a string field
+(`…</defect_shape><parameter name="sites">…`) and emptied the remaining
+fields — schema-valid, content destroyed (DESIGN §7). Measured on a recorded
+v0.36.0 `defect_scope_auditor` call: 4/4 leaks with the proxy, 0/4 without,
+0/4 with it on 2.1.289.
+
+`tests/test_protocol_markup_guard.py` pins both layers:
+
+- **The detector** (`_find_protocol_markup`): each fixed token; a closing tag
+  named after one of the worker's own schema properties (and NOT an
+  unrelated `</div>`); backtick-quoted protocol text ignored (the one
+  legitimate hit in a 120-sample corpus audit had that shape); recursion into
+  nested dicts/lists; `_schema_property_names` reaching nested `items`; and
+  `_validate_result`'s `corrupted_envelope` arm delegating to it.
+- **`claude_p`**: a leaked first answer is re-prompted (attempt-2 prompt names
+  the leak) and the clean retry is returned; two leaks raise `WorkerError`;
+  a clean first answer is untouched. Falsified: disabling the check turns the
+  re-prompt and two-leak tests red.
+- **The floor**: `MIN_CLAUDE_CLI_STRICT_OUTPUT == (2, 1, 289)` and stays above
+  `MIN_CLAUDE_CLI`; `_check_strict_output_cli_version` dies below, passes at
+  the floor, defers on an unparseable version; and real `main()` with the flag
+  on and a 2.1.280 stub dies with the floor's own message (falsified by
+  removing the call).
+
+`tests/test_retryable_failure.py` follows the rename
+(`_find_antml_markup` → `_find_protocol_markup`).
+
+## The report's own example inputs (2026-10-04)
+
+Both repeat runs on v0.36.0 traced to a first run whose fix failed on the
+report's own quoted input (executed against run 1's shipped code): the tests
+paraphrased the input and dropped the triggering feature (DESIGN §5 *The
+report's own example inputs are captured too*).
+
+`tests/test_inline_examples.py`:
+
+- **Passthrough.** The executed audit phase carries
+  `ground_truth.inline_examples` (literal, `site_identifying`,
+  `trigger_tokens`, `site_tokens`) into the scope by value; malformed entries
+  (prose, missing literal, empty tokens) are dropped. Falsified: emptying the
+  passthrough turns three tests red.
+- **Planner.** Driving the real `phase_plan`, the example literal reaches the
+  planner's user prompt, and the planner system prompt carries the
+  verbatim-test directive.
+- **Advisory site-token check** (`_warn_site_token_leaks`), against a real git
+  repo: a token the run's diff adds is reported with its file and recorded in
+  `site_token_warnings`; a token already in the base tree is skipped (the
+  measured false-positive source — falsified by removing the skip); a partial
+  word is not a hit; no examples means no check. Word boundaries are `\w`,
+  so `AcmeShop-style` is a hit, as `git grep -w` would also see it.
+- **Order.** In `_run_phases` the check runs after `phase_execute` and before
+  `_run_delivery_prejudge`, inside an `except Exception` (advisory). Falsified
+  by removing the call.
+
+`tests/test_defect_scope_audit.py::test_ground_truth_attestations_are_schema_required`
+now pins `inline_examples` (and its item's four fields) as required.
+
+## Per-site dispositions in the defect-scope audit (2026-10-04)
+
+The dominant cause of serial narrow fixing (5 of 11 historical repeat pairs)
+was the audit: the site a later run had to fix was usually already LISTED,
+as a "consumer" left to mechanical consequence (DESIGN §5 *Every site
+carries a disposition*).
+
+`tests/test_site_dispositions.py`: the site schema requires `disposition`
+(`fix` | `ruled_out`) and has no separate `evidence` field, and the
+top-level schema has no `already_resolved_on_tree` (both pinned as absent,
+with the measured strict-decoding reason in the test); the executed audit
+phase keeps each site's disposition and its `note` evidence;
+`_warn_defect_sites_uncovered` names an uncovered `fix` site and never a
+`ruled_out` one (falsified by removing the filter: 2 red), stays quiet when
+every `fix` site is claimed, and still warns on a legacy site without a
+disposition; both prompts carry their rule.
+
+Live strict-mode replays of a recorded v0.36.0 auditor call (CLI 2.1.289)
+chose the shape: dispositions alone came back non-empty 6/6, the prior schema
+10/10, while every variant that also carried a top-level
+`already_resolved_on_tree` boolean returned `sites: []` in 5 of 18 calls —
+so that flag was dropped.
+
+## Held-out acceptance tests (2026-10-04)
+
+Every verification layer before this graded a fix against tests the fixing run
+wrote itself (DESIGN §8 *Held-out acceptance tests*).
+`tests/test_acceptance_gate.py` runs the REAL write/validate/gate code against
+a real git repo with a real pytest `test_scoped` command; only `claude_p` is
+stubbed, and the stubs write files the way the workers would.
+
+- **Validity by exit code.** A file the test command cannot run (not test-shaped,
+  runner missing) discards the set with an honest "could not run" reason. A
+  defect file that passes on the validity base is
+  dropped (it cannot discriminate); a failing control discards the set; a set
+  with no discriminating defect file is discarded; kept files land under
+  `<run_dir>/acceptance/set-<k>/`, the disposable worktree is removed and the
+  user's checkout stays clean. The writer is shown the defect contract, the
+  inline examples and the referenced report, at `medium` effort, as an acting
+  worker.
+- **Skips** (audit not applicable, `--skip-acceptance-check`) are recorded with
+  their reason.
+- **Validity base**: the earliest same-task sibling's starting HEAD; a
+  different task is ignored.
+- **Evaluation** never overwrites, or runs in place of, a file the run itself
+  put at the same path, and removes what it copied.
+- **Repair**: one fixing round at `EFFORT_ACCEPTANCE_REPAIR == "high"`, its
+  prompt naming shown sets' cases and never the hidden two; an unfixed tree
+  gets exactly two rounds and ships with a residual; a repair that turns the
+  test axis red is `git reset --hard` away (`rolled_back`); the gate is
+  resume-idempotent on `gate.final`.
+- **Cross-run**: the residual reaches `_prior_delivery_residual` as
+  `acceptance_unmet`, and the planner prompt carries guidance for it.
+- **Hiding**: `_acceptance_read_denials` adds the `Read` deny for implementer
+  and conformer only, and `claude_p` wires it.
+- **Order**: in `_run_phases`, audit → acceptance write → plan, and
+  delivery recheck → acceptance gate → finalize.
+
+Falsified five ways, each turning at least one test red: repair at the
+conformer's own effort; no hidden sets; no rollback; keeping
+non-discriminating defect files; no Read deny.
+`tests/test_repo_write_denial.py` now asserts the write deny's presence rather
+than its position (the acceptance Read deny follows it for implementer and
+conformer), and the registry tests (`test_resolve_models`,
+`test_resolve_efforts`) list the new worker.
+
+## No work on executed evidence, disputed at most once (2026-10-04)
+
+A no-work confirmation used to end the run on the read-only judge's word;
+one such confirmation declared done a defect that report-shaped tests still
+reproduce on barnacle's HEAD (DESIGN §8 *No work is declared on executed
+evidence, and disputed at most once*).
+
+`tests/test_acceptance_no_work.py`:
+
+- **Hold.** With acceptance available (not skipped, `bug-fixing`, a scoped
+  test template), a confirming judge leaves `no_work_pending` and does not
+  finish; without any of the three it finishes at once, as before.
+  Falsified by disabling the hold.
+- **Settle.** Passing sets → no work (`verdict: pass`); failing sets with no
+  prior dispute → `acceptance_dispute` plus a `no_work_dispute` whose evidence
+  names only the failing cases, pending cleared, planning continues; failing
+  sets after a prior dispute → no work with a WARNING and no second dispute
+  record (falsified by removing the dispute-once branch); no valid sets → the
+  judge's confirmation stands.
+- **Dispute-once lookup.** Only the newest COMPLETED same-task sibling counts;
+  another task's or a crashed run's record is ignored.
+- **A4.** `_acceptance_passes_on_head` over no sets, a passing and a failing
+  majority; in `_run_phases` the fix-subtask set is taken before the
+  satisfied-probe sweep and re-checked after it, gated on that helper, and the
+  pending settle runs after the acceptance write and before planning. The A4
+  routing itself is pinned behaviourally (round-1 fixes below); only its
+  placement in `_run_phases` is a source-order pin.
+
+### Review round 1 fixes (2026-10-04)
+
+The first adversarial review round found the held-out machinery could read
+"no evidence" as "pass", could be gamed or sunk by one writer's output, and
+that the protocol-markup check flagged ordinary markup. Each fix is pinned
+below. (The round-1 commit claimed every reversion turned exactly one test red;
+round 2 measured that as false — reverting the absolute-path rejection turned
+none red, and several smaller fixes had no test. Round 2 added the missing
+tests; see below.)
+
+- **Unrunnable ≠ passing** (`test_unrunnable_files_never_count_as_passing`,
+  `test_unmeasurable_sets_keep_the_judges_confirmation`): a file the runner
+  cannot run, or a path the target tree already uses, marks the set
+  `unmeasured`; unmeasured sets are left out of the vote, and nothing measured
+  is "no evidence" (the judge's confirmation stands), never a pass.
+- **New files only, in code** (`test_writer_editing_an_existing_file_is_not_kept`).
+- **One writer cannot sink the rest**
+  (`test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest`):
+  absolute and `..` paths are rejected, and any per-writer exception only
+  discards that set.
+- **Disputed at most once, really** (`test_a_second_failing_run_accepts_no_work`
+  asserts the carried-forward marker; `test_a_third_run_still_does_not_dispute`).
+- **Ties are not a passing majority** (`test_majority_rule`).
+- **No residue** — superseded in round 4: evaluation no longer writes the
+  target tree at all (`test_evaluation_never_touches_the_tree_and_never_overwrites`).
+- **Markup check precision** (`test_ordinary_markup_named_like_a_schema_field_is_not_a_hit`):
+  fenced code is stripped, and a schema-named closing tag counts only where
+  leaked syntax sits; the leaked shapes still hit.
+- **A4, behaviourally** (`test_every_fix_already_on_head_routing`, four cases,
+  and `test_already_fixed_check_errors_proceed_with_the_plan`), now through
+  `_finish_if_every_fix_already_on_head` rather than a source-order pin alone.
+
+### Review round 2 fixes (2026-10-04)
+
+The round-2 commit claimed 18 reversions of its fixes, 17 caught. Round 3
+measured five more of that commit's fixes with no catching test (the
+call-site `WorkerError` re-raise, `_gather_or_cancel`, the scoped cleanup, a
+failed snapshot cleaning nothing, the per-round save); round 3 added them (see
+below). Removing the explicit save after `pre_tests_passed` is an equivalent
+mutant: `bump_workers` saves state before the round's worker starts, with
+nothing awaited in between. The save is kept so persistence does not rest on
+that coincidence.
+
+- **Undeclared helpers travel with the set**
+  (`test_undeclared_helper_travels_with_the_set`): a file the writer created
+  but did not declare becomes a `support_files` entry; without it a correct fix
+  failed the set at evaluation. (Round 3 widened this to test-shaped paths.)
+- **A writer may not edit tracked files**
+  (`test_writer_editing_a_tracked_file_discards_the_set`), read from
+  `git status --porcelain -z`.
+- **Absolute paths, really** (`test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest`
+  now has set 1 declare an absolute AND a relative file: rejected, the set
+  survives on the relative one; unrejected, the self-copy discards it).
+- **Resume mid-repair** (`test_resume_mid_repair_still_rolls_back_a_red_repair`,
+  `test_pre_repair_state_is_persisted_before_the_first_round`): `before_sha` and
+  `pre_tests_passed` are on disk before round 1, and spent rounds count.
+- **Budget exhaustion mid-repair still rolls back**
+  (`test_budget_exhaustion_mid_repair_still_rolls_back`); in the writer it
+  still propagates (`test_writer_budget_exhaustion_propagates`).
+- **Cap, concurrency, deps** (`test_repair_rounds_follow_the_cap`,
+  `test_writers_respect_max_parallel`, and — since round 4 installs in the
+  evaluation worktree — `test_evaluation_installs_deps_before_running`).
+- **Created directories** — a round-1 behaviour first pinned in round 2, removed
+  in round 4 with in-tree evaluation (a disposable worktree makes it moot).
+- **Validity base** skips an undated sibling
+  (`test_validity_base_prefers_the_earliest_same_task_sibling`).
+- **No claim of hidden tests that do not exist**
+  (`test_no_hidden_sets_means_no_claim_of_hidden_tests`).
+- **Counts over measured sets only** (`test_residual_counts_only_measured_sets`,
+  `test_dispute_counts_only_measured_sets`); `_acceptance_passes_on_head`
+  reads nothing-measured as not passing (`test_passes_on_head_helper`).
+- **Settle fails open** (`test_settle_errors_fail_open_to_the_judges_confirmation`,
+  through the extracted `_settle_pending_no_work_failing_open`).
+- **Fenced code in the markup check** is matched line-anchored, so a stray
+  inline triple backtick cannot swallow a leak
+  (`test_ordinary_markup_named_like_a_schema_field_is_not_a_hit`).
+
+### Review round 3 fixes (2026-10-04)
+
+Each pin was falsified by reverting its fix and running the named test: 19
+reversions (14 covering round-3 fixes, 5 covering previously unpinned round-2
+fixes), 19 caught. One round-3 fix — saving an errored round — had no
+reversion and no catching test; round 4 added it. Round 4 replaced the
+in-staging cleanup pins below with a disposable evaluation worktree.
+
+- **Resume never skips the rollback check**
+  (`test_resume_after_a_passing_but_red_round_still_rolls_back`, with and
+  without a persisted `initial`): the pre-repair verdict is persisted and
+  reused, and a recorded `before_sha` resumes the repair branch; the shipped
+  pre-repair tree keeps its own verdict and residual.
+  `test_resume_after_a_passing_round_runs_no_further_round`,
+  `test_every_round_is_on_disk_before_the_rollback_check`,
+  `test_the_pre_repair_verdict_is_on_disk_before_round_one`.
+- **Helpers beside the tests travel; caches and the install's output do not**
+  (`test_helper_beside_the_tests_travels_with_the_set`,
+  `test_cache_and_provision_paths`).
+- **Fixers cannot Read the writers' transcripts, evaluation logs or
+  `calls.ndjson`** (`test_fixers_cannot_read_the_sets`; widened in round 4).
+- **No hidden test id survives in staging**
+  (now `test_a_runner_cache_in_the_tree_is_never_touched`).
+- **Cleanup is scoped** — removed in round 4 together with in-staging
+  evaluation (its two tests went with it).
+- **Budget exhaustion stops the run and the other writers**
+  (`test_write_or_skip_lets_budget_exhaustion_stop_the_run`,
+  `test_budget_exhaustion_cancels_the_other_writers`).
+- **Indented fences are quoting** (`test_indented_fenced_code_is_quoting_not_a_leak`).
+
+### Review round 4 fixes (2026-10-05)
+
+Each pin was falsified by reverting its fix and running the named test: 19
+reversions, 19 caught (one, the errored-round save, only after its test was
+made to commit before erroring).
+
+- **Evaluation in a disposable worktree**
+  (`test_evaluation_never_touches_the_tree_and_never_overwrites`,
+  `test_a_crashed_evaluations_worktree_is_replaced`,
+  `test_sets_are_isolated_from_one_another`): a crash mid-evaluation used to
+  leave hidden tests in staging for the next fixer to read or commit, and make
+  every later evaluation of those sets unmeasured.
+- **Declared `./` paths** (`test_dot_slash_declared_paths_are_not_also_support_files`)
+  and **gitignored helpers** (`test_a_gitignored_helper_still_travels`).
+- **Exit-code verdicts** (`test_verdict_is_by_exit_code`,
+  `test_an_unrunnable_command_is_no_verdict`): a failing missing-file test is a
+  failure, not an unrunnable runner.
+- **No echo** (`test_runner_output_never_reaches_the_orchestrator_log`) and the
+  widened deny list (`test_fixers_cannot_read_the_sets`).
+- **Rollback decision first** (`test_the_rollback_decision_is_on_disk_before_the_reset`,
+  `test_resume_after_the_rollback_decision_finishes_the_reset`) and **errored
+  rounds** (`test_an_errored_round_is_saved_and_the_round_before_still_counts`,
+  `test_a_recorded_rollback_runs_no_further_round`); the reused evaluation
+  path drops its install memo (`test_each_evaluation_installs_into_its_fresh_worktree`).
+
+### Review round 5 fixes (2026-10-05)
+
+11 distinct reversions run 12 times (one edit against two tests), 12 caught;
+the `.cache` pin was reverted separately afterwards and caught too.
+
+- **A failed install is no evidence** (`test_a_failed_install_is_no_evidence`,
+  `test_a_failed_install_in_the_writer_discards_the_set`,
+  `test_ensure_worktree_deps_reports_failure`): exit-code verdicts cannot tell
+  a missing dependency from a failing fix.
+- **A set that cannot be placed is no evidence, and the rollback still runs**
+  (`test_a_set_that_cannot_be_placed_is_no_evidence`,
+  `test_a_red_repair_rolls_back_even_when_evaluation_breaks`).
+- **A round that commits then errors is measured again**
+  (`test_a_round_that_commits_then_errors_is_measured_again`).
+- **"Ran no test" is no verdict** — narrowed in round 6 to exclude pytest's
+  exit 2 (`test_a_file_that_ran_no_test_is_no_verdict`,
+  `test_no_verdict_exits_are_matched_on_command_tokens`); fork exhaustion is
+  none either and a timeout fails (`test_a_fork_exhaustion_kill_is_no_verdict`,
+  `test_a_timeout_fails`).
+- **Paths normalised** (`test_dot_slash_declared_paths_are_not_also_support_files`,
+  now `a/./b` too); **ignored files travel only beside a test**
+  (`test_ignored_build_output_elsewhere_does_not_travel`,
+  `test_a_gitignored_helper_still_travels`); `.cache` is not a by-product
+  (`test_cache_and_provision_paths`).
+
+### Review round 6 fixes (2026-10-05)
+
+6 distinct reversions run 7 times, 7 caught (the `round_start` pin only after
+its test made both HEAD reads unreadable).
+
+- **pytest's collection error is evidence**
+  (`test_an_unimportable_module_under_test_is_a_failure`: a fix that broke the
+  module). The "import-time defect at the base" half was undone in round 7,
+  which discards such a set while validating (fail-open).
+- **A failing build step is not a failed install**
+  (`test_only_a_failed_install_counts`, renamed in round 7 and widened to
+  timeouts and raised errors).
+- **Evaluation never raises** (`test_an_evaluation_that_cannot_be_set_up_is_no_evidence`,
+  `test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up`).
+- **An unmeasurable final keeps the last measured residual**
+  (`test_an_unmeasurable_final_keeps_the_last_measured_residual`), and an
+  unreadable HEAD counts as moved
+  (`test_an_unreadable_round_start_still_measures_a_committing_error`).
+
+### Review round 7 fixes (2026-10-05)
+
+13 distinct reversions run 14 times (one edit against two tests), 14 caught —
+the two test-axis measurement guards only after
+`test_a_test_axis_measurement_that_raises_never_escapes` was added for them.
+
+- **Runner "ran no test" exits only while validating**
+  (`test_a_file_that_ran_no_test_is_no_verdict` — no verdict validating, a
+  failure evaluating; `test_a_writer_file_broken_in_itself_discards_the_set`;
+  `test_a_broken_module_a_conftest_imports_is_a_failure` — pytest's exit 4;
+  `test_an_unimportable_module_under_test_is_a_failure`). Round 6 had dropped
+  exit 2 entirely, reopening the broken-test-file case round 5 had closed.
+- **Nothing reading HEAD can raise past the rollback**
+  (`test_branch_head_sha_never_raises`,
+  `test_a_fork_failure_reading_head_after_a_repair_still_rolls_back`).
+- **A repair that makes the sets unmeasurable is rolled back** — since round
+  8, only after a retry of the repaired tree and a pre-repair control
+  (`test_a_repair_that_breaks_the_install_is_rolled_back`); **a failed reset is
+  recorded, not assumed** (`test_a_failed_reset_is_recorded_not_assumed`); **no
+  rollback target, no repair** (`test_no_rollback_target_means_no_repair`).
+- **Build failures of every shape are evidence; install failures are not**
+  (`test_only_a_failed_install_counts`, 6 cases). `unmeasured_final` reaches the
+  planner (`test_residual_reaches_the_next_runs_planner_ctx`).
+
+### Review round 8 fixes (2026-10-05)
+
+7 distinct reversions, each against its named test, 7 caught.
+
+- **A one-off install failure keeps a correct repair**
+  (`test_a_one_off_install_failure_keeps_a_correct_repair`,
+  `test_a_lasting_environment_failure_keeps_the_repair`): the repaired tree is
+  measured again, and the pre-repair tree is the control, before the
+  unmeasurable-sets rule rolls anything back.
+- **Any failure spawning a later round still reaches the rollback**
+  (`test_a_failure_spawning_a_later_round_still_rolls_back`).
+- **A failed reset leaves the repair tree's verdict**, and an unreadable HEAD
+  after a reset is read again (`test_a_failed_reset_is_recorded_not_assumed`,
+  `test_an_unreadable_head_after_a_reset_is_read_again`).
+
+### Review round 9 fixes (2026-10-05)
+
+4 distinct reversions, each against its named test, 4 caught.
+
+- **A failed rollback reaches the next run**
+  (`test_an_unmeasurable_repair_whose_reset_fails_says_so`,
+  `test_a_failed_reset_is_recorded_not_assumed`): `rollback_failed` rides the
+  residual — created if the sets pass — and `_prior_delivery_residual`
+  forwards it; `unmeasured_final` no longer claims to mean only an
+  environment failure.
+- **The reset itself is retried** (`test_a_reset_that_cannot_spawn_is_tried_again`).
+- **A measured retry replaces the round's record**
+  (`test_a_one_off_install_failure_keeps_a_correct_repair`).
+
+`tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
+(CLI → env → leerie.toml → off), mirroring its sibling resolvers.

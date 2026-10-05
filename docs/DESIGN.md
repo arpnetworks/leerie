@@ -382,6 +382,63 @@ subtask it tests). Three mechanisms reconcile that coupling:
   gate's refresh, and the gate's payload names the resolved
   location ("PRESENT at …") instead of asserting absence.
 
+  **The report's own example inputs are captured too.** Most reports
+  carry no archive at all — their evidence is the example the report
+  quotes inline: a step instruction, a URL sequence, a hash fragment,
+  a request-body fragment. Those literals are the inputs a fix must be
+  proven against, and they were being lost: both repeat runs on v0.36.0
+  traced to a first run whose fix failed on the report's own quoted
+  input (executed against run 1's shipped code), because the tests
+  paraphrased the input and the paraphrase dropped the feature that
+  triggers the defect — "Below the newly-revealed … sign-in form, click
+  'Create Account'" became "Click the Create Profile button", and a
+  comma-accumulating hash sequence became a single `/`-segmented one.
+  So `ground_truth` also carries `inline_examples`, each the verbatim
+  `literal`, whether it is `site_identifying` (it names the real site
+  or brand, so it cannot be committed to a site-agnostic repo
+  verbatim), the `trigger_tokens` that carry the triggering feature
+  (short verbatim substrings any faithful substitute must keep) and the
+  `site_tokens` that identify the site. Measured: extraction caught the
+  decisive trigger in 12/12 trials across both reports; given the
+  examples, planners required a verbatim or feature-preserving test in
+  9/9 plans (0/12 recorded plans did without them), and the resulting
+  verbatim test failed on a broken fix 4/4 times. The field is
+  schema-required (possibly empty) for the same reason as
+  `resolved_path`. The planner prompt turns the examples into test
+  requirements; the `site_tokens` back an advisory, never gating,
+  diff check after integration — measured precision 100% but recall
+  only 1 of 3 leaking commits across 36 shipped commits, because a
+  leak already present in the base tree hides later ones.
+
+  **Every site carries a disposition.** Listing a site is not deciding
+  it. The dominant cause of serial narrow fixing — 5 of 11 historical
+  repeat pairs where run N+1 fixed a site run N never touched — was the
+  audit, and in most of those the site was *listed*: as a "consumer"
+  read as a mechanical consequence of the chokepoint, or explicitly
+  ruled out without evidence. So each site carries a required
+  `disposition` (`fix` | `ruled_out`), with the evidence behind it
+  (file:line and what it does) in the site's `note` — not a separate
+  required string, the grammar-cost driver §7 measures — and "a mechanical consequence of the
+  chokepoint" is not by itself a ruling-out: the auditor must show the
+  chokepoint fix alone changes that site's output on the report's
+  inputs, or dispose it `fix`. Measured on the post-0.33 repeat pairs
+  (replayed against run N's base tree): the later-fixed symbol came back
+  disposed `fix` 8/8, 3/3, 7/8 and 5/8, and the mean site count did not
+  grow (12.0 with dispositions, 12.8 without). One blind spot stayed (a helper
+  1/8), which is why the planner's coverage warning remains advisory.
+  The planner must cover every `fix` site; `ruled_out` sites travel with
+  their evidence (in `note`) for the record. A per-site judge on the integrated tree
+  was tried and dropped: it caught every missed site but at 16%
+  precision — on long site lists it defaulted to "unfixed" instead of
+  reading the code.
+
+  A top-level `already_resolved_on_tree` flag was tried alongside and
+  dropped: under strict decoding, every schema variant carrying that one
+  extra required boolean returned `sites: []` in 5 of 18 calls combined,
+  against 0 of 6 with dispositions alone and 0 of 10 on the prior schema
+  — the no-work routing (§8) relies on the
+  satisfied-probe sweep and the held-out acceptance tests instead.
+
   **An applicable audit with zero sites is re-asked once.**
   `applicable: true` with an empty `sites` list disarms both
   consumers of the audit — planner injection and the gate's contract
@@ -4981,6 +5038,28 @@ rewrote *nothing* is reported once, at the end, as a probable rename.
 rather than proceeding unconstrained, so an operator who asked for the
 guarantee is never quietly given the old behaviour.
 
+**On some CLI builds, strict decoding turns leaked markup into silent data
+loss.** The grammar guarantees syntactically valid JSON, not that the model
+stayed inside it: when the model starts emitting its own tool-call markup
+mid-answer (`</defect_shape><parameter name="sites">…`), strict decoding
+absorbs those characters *into* the string field it was writing and the
+remaining fields come out empty — schema-valid, content destroyed. Without
+`strict`, the CLI's own post-hoc validator rejects that payload and the
+model retries cleanly. Measured on a recorded v0.36.0 `defect_scope_auditor`
+call: CLI 2.1.280 with the proxy leaked 4/4 (zero sites kept), 0/4 without
+it, and 0/4 with it on CLI 2.1.289; in production the same worker leaked in
+7 of 17 recorded v0.36.0 calls (one per run), two of which came back with
+`sites: []`. Two layers answer it.
+The flag refuses a CLI below `MIN_CLAUDE_CLI_STRICT_OUTPUT` at startup — the
+same refuse-rather-than-silently-degrade contract as the
+`ANTHROPIC_BASE_URL` and Bedrock collisions. And every worker's structured
+output, strict or not, passes a protocol-markup check in `claude_p`: a hit
+is handled exactly like a schema miss (one corrective re-prompt, then the
+ordinary schema-failure `WorkerError`). That generalizes the implementer-only
+`corrupted_envelope` check (upstream anthropics/claude-code#64690) to every
+worker; the tokens it looks for are wire syntax, not prose (§12
+*Language-to-JSON*).
+
 **Two distinct limits, both undocumented.** The API refuses an over-large
 schema two ways — *"Schema is too complex for compilation"* and *"The
 compiled grammar is too large"* — with no numeric bound documented anywhere.
@@ -5235,6 +5314,37 @@ auto-finalize scan can't distinguish from a crash before `phase_classify`
 completed. The identity write is therefore hoisted to run start, before
 `phase_classify`, so every early-exit path sees a correctly-identified
 `run.json`.
+
+**No work is declared on executed evidence, and disputed at most once.**
+A confirmed claim used to end the run on the judge's reading alone, and the
+judge can neither run tests nor, as measured, see the report's contract:
+6 of the 14 no-work confirmations recorded from v0.31.0 through 2026-10-03
+carried no contract item, and one
+of them (generate-1.12.74) declared done a defect that report-shaped tests
+still reproduce on barnacle's HEAD. So on a defect-fix task with held-out
+acceptance available, the judge's confirmation is held as *pending*; the
+run continues through provisioning, the defect-scope audit and the
+acceptance sets (§8 *Held-out acceptance tests* — they need the installed
+dependencies, which is why the decision moves after provisioning), and the
+sets are run on HEAD. A majority passing ends the run as no work. A
+majority failing is a dispute: the failing case names become the
+`no_work_dispute` evidence and the run plans the work. But held-out tests
+can be wrong — on a finished task whose report states no expected behaviour,
+all three sets failed it — and a wrong dispute repeated on every re-run
+would be a new infinite loop. So a dispute is raised at most once per task:
+when the previous same-task run already disputed on acceptance evidence, a
+still-failing majority ends the run as no work with a loud warning and the
+residual recorded. The cost of a wrong dispute is bounded to one extra run.
+With no valid sets the judge's confirmation stands, as before.
+
+**A plan whose fixes are all already on HEAD ends as no work.** The
+satisfied-probe sweep could drop every subtask that fixes the reported
+symptom and still let the run ship, because the survivors (verification
+and test-only subtasks) are never judged satisfied by a read-only probe —
+three of the six measured CHURN pairs shipped such a test-only PR. When
+every subtask flagged `fixes_reported_symptom` was dropped as already
+satisfied and the held-out sets pass on HEAD, the run ends as no work;
+otherwise it proceeds as before.
 
 **The delivery gate: required items are verified on the tree that
 ships.** The no-work judge above enforces `required_items` against the
@@ -5861,6 +5971,140 @@ weakening a test, because it constructs *new* adversarial inputs the graded
 worker never anticipated. A verdict is a list of concrete found defects, not
 a score crossing a threshold — the invariant every new verifier must
 preserve.
+
+### Held-out acceptance tests
+
+Every verification layer above grades the fix against tests the fixing
+run wrote itself. On both v0.36.0 repeat runs the first run's fix failed
+on the report's own quoted input, and none of the 44 review calls across
+those two runs (fit judges, conformers, delivery judges) flagged it: the
+tests had been written around the implementation, not the report. The
+automated-program-repair literature names this *overfitting*: a patch
+that passes the tests its author saw and fails the behaviour those tests
+stood for (Smith et al., FSE 2015; on SWE-bench, 29.6% of "plausible"
+patches disagree with the reference fix on fresh tests — Wang, Pradel et
+al., ICSE 2026). The measured remedy that recurs across that work is the
+same: tests the patch author never saw (DiffTGen, Opad, UTBoost), and
+ImpossibleBench (ICLR 2026) shows that test visibility is exactly what
+drives special-casing to a test's inputs.
+
+So after the defect-scope audit, an `acceptance_writer` worker — an
+acting worker in a disposable worktree at the **validity base** (the
+tree the report was filed against: the earliest same-task run's starting
+HEAD, else this run's) — writes tests from the report alone. It sees the
+report, the audited `defect_shape` and the report's `inline_examples`;
+it never sees the plan or any code the run will write. It writes several
+independent *sets*, each split into **defect files** (must fail on the
+validity base) and **control files** (correct behaviour that must keep
+passing), driving the behaviour through the module's stable entry points
+rather than internal helpers whose signatures a fix may change. Python
+validates each set mechanically, by exit code only (no runner-output
+parsing, so the mechanism is language-agnostic): a defect file that
+passes on the validity base cannot discriminate and is dropped; a set
+needs at least one discriminating defect file and every control passing.
+A set carries what its validation ran on: a writer that
+edited an existing file loses the set, and every other new file it left
+(a helper or fixture beside the tests, even one the repo's ignore rules
+match — though an ignored file elsewhere, likely build output from the
+unfixed tree, does not) travels with the set — minus what the dependency install made
+and the runner's caches and bytecode, which would only collide with the
+target tree's own. Without its helper, a correct fix fails the set. Measured: on the page-advance report, five sets written this way
+classified all 8 trees correctly (40/40: run 1's broken fix, two other
+example-shaped or test-skipping fixes, four correct ones); on the
+generate report all sets failed every broken tree including barnacle's
+HEAD, which leerie had declared "no work required"; on a Python repo
+with a planted defect, 3/3 sets were valid, passed the fixed code and
+flagged an example-shaped patch.
+
+**The gate runs after the run's own final conformance.** Each valid set
+runs against staging's committed HEAD in a disposable worktree of its
+own — never in staging itself, where a crash mid-run (which no cleanup
+survives) would leave hidden tests for the next fixer to read or commit.
+Verdicts are by exit code alone: a command the shell could not run, one
+the container's limits killed, or any set run where a dependency install
+failed is no verdict (a failing build step is not: a fix that breaks the
+build is evidence against it — at the cost that a transient build failure
+reads as the fix failing). A known runner's "ran no test" exits (pytest's
+collection, internal, usage and no-tests codes) are ambiguous — the test
+file may be broken, or the code under test may be — so they are no
+verdict only while validating a set on the base, where such a file
+discards its set (the gate then has less to check, never a false
+failure — the price is that a report whose defect is itself an import
+failure gets no held-out check); once
+a file has run on the base, the same exit on a fix is the fix's doing and
+fails — a defect file that never ran
+must not count as failing — but a test that fails for any other reason,
+including a missing-file defect whose failure prints "No such file or
+directory", fails. A set that cannot even be placed is no verdict too,
+never an error that skips the rollback check below. A majority of
+failing sets triggers **at most two repair rounds**: the conformer is
+told which declared cases failed and the defect contract — never the
+runner output or the test source, because a conformer shown the failing
+output special-cased it (one shown runner output patched the visible
+redirect parameter; failing names plus the contract got 2/4 page fixes
+at the root against 1/4). When four or more sets are valid, the two
+highest-indexed are never shown at all; every round is re-judged on all
+sets, so a fix fitted to the shown names still fails the hidden ones. With
+fewer valid sets every failing set is shown and nothing is held back — a
+weaker check, logged as such, and the repair is not told of hidden tests
+that do not exist. A set whose files could not all be run (a
+missing runner, a path the target tree already uses) is no evidence either
+way: it is left out of the vote rather than counted as passing, and when
+no set can be run the gate records no evidence instead of a pass. A tie is
+not a passing majority. Repair rounds run the conformer at **high
+effort**, regardless of the operator's `--effort`/`--effort-conformer`
+settings — the rounds exist only on failing runs, and effort is the
+measured lever: on the multi-mechanism generate report the low-effort
+pinned conformer fixed the contract from HEAD 1/2 times, medium 2/3,
+high every time it finished (6/6) — effort, not turn budget, was the
+lever, and only failing runs pay for it.
+
+**Non-blocking, with a mechanical safety net.** Held-out tests can be
+wrong: on a report that states no expected behaviour (a diagnostic
+report) or needs a heavily mocked harness, all three sets failed a task
+the operator had confirmed finished. So a residual after two rounds
+never blocks the PR; it is recorded and handed to the next same-task
+run's planner (`prior_delivery_residual`), where a full plan-and-
+implement cycle settled the generate residual 2/3 times. And a repair
+round must not trade the report for a regression: if the repo's test
+axis goes from passing to failing across the repair rounds, their
+commits are reset away and the residual is recorded instead — likewise
+if the repair turned measurable held-out sets unmeasurable (a broken
+dependency manifest, which the staging test axis, installed long before,
+would not notice) — but only after the repaired tree is measured once
+more and the pre-repair tree measures where it does not, since every
+evaluation installs afresh and a one-off failure looks the same. The
+reset is confirmed, never assumed: a failed one is recorded as such, the
+record then describes the repair's tree, which is what ships, and the
+next run's planner is told the repair it should not have inherited is
+still on the branch. With no readable HEAD to reset to, no repair starts. The
+pre-repair verdict and HEAD are persisted before the first round and
+every round after it runs (a round whose worker committed and then
+failed is measured again, since the previous verdict no longer describes
+the tree; when the shipped tree cannot be measured at all — usually an
+environment failure, since a repair that made the sets unmeasurable is
+rolled back below, unless that rollback itself fails — the last measured
+failing verdict is the residual, marked as such), and the rollback decision
+before the reset
+it orders, so a resumed gate always reaches this check and never records
+the repaired tree's verdict for the reset one: re-measured on resume,
+the verdict would read the already-repaired tree and skip it. Measured
+on the finished task with wrong held-out tests: the repair conformer
+changed code in 3/3 trials, but 0 of the task's 247 regression tests
+and 0 attributable scraper tests (of 1,605) regressed.
+
+**Hidden from the fixers.** The sets live under the run's state root,
+and implementers and conformers carry `Read` denies on that directory
+and on every run-directory file that records them — the evaluation
+worktree, the logs (the writers' transcripts carry the test source), the
+orchestrator log, the captured-call log and the run state (case names
+and paths) — and on the CLI's own session transcripts; the fixers read
+nothing else there but their subtask specs, criteria and checkpoints.
+It is the same deny mechanism that keeps acting workers out of the
+user's checkout, and evaluation output is never echoed. Nothing of a set
+reaches staging at all (above). A shell `cat` is not covered by a `Read`
+deny; hiding is a best-effort reduction of the special-casing incentive,
+not a guarantee.
 
 ### Mechanical-feedback loops (the CRITIC pattern)
 
@@ -7175,6 +7419,22 @@ silently on inputs the author didn't anticipate. Regex remains legitimate
 only where the string matched is itself mechanical rather than natural
 language — a semver, a shell command, a fixed CLI output string, a file
 path — never prose a human wrote to communicate intent.
+The tool-call protocol tokens a model can leak into a structured field
+(`antml:`, `<parameter name="`, `<invoke name="`, a closing tag named after
+one of the worker's own schema properties) are mechanical in this sense:
+they are the CLI's wire syntax, never a worker's way of saying something,
+so `claude_p`'s check for them (§7 *Forcing constrained decoding*) is
+inside the rule. It answers "is this payload corrupted?", not "what does
+this text mean?". The check first removes markdown code spans (fenced
+blocks and inline backtick spans) — again by their mechanical delimiters,
+not by reading what they say — because a worker quoting code is quoting,
+not leaking; and a closing tag named after a schema property counts only
+where leaked syntax sits (at the end of the value, or before another tool
+or schema tag), since names like `summary` or `title` are also ordinary
+markup (such a tag that happens to end the value is still a hit).
+Measured on 2026-10-04, these two restrictions dropped none of the 2,395
+hits in the 26,673 recorded responses and removed the false positives a
+review found in PR bodies and summaries quoting HTML.
 
 An earlier audit found several orchestrator sites that violated this by
 regexing natural-language prose (task text, planner intent,
@@ -7361,13 +7621,13 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the twenty-two worker types in
+Every main-loop LLM call in Leerie passes through one of the twenty-three worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
 `artifact_registry`, `integration_judge`, `no_work_judge`,
-`delivery_judge`, `defect_scope_auditor`, or `rebaser`
+`delivery_judge`, `defect_scope_auditor`, `acceptance_writer`, or `rebaser`
 (`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
@@ -7375,7 +7635,8 @@ recursive-decomposition workers — see §5½; `classification_judge`,
 independent adversarial
 verifiers — see §8; `artifact_registry` is the pre-planning
 shared-vocabulary worker and `defect_scope_auditor` the pre-planning
-defect-shape enumerator — see §5; `rebaser` is the finalize-time rebase
+defect-shape enumerator — see §5; `acceptance_writer` writes the held-out
+acceptance tests — see §8; `rebaser` is the finalize-time rebase
 worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per

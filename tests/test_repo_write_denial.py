@@ -129,7 +129,13 @@ class TestReachesTheArgv:
                                schema_key, autonomous):
         argv = _argv_for(leerie, monkeypatch, schema_key=schema_key,
                          autonomous=autonomous, repo_root="/work")
-        assert _deny_value(argv).endswith(",Edit(//work/**)")
+        # Containment, not position: the held-out acceptance Read deny
+        # (DESIGN §8) now follows it for implementer/conformer.
+        assert ",Edit(//work/**)" in _deny_value(argv)
+        if schema_key == "implementer":
+            deny = _deny_value(argv)
+            assert "/acceptance/**)," in deny
+            assert deny.endswith(",Read(~/.claude/projects/**)")
 
     def test_the_acting_worker_really_does_carry_the_bypass_flag(
             self, leerie, monkeypatch):
@@ -146,7 +152,7 @@ class TestReachesTheArgv:
         `/work` passes every assertion above and fails this one."""
         argv = _argv_for(leerie, monkeypatch, schema_key="implementer",
                          autonomous=True, repo_root="/srv/other")
-        assert _deny_value(argv).endswith(",Edit(//srv/other/**)")
+        assert ",Edit(//srv/other/**)" in _deny_value(argv)
         assert "//work/**" not in _deny_value(argv)
 
     def test_base_denials_are_preserved(self, leerie, monkeypatch):

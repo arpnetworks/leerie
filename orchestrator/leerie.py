@@ -104,6 +104,21 @@ def _load_prompt(name: str) -> str:
 # have the flag at all. Enforced at preflight by _check_claude_cli_version().
 MIN_CLAUDE_CLI = (2, 1, 22)
 
+# Floor for --dangerously-force-strict-output only (DESIGN §7 *Forcing
+# constrained decoding*). On CLI 2.1.280, forcing `strict: true` let the
+# model's leaked tool-call markup be decoded into a string field and the
+# remaining fields come out empty — a recorded defect_scope_auditor call
+# leaked 4/4 with the proxy, 0/4 without it, and 0/4 with it on 2.1.289.
+# Not folded into MIN_CLAUDE_CLI: without the flag the CLI's own validator
+# rejects that payload, so an older host CLI is still fine for normal runs.
+MIN_CLAUDE_CLI_STRICT_OUTPUT = (2, 1, 289)
+
+# Effort for the acceptance gate's repair rounds only (DESIGN §8 *Held-out
+# acceptance tests*): on a multi-mechanism report the pinned-low conformer
+# repaired the contract 1/2 times, medium 2/3, high every time it finished
+# (6/6). Only runs whose held-out sets fail pay it.
+EFFORT_ACCEPTANCE_REPAIR = "high"
+
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
     # Runaway backstop, not a routine capacity limit (N3+N4, corpus-derived
@@ -212,6 +227,13 @@ DEFAULT_CAPS = {
     "implementer_confidence_retries": 2,  # separate from subtask_continuations
     "planner_samples": 3,           # multi-sample; set to 1 to disable
     "worker_timeout_sec": 5400,     # 90 minutes per worker process
+    # Held-out acceptance sets written per run (DESIGN §8 *Held-out
+    # acceptance tests*). Five so the last two can stay unseen by the
+    # repair rounds while three are shown (by case name only).
+    "acceptance_sets": 5,
+    # Repair rounds when a majority of held-out sets fail on the integrated
+    # tree; the residual then ships and feeds the next run.
+    "acceptance_repair_rounds": 2,
     # Longest rate-limit reset `main()` will sleep through before it stops
     # auto-resuming and pauses resumably instead (the `out_of_credits`
     # disposition). Sized to the subscription's own windows: the five-hour
@@ -431,6 +453,30 @@ STATE_FIELDS = (
     # resume checkpoint mirroring artifact_registry; injected into
     # planner ctx when applicable with non-empty sites.
     "defect_scope",
+    # site_token_warnings: advisory [{token, file}] from
+    # _warn_site_token_leaks after integration — a report's site-identifying
+    # token found in the run's added lines and absent from the base tree
+    # (DESIGN §5 *The report's own example inputs are captured too*).
+    # Never gates.
+    "site_token_warnings",
+    # acceptance: the held-out acceptance record (DESIGN §8 *Held-out
+    # acceptance tests*): {validity_base, written, sets[], skipped?, gate?}
+    # — each valid set {index, valid, dir, defect_files[], control_files[],
+    # support_files[], cases{}}; `gate` {initial[], rounds[], final[],
+    # before_sha?, pre_tests_passed?, residual?, rolled_back?,
+    # rollback_reason?, rollback_failed?} (IMPLEMENTATION §8 state table).
+    # Presence-keyed resume checkpoint for the write half; gate.final is
+    # the gate half's sentinel.
+    "acceptance",
+    # skip_acceptance_check: --skip-acceptance-check resolved at run start.
+    "skip_acceptance_check",
+    # no_work_pending / no_work_acceptance / acceptance_dispute (DESIGN §8
+    # *No work is declared on executed evidence, and disputed at most
+    # once*): a judge confirmation held for the held-out check, the check's
+    # verdict, and the dispute record the next run's dispute-once reads.
+    "no_work_pending",
+    "no_work_acceptance",
+    "acceptance_dispute",
     # delivery_gate: audit record of the finalize-side required-items
     # verification on the integrated staging tree (DESIGN §8 *The
     # delivery gate*): {unmet_before[], unmet_after[], samples_before,
@@ -1297,6 +1343,14 @@ STRICT_CONFORMER_FILE = SOURCE_OF_TRUTH_FILE
 SKIP_BASE_BASELINE_ENV = "LEERIE_SKIP_BASE_BASELINE"
 SKIP_BASE_BASELINE_FILE = SOURCE_OF_TRUTH_FILE
 
+# --skip-acceptance-check bypass (DESIGN §8 *Held-out acceptance tests*).
+# Suppresses the acceptance_writer sets and the post-integration acceptance
+# gate. Resolution order: --skip-acceptance-check CLI flag →
+# LEERIE_SKIP_ACCEPTANCE_CHECK env → skip_acceptance_check in leerie.toml →
+# False.
+SKIP_ACCEPTANCE_CHECK_ENV = "LEERIE_SKIP_ACCEPTANCE_CHECK"
+SKIP_ACCEPTANCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
+
 # --skip-repo-map bypass (DESIGN §5½ (P6) *Codebase structural map*). Suppresses
 # `_build_repo_map()` and the ranked-subgraph injection into the planner
 # context. Use on repos where tree-sitter cannot parse the primary language,
@@ -1536,6 +1590,9 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # every other respect (sonnet via MODEL_DEFAULT fallback, absent from
     # MODEL_DEFAULT_PER_WORKER).
     "rebaser": "medium",
+    # Writes the held-out tests from the report alone; measured at medium
+    # (DESIGN §8 *Held-out acceptance tests*: 40/40 page verdicts correct).
+    "acceptance_writer": "medium",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -1666,7 +1723,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
                 "integration_judge", "no_work_judge", "delivery_judge",
-                "defect_scope_auditor", "rebaser")
+                "defect_scope_auditor", "rebaser", "acceptance_writer")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1697,7 +1754,7 @@ PLANNING_WORKER_TYPES = frozenset({
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
 ACTING_WORKER_TYPES = frozenset({
-    "implementer", "integrator", "conformer", "rebaser",
+    "implementer", "integrator", "conformer", "rebaser", "acceptance_writer",
 })
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main _orchestrate loop, but they do get dedicated model resolution via
@@ -2452,6 +2509,34 @@ SCHEMAS: dict[str, dict] = {
     # "irreconcilable" naming the abort outcome explicitly (distinct from
     # "failed", which covers a worker-side error rather than a deliberate,
     # reasoned abort).
+    "acceptance_writer": {
+        # Held-out acceptance tests written from the report alone, in a
+        # disposable worktree at the validity base (DESIGN §8 *Held-out
+        # acceptance tests*). Python validates each file by exit code
+        # only; `cases` are the names the repair rounds are shown — never
+        # the runner output or the test source.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["files"],
+        "properties": {
+            "files": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["path", "kind", "cases"],
+                    "properties": {
+                        "path": {"type": "string"},
+                        "kind": {"type": "string",
+                                 "enum": ["defect", "control"]},
+                        "cases": {"type": "array",
+                                  "items": {"type": "string"}},
+                    },
+                },
+            },
+            "notes": {"type": "string"},
+        },
+    },
     "rebaser": {
         "type": "object",
         "required": ["status", "final_branch_state"],
@@ -3172,7 +3257,14 @@ SCHEMAS: dict[str, dict] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["file", "symbol", "role"],
+                    # disposition (DESIGN §5 *Every site carries a
+                    # disposition*): listing a site is not deciding it —
+                    # the measured SCOPE repeats mostly LISTED the
+                    # later-fixed site as a "consumer" and left it to
+                    # mechanical consequence. The evidence goes in `note`,
+                    # not a new required string: free-form strings are
+                    # the strict grammar's expensive element (§7).
+                    "required": ["file", "symbol", "role", "disposition"],
                     "properties": {
                         "file": {"type": "string"},
                         "symbol": {"type": "string"},
@@ -3180,6 +3272,8 @@ SCHEMAS: dict[str, dict] = {
                         "role": {"type": "string",
                                  "enum": ["decision_site", "producer",
                                           "consumer", "bypass"]},
+                        "disposition": {"type": "string",
+                                        "enum": ["fix", "ruled_out"]},
                         "note": {"type": "string"},
                     },
                 },
@@ -3215,7 +3309,7 @@ SCHEMAS: dict[str, dict] = {
                 # for the repro-decides loop (null = the report gives
                 # none).
                 "required": ["data_dependent", "inputs",
-                             "repro_command"],
+                             "repro_command", "inline_examples"],
                 "properties": {
                     "data_dependent": {"type": "boolean"},
                     "inputs": {
@@ -3256,6 +3350,31 @@ SCHEMAS: dict[str, dict] = {
                         },
                     },
                     "repro_command": {"type": ["string", "null"]},
+                    # The example inputs the report quotes inline (DESIGN
+                    # §5 *The report's own example inputs are captured
+                    # too*): the literals a fix must be proven against.
+                    # Required (possibly empty) for the resolved_path
+                    # reason above — the planner's test requirements and
+                    # the site-token warning both read it.
+                    "inline_examples": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["literal", "site_identifying",
+                                         "trigger_tokens", "site_tokens"],
+                            "properties": {
+                                "literal": {"type": "string"},
+                                "site_identifying": {"type": "boolean"},
+                                "trigger_tokens": {
+                                    "type": "array",
+                                    "items": {"type": "string"}},
+                                "site_tokens": {
+                                    "type": "array",
+                                    "items": {"type": "string"}},
+                            },
+                        },
+                    },
                 },
             },
             "rationale": {"type": "string"},
@@ -4674,6 +4793,33 @@ def _check_claude_cli_version() -> None:
             "`curl -fsSL https://claude.ai/install.sh | bash`. "
             "(npm/pnpm installs are now an advanced/legacy option per the "
             "Claude Code docs.)"
+        )
+
+
+def _check_strict_output_cli_version() -> None:
+    """die() if --dangerously-force-strict-output is on and `claude` is
+    below MIN_CLAUDE_CLI_STRICT_OUTPUT — the same refuse-rather-than-
+    silently-degrade contract as the ANTHROPIC_BASE_URL and Bedrock
+    refusals beside its call site. An unrecognized version string falls
+    through, as in `_check_claude_cli_version`."""
+    try:
+        out = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        die("`claude --version` timed out — investigate the CLI install.")
+    found = _parse_claude_version(out.stdout)
+    if found is None:
+        return
+    if found < MIN_CLAUDE_CLI_STRICT_OUTPUT:
+        die(
+            f"--dangerously-force-strict-output needs claude CLI >= "
+            f"{'.'.join(map(str, MIN_CLAUDE_CLI_STRICT_OUTPUT))}, found "
+            f"{'.'.join(map(str, found))}. On older builds strict decoding "
+            "can absorb leaked tool-call markup into a string field and "
+            "empty the rest of the worker's answer while still passing the "
+            "schema. Upgrade the CLI, or drop the flag."
         )
 
 
@@ -7165,6 +7311,22 @@ def resolve_skip_base_baseline(repo_root: Path, cli_value: bool) -> bool:
         env_var=SKIP_BASE_BASELINE_ENV,
         file_key="skip_base_baseline",
         file_name=SKIP_BASE_BASELINE_FILE)
+
+
+def resolve_skip_acceptance_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-acceptance-check preference. Order:
+    --skip-acceptance-check CLI flag (action='store_true') →
+    LEERIE_SKIP_ACCEPTANCE_CHECK env var →
+    skip_acceptance_check in leerie.toml → False.
+
+    When True, no held-out acceptance sets are written and the
+    post-integration acceptance gate does not run (DESIGN §8 *Held-out
+    acceptance tests*)."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_ACCEPTANCE_CHECK_ENV,
+        file_key="skip_acceptance_check",
+        file_name=SKIP_ACCEPTANCE_CHECK_FILE)
 
 
 def resolve_skip_repo_map(repo_root: Path, cli_value: bool) -> bool:
@@ -14895,23 +15057,84 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
     return (None, False)
 
 
-def _find_antml_markup(value: object) -> str | None:
-    """Recursively scan a JSON-shaped value for a string containing
-    literal `antml:` markup. Returns the offending string on the first
-    hit, None if clean. Structured recursion (dict/list), not a
-    top-level-only check — the incident showed corruption landing in
-    arbitrary nested fields (e.g. inside `clarification_question`)."""
+# Tool-call wire syntax a model can leak into a structured-output string
+# field (DESIGN §7 *Forcing constrained decoding*, §12 *Language-to-JSON*:
+# protocol tokens are mechanical strings, not prose). A closing tag named
+# after one of the worker's own schema properties is matched too — that is
+# how the observed leak reads (`…</defect_shape><parameter name="sites">`).
+_PROTOCOL_MARKUP_TOKENS = (
+    "antml:", '<parameter name="', "</parameter>", '<invoke name="',
+    "</invoke>",
+)
+# Quoted code — fenced blocks and inline backtick spans — is something the
+# worker is quoting (a repo that is itself about this protocol, an HTML
+# snippet in a PR body), not leaked syntax; the one legitimate hit in a
+# 120-sample corpus audit was exactly that shape.
+_QUOTED_CODE_SPAN_RE = re.compile(r"^[ \t]*```[^\n]*\n.*?^[ \t]*```|`[^`\n]*`",
+                               re.S | re.M)
+
+
+def _schema_property_names(schema: object) -> frozenset[str]:
+    """Every property name declared anywhere in a JSON schema."""
+    names: set[str] = set()
+    stack = [schema]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            props = node.get("properties")
+            if isinstance(props, dict):
+                names.update(props)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return frozenset(names)
+
+
+def _closing_tag_leak(text: str, prop_names: frozenset[str]) -> bool:
+    """A closing tag named after one of the worker's own schema properties
+    counts only where leaked tool-call syntax sits: at the end of the value,
+    or directly before another parameter/invoke tag or another of the
+    schema's own tags. A schema property that is also an ordinary markup
+    name (`summary`, `title`, `name`) inside running text is not a leak
+    (one that ends the value still is) — measured 2026-10-04, it dropped
+    none of the 2,395 hits in 26,673 recorded responses."""
+    for p in prop_names:
+        start = 0
+        tag = f"</{p}>"
+        while (i := text.find(tag, start)) != -1:
+            rest = text[i + len(tag):].lstrip()
+            if (not rest or rest.startswith(("<parameter", "<invoke"))
+                    or any(rest.startswith((f"</{q}>", f"<{q}"))
+                           for q in prop_names)):
+                return True
+            start = i + len(tag)
+    return False
+
+
+def _find_protocol_markup(value: object,
+                          prop_names: frozenset[str] = frozenset()
+                          ) -> str | None:
+    """Recursively scan a JSON-shaped value for a string carrying leaked
+    tool-call markup. Returns the offending string on the first hit, None
+    if clean. Structured recursion (dict/list), not a top-level-only check
+    — the corruption lands in arbitrary nested fields (e.g. inside
+    `clarification_question`)."""
     if isinstance(value, str):
-        return value if "antml:" in value else None
+        bare = _QUOTED_CODE_SPAN_RE.sub("", value)
+        if any(t in bare for t in _PROTOCOL_MARKUP_TOKENS):
+            return value
+        if "</" in bare and _closing_tag_leak(bare, prop_names):
+            return value
+        return None
     if isinstance(value, dict):
         for v in value.values():
-            hit = _find_antml_markup(v)
+            hit = _find_protocol_markup(v, prop_names)
             if hit is not None:
                 return hit
         return None
     if isinstance(value, list):
         for v in value:
-            hit = _find_antml_markup(v)
+            hit = _find_protocol_markup(v, prop_names)
             if hit is not None:
                 return hit
         return None
@@ -14947,9 +15170,10 @@ def _validate_result(result: dict) -> tuple[str, str] | None:
     than the terminal `"broken"` the status dispatch below would
     otherwise assign it via a coincidentally-matching shape (e.g. a
     corrupted `checkpoint_path`)."""
-    if _find_antml_markup(result) is not None:
+    if _find_protocol_markup(
+            result, _schema_property_names(SCHEMAS["implementer"])) is not None:
         return ("corrupted_envelope",
-                "result contains literal 'antml:' markup in a string field "
+                "result contains leaked tool-call markup in a string field "
                 "— upstream anthropics/claude-code#64690 token-generation "
                 "corruption")
     status = result.get("status")
@@ -19025,6 +19249,31 @@ def _warn_denial_skipped_once(root: Path) -> None:
         "applies. Set LEERIE_STATE_DIR outside the repo to restore it.")
 
 
+def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
+    """Keep the held-out acceptance sets out of the fixers' reach (DESIGN §8
+    *Held-out acceptance tests*): `Read` denies for implementer and
+    conformer on every run-directory file that records a set — the sets
+    themselves, the evaluation worktree, every log (the writers' stream
+    transcripts carry the test source), `orchestrator.log` (where streamed
+    output is echoed), `calls.ndjson` (the writers' responses) and
+    `state.json` (case names and paths) — and on the CLI's own session
+    transcripts. The fixers' prompts read only `subtasks/`, `criteria/` and
+    `checkpoints/` there. Joined with `_repo_write_denials`' rules at the
+    call site. A shell `cat` is not covered; hiding reduces the
+    special-casing incentive, it does not guarantee it."""
+    if schema_key not in ("implementer", "conformer"):
+        return ""
+    rd = Path(run_dir)
+    # `//` anchors an absolute path for the CLI, as in _repo_write_denials.
+    return ",".join([f"Read(/{rd / 'acceptance'}/**)",
+                     f"Read(/{rd / 'worktrees' / 'acceptance-eval'}/**)",
+                     f"Read(/{rd / 'logs'}/**)",
+                     f"Read(/{rd / 'orchestrator.log'})",
+                     f"Read(/{rd / 'calls.ndjson'})",
+                     f"Read(/{rd / 'state.json'})",
+                     "Read(~/.claude/projects/**)"])
+
+
 def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
     """Path-scoped deny rules keeping every worker's file writers out of the
     user's real checkout.
@@ -19288,8 +19537,9 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             cmd = _contained_claude_argv(
                 schema=schema, allowed_tools=allowed_tools,
                 max_turns=max_turns, model=model,
-                deny_extra=_repo_write_denials(st.repo_root,
-                                               st.run_dir))
+                deny_extra=",".join(d for d in (
+                    _repo_write_denials(st.repo_root, st.run_dir),
+                    _acceptance_read_denials(schema_key, st.run_dir)) if d))
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
             else:
@@ -19632,6 +19882,20 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             if structured is None:
                 last_problem = ("the run produced no structured_output — the final "
                                 "output did not satisfy the JSON schema")
+                continue
+            # Schema-valid is not the same as intact: leaked tool-call markup
+            # inside a string field passes the schema (and, under strict
+            # decoding, empties the fields after it). Handled exactly like a
+            # schema miss (DESIGN §7 *Forcing constrained decoding*).
+            if _find_protocol_markup(
+                    structured,
+                    _schema_property_names(SCHEMAS[schema_key])) is not None:
+                last_problem = ("a string field in your answer contains leaked "
+                                "tool-call markup (e.g. `<parameter name=` or a "
+                                "closing tag named after a schema field) — "
+                                "write each field's value as plain text only")
+                log(f"  [{sid}] structured output carried leaked tool-call "
+                    f"markup (attempt {attempt} of 2) — re-prompting")
                 continue
             return structured
 
@@ -21396,6 +21660,15 @@ async def _confirm_no_work_on_converged_gate(
             "judge_evidence": judge_evidence,
             "checked": list(out.get("checked", []) or []),
         }
+        if _acceptance_can_check(st):
+            # DESIGN §8 *No work is declared on executed evidence*: hold the
+            # confirmation until the held-out sets have run on HEAD, which
+            # needs provisioning first (`_settle_pending_no_work`).
+            st.data["no_work_pending"] = True
+            st.save()
+            log("  no-work confirmation held pending the held-out "
+                "acceptance check on HEAD")
+            return False
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence})
         return True
@@ -22568,7 +22841,11 @@ def _warn_defect_sites_uncovered(plans: list[dict],
     able to block a run."""
     if not defect_scope.get("applicable"):
         return
-    sites = defect_scope.get("sites") or []
+    # Only sites the audit disposed `fix` must be claimed; a `ruled_out`
+    # site carries its own evidence (DESIGN §5 *Every site carries a
+    # disposition*). A legacy site without a disposition counts as `fix`.
+    sites = [st_ for st_ in (defect_scope.get("sites") or [])
+             if st_.get("disposition", "fix") == "fix"]
     if not sites:
         return
     def _norm(path: str) -> str:
@@ -29862,9 +30139,14 @@ def _format_solution_defects(defects: list[dict]) -> str:
 
 
 async def _branch_head_sha(worktree: str) -> str:
-    """HEAD sha in the worktree, or empty string on failure. Used as the
-    rollback target before the conformer adds commits."""
-    r = await run_proc(["git", "rev-parse", "HEAD"], cwd=worktree)
+    """HEAD sha in the worktree, or empty string on failure — including a
+    failure to spawn git at all (EAGAIN under fork exhaustion), which a
+    caller about to decide a rollback must not see as an exception. Used as
+    the rollback target before the conformer adds commits."""
+    try:
+        r = await run_proc(["git", "rev-parse", "HEAD"], cwd=worktree)
+    except OSError:
+        return ""
     if r.returncode != 0:
         return ""
     return r.stdout.strip()
@@ -31387,7 +31669,7 @@ _DEPS_INSTALLED: set[str] = set()
 async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                                 log_path: Path, verbosity: str,
                                 label_prefix: str = "baseline",
-                                log_prefix: str = "base-baseline") -> None:
+                                log_prefix: str = "base-baseline") -> bool:
     """Apply the persisted provision recipe's install/build entries in
     `tree`, at most once per worktree per orchestrator process.
 
@@ -31400,11 +31682,19 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     as whatever the subsequent build/lint/test command reports, rather than
     raising here — that reported failure is the more useful signal, and it
     is already classified (`_runner_missing` demotes a missing runner to
-    "could not measure" rather than RED)."""
+    "could not measure" rather than RED).
+
+    Returns False when an `install` entry exited non-zero, timed out or
+    raised on this call, else True (a memo hit included). The held-out
+    acceptance tests judge by exit code alone, so their callers need this:
+    a failed install would otherwise read as every test failing. A failed
+    `build` entry does not count — a fix that breaks the build is evidence
+    against the fix, which the tests then show."""
     key = os.path.realpath(tree)
     if key in _DEPS_INSTALLED:
-        return
+        return True
     _DEPS_INSTALLED.add(key)
+    ok = True
     recipe = (st.data.get("provision") or {}).get("recipe") or []
     for e in recipe:
         if e.get("kind") not in ("install", "build") or not e.get("command"):
@@ -31417,18 +31707,23 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
         # PATH etc.
         entry_env = ({**os.environ, **e["env"]} if e.get("env") else None)
         try:
-            await _run_streaming(
+            rc, _tail = await _run_streaming(
                 e["command"], cwd=str(wd), env=entry_env,
                 timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
                 log_path=log_path,
                 label=f"{label_prefix}-install: {' '.join(e['command'])}",
                 verbosity=verbosity)
+            if rc != 0 and e.get("kind") == "install":
+                ok = False
         except subprocess.TimeoutExpired:
+            ok = ok and e.get("kind") != "install"
             log(f"  {log_prefix}: install timed out: "
                 f"{' '.join(e['command'])}")
         except Exception as ex:  # non-fatal: BLT below will show the effect
+            ok = ok and e.get("kind") != "install"
             log(f"  {log_prefix}: install error "
                 f"({type(ex).__name__}): {' '.join(e['command'])}")
+    return ok
 
 
 # Bounds concurrent orchestrator-run BLT commands, keyed by (running loop,
@@ -32003,9 +32298,21 @@ def _check_ground_truth_inputs(ground_truth: object,
                        "role": str(i.get("role") or ""),
                        "present": present_at is not None,
                        "resolved_path": present_at or rp})
+    examples: list[dict] = []
+    for e in (ground_truth.get("inline_examples") or []):
+        if not (isinstance(e, dict) and e.get("literal")):
+            continue
+        examples.append({
+            "literal": str(e["literal"]),
+            "site_identifying": bool(e.get("site_identifying")),
+            "trigger_tokens": [str(t) for t in (e.get("trigger_tokens") or [])
+                               if t],
+            "site_tokens": [str(t) for t in (e.get("site_tokens") or []) if t],
+        })
     gt = {"data_dependent": bool(ground_truth.get("data_dependent")),
           "inputs": inputs,
-          "repro_command": ground_truth.get("repro_command") or None}
+          "repro_command": ground_truth.get("repro_command") or None,
+          "inline_examples": examples}
     missing = [i for i in inputs if not i["present"]]
     if log_missing and missing and gt["data_dependent"]:
         log("  WARNING: the report pins its defect to external data "
@@ -32201,10 +32508,26 @@ def _prior_delivery_residual(st: "State") -> dict | None:
         except OSError:
             continue
         gate = data.get("delivery_gate") or {}
+        acc_residual = ((data.get("acceptance") or {}).get("gate")
+                        or {}).get("residual")
         unmet_after = gate.get("unmet_after") or []
         contract_after = gate.get("contract_after") or {}
         contract_before = gate.get("contract_before") or {}
         residual: dict = {}
+        if acc_residual:
+            # Held-out acceptance residual (DESIGN §8 *Held-out acceptance
+            # tests*): the case NAMES that still failed — never test
+            # source — so the next plan targets the open contract.
+            residual["acceptance_unmet"] = {
+                "failing_sets": acc_residual.get("failing_sets"),
+                "total_sets": acc_residual.get("total_sets"),
+                # The shipped tree could not be measured, so this is the last
+                # verdict that could be — usually an environment failure.
+                "unmeasured_final": bool(acc_residual.get("unmeasured_final")),
+                # A repair the gate decided to revert is still on the branch.
+                "rollback_failed": bool(acc_residual.get("rollback_failed")),
+                "cases": [str(c)[:200] for c in
+                          (acc_residual.get("cases") or [])][:10]}
         if unmet_after:
             residual["unmet_after"] = [
                 {"item": (u.get("item") or "")[:200],
@@ -32561,6 +32884,1058 @@ async def _delivery_judge_unmet(
         contract_result = _downgrade_ungrounded_met(
             contract_result, ground_truth)
     return confirmed, len(samples), contract_result
+
+
+# --- held-out acceptance tests (DESIGN §8 *Held-out acceptance tests*) ----
+
+def _acceptance_validity_base(st: "State") -> str | None:
+    """The tree the report was filed against: the earliest COMPLETED-or-not
+    same-task sibling run's starting HEAD when one exists and is still
+    reachable, else this run's own starting HEAD. Same exact-task match as
+    `_prior_delivery_residual` (mechanical string equality)."""
+    own = (st.data.get("repo_state_before_planning") or {}).get("head")
+    task = (st.data.get("task") or "").strip()
+    best: tuple[str, str] | None = None
+    try:
+        siblings = [d for d in st.run_dir.parent.iterdir()
+                    if d.is_dir() and d.name != st.run_dir.name]
+    except OSError:
+        siblings = []
+    for d in siblings:
+        try:
+            data = json.loads((d / "state.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if (data.get("task") or "").strip() != task:
+            continue
+        head = (data.get("repo_state_before_planning") or {}).get("head")
+        started = str(data.get("started_at") or "")
+        if not started:
+            # Unknown start time: cannot be ranked earliest.
+            continue
+        if head and (best is None or started < best[0]):
+            best = (started, head)
+    if best is not None:
+        ok = subprocess.run(
+            ["git", "-C", str(st.repo_root), "cat-file", "-e",
+             f"{best[1]}^{{commit}}"],
+            capture_output=True, check=False).returncode == 0
+        if ok:
+            return best[1]
+    return own
+
+
+# Path components a test runner or interpreter writes as a by-product.
+# Carried with a set, they would collide with the evaluation tree's own
+# copies and turn every set unmeasurable.
+_ACCEPTANCE_BYPRODUCT_PARTS = frozenset({
+    "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    ".hypothesis"})
+# Environments a runner provisions: never a set's file.
+_ACCEPTANCE_PROVISION_PARTS = frozenset({
+    "node_modules", ".venv", "venv", ".tox", ".nox"})
+
+
+def _acceptance_is_cache_path(rel: str) -> bool:
+    """Mechanical path check (DESIGN §12): a runner by-product, bytecode or
+    a provisioned environment — never a file a set needs."""
+    parts = set(Path(rel).parts)
+    return (bool(parts & (_ACCEPTANCE_BYPRODUCT_PARTS
+                          | _ACCEPTANCE_PROVISION_PARTS))
+            or rel.endswith((".pyc", ".pyo")))
+
+
+# Exit codes with which a known runner may report that it ran no test at
+# all — pytest: 2 collection error, 3 internal error, 4 usage error (a
+# conftest that fails to import), 5 no tests collected. Each is ambiguous:
+# the test file may be broken (a writer bug) or the code under test may be
+# (evidence). So they are applied only when VALIDATING a set on the base,
+# where a file that ran no test is discarded (fail-open: the gate then has
+# less to check); never when evaluating a fix, where a file that already
+# ran on the base and now cannot is the fix's doing.
+_RUNNER_NO_VERDICT_EXITS: dict[str, frozenset[int]] = {
+    "pytest": frozenset({2, 3, 4, 5}),
+}
+
+
+def _acceptance_no_verdict_exits(cmd: str) -> frozenset[int]:
+    """The no-verdict exit codes of the runner a shell command invokes,
+    matched on the command's own tokens (a mechanical string, DESIGN §12)."""
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return frozenset()
+    for runner, codes in _RUNNER_NO_VERDICT_EXITS.items():
+        if any(os.path.basename(t) == runner for t in tokens):
+            return codes
+    return frozenset()
+
+
+def _acceptance_declared_rel(declared: dict) -> str:
+    """A writer-declared path in the form git reports it: writers often
+    prefix `./`, and a declared file compared unnormalised against git's
+    list would also be carried as a support file — and then collide with
+    itself at evaluation."""
+    raw = str(declared.get("path") or "")
+    # normpath also folds `a/./b` and `a//b`; a `..` it leaves in place is
+    # rejected by the caller.
+    return os.path.normpath(raw) if raw else ""
+
+
+def _acceptance_cmd(st: "State", files: list[str]) -> str | None:
+    """The repo's scoped test template rendered over explicit test files,
+    or None when there is no template or a file is not test-shaped."""
+    template = resolve_blt_scoped(st.repo_root).get("test")
+    if not template or not files:
+        return None
+    globs = resolve_test_file_globs(st.repo_root)
+    rendered = _render_scoped(template, files, "HEAD", globs)
+    if rendered is None:
+        return None
+    # Every file must be test-shaped, or {test_files} silently drops it.
+    if "{test_files}" in template and not all(
+            _is_test_file(f, globs) for f in files):
+        return None
+    return rendered
+
+
+async def _run_acceptance_file(st: "State", caps: dict, tree: str,
+                               rel: str, log_path: Path,
+                               label: str, *,
+                               validating: bool = False) -> bool | None:
+    """Exit-code verdict for one acceptance file in `tree`: True passed,
+    False failed, None not measurable (no command, the shell could not run
+    it — exit 126/127 — or the container's limits killed it; and, only when
+    `validating`, a runner's ran-no-test exit, `_RUNNER_NO_VERDICT_EXITS`).
+
+    Not `_measure_blt`: its "could not measure" test reads the whole output
+    for `No such file or directory`, which is also what a test of a missing-
+    file defect prints when it fails — exactly the failure a defect file
+    exists to show. And always quiet: a streamed echo would put the hidden
+    test's source and output in `orchestrator.log`."""
+    cmd = _acceptance_cmd(st, [rel])
+    if cmd is None:
+        return None
+    async with _blt_semaphore(caps):
+        try:
+            rc, tail = await _run_streaming(
+                ["bash", "-c", cmd], cwd=str(tree),
+                timeout=float(caps.get("worker_timeout_sec",
+                                       DEFAULT_CAPS["worker_timeout_sec"])),
+                log_path=log_path, label=f"{label}-tests: {cmd}",
+                verbosity="quiet")
+        except subprocess.TimeoutExpired:
+            return False
+        except Exception:
+            return None
+    if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
+        return None
+    if validating and rc in _acceptance_no_verdict_exits(cmd):
+        return None
+    return rc == 0
+
+
+async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
+                                models: dict, efforts: dict,
+                                base: str) -> dict:
+    """One acceptance_writer in a disposable worktree at `base`; returns the
+    validated set (`valid` False when nothing discriminates)."""
+    leerie_dir = st.run_dir
+    wt = leerie_dir / "worktrees" / f"acceptance-{k}"
+    log_path = leerie_dir / "logs" / f"acceptance-{k}.log"
+    out = {"index": k, "valid": False}
+    # Outside every try: budget exhaustion must propagate, not read as an
+    # invalid set (the same discipline as the no_work_judge call).
+    st.bump_workers(caps)
+    subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                    "--force", str(wt)], capture_output=True, check=False)
+    shutil.rmtree(wt, ignore_errors=True)
+    add = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
+                          "--detach", str(wt), base],
+                         capture_output=True, text=True, check=False)
+    if add.returncode != 0:
+        out["reason"] = f"worktree add failed: {add.stderr.strip()[:200]}"
+        return out
+    try:
+        # The report is usually an untracked file in the user's checkout,
+        # absent from a fresh worktree: copy what the task names.
+        refs = []
+        for f in _glob_task_references(task, st.repo_root):
+            rel = _repo_rel(f, st.repo_root)
+            dst = wt / rel
+            if not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dst)
+            refs.append(rel)
+        if not await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"acceptance-{k}", log_prefix="acceptance"):
+            # Validated without its dependencies, a defect file "fails" on
+            # the base for the wrong reason and could never pass anywhere.
+            out["reason"] = "dependency install failed in the writer worktree"
+            return out
+        scope = st.data.get("defect_scope") or {}
+        gt = scope.get("ground_truth") or {}
+        user = "\n".join([
+            "TASK:", task, "",
+            "Files the task references (read them; they are the report):",
+            *[f"- {r}" for r in refs], "",
+            "DEFECT CONTRACT (from the defect-scope audit): "
+            + (scope.get("defect_shape") or "(none)"), "",
+            "REPORT EXAMPLE INPUTS (verbatim from the report):",
+            json.dumps(gt.get("inline_examples") or [], indent=1), "",
+            "Your current working directory is a disposable checkout of the "
+            "UNFIXED tree. Write the held-out tests per your rules, run them "
+            "here, and return the JSON object per your schema.",
+        ])
+        # What existed before the writer (the dependency install's
+        # output) is never the writer's file.
+        pre = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
+                              "-z"], capture_output=True, text=True,
+                             check=False)
+        if pre.returncode != 0:
+            out["reason"] = "could not read the writer's worktree status"
+            return out
+        pre_untracked = {p for p in pre.stdout.split("\0") if p}
+        res = await claude_p(
+            user_prompt=user,
+            system_prompt=_load_prompt("acceptance_writer"),
+            schema_key="acceptance_writer", cwd=str(wt),
+            allowed_tools=ACT_TOOLS, max_turns=100, autonomous=True,
+            caps=caps, st=st,
+            model=models.get("acceptance_writer", MODEL_DEFAULT),
+            effort=efforts.get("acceptance_writer"),
+            sid=f"acceptance-{k}")
+        # What the writer actually left in the tree (git porcelain —
+        # mechanical CLI output). Validation runs on THIS tree, so the set
+        # must carry exactly it: an edited tracked file invalidates the set,
+        # and every undeclared new file (a fixture module, a helper) becomes
+        # a support file copied with the set — without it a correct fix
+        # fails the set elsewhere.
+        porcelain = subprocess.run(
+            ["git", "-C", str(wt), "status", "--porcelain=v1", "-z",
+             "--untracked-files=no"],
+            capture_output=True, text=True, check=False)
+        # Untracked files INCLUDING ignored ones (no --exclude-standard): a
+        # helper the repo's .gitignore happens to match is still needed.
+        post = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
+                               "-z"], capture_output=True, text=True,
+                              check=False)
+        visible = subprocess.run(["git", "-C", str(wt), "ls-files",
+                                  "--others", "--exclude-standard", "-z"],
+                                 capture_output=True, text=True, check=False)
+        if (porcelain.returncode != 0 or post.returncode != 0
+                or visible.returncode != 0):
+            out["reason"] = "could not read the writer's worktree status"
+            return out
+        for entry in porcelain.stdout.split("\0"):
+            if len(entry) >= 4:
+                out["reason"] = f"writer modified a tracked file: {entry[3:]}"
+                return out
+        new_files = sorted(
+            p for p in post.stdout.split("\0")
+            if p and p not in refs and p not in pre_untracked
+            and not _acceptance_is_cache_path(p))
+        defect, control, cases = [], [], {}
+        for f in (res.get("files") or []):
+            rel = _acceptance_declared_rel(f)
+            # Relative, inside the worktree, a real file, not the report.
+            if (not rel or os.path.isabs(rel) or ".." in Path(rel).parts
+                    or rel in refs):
+                continue
+            p_ = (wt / rel).resolve()
+            if not str(p_).startswith(str(wt.resolve()) + os.sep) \
+                    or not p_.is_file():
+                continue
+            # New files only (code, not the prompt, enforces it): an edited
+            # existing test would collide with the target tree's own copy at
+            # evaluation and could never be run there.
+            if subprocess.run(["git", "-C", str(wt), "cat-file", "-e",
+                               f"{base}:{rel}"], capture_output=True,
+                              check=False).returncode == 0:
+                continue
+            verdict = await _run_acceptance_file(
+                st, caps, str(wt), rel, log_path, f"acceptance-{k}-base",
+                validating=True)
+            if verdict is None:
+                # Not measurable (no test command for this file, the runner
+                # is missing, or it ran no test) — never mistaken for pass
+                # or fail.
+                out["reason"] = f"could not run {rel} on the validity base"
+                return out
+            if f.get("kind") == "defect":
+                # Must FAIL on the unfixed tree, or it cannot discriminate.
+                if verdict is False:
+                    defect.append(rel)
+                    cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
+            elif verdict is True:
+                control.append(rel)
+                cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
+            elif f.get("kind") == "control":
+                out["reason"] = f"control file {rel} does not pass on base"
+                return out
+        if not defect:
+            out["reason"] = "no defect file fails on the validity base"
+            return out
+        # Every undeclared new file travels — a conftest or helper beside the
+        # tests is test-shaped by path and still needed. Declared files that
+        # were dropped (a defect file that passes on base) are not carried.
+        declared_any = {_acceptance_declared_rel(f) for f in
+                        (res.get("files") or [])}
+        not_ignored = {p for p in visible.stdout.split("\0") if p}
+        test_dirs = {os.path.dirname(f) for f in defect + control}
+
+        def _beside_a_test(f: str) -> bool:
+            d = os.path.dirname(f)
+            return any(d == t or (t and d.startswith(t + "/"))
+                       for t in test_dirs)
+        # An ignored file travels only beside a kept test file (fixture
+        # data): elsewhere it is likely build output from the UNFIXED tree
+        # (dist/, target/), which would shadow a correct fix.
+        support = sorted(f for f in new_files if f not in declared_any
+                         and (f in not_ignored or _beside_a_test(f)))
+        dest = leerie_dir / "acceptance" / f"set-{k}"
+        shutil.rmtree(dest, ignore_errors=True)
+        for rel in defect + control + support:
+            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(wt / rel, dest / rel)
+        out.update(valid=True, dir=str(dest), defect_files=defect,
+                   control_files=control, support_files=support, cases=cases)
+        return out
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        out["reason"] = _brief_worker_exc(e)
+        return out
+    except Exception as e:
+        # One writer's failure must not lose the other sets.
+        out["reason"] = f"{type(e).__name__}: {e}"[:200]
+        return out
+    finally:
+        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                        "--force", str(wt)], capture_output=True, check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+
+
+async def phase_acceptance_write(task: str, st: "State", caps: dict,
+                                 models: dict, efforts: dict) -> dict:
+    """Write and mechanically validate the held-out acceptance sets
+    (DESIGN §8 *Held-out acceptance tests*). Fail-open: any skip is
+    recorded with its reason and the gate simply does not run."""
+    if st.data.get("skip_acceptance_check"):
+        return {"skipped": "--skip-acceptance-check"}
+    scope = st.data.get("defect_scope") or {}
+    if not scope.get("applicable"):
+        return {"skipped": "defect-scope audit not applicable"}
+    if not resolve_blt_scoped(st.repo_root).get("test"):
+        log("  acceptance: no scoped test command — held-out acceptance "
+            "tests skipped (declare test_scoped in .leerie/config.toml)")
+        return {"skipped": "no scoped test command"}
+    base = _acceptance_validity_base(st)
+    if not base:
+        return {"skipped": "no validity base"}
+    n = int(caps.get("acceptance_sets", DEFAULT_CAPS["acceptance_sets"]))
+    log(f"phase 2: writing {n} held-out acceptance set(s) against "
+        f"{base[:12]} (DESIGN §8)")
+    sem = asyncio.Semaphore(max(1, int(caps.get("max_parallel", 1))))
+
+    async def _one(k: int) -> dict:
+        async with sem:
+            return await _write_acceptance_set(k, task, st, caps, models,
+                                               efforts, base)
+    results = await _gather_or_cancel(*[_one(k) for k in range(1, n + 1)])
+    sets = [r for r in results if r.get("valid")]
+    for r in results:
+        if not r.get("valid"):
+            log(f"  acceptance set {r['index']} discarded: "
+                f"{r.get('reason', 'invalid')}")
+    log(f"  acceptance: {len(sets)} of {n} set(s) valid")
+    return {"validity_base": base, "sets": sets, "written": n}
+
+
+async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
+                                    sets: list[dict], label: str, *,
+                                    rev: str = "HEAD") -> list[dict]:
+    """`_evaluate_acceptance_sets_inner`, never raising: any failure to set
+    up or run the evaluation (a fork failure on `git worktree add`, a full
+    disk) is no evidence from any set — never an exception that would skip
+    a repair's rollback check."""
+    try:
+        return await _evaluate_acceptance_sets_inner(st, caps, tree, sets,
+                                                     label, rev=rev)
+    except Exception as e:
+        log(f"  acceptance: evaluation failed ({type(e).__name__}: {e}) — "
+            "no evidence either way")
+        return [{"index": s_["index"], "passed": False, "unmeasured": True,
+                 "failing_files": []} for s_ in sets]
+
+
+async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
+                                          sets: list[dict], label: str, *,
+                                          rev: str = "HEAD") -> list[dict]:
+    """Run each valid set against `tree`'s `rev` commit (default HEAD), in
+    a disposable worktree at that commit — never in `tree` itself. Nothing of a set can
+    then linger where a fixer works, not even after a crash mid-run (no
+    `finally` survives a SIGKILL), and no runner cache in `tree` records
+    the hidden tests' ids. A set fails when any of its files fails; a set
+    file whose path the tree already uses is never overwritten and makes
+    the set unmeasured."""
+    log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+    wt = st.run_dir / "worktrees" / "acceptance-eval"
+
+    def _teardown() -> None:
+        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                        "--force", str(wt)], capture_output=True, check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+        # A later evaluation recreates the same path: its install memo must
+        # not survive the tree it describes.
+        _DEPS_INSTALLED.discard(os.path.realpath(wt))
+
+    unmeasured_all = [{"index": s_["index"], "passed": False,
+                       "unmeasured": True, "failing_files": []}
+                      for s_ in sets]
+    head = subprocess.run(["git", "-C", tree, "rev-parse", rev],
+                          capture_output=True, text=True, check=False)
+    if head.returncode != 0:
+        return unmeasured_all
+    _teardown()                     # what a crashed evaluation left
+    add = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
+                          "--detach", str(wt), head.stdout.strip()],
+                         capture_output=True, text=True, check=False)
+    if add.returncode != 0:
+        log(f"  acceptance: could not create the evaluation worktree: "
+            f"{add.stderr.strip()[:200]} — no evidence either way")
+        return unmeasured_all
+    results = []
+    try:
+        if not await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"acceptance-{label}", log_prefix="acceptance"):
+            # Every test would fail for want of a dependency, which an
+            # exit-code verdict cannot tell from the fix failing.
+            log("  acceptance: dependency install failed in the evaluation "
+                "worktree — no evidence either way")
+            return unmeasured_all
+        for s_ in sets:
+            failing, copied, ran = [], [], []
+            unmeasured = False
+            try:
+                for rel in ((s_.get("support_files") or [])
+                            + s_["defect_files"] + s_["control_files"]):
+                    dst = wt / rel
+                    if dst.exists():
+                        # Never overwrite (or run in its place) a file the
+                        # tree already has — and never count the set as
+                        # passing on a file it could not run.
+                        unmeasured = True
+                        continue
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(Path(s_["dir"]) / rel, dst)
+                    copied.append(dst)
+                    if rel not in (s_.get("support_files") or []):
+                        ran.append(rel)
+                for rel in ran:
+                    verdict = await _run_acceptance_file(
+                        st, caps, str(wt), rel, log_path,
+                        f"acceptance-{label}")
+                    if verdict is None:
+                        unmeasured = True
+                    elif verdict is False:
+                        failing.append(rel)
+            except Exception as e:
+                # A copy that fails (a full disk) is no verdict on this set —
+                # and must not escape: a repair's rollback check runs after.
+                log(f"  acceptance: set {s_['index']} could not be placed "
+                    f"({type(e).__name__}) — no evidence from it")
+                unmeasured = True
+            finally:
+                # Sets are isolated from one another: one set's files are
+                # gone before the next set's go in.
+                for dst in copied:
+                    with contextlib.suppress(OSError):
+                        dst.unlink()
+            results.append({"index": s_["index"],
+                            "passed": not failing and not unmeasured,
+                            "unmeasured": unmeasured and not failing,
+                            "failing_files": failing})
+    finally:
+        _teardown()
+    return results
+
+
+def _acceptance_measured(results: list[dict]) -> list[dict]:
+    """Sets that produced a verdict: one whose files could not all be run
+    is no evidence either way (DESIGN §8 *Held-out acceptance tests*)."""
+    return [r for r in results if not r.get("unmeasured")]
+
+
+def _acceptance_majority_fails(results: list[dict]) -> bool:
+    """True unless a strict majority of MEASURED sets passed — a tie is not
+    a passing majority. False when nothing was measured: the caller treats
+    that as no evidence, never as a pass."""
+    measured = _acceptance_measured(results)
+    return bool(measured) and sum(1 for r in measured if r["passed"]) * 2 \
+        <= len(measured)
+
+
+def _format_acceptance_failures_section(results: list[dict],
+                                        sets: list[dict], shown: set[int],
+                                        rnd: int, defect_shape: str,
+                                        rounds: int = 2,
+                                        held_back: bool = True) -> str:
+    """Names, never output or source (DESIGN §8: a conformer shown the
+    runner output special-cased it)."""
+    by_index = {s_["index"]: s_ for s_ in sets}
+    lines = [
+        f"ACCEPTANCE FAILURES (held-out acceptance gate, round {rnd} of "
+        f"{rounds}): "
+        "independent tests written from the defect report alone, by workers "
+        "that never saw this run's code, FAIL on this integrated tree. You "
+        "cannot see the tests or their output; the failing cases are named "
+        "below. They encode the REPORT'S contract — fix the defect at its "
+        "root so the contract holds in general. "
+        + ("Fitting these names will fail the recheck, which also runs "
+           "further tests you are not shown. " if held_back else
+           "Fitting these names alone does not fix the defect. ")
+        + "Re-derive the cause from the report itself (the task names it).",
+    ]
+    for r in results:
+        if r["passed"] or r["index"] not in shown:
+            continue
+        for rel in r["failing_files"]:
+            for c in by_index[r["index"]]["cases"].get(rel, [])[:12]:
+                lines.append(f"  - {c}")
+    lines.append("DEFECT CONTRACT: " + (defect_shape or "(none recorded)"))
+    return "\n".join(lines)
+
+
+async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
+                               models: dict, efforts: dict) -> None:
+    """Post-integration held-out acceptance gate (DESIGN §8 *Held-out
+    acceptance tests*): at most two high-effort repair rounds, non-blocking,
+    with a mechanical rollback if the repair turns the test axis red."""
+    acc = st.data.get("acceptance") or {}
+    sets = acc.get("sets") or []
+    if not sets or (acc.get("gate") or {}).get("final") is not None:
+        return
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        return
+    st.data["current_phase"] = "phase 5: acceptance gate"
+    st.save()
+    gate: dict = dict(acc.get("gate") or {})
+    gate.setdefault("rounds", [])
+    # The pre-repair verdict is reused on resume: re-measured, it would read
+    # an already-repaired tree, and a rolled-back tree would be recorded with
+    # the repaired tree's verdict. It reaches disk with before_sha, before
+    # any repair can commit.
+    if "initial" in gate:
+        initial = gate["initial"]
+    else:
+        initial = await _evaluate_acceptance_sets(st, caps, str(staging),
+                                                  sets, "gate-initial")
+        gate["initial"] = initial
+    # The latest verdict with results: an errored round carries results
+    # only when it committed (and was measured again); otherwise the round
+    # before it still describes the tree.
+    final = next((r["results"] for r in reversed(gate["rounds"])
+                  if r.get("results")), initial)
+    # A recorded before_sha means a repair already started: resume it, so
+    # the rollback check below always runs on what it committed.
+    resumed_repair = bool(gate.get("before_sha"))
+    if not resumed_repair and not _acceptance_measured(initial):
+        log("phase 5: acceptance gate — no held-out set could be run on the "
+            "integrated tree; no evidence either way")
+    elif resumed_repair or _acceptance_majority_fails(initial):
+        measured = _acceptance_measured(initial)
+        log(f"phase 5: acceptance gate — "
+            f"{sum(1 for r in measured if not r['passed'])} of "
+            f"{len(measured)} measured held-out set(s) fail on the integrated "
+            "tree; repairing")
+        ordered = sorted(s_["index"] for s_ in sets)
+        hidden = set(ordered[-2:]) if len(ordered) >= 4 else set()
+        shown = set(ordered) - hidden
+        if not hidden:
+            log(f"  only {len(ordered)} valid set(s): every failing set is "
+                "shown to the repair and none is held back — a weaker check")
+        # Persisted so a resume mid-repair still rolls back to the tree the
+        # repair started from, not to a later repair commit.
+        if not gate.get("before_sha"):
+            gate["before_sha"] = await _branch_head_sha(str(staging))
+            acc["gate"] = gate
+            st.data["acceptance"] = acc
+            st.save()
+        before_sha = gate["before_sha"]
+        blt = resolve_blt(st.repo_root)
+        test_cmd = (blt.get(_AXIS_CMD_KEY["tests"]) or "").strip()
+        # The pre-repair verdict is persisted beside before_sha: re-measured
+        # on resume it would read the already-repaired tree, and a red
+        # repair would then escape the rollback.
+        if test_cmd and "pre_tests_passed" not in gate:
+            try:
+                pre = (await _measure_axes(
+                    str(staging), {"tests": test_cmd}, st, caps,
+                    log_path=leerie_dir / "logs" / "acceptance-repair.log",
+                    verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                    label_prefix="acceptance-pre",
+                    log_prefix="acceptance")).get("tests") or {}
+            except Exception:
+                # Unmeasured: the test-axis rollback rule then cannot fire,
+                # the unmeasurable-sets rule still can.
+                pre = {"measured": False}
+            gate["pre_tests_passed"] = bool(
+                pre.get("passed") and pre.get("measured", True))
+            acc["gate"] = gate
+            st.data["acceptance"] = acc
+            st.save()
+        pre_tests = {"passed": gate.get("pre_tests_passed", False)}
+        shape = (st.data.get("defect_scope") or {}).get("defect_shape") or ""
+        rounds = int(caps.get("acceptance_repair_rounds",
+                              DEFAULT_CAPS["acceptance_repair_rounds"]))
+        if not before_sha:
+            # No rollback target, no repair: nothing could undo a bad one.
+            log("  acceptance: staging HEAD unreadable — no rollback target, "
+                "so no repair; residual recorded")
+            rounds = 0
+        # Rounds already spent before a resume count against the cap.
+        for rnd in range(len(gate["rounds"]) + 1, rounds + 1):
+            # At the top, not only after a round: a resume after a round
+            # that already passed — or after the rollback decision — must
+            # not run another.
+            if gate.get("rolled_back") or not _acceptance_majority_fails(final):
+                break
+            up = [
+                "Run the acceptance repair pass on the merged run branch.",
+                f"LEERIE_DIR is {leerie_dir} (absolute).",
+                "Your current working directory IS the integrated staging "
+                "worktree. Make and commit any fixes here. Every commit "
+                "subject must start with `conformer:`.",
+                f"DIFF_BASE: {st.data.get('working_branch')} (compare with "
+                f"`git diff {st.data.get('working_branch')}..HEAD`)",
+                _format_acceptance_failures_section(
+                    final, sets, shown, rnd, shape, rounds,
+                    held_back=bool(hidden)),
+            ]
+            round_start = await _branch_head_sha(str(staging))
+            try:
+                # Inside the try: an exhausted worker budget ends the
+                # repair like any worker failure, and the rollback check
+                # below still runs on the rounds already committed.
+                st.bump_workers(caps)
+                await claude_p(
+                    user_prompt="\n".join(up),
+                    system_prompt=_load_prompt("conformer"),
+                    schema_key="conformer", cwd=str(staging),
+                    allowed_tools=ACT_TOOLS, max_turns=120,
+                    autonomous=True, caps=caps, st=st,
+                    model=models.get("conformer", MODEL_DEFAULT),
+                    effort=EFFORT_ACCEPTANCE_REPAIR,
+                    sid=f"acceptance-repair-r{rnd}")
+            except Exception as e:
+                # Any failure, not only WorkerError/timeout: `claude_p` lets
+                # an OSError spawning the worker (EAGAIN) through unchanged,
+                # and after an earlier round's commit that must not skip the
+                # rollback check below.
+                entry = {"round": rnd, "error": _brief_worker_exc(e)}
+                # A worker can commit and then fail (a schema miss, a
+                # timeout): the previous verdict no longer describes the
+                # tree, so measure it again.
+                # An unreadable HEAD before or after counts as moved: two
+                # failed reads ("" == "") must not read as "unchanged".
+                now = await _branch_head_sha(str(staging))
+                if not now or now != round_start:
+                    final = await _evaluate_acceptance_sets(
+                        st, caps, str(staging), sets, f"gate-r{rnd}")
+                    entry["results"] = final
+                gate["rounds"].append(entry)
+                acc["gate"] = gate
+                st.data["acceptance"] = acc
+                st.save()
+                break
+            # `_evaluate_acceptance_sets` turns a set it cannot place into
+            # no evidence rather than raising, so the rollback check below
+            # always runs on what this round committed.
+            final = await _evaluate_acceptance_sets(
+                st, caps, str(staging), sets, f"gate-r{rnd}")
+            # Saved per round: a crash before the rollback check must not
+            # lose a spent round, or a resume would run it past the cap.
+            gate["rounds"].append({"round": rnd, "results": final})
+            acc["gate"] = gate
+            st.data["acceptance"] = acc
+            st.save()
+        reason = ""
+        if not gate.get("rolled_back") and before_sha:
+            after_sha = await _branch_head_sha(str(staging))
+            # An unreadable HEAD counts as moved.
+            if not after_sha or after_sha != before_sha:
+                if pre_tests and pre_tests.get("passed") and test_cmd:
+                    try:
+                        post_tests = (await _measure_axes(
+                            str(staging), {"tests": test_cmd}, st, caps,
+                            log_path=(leerie_dir / "logs"
+                                      / "acceptance-repair.log"),
+                            verbosity=st.data.get("verbosity",
+                                                  VERBOSITY_DEFAULT),
+                            label_prefix="acceptance-post",
+                            log_prefix="acceptance")).get("tests") or {}
+                    except Exception:
+                        post_tests = {"measured": False}
+                    if (post_tests.get("measured", True)
+                            and not post_tests.get("passed")):
+                        # A repair must not trade the report for a
+                        # regression.
+                        reason = "turned the test axis red"
+                if (not reason and _acceptance_measured(initial)
+                        and not _acceptance_measured(final)):
+                    # Nor make the held-out sets unmeasurable (a broken
+                    # dependency manifest): the staging test axis would not
+                    # notice, its install being memoised from earlier. But
+                    # every evaluation installs afresh, so a one-off failure
+                    # (a network blip) looks the same. Measure the repaired
+                    # tree once more; only if it still measures nothing while
+                    # the pre-repair tree does is the repair to blame.
+                    retry = await _evaluate_acceptance_sets(
+                        st, caps, str(staging), sets, "gate-retry")
+                    if _acceptance_measured(retry):
+                        final = retry
+                        if gate["rounds"]:
+                            gate["rounds"][-1]["results"] = retry
+                    else:
+                        control = await _evaluate_acceptance_sets(
+                            st, caps, str(staging), sets, "gate-before",
+                            rev=before_sha)
+                        if _acceptance_measured(control):
+                            reason = "left the held-out sets unmeasurable"
+                        else:
+                            log("  acceptance: the pre-repair tree cannot be "
+                                "measured now either — an environment "
+                                "failure, not the repair; the repair is kept")
+            if reason:
+                # The decision is saved before the reset, so a crash between
+                # them cannot record the repaired tree's verdict for the
+                # reset one.
+                gate["rolled_back"] = True
+                gate["rollback_reason"] = reason
+                acc["gate"] = gate
+                st.data["acceptance"] = acc
+                st.save()
+        if gate.get("rolled_back"):
+            # Also the path a resume after the decision takes: the reset is
+            # idempotent. Its result is checked, never assumed.
+            if await _acceptance_rollback(str(staging), before_sha):
+                log(f"  acceptance repair {gate.get('rollback_reason') or ''}"
+                    " — its commits were reset away; residual recorded")
+                final = initial
+            else:
+                gate["rollback_failed"] = True
+                log(f"  WARNING: acceptance repair "
+                    f"{gate.get('rollback_reason') or ''} but resetting staging "
+                    f"to {before_sha[:12] or '(unknown)'} FAILED — the "
+                    "repair's commits remain on the branch")
+                # `final` keeps describing the repair's tree: it is what
+                # ships.
+    gate["final"] = final
+    # A repair that left nothing measurable (it broke the dependency
+    # manifest, say) must not erase a failing verdict: the last measured
+    # one becomes the residual, marked as such.
+    basis, unmeasured_final = final, False
+    if not _acceptance_measured(final):
+        for r in reversed([initial] + [x.get("results") or []
+                                       for x in gate["rounds"]]):
+            if _acceptance_measured(r):
+                basis, unmeasured_final = r, True
+                break
+    if _acceptance_measured(basis) and _acceptance_majority_fails(basis):
+        by_index = {s_["index"]: s_ for s_ in sets}
+        measured = _acceptance_measured(basis)
+        names = [c for r in measured if not r["passed"]
+                 for rel in r["failing_files"]
+                 for c in by_index[r["index"]]["cases"].get(rel, [])]
+        gate["residual"] = {
+            "failing_sets": sum(1 for r in measured if not r["passed"]),
+            "total_sets": len(measured), "cases": names[:20]}
+        if unmeasured_final:
+            gate["residual"]["unmeasured_final"] = True
+        log(f"  WARNING: held-out acceptance residual — "
+            f"{gate['residual']['failing_sets']} of "
+            f"{gate['residual']['total_sets']} measured set(s) still "
+            "fail; shipping anyway (non-blocking), recorded for the next run")
+    elif _acceptance_measured(final):
+        log("phase 5: acceptance gate — held-out sets pass on the "
+            "integrated tree")
+    if gate.get("rollback_failed"):
+        # The repair the gate decided to revert ships anyway: the next run
+        # must hear of it even when its sets pass (a red test axis).
+        res = gate.setdefault("residual", {
+            "failing_sets": 0,
+            "total_sets": len(_acceptance_measured(final)), "cases": []})
+        res["rollback_failed"] = True
+    acc["gate"] = gate
+    st.data["acceptance"] = acc
+    st.save()
+
+
+def _acceptance_can_check(st: "State") -> bool:
+    """Whether held-out acceptance sets can be produced for this run —
+    the precondition for holding a no-work confirmation pending them."""
+    return (not st.data.get("skip_acceptance_check")
+            and "bug-fixing" in (st.data.get("categories") or [])
+            and bool(resolve_blt_scoped(st.repo_root).get("test")))
+
+
+async def _acceptance_rollback(staging: str, before_sha: str) -> bool:
+    """Reset staging to `before_sha` and confirm HEAD is there — the same
+    don't-trust-the-report discipline applied to leerie's own git step (a
+    stale index.lock makes `reset --hard` fail)."""
+    if not before_sha:
+        return False
+    # Up to three attempts, a second apart: a spawn failure (EAGAIN) on the
+    # reset or an unreadable HEAD afterwards is not yet a failed reset.
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(1)
+        try:
+            subprocess.run(["git", "-C", staging, "reset", "--hard",
+                            before_sha], capture_output=True, check=False)
+        except OSError:
+            continue
+        head = await _branch_head_sha(staging)
+        if head:
+            return head == before_sha
+    return False
+
+
+async def _acceptance_write_or_skip(task: str, st: "State", caps: dict,
+                                    models: dict, efforts: dict) -> dict:
+    """`phase_acceptance_write`, recording any failure as a skip — except
+    budget exhaustion (`WorkerError` from `bump_workers`), which stops the
+    run as it does everywhere else. Per-writer failures never reach here."""
+    try:
+        return await phase_acceptance_write(task, st, caps, models, efforts)
+    except WorkerError:
+        raise
+    except Exception as e:
+        log(f"acceptance: writing sets raised {type(e).__name__}: {e} — "
+            "gate disabled for this run")
+        return {"skipped": f"error: {type(e).__name__}"}
+
+
+async def _acceptance_results_on_head(st: "State", caps: dict
+                                      ) -> list[dict] | None:
+    """Run the valid acceptance sets on HEAD (the planning worktree), or
+    None when there are none."""
+    sets = (st.data.get("acceptance") or {}).get("sets") or []
+    if not sets:
+        return None
+    await _ensure_planning_worktree(st)
+    return await _evaluate_acceptance_sets(st, caps, str(_judgment_cwd(st)),
+                                           sets, "head")
+
+
+async def _acceptance_passes_on_head(st: "State", caps: dict) -> bool:
+    res = await _acceptance_results_on_head(st, caps)
+    return (res is not None and bool(_acceptance_measured(res))
+            and not _acceptance_majority_fails(res))
+
+
+def _prior_acceptance_dispute(st: "State") -> bool:
+    """Whether the most recent COMPLETED same-task run already raised an
+    acceptance dispute (DESIGN §8 *disputed at most once*). Same sibling
+    rules as `_prior_delivery_residual`: exact task match, newest first,
+    completed runs only."""
+    task = (st.data.get("task") or "").strip()
+    try:
+        candidates = sorted(
+            (d for d in st.run_dir.parent.iterdir()
+             if d.is_dir() and d.name != st.run_dir.name),
+            key=lambda d: d.stat().st_mtime, reverse=True)
+    except OSError:
+        return False
+    for d in candidates:
+        try:
+            data = json.loads((d / "state.json").read_text())
+            if (data.get("task") or "").strip() != task:
+                continue
+            if (d / "orchestrator.exit_code").read_text().strip() != "0":
+                continue
+        except (OSError, ValueError):
+            continue
+        return bool(data.get("acceptance_dispute"))
+    return False
+
+
+async def _finish_if_every_fix_already_on_head(st: "State", caps: dict,
+                                              fix_ids_before: set[str],
+                                              plans: list[dict]) -> bool:
+    """DESIGN §8 *A plan whose fixes are all already on HEAD ends as no
+    work*: every subtask flagged `fixes_reported_symptom` before the
+    satisfied-probe sweep was dropped by it, and the held-out sets pass on
+    HEAD. Ends the run and returns True; otherwise the plan proceeds. Typed
+    fields and exit codes only. Fail-open: an error proceeds with the plan."""
+    fix_ids_after = {s_["id"] for p_ in plans
+                     for s_ in (p_.get("subtasks") or [])
+                     if s_.get("fixes_reported_symptom")}
+    if not fix_ids_before or fix_ids_after:
+        return False
+    try:
+        passes = await _acceptance_passes_on_head(st, caps)
+    except Exception as e:
+        log(f"acceptance: the already-fixed check raised "
+            f"{type(e).__name__}: {e} — proceeding with the plan")
+        return False
+    if not passes:
+        return False
+    _finish_no_work_run(st, {
+        "<every fix already on HEAD>": (
+            "every subtask fixing the reported symptom was dropped as "
+            "already satisfied, and the held-out acceptance sets pass on "
+            "HEAD")})
+    return True
+
+
+async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
+    """Decide a held no-work confirmation on executed evidence (DESIGN §8
+    *No work is declared on executed evidence, and disputed at most
+    once*). Returns True when the run ended as no work."""
+    conf = st.data.get("no_work_confirmation") or {}
+    judge_evidence = conf.get("judge_evidence") or ""
+    res = await _acceptance_results_on_head(st, caps)
+    if res is None or not _acceptance_measured(res):
+        # No valid sets, or none could be run on HEAD: no evidence either
+        # way, so the judge's confirmation stands (as before this check).
+        st.data["no_work_acceptance"] = {
+            "verdict": "no valid sets" if res is None else "not measurable"}
+        _finish_no_work_run(st, {"<confirmed already-satisfied>":
+                                 judge_evidence})
+        return True
+    if not _acceptance_majority_fails(res):
+        st.data["no_work_acceptance"] = {"verdict": "pass", "results": res}
+        _finish_no_work_run(st, {"<confirmed already-satisfied>":
+                                 judge_evidence + " — and the held-out "
+                                 "acceptance sets pass on HEAD"})
+        return True
+    sets = {s_["index"]: s_ for s_ in
+            (st.data.get("acceptance") or {}).get("sets") or []}
+    # Counts are over measured sets only: an unrunnable set is no evidence.
+    measured = _acceptance_measured(res)
+    failing_sets = sum(1 for r in measured if not r["passed"])
+    cases = [c for r in measured if not r["passed"]
+             for rel in r["failing_files"]
+             for c in sets[r["index"]]["cases"].get(rel, [])][:20]
+    if _prior_acceptance_dispute(st):
+        st.data["no_work_acceptance"] = {"verdict": "accepted after dispute",
+                                         "results": res, "cases": cases}
+        # Carry the marker forward: the dispute-once rule reads only the
+        # newest completed same-task run, so without this the run after an
+        # accepted one would dispute again — every other re-run.
+        st.data["acceptance_dispute"] = {
+            "failing_sets": failing_sets, "total_sets": len(measured),
+            "cases": cases, "accepted": True}
+        log("  WARNING: held-out acceptance sets still fail on HEAD, but the "
+            "previous run of this task already disputed on them — accepting "
+            "no work (disputed at most once). Failing cases: "
+            + "; ".join(cases[:5]))
+        _finish_no_work_run(st, {"<confirmed already-satisfied>":
+                                 judge_evidence + " — accepted after one "
+                                 "acceptance dispute; residual recorded"})
+        return True
+    st.data["no_work_acceptance"] = {"verdict": "dispute", "results": res,
+                                     "cases": cases}
+    st.data["acceptance_dispute"] = {
+        "failing_sets": failing_sets, "total_sets": len(measured),
+        "cases": cases}
+    st.data["no_work_dispute"] = {
+        "classifier_evidence": conf.get("classifier_evidence", ""),
+        "judge_evidence": ("Held-out acceptance tests written from the "
+                           "report fail on HEAD: " + "; ".join(cases)),
+        "checked": []}
+    st.data.pop("no_work_pending", None)
+    st.save()
+    log("  no-work confirmation DISPUTED by the held-out acceptance sets on "
+        f"HEAD ({failing_sets} of {len(measured)} measured set(s) "
+        "fail) — planning the work")
+    return False
+
+
+async def _settle_pending_no_work_failing_open(st: "State",
+                                              caps: dict) -> bool:
+    """`_settle_pending_no_work`, failing open toward the judge's
+    confirmation on any error, as with no valid sets: the acceptance check
+    is evidence, not a gate that may crash the run."""
+    try:
+        return await _settle_pending_no_work(st, caps)
+    except Exception as e:
+        log(f"acceptance: settling the held no-work confirmation raised "
+            f"{type(e).__name__}: {e} — the judge's confirmation stands")
+        st.data["no_work_acceptance"] = {
+            "verdict": f"error: {type(e).__name__}"}
+        _finish_no_work_run(st, {"<confirmed already-satisfied>": (
+            (st.data.get("no_work_confirmation") or {})
+            .get("judge_evidence") or "")})
+        return True
+
+
+def _site_tokens_from_scope(defect_scope: object) -> list[str]:
+    """Lower-cased, de-duplicated site tokens across every inline example
+    the audit recorded."""
+    if not isinstance(defect_scope, dict):
+        return []
+    gt = defect_scope.get("ground_truth") or {}
+    seen: dict[str, None] = {}
+    for e in (gt.get("inline_examples") or []):
+        for t in (e.get("site_tokens") or []):
+            t = str(t).strip().lower()
+            if t:
+                seen.setdefault(t, None)
+    return list(seen)
+
+
+def _warn_site_token_leaks(st: "State", leerie_dir: Path) -> list[dict]:
+    """Advisory: report any site-identifying token from the report's inline
+    examples that this run's diff adds and the base tree does not already
+    contain (DESIGN §5 *The report's own example inputs are captured
+    too*). Tokens are matched as whole words, case-insensitively, against
+    `git diff` added lines — mechanical string containment on an
+    LLM-extracted typed field, never prose interpretation. A token already
+    in the base tree is skipped: measured, that exclusion is what keeps
+    generic words ("go", "cruise") from flagging nearly every commit. It
+    also hides a leak that is already merged, which is why this never
+    gates. Returns the recorded hits."""
+    tokens = _site_tokens_from_scope(st.data.get("defect_scope"))
+    base = st.data.get("working_branch")
+    staging = leerie_dir / "worktrees" / "staging"
+    if not tokens or not base or not staging.is_dir():
+        return []
+    diff = subprocess.run(
+        ["git", "-C", str(staging), "diff", "--unified=0", f"{base}..HEAD"],
+        capture_output=True, text=True, check=False).stdout
+    added: list[tuple[str, str]] = []
+    current = ""
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+        elif line.startswith("+") and not line.startswith("+++"):
+            added.append((current, line[1:]))
+    hits: list[dict] = []
+    for tok in tokens:
+        in_base = subprocess.run(
+            ["git", "-C", str(staging), "grep", "-q", "-w", "-i", "-F",
+             "-e", tok, base, "--"],
+            capture_output=True, check=False).returncode == 0
+        if in_base:
+            continue
+        pat = re.compile(rf"(?<!\w){re.escape(tok)}(?!\w)", re.IGNORECASE)
+        files = sorted({f for f, text in added if pat.search(text)})
+        hits.extend({"token": tok, "file": f} for f in files)
+    if hits:
+        log("  WARNING: this run's diff adds site-identifying name(s) from "
+            "the report's examples (the task may require a site-agnostic "
+            "repo; advisory only):")
+        for h in hits:
+            log(f"    • {h['token']!r} in {h['file']}")
+    st.data["site_token_warnings"] = hits
+    st.save()
+    return hits
 
 
 async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
@@ -35618,6 +36993,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         st.data["subtask_tests"] = resolve_subtask_tests(
             st.repo_root, getattr(args, "subtask_tests", None))
         st.data["skip_base_baseline"] = bool(args.skip_base_baseline)
+        st.data["skip_acceptance_check"] = bool(
+            getattr(args, "skip_acceptance_check", False))
         st.data["skip_repo_map"] = bool(args.skip_repo_map)
         # leerie_version/leerie_commit are set ONCE, at the run's original
         # start, and must stay immutable across every later resume — a
@@ -35727,6 +37104,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                        st.repo_root,
                        getattr(args, "subtask_tests", None)),
                    "skip_base_baseline": bool(args.skip_base_baseline),
+                   "skip_acceptance_check": bool(
+                       getattr(args, "skip_acceptance_check", False)),
                    "skip_repo_map": bool(args.skip_repo_map),
                    "leerie_version": _read_version(),
                    # Must stay beside leerie_version in BOTH branches: the
@@ -35975,6 +37354,20 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             st.data["defect_scope"] = await phase_defect_scope_audit(
                 task, st, caps, models, efforts)
             st.save()
+        # Held-out acceptance sets (DESIGN §8 *Held-out acceptance tests*):
+        # written from the report alone, before the plan exists. Presence-
+        # keyed checkpoint like defect_scope; advisory (a failure records a
+        # skip and the gate never runs) except budget exhaustion, which
+        # stops the run.
+        if ("acceptance" not in st.data
+                and "plans_after_plan" not in st.data):
+            st.data["acceptance"] = await _acceptance_write_or_skip(
+                task, st, caps, models, efforts)
+            st.save()
+        if (st.data.get("no_work_pending")
+                and "no_work_acceptance" not in st.data):
+            if await _settle_pending_no_work_failing_open(st, caps):
+                return
 
         if "plans_after_plan" not in st.data:
             plans = await phase_plan(task, st, caps, models, efforts)
@@ -36149,10 +37542,16 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # moves across a pause; keyed off the detached worktree instead it
             # would be constant by construction and the invalidation would
             # silently never fire.
+            fix_ids_before = {s_["id"] for p_ in plans
+                              for s_ in (p_.get("subtasks") or [])
+                              if s_.get("fixes_reported_symptom")}
             satisfied_no_work = await _filter_satisfied_subtasks(
                 plans, Path(os.getcwd()), st, caps, models, efforts)
             if satisfied_no_work is not None:
                 _finish_no_work_run(st, satisfied_no_work)
+                return
+            if await _finish_if_every_fix_already_on_head(
+                    st, caps, fix_ids_before, plans):
                 return
             # Resumable-planning checkpoint: the filtered `plans`
             # immediately before _schedule() — the last plans_after_*
@@ -36271,6 +37670,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         _write_plan(leerie_dir, task, st, subtasks, waves)
 
     await phase_execute(leerie_dir, st, caps, models, efforts)
+    try:
+        _warn_site_token_leaks(st, leerie_dir)
+    except Exception as e:
+        # Advisory output must never abort a run.
+        log(f"site-token check errored ({type(e).__name__}: {e}); continuing")
     # Delivery gate, first half (DESIGN §8 *The delivery gate*): verify
     # the integrated tree against required_items and hand any
     # confirmed-unmet items to the final-conformer pass below. Advisory
@@ -36316,6 +37720,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         except Exception as e:
             log(f"delivery gate (recheck) raised {type(e).__name__}: {e} "
                 "— surfaced as advisory, finalize proceeds")
+    # Held-out acceptance gate (DESIGN §8 *Held-out acceptance tests*):
+    # after the run's own final conformance, non-blocking.
+    try:
+        await _run_acceptance_gate(leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        log(f"acceptance gate raised {type(e).__name__}: {e} — surfaced as "
+            "advisory, finalize proceeds")
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False),
@@ -36670,6 +38081,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "base is known green or the up-front cost is unwanted. "
                          f"Also {SKIP_BASE_BASELINE_ENV} env or "
                          "skip_base_baseline in leerie.toml. Default: off.")
+    ap.add_argument("--skip-acceptance-check", action="store_true",
+                    help="skip the held-out acceptance tests (DESIGN §8): no "
+                         "acceptance_writer sets are written and the "
+                         "post-integration acceptance gate does not run. "
+                         f"Also {SKIP_ACCEPTANCE_CHECK_ENV} env or "
+                         "skip_acceptance_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-repo-map", action="store_true",
                     help="skip the P6 repo-map structural context (DESIGN §5½ (P6)): "
                          "suppresses _build_repo_map() and the ranked subgraph "
@@ -37102,6 +38519,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
 
     args.skip_base_baseline = resolve_skip_base_baseline(
         repo_root, args.skip_base_baseline)
+    args.skip_acceptance_check = resolve_skip_acceptance_check(
+        repo_root, args.skip_acceptance_check)
 
     args.skip_repo_map = resolve_skip_repo_map(
         repo_root, args.skip_repo_map)
@@ -37147,6 +38566,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             "endpoint. leerie will not silently run without the constrained "
             "decoding you asked for. Drop the flag, or use subscription/API "
             "auth for this run.")
+    if caps["force_strict_output"]:
+        _check_strict_output_cli_version()
 
     # Resolve --pr-template: free-form string (no enum). Re-attach to
     # args so phase_finalize sees the resolved value via

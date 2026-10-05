@@ -405,7 +405,10 @@ The orchestrator gives you, in your prompt:
    subtask's `scope_note` with the reason.
    List each covered site's file in that subtask's
    `files_likely_touched`: the orchestrator mechanically warns when an
-   audited site's file appears in no subtask.
+   audited site's file appears in no subtask. Every site the audit
+   disposed `fix` must be covered; a `ruled_out` site carries the
+   auditor's evidence and needs no subtask unless you find that evidence
+   wrong (then cover it and say why in `scope_note`).
 
    When the `ground_truth` object inside your `defect_scope` ctx
    lists the report's named inputs with every one PRESENT (each
@@ -425,6 +428,21 @@ The orchestrator gives you, in your prompt:
    stand-in for this check — state the limitation in the relevant
    subtask's `scope_note` and keep verification honest about resting
    on fixtures.
+
+   When `ground_truth.inline_examples` lists the report's own example
+   inputs, the plan MUST include a test whose `success_criteria_seed`
+   feeds the decision site each example — VERBATIM when
+   `site_identifying` is false; when true, through a site-neutral
+   substitute that preserves EVERY trigger feature (name the preserved
+   features, and never write any of its `site_tokens`). Put the literal
+   (or the substitute and its preserved features) in the criterion
+   itself; the implementer reads your spec, not the report. A test whose
+   inputs drop a trigger feature does not prove the fix, even if it
+   passes. (Measured: a first run's fix failed on the report's own quoted
+   instruction because its test paraphrased it — the shape is "Below the
+   summary panel, click the 'Export' button" becoming "Click the
+   download button", which drops the "summary panel" mention that
+   triggers the defect.)
 
    **Put the audit's `defect_shape` into every covering subtask's
    `success_criteria_seed`** — each subtask states its OWN site-scoped
@@ -480,7 +498,17 @@ The orchestrator gives you, in your prompt:
    than another hypothesis-scoped fix; if they are still absent, say
    so in `confidence.basis` and keep the plan minimal — stacking more
    unverifiable fixes on an unverifiable pile is how the same task
-   loops. Do not re-plan work the record does not
+   loops. An `acceptance_unmet` entry names held-out acceptance cases —
+   tests written from the report alone, which that run's fix still
+   failed after its repair rounds: plan the root-cause change that makes
+   the report's contract hold for those cases in general, not a change
+   shaped to the case names. `unmeasured_final: true` means the shipped
+   tree could not be measured at all — usually an environment failure —
+   so the verdict is the last one that could be, possibly from before
+   that run's last repair; check the tree before trusting it.
+   `rollback_failed: true` means that run's last repair should have been
+   reverted (it broke the repository's own tests or the held-out tests'
+   setup) and was not: its commits are on the branch — inspect them first. Do not re-plan work the record does not
    dispute. If the tree contradicts the record (someone fixed it since),
    trust the tree and say so in `confidence.basis`.
 

@@ -157,7 +157,9 @@ for whenever the CLI renames a tool.
   `TestRegexPathAbsent` — dep-capture's migration off a regex path onto
   LLM-structured output, see below — is prior art for this same
   principle; see DESIGN.md §"Language-to-JSON: natural-language
-  interpretation is never regex" for the architectural statement.)
+  interpretation is never regex" (§12) for the architectural statement,
+  including why tool-call wire syntax in a worker's output — checked by
+  `_find_protocol_markup` — counts as a mechanical string.)
 - **Every worker — judgment and acting/workhorse alike — defaults to
   `sonnet`.** This was previously split: judgment workers (classify,
   plan, reconcile, judge, verify, gate) defaulted to opus, because
@@ -174,13 +176,18 @@ for whenever the CLI renames a tool.
   "medium"` — that dial is about reproducibility/determinism, not model
   tier, and is unaffected by this change.
   **Separately, `implementer` and `conformer` — the two workers that
-  actually write code — are pinned to `EFFORT_DEFAULT_PER_WORKER =
+  write the fix — are pinned to `EFFORT_DEFAULT_PER_WORKER =
   "low"`,** a deliberate cost/latency trade-off distinct from the
   judgment workers' `medium`: these previously inherited Claude's own
   default reasoning depth (unset, i.e. high) so their effort stayed
   bounded by their own evidence gates (DESIGN §8); that tradeoff is now
   overridden in favor of a fixed low-effort ceiling, with the downstream
-  conformer/confidence-gate loops absorbing the quality difference.
+  conformer/confidence-gate loops absorbing the quality difference. Two
+  scoped exceptions: `acceptance_writer` writes only held-out *tests*, at
+  `medium`; and the held-out acceptance gate's repair rounds call the
+  conformer at `EFFORT_ACCEPTANCE_REPAIR = "high"` regardless of effort
+  overrides — measured as the lever on multi-mechanism defects, paid only
+  by runs whose held-out sets fail (DESIGN §8 *Held-out acceptance tests*).
   `satisfied_probe` remains an explicit `MODEL_DEFAULT_PER_WORKER` entry
   (still sonnet, matching the global default, but kept for its own
   documented reason: it runs once per subtask and throughput dominates,

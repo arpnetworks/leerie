@@ -59,6 +59,28 @@ Cite real files and symbols you actually read. An enumerated site you
 did not read is worse than an omitted one: the planner will scope work
 to what you list.
 
+## Dispose of every site
+
+Listing a site is not deciding it. Trace each reported symptom back
+through the code to every function that can produce it, list each such
+function as its own site, then give each a `disposition`, and put the
+evidence behind it (file:line and what it does) in the site's `note`:
+
+- `fix` — the site must change for the report's symptoms to be gone.
+  This is the default.
+- `ruled_out` — permitted ONLY with code evidence showing this site
+  cannot exhibit the reported symptom on its own.
+
+"A mechanical consequence of the chokepoint" is not a ruling-out by
+itself: show concretely that the chokepoint fix alone changes THIS
+site's output on the report's inputs, or dispose it `fix`. A site with
+its own matching, ranking, filtering, threshold or fallback logic that
+could produce the symptom on correct inputs is `fix`. When the report
+describes several symptoms, each needs at least one `fix` site whose own
+logic explains it. (Measured: the sites later runs had to fix were
+mostly already in an earlier audit's list — as a "consumer" left to
+mechanical consequence.)
+
 ## Unconfirmed-cause reports ARE applicable
 
 A report that describes one live symptom, says the cause is
@@ -121,7 +143,37 @@ this environment and tells both the operator and the delivery judge
 which inputs are absent — this is how a run learns its verification
 can only be hypothesis-shaped BEFORE it ships a fix, instead of
 after. A report with no named external inputs returns
-`{"data_dependent": false, "inputs": [], "repro_command": null}`.
+`{"data_dependent": false, "inputs": [], "repro_command": null, "inline_examples": []}`.
+
+## The report's own example inputs
+
+Also return `ground_truth.inline_examples`: the concrete values the
+report quotes on which the defect manifests — a step instruction
+string, a URL or URL sequence, a hash fragment, a request-body
+fragment, a configuration entry. These are the inputs the fix must be
+proven against; a test that paraphrases them can drop the very feature
+that triggers the defect and pass against a broken fix. For each:
+
+- `literal`: the value copied verbatim from the report — no
+  paraphrase, no trimming of words; join a value the report wraps
+  across lines with single spaces. When the defect needs a SEQUENCE
+  of related inputs to fire, give the whole sequence in one literal,
+  one value per line.
+- `site_identifying`: true when the literal names a real site, brand,
+  company, product or customer, so it cannot be committed verbatim to
+  a repository that must stay site-agnostic; false otherwise.
+- `trigger_tokens`: the SHORT verbatim substrings of the literal (a few
+  words each) that carry the triggering feature and that any faithful
+  substitute must keep word-for-word. Empty when the trigger is purely
+  structural (a shape of a sequence) rather than lexical.
+- `site_tokens`: the words in the literal that identify the real site,
+  brand, company, product or customer — lowercase, one word each.
+  Empty when `site_identifying` is false.
+
+Do not list values that are only outputs or symptoms (log lines, the
+generated code the report shows as wrong) unless they are also
+inputs, and never invent an example the report does not contain.
+`[]` only when the report quotes no concrete input at all.
 
 ## When to say "not applicable"
 
@@ -150,11 +202,11 @@ Return **only** a JSON object per your schema:
   "defect_shape": "candidate matching keys on positional index instead of the declared identity field",
   "sites": [
     {"file": "src/example_module.py", "symbol": "merge_candidates",
-     "line_hint": 120, "role": "decision_site",
-     "note": "three branches share the idiom"},
+     "line_hint": 120, "role": "decision_site", "disposition": "fix",
+     "note": "example_module.py:120-134 compares rows by position; three branches share the idiom"},
     {"file": "src/example_module.py", "symbol": "collect_pending_rows",
-     "line_hint": 480, "role": "bypass",
-     "note": "builds its own plan list; never consults the shared resolver"}
+     "line_hint": 480, "role": "bypass", "disposition": "fix",
+     "note": "example_module.py:480 builds its own plan list; never calls resolve_identity_key"}
   ],
   "chokepoint": {"exists": true, "file": "src/example_module.py",
                  "symbol": "resolve_identity_key",
@@ -169,7 +221,13 @@ Return **only** a JSON object per your schema:
        "role": "the configuration the report's repro loads",
        "resolved_path": null}
     ],
-    "repro_command": "python3 scripts/example_repro.py --dataset /tmp/example-input-dataset/"
+    "repro_command": "python3 scripts/example_repro.py --dataset /tmp/example-input-dataset/",
+    "inline_examples": [
+      {"literal": "Below the summary panel, click the 'Export' button to download the report",
+       "site_identifying": false,
+       "trigger_tokens": ["summary panel", "click the 'Export' button"],
+       "site_tokens": []}
+    ]
   },
   "rationale": "how you searched and what you read"
 }
