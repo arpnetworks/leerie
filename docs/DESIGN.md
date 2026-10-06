@@ -5315,7 +5315,7 @@ completed. The identity write is therefore hoisted to run start, before
 `phase_classify`, so every early-exit path sees a correctly-identified
 `run.json`.
 
-**No work is declared on executed evidence, and disputed at most once.**
+**No work is declared on executed evidence, and a dispute is bounded.**
 A confirmed claim used to end the run on the judge's reading alone, and the
 judge can neither run tests nor, as measured, see the report's contract:
 6 of the 14 no-work confirmations recorded from v0.31.0 through 2026-10-03
@@ -5333,11 +5333,13 @@ sets a repair round would be shown are used: the planners' words reach the
 implementers, and the held-back sets must stay unseen until the gate
 re-judges on them. When no case names are left — only held-back sets fail,
 or the failing shown sets named no cases — the evidence gives the counts,
-saying which of the two it is. But held-out tests
+saying which of the two it is; when some failing shown tests named cases
+and others did not, it says so after the names. But held-out tests
 can be wrong — on a finished task whose report states no expected behaviour,
 all three sets failed it — and a wrong dispute repeated on every re-run
-would be a new infinite loop. So a dispute is raised at most once per task:
-when the previous same-task run already disputed on acceptance evidence, a
+would be a new infinite loop. So a dispute is raised once per task (twice
+when the first goes unacted, below): when the previous same-task run
+already disputed on acceptance evidence, a
 still-failing majority ends the run as no work with a loud warning and the
 residual recorded. The cost of a wrong dispute is bounded to one extra run
 (two when the first dispute goes unacted, below).
@@ -5348,16 +5350,18 @@ still end as no work by another exit — its planners return nothing, or
 the satisfied-probe sweep drops every subtask — and the next run would
 then accept "no work" after a dispute no run ever acted on, leaving the
 defect the tests still show on HEAD unfixed for good. So executed
-evidence outranks the probe: whenever held-out sets exist and a majority
-of them fails on HEAD, the sweep is not offered the subtasks that fix
-the reported symptom (below). And a disputing run that still ends as no
+evidence outranks the probe: whenever held-out sets exist, some of them
+could be run on HEAD, and no strict majority of those passes (a tie counts
+as failing, as everywhere in the gate; nothing measured protects nothing),
+the sweep is not offered the subtasks that fix the reported
+symptom (below). And a disputing run that still ends as no
 work by either of those two planning-time exits records its dispute as not
 acted on, which the next run does not count — once. That re-dispute is
 recorded as such, and if it too ends unacted it counts: two runs have
 then been shown the failing cases and twice produced no work for them —
 the planners found nothing, or none of what they planned was flagged as
 fixing the symptom and the probe judged all of it satisfied — which is
-the wrong-tests case the at-most-once rule exists for, and
+the wrong-tests case the dispute bound exists for, and
 re-disputing it on every run would reopen that loop. So the cost of a wrong
 dispute is bounded to two extra runs, not one, when the first goes unacted.
 (A run that reaches implementation has acted on its dispute, whatever its
@@ -5708,7 +5712,10 @@ represent.
 
 The fix is the per-subtask analogue: before scheduling, a read-only
 **satisfied-probe** evaluates each subtask's `success_criteria_seed` against
-the base tree and soft-drops the ones already met (same shape as
+the base tree — except the subtasks that fix the reported symptom while
+held-out acceptance sets fail on HEAD, which are never offered to it (§8
+*A dispute counts only once it is acted on*) — and soft-drops the ones
+already met (same shape as
 dead-subtask elimination, §5, recorded in `dropped_subtasks`). If all
 subtasks drop, the run routes to `no_work_required`. This is a soft,
 advisory prune subordinate to the no-commits backstop, which remains the
@@ -6069,17 +6076,50 @@ jest and vitest exit 1 alike for "no tests", "could not load" and "a test
 failed"; cargo exits 101 for a build or a test failure; and `go test`
 exits 0 when nothing ran. So where the runner can write a structured
 report of the run — pytest's JUnit XML, the jest-compatible JSON of jest
-and vitest — validation asks for one (a test command that already names
-its own JUnit report path would override the request, so the request is
-then appended after it, where it is the one that counts; where nothing can
-be appended safely — after the runner's command ends, or past a `--` that
-would make the option a file argument — there is no report) and reads how many tests executed
-(a test whose fixture failed to set up counts as executed: it ran and
-failed) and whether the file loaded — pytest marks a file it could not
-collect with a fixed "collection failure" message, which no report option
-renames. A file that ran no test, or could
-not be loaded, is no verdict and discards its set (the gate then has less
-to check, never a false failure) — with one exception. When the report's
+and vitest — validation asks for one and reads how many tests executed (a
+test whose fixture failed to set up counts as executed: it ran and failed)
+and whether the file loaded — pytest marks a file it could not collect
+with a fixed "collection failure" message, which no report option
+renames.
+
+Asking means appending report flags to the test command (or, for pytest,
+setting `PYTEST_ADDOPTS`, unless the command names its own JUnit path,
+which would override it). What runs is the template as written with the
+flags appended, and only when the appended words would land as the last
+arguments of the runner's own simple command. The command is split into
+words and operators by a close reading of bash's rules — quotes kept in
+mind (a quoted `"("` is a word, not a paren; an escaped quote inside
+`${…}` opens nothing), a line continuation joining lines, a comment
+starting only at a word, a newline ending a command as `;` does — noting
+how deep in command substitutions each token sits. It is a reading, not
+bash: the tests pin it against bash's own argv. The file under test never
+counts as the runner, even when named like one. There is no report when,
+from the runner on, anything but words follows at the top level (a
+separator, pipe, redirect, or a `)` closing a subshell the runner runs in
+— a `$(…)` among its arguments is not that), when a `--` after it would
+make the flags file arguments, when the appended word would fall into a
+trailing comment or be joined by a trailing backslash, when the command
+has a heredoc (its body is text, not commands), when the runner runs
+inside a substitution, or when a shell, `eval`, `source` or `.` comes
+before it in its command — each takes what follows as text or as a
+script, not as a program and its arguments (`sh -c jest`, `timeout 60 sh
+-c jest`, `bash run.sh jest`, `eval jest`). A redirect (`2>&1`, `<in.txt`)
+belongs to its command and ends nothing, so neither this nor the container
+check below can be hidden behind one. The placement
+is syntactic: the flags reach the runner when its command is the runner
+or a wrapper that passes arguments on (`npx jest`, `uv run pytest`). A
+command that merely names the runner as an argument (`./run.sh jest`) is
+not told apart and receives the flags itself, as it has since reports
+were introduced. A runner started through a container CLI — `docker`,
+`docker-compose`, `podman`, `nerdctl` or `kubectl` earlier in the simple
+command of any occurrence of the runner, not a container started by an
+earlier command nor one queried inside a `$(…)` for a value — is not
+asked at all: it cannot see the orchestrator's environment, and
+a report path it cannot create would fail a run whose tests pass.
+
+A file that ran no test, or could not be loaded, is no verdict and
+discards its set (the gate then has less to check, never a false failure)
+— with one exception. When the report's
 defect is itself that loading fails (a missing entry point, a module that
 raises on import), the writer says so for that file, and a file that
 cannot load on the base is then the defect showing — provided the file,
@@ -6107,8 +6147,8 @@ Python's (§12); the price is that a writer who declares a guessed import
 produces a test no fix can pass, which costs two repair rounds and a
 residual, never the run. Without a readable report (a runner with none
 known, a report that was not written, or a runner the test command starts
-inside another container, whose files the orchestrator cannot read) validation falls back to the
-runner's own "ran no test" exits where they exist (pytest's), and
+inside another container, which is never asked for one) validation falls
+back to the runner's own "ran no test" exits where they exist (pytest's), and
 otherwise to the exit code alone — so on `go test`, a file that ran
 nothing reads as passing: it cannot become a defect file (it does not
 fail on the base), but it can be accepted as a control that proves
@@ -6130,7 +6170,12 @@ When only hidden sets fail, the round is told exactly that — every failing
 test is one it is not shown — and works from the contract alone, rather
 than being promised a list of failing cases that is empty; when a shown set
 fails but names no cases, it is told that instead, never that tests are
-hidden. A
+hidden; and when named and unnamed failures mix, the names are followed by
+a note that other failing tests declared none. The sets are evaluated on a
+given commit once per invocation (a resume measures afresh): the no-work
+settle, the pre-sweep protection check and the already-fixed check all
+read the same HEAD during planning, so the later ones reuse the first
+measurement. A
 round whose verdict measures nothing where the one before it measured is
 measured once more before the rounds stop on it: every evaluation installs
 afresh, and a one-off install failure would otherwise end the repair with

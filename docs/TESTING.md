@@ -1846,13 +1846,15 @@ against `max_total_workers`, spanning v0.9.95–v0.16.0. The first fix
 (#198: a `create_task` feeder at the spawn plus `to_thread` on both broker
 calls) narrowed the window but still depended on the event loop scheduling
 the feeder within 3 s, and lost every prompt under bursts of synchronous
-work on the loop; #200 replaced it by staging the prompt to a file that is
-the child's stdin before it exists.
-`test_only_a_staged_file_survives_a_blocked_event_loop` drives both
-transports against a blocked loop behaviourally (pipe: lost; file:
+work on the loop; #200 replaced the feeder by staging the prompt to a file
+that is the child's stdin before it exists (the `to_thread` broker calls
+stayed). `test_only_a_staged_file_survives_a_blocked_event_loop` drives
+both transports against a blocked loop behaviourally (pipe: lost; file:
 delivered) rather than trusting source order, and the remaining tests pin
-the staging order, that stdin is never a pipe when a prompt is given, and
-the staged file's cleanup. One harness
+the staging order, that no writer task exists, that stdin is never a pipe
+when a prompt is given, that the broker calls stay off the loop
+(`test_cgroup_calls_do_not_block_the_event_loop`), that `gather` awaits no
+stdin task, and the staged file's cleanup. One harness
 trap: `_invoke_src` strips comments via `tokenize`, not a `#` heuristic (a
 `#` inside a string literal would corrupt the result), because the region's
 comments name the old feeder, `await` and `_cgroup_enroll` while explaining
@@ -4297,12 +4299,13 @@ than its position (the acceptance Read deny follows it for implementer and
 conformer), and the registry tests (`test_resolve_models`,
 `test_resolve_efforts`) list the new worker.
 
-## No work on executed evidence, disputed at most once (2026-10-04)
+## No work on executed evidence, with a bounded dispute (2026-10-04)
 
 A no-work confirmation used to end the run on the read-only judge's word;
 one such confirmation declared done a defect that report-shaped tests still
 reproduce on barnacle's HEAD (DESIGN §8 *No work is declared on executed
-evidence, and disputed at most once*).
+evidence, and a dispute is bounded*; "at most once" until 2026-10-06, when
+an unacted dispute gained one re-dispute).
 
 `tests/test_acceptance_no_work.py`:
 
@@ -4315,9 +4318,9 @@ evidence, and disputed at most once*).
   names only the failing cases, pending cleared, planning continues; failing
   sets after a prior dispute → no work with a WARNING and the dispute marker
   re-recorded with `accepted: true` — carried forward, not a new dispute
-  (falsified by removing the dispute-once branch); no valid sets → the
+  (falsified by removing the accept-after-dispute branch); no valid sets → the
   judge's confirmation stands.
-- **Dispute-once lookup.** Only the newest COMPLETED same-task sibling counts;
+- **Prior-dispute lookup.** Only the newest COMPLETED same-task sibling counts;
   another task's or a crashed run's record is ignored.
 - **A4.** `_acceptance_passes_on_head` over no sets, a passing and a failing
   majority; in `_run_phases` the fix-subtask set is taken before the
@@ -4346,7 +4349,9 @@ tests; see below.)
   (`test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest`):
   absolute and `..` paths are rejected, and any per-writer exception only
   discards that set.
-- **Disputed at most once, really** (`test_a_second_failing_run_accepts_no_work`
+- **Disputed at most once, really** (the rule as of this round; since
+  2026-10-06 an unacted dispute is re-raised once —
+  `test_a_second_failing_run_accepts_no_work`
   asserts the carried-forward marker; `test_a_third_run_still_does_not_dispute`).
 - **Ties are not a passing majority** (`test_majority_rule`).
 - **No residue** — superseded in round 4: evaluation no longer writes the
@@ -4667,7 +4672,8 @@ another exit (empty plans, or the satisfied-probe sweep dropping every
 subtask), and the next run then accepted "no work" on a dispute nobody acted
 on. Seven reversions of the fix, each caught by at least one test below:
 
-- **Protect** (`tests/test_filter_satisfied_subtasks.py::test_protected_subtask_is_never_probed_or_dropped`):
+- **Protect**
+  (`tests/test_filter_satisfied_subtasks.py::test_protected_subtask_is_never_probed_or_dropped`):
   a protected subtask is never handed to the probe, even when the probe would
   call everything satisfied, and the plan is not emptied.
 - **When to protect** (`test_pre_sweep_protect`, six cases;
@@ -4684,24 +4690,26 @@ on. Seven reversions of the fix, each caught by at least one test below:
   `test_an_unacted_dispute_does_not_count`): this run's own dispute is marked
   and persisted, a carried-forward acceptance is not, and the lookup ignores an
   unacted dispute.
-- **Wiring** (`test_run_phases_wiring`, `test_both_other_no_work_exits_mark_the_dispute_unacted`):
-  source-order pins that the protect set is computed before the sweep and
-  passed to it, and that each of the two other no-work exits marks the dispute
-  first. The behaviour of each helper is pinned by the tests above.
+- **Wiring** (`test_run_phases_wiring`,
+  `test_both_other_no_work_exits_mark_the_dispute_unacted`): source-order
+  pins that the protect set is computed before the sweep and passed to it,
+  and that each of the two other no-work exits marks the dispute first. The
+  behaviour of each helper is pinned by the tests above.
 
 #### Review round 1 fixes (2026-10-06)
 
 The first review of #283 found that an unacted dispute was re-raised on every
 run when the held-out tests themselves are wrong: the planners, shown the
 failing cases, correctly return nothing, the dispute goes unacted, and the
-next run disputes again — the loop the at-most-once rule exists to prevent.
-A re-dispute raised past an unacted one is now marked `redispute`, and counts
-even if it too goes unacted (`test_a_wrong_dispute_that_goes_unacted_is_bounded`,
-three runs' state; `test_a_first_dispute_is_not_a_redispute`). The tie case
-and the skip flag gained the cases named above. Five reversions (the
-`redispute` write, counting it, the skip flag, a strict-majority rule in place
-of `_acceptance_majority_fails`, and counting unacted disputes) are each
-caught by at least one test.
+next run disputes again — the loop the at-most-once rule exists to prevent. A
+re-dispute raised past an unacted one is now marked `redispute`, and counts
+even if it too goes unacted
+(`test_a_wrong_dispute_that_goes_unacted_is_bounded`, three runs' state;
+`test_a_first_dispute_is_not_a_redispute`). The tie case and the skip flag
+gained the cases named above. Five reversions (the `redispute` write, counting
+it, the skip flag, a strict-majority rule in place of
+`_acceptance_majority_fails`, and counting unacted disputes) are each caught
+by at least one test.
 
 #### The open #282 LOWs (2026-10-06)
 
@@ -4733,16 +4741,17 @@ held-back split itself, and the placement check on the appended option.
 
 - **An appended option past `--` or `)`**
   (`test_a_command_naming_its_own_junit_path_gets_ours_appended`, now six
-  cases; `test_report_flags_are_placed_only_where_they_reach_the_runner`,
-  now ten — each with a wrapper form whose `--` precedes the runner proper,
-  which must still place): #283 appended `--junitxml=<path>` after a template's own,
-  which after `--` is a file argument and after `)` a syntax error — a
-  working template became a discarded set. `_flags_reach_runner` now
-  refuses both, which means no report, as before #283.
-- **A failing shown set that named no cases** (`test_a_shown_set_naming_no_cases_is_not_called_hidden`,
-  `test_unnamed_shown_failures_are_not_called_held_back`): neither the
-  repair section nor the dispute evidence calls it held back; and a shown
-  set with no verdict is not such a failure
+  cases; `test_report_flags_are_placed_only_where_they_reach_the_runner`, now
+  ten — each with a wrapper form whose `--` precedes the runner proper, which
+  must still place): #283 appended `--junitxml=<path>` after a template's own,
+  which after `--` is a file argument and after `)` a syntax error — a working
+  template became a discarded set. `_flags_reach_runner` now refuses both,
+  which means no report, as before #283.
+- **A failing shown set that named no cases**
+  (`test_a_shown_set_naming_no_cases_is_not_called_hidden`,
+  `test_unnamed_shown_failures_are_not_called_held_back`): neither the repair
+  section nor the dispute evidence calls it held back; and a shown set with no
+  verdict is not such a failure
   (`test_an_unmeasured_shown_set_is_not_a_failure_without_names`).
 - **The accepted-after-dispute WARNING**
   (`test_accepted_warning_never_ends_in_an_empty_case_list`).
@@ -4754,3 +4763,235 @@ Seven reversions, each caught by at least one test: dropping the `)`/`--`
 check, keeping only `)`, keeping only `--`, the unnamed-shown section branch,
 the evidence's not-named reason, the WARNING's empty list, and the
 re-added worktree reset.
+
+#### Post-merge review of #283 and #284 (2026-10-06)
+
+- **Placement** (`test_report_flags_are_placed_only_where_they_reach_the_runner`
+  and `test_a_command_naming_its_own_junit_path_gets_ours_appended` gained
+  `$(…)`, grouped-operator and container cases;
+  `test_a_file_named_like_the_runner_is_never_the_runner`, two cases;
+  `test_a_containerised_pytest_gets_no_environment_request_either`;
+  `test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes`): a
+  `$(…)` among the runner's arguments no longer stops placement (#284 had
+  made `--maxWorkers=$(nproc)` lose jest's report); a `)` stops it only when
+  it closes a subshell the runner runs in; operator characters `shlex`
+  groups (`))`, `)&&`) are read one at a time; the rendered file is never a
+  runner token; and a runner started through a container CLI gets no
+  report request (an appended path it cannot create failed a passing run).
+- **Mixed named and unnamed failures**
+  (`test_mixed_named_and_unnamed_failures_say_the_list_is_partial`,
+  `test_dispute_evidence_says_when_names_are_partial`).
+- **The planner's reading of acceptance evidence**
+  (`test_the_planner_prompt_names_the_evidence_prefix_the_settle_writes`):
+  `prompts/planner.md` tells planners how to read counts-only evidence by
+  its opening words; the test pins that the settle still writes them.
+- **One evaluation per commit**
+  (`test_head_results_are_measured_once_per_commit`): the settle, the
+  pre-sweep check and the already-fixed check share one measurement; one that
+  measured nothing is not kept.
+
+Ten reversions, each caught by at least one test: the file exclusion in
+placement and in runner detection, the paren depth, the character-wise
+operator scan, the `--` stop, the container check, the mixed-name note in
+the section and in the evidence, the cache read, and the rule never to
+cache a measurement that measured nothing.
+
+##### Review round 1 of the post-merge fixes (2026-10-06)
+
+- **Container check scoped to the runner's own command**
+  (`test_report_flags_are_placed_only_where_they_reach_the_runner` gained
+  `docker compose up -d db && npx jest …` and `--rootDir docker`, both
+  placed; `test_a_containerised_pytest_gets_no_environment_request_either`
+  now also asserts a host pytest after `docker compose up` keeps its
+  environment request). The first version matched `docker` anywhere and
+  cost a common start-the-database template its report.
+- **Files compared normalised**
+  (`test_a_file_named_like_the_runner_is_never_the_runner` gained
+  `./t/jest`).
+- **Operator characters read one at a time, really**: a `))` closing a
+  `$(…)` and the runner's subshell at once (the earlier grouped cases sat at
+  depth 0, where a whole-token reading also refused, so that reversion
+  passed).
+- **The mixed-name note follows every name**, the import list included
+  (`test_mixed_named_and_unnamed_failures_say_the_list_is_partial`).
+- **The accept message names the bound, not "one dispute"**
+  (`test_a_second_failing_run_accepts_no_work`).
+- **A fresh `_HEAD_ACCEPTANCE_RESULTS` per test** (`tests/conftest.py`'s
+  autouse `_fresh_head_acceptance_results`): the `leerie` module is
+  session-scoped.
+
+Five reversions, each caught: the container check over the whole command,
+raw-token file comparison, a whole-token operator reading, the note before
+the import list, and the old accept message.
+
+##### Review round 2 of the post-merge fixes (2026-10-06)
+
+- **The container check per runner occurrence, from the separator before
+  it** (`test_only_a_container_that_starts_the_runner_withholds_the_report`,
+  seven cases): round 1 sliced from the command's LAST separator, so a
+  runner in a container followed by `&& docker compose down`, `| tee` or
+  `|| true` was missed; a later containerised occurrence after a host
+  `pytest --version` was missed; `docker-compose` (v1) was unknown; and a
+  `$(docker port db)` computing a value counted as starting the runner.
+  The `)&&` case pins that grouped operator tokens still separate.
+- **A newline ends a command** (`test_a_newline_ends_the_runner_command`);
+  a trailing one is stripped.
+- **Runner detection reads operators as placement does**
+  (`test_runner_detection_reads_operators_as_the_shell_does`, three cases):
+  `(pytest x)` and `cd w&&pytest x` used to find no runner.
+
+Eight reversions, each caught: slicing from the last separator, checking
+only the first occurrence, counting a container inside `$(…)`, dropping
+`docker-compose`, lexing newlines as whitespace, not stripping the trailing
+newline, plain `shlex.split` for runner detection, and not reading grouped
+separators.
+
+##### Review round 3 of the post-merge fixes (2026-10-06)
+
+- **The command is read as bash reads it** (`_shell_unfold`, replaced in round
+  6 by `_shell_scan`):
+  `test_continuations_and_comments_are_read_as_bash_reads_them` (four cases)
+  and the container cases for multi-line `docker run \`/`docker compose run \`
+  templates pin that a backslash-newline joins lines (shlex had made it a
+  newline token, which round 2 then read as a separator), a trailing comment
+  does not swallow appended flags, and a comment does not swallow the newline
+  after it. `test_unfolding_does_not_change_what_bash_runs` (replaced in round
+  6) (seven cases) runs each raw and unfolded command through real bash.
+- **A `#` inside a word is not a comment** (the `uvx --from …#subdirectory`
+  case in `test_runner_detection_reads_operators_as_the_shell_does`, whose
+  three other cases now each fail under plain `shlex.split`), and a runner
+  named only in a comment is not detected
+  (`test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes`).
+- **A separator inside a `$(…)`** ends the substitution's command only, both
+  for a container CLI inside it and one before it.
+
+Seven reversions, each caught: tokenising the raw command, keeping
+continuations, a comment at any `#`, shlex's default commenters, separators
+inside `$(…)` ending the runner's command, appending to the raw command,
+and ignoring single quotes.
+
+##### Review round 4 of the post-merge fixes (2026-10-06)
+
+- **What runs is the template as written, flags appended**
+  (`test_continuations_and_comments_are_read_as_bash_reads_them`, now
+  seven cases, asserts the exact command): round 3 ran the unfolded
+  rewrite, so any reading that differed from bash — a heredoc body's `#`
+  lines, a backslash-newline in a quoted heredoc — changed what ran.
+  Placement now also needs the appended word to lex as the last word of
+  the same command, and never enters a command with a heredoc.
+- **`_shell_unfold` closer to bash**
+  (`test_unfolding_does_not_change_what_bash_runs` (replaced in round 6), now
+  fourteen cases): a `#` after a substitution's `)` is mid-word and after a
+  subshell's starts a comment; `$'…'` takes backslash escapes; a CR is a word
+  character; `${x#y}`, `$#` and `$((16#ff))` are untouched.
+- **Backtick substitutions in the container check**
+  (`test_only_a_container_that_starts_the_runner_withholds_the_report`,
+  now thirteen cases).
+
+Seven reversions, each caught: running the unfolded form, dropping the
+appended-word check, dropping the heredoc check, a substitution's `)`
+read as an operator, a CR read as whitespace, no `$'…'` quoting, and no
+backtick tracking.
+
+##### Review round 5 of the post-merge fixes (2026-10-06)
+
+- **Placement refuses what the token scan cannot see into**
+  (`test_continuations_and_comments_are_read_as_bash_reads_them`, now
+  thirteen cases): a backtick after the runner, a quoted `$(…)` hiding that
+  the runner runs inside it, a runner handed to `sh -c` as text, and a
+  heredoc `<<` grouped with another operator (`(cat)<<EOF`). A trailing
+  line continuation is dropped rather than refused.
+- **The flags arrive as the runner's last arguments**
+  (`test_placed_flags_arrive_as_the_runners_last_arguments`, seven cases):
+  each placed command runs through real bash with `jest` defined to print
+  its arguments. Two cases have an earlier occurrence of the runner inside a
+  `$(…)` or backticks, which must not stop placement.
+- **A CR stays in its word**
+  (`test_a_carriage_return_is_part_of_a_word_as_in_bash`), and `_shell_unfold`
+  handles `${…}` and `<(…)` (`test_unfolding_does_not_change_what_bash_runs`
+  (replaced in round 6), now sixteen cases).
+
+Nine reversions, each caught: dropping the backtick-after check, widening
+it to any backtick, splitting words on CR, dropping the quoted-`$(…)` check,
+dropping the `-c` check, matching only a bare `<<`, keeping a trailing
+continuation, ignoring `${…}`, and treating `<(` as a subshell.
+
+##### Review round 6 of the post-merge fixes (2026-10-06)
+
+Round 6 found that the rules layered on `shlex` could not be made right:
+`shlex` drops the quotes that tell a quoted `"("` from a subshell's paren,
+so `(npx jest -t "(" x)` and `X=$(npx jest -t "(" x)` placed flags where
+they broke the command or reached `echo`. `_shell_scan` replaces `shlex`,
+`_shell_unfold` and the rules over them: it splits a command into words and
+operators as bash does, keeping quoting in mind and recording how deep in
+command substitutions each token sits, and the placement rules become plain
+statements over those tokens.
+
+- **Scanner against bash** (`test_scanned_words_are_the_words_bash_passes`,
+  twelve cases, exact argv; `test_expanding_words_split_where_bash_splits_them`,
+  nine cases, word boundaries; `test_expansions_keep_their_words_whole`, two
+  cases; `test_a_subshell_paren_is_an_operator_and_a_comment_may_follow`;
+  `test_a_carriage_return_is_part_of_a_word_as_in_bash`).
+- **Placement** (`test_continuations_and_comments_are_read_as_bash_reads_them`,
+  `test_placed_flags_arrive_as_the_runners_last_arguments` and the
+  container and detection tests, unchanged in intent): a quoted paren, a
+  runner inside a substitution and `sh -xc jest` are refused; a backtick
+  among the runner's arguments (`--maxWorkers=`nproc``) and a quoted
+  substitution there (`-t "$(echo "a b")"`) place again. (Round 7 found
+  no test held `sh -xc jest` or the two placements; they are pinned from
+  round 7 on.)
+- **Fuzzing, not committed as tests:** 40,000 random inputs scanned with no
+  exception or hang; and of 20,000 random valid templates with the runner
+  in command position, all 4,739 that were placed delivered the flags as
+  the runner's last two arguments under real bash.
+
+Fourteen reversions, each caught: placing at any depth, refusing only
+separators, dropping the `--` check, dropping the shell check, no comments,
+no continuations, no backtick frames, ignoring heredocs, dropping the probe
+check, container CLIs at any depth, no `${…}` frames, unquoted handling
+inside double quotes, no `$'…'`, and no `<(…)` frames.
+
+##### Review round 7 of the post-merge fixes (2026-10-06)
+
+- **Escaped quotes and braces inside `${…}`**: in
+  `T=a; npx jest ${T//\'/} && cd …` the scan opened a quote at `\'`, so
+  flags went to `cd`. A case in
+  `test_continuations_and_comments_are_read_as_bash_reads_them` pins it.
+  That test also gained a `|<<` heredoc run, `eval jest \;` (new this
+  round), and the shapes round 6 claimed but did not test: `sh -xc jest`,
+  `--maxWorkers=`nproc`` and `-t "$(echo "a b")"`.
+- **`eval`** joins `_SHELLS`: it re-parses appended flags as a command.
+- **Runner detection survives a scan that cannot close**
+  (`test_runner_detection_reads_operators_as_the_shell_does` gained an
+  unparenthesised `case` inside `$(…)`): exit codes still apply.
+- **A trailing CR stays in the command that runs**
+  (`test_a_trailing_carriage_return_stays_in_the_command_that_runs`).
+
+Seven reversions, each caught: no `${…}` escapes, no `eval`, no fallback
+detection, stripping a trailing CR, the old exact `-c` check, a backtick
+after the runner refusing placement, and matching only a bare `<<`.
+
+##### Review round 8 of the post-merge fixes (2026-10-06)
+
+- **A redirect ends no command** (`_is_control_op`): `docker compose run
+  web 2>&1 npx jest …` had `2>&1` taken for the end of the container's
+  command, so the containerised jest got the flags; `sh 2>/dev/null -c
+  jest` and `eval >o jest x` hid the shell and `eval` the same way. Cases
+  in `test_only_a_container_that_starts_the_runner_withholds_the_report`
+  and `test_continuations_and_comments_are_read_as_bash_reads_them` pin
+  both, with a redirect in an earlier command still placing.
+- **`source` and `.`** join `_SHELLS`; a shell anywhere before the runner
+  in its command is refused (`timeout 60 sh -c jest`).
+- **The scan against bash, for what round 7 changed and more**
+  (`test_expanding_words_split_where_bash_splits_them` gained escaped
+  `}`, `'` and `"` inside `${…}` and a comment inside backticks, which
+  ends at the backtick; `test_scanned_words_are_the_words_bash_passes`
+  gained `$"…"` and a lone trailing backslash, which bash keeps).
+- **The detection fallback drops comments**
+  (`test_runner_detection_reads_operators_as_the_shell_does`: a runner
+  named only in a comment after an unclosable `case` is not detected).
+
+Six reversions, each caught: a redirect ending the command, no `source`
+or `.`, a fallback that keeps comments, `$"…"` keeping its `$`, a
+backtick comment running to the newline, and no `${…}` escapes.
+

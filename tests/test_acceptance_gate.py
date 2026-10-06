@@ -589,6 +589,19 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
     # The wrapper names the runner as a package before its own `--`: the
     # runner proper comes after it, so the flags reach it (#284 review).
     ("npx -p jest -- jest acc/a.test.js", True),
+    # A `$(…)` among the runner's arguments is not a subshell it runs in.
+    ("npx jest --maxWorkers=$(nproc) acc/a.test.js", True),
+    # Nested subshell parens close around the runner.
+    ("((npx jest acc/a.test.js))", False),
+    ("npx jest acc/a.test.js)&&echo", False),
+    # A container's runner gets no request: it cannot write our path.
+    ("docker compose run web npx jest acc/a.test.js", False),
+    # A container an EARLIER command starts, or `docker` among the
+    # runner's arguments, leaves the runner on the host.
+    ("docker compose up -d db && npx jest acc/a.test.js", True),
+    ("npx jest --rootDir docker acc/a.test.js", True),
+    # A `))` closing a `$(…)` and the subshell at once: read per character.
+    ("(cd w && npx jest $(echo acc/a.test.js))", False),
 ])
 def test_report_flags_are_placed_only_where_they_reach_the_runner(
         leerie, tmp_path, cmd, placed):
@@ -621,6 +634,8 @@ def test_pytest_is_asked_for_junit_through_its_environment(
     ("(cd sub && python3 -m pytest --junitxml=own.xml {f})", False),
     # A wrapper's own `--` before the runner proper is not the runner's.
     ("uv run --with pytest -- pytest --junitxml=own.xml {f}", True),
+    ("pytest --junitxml=own.xml $(echo -q) {f}", True),
+    ("docker compose run app pytest --junitxml=own.xml {f}", False),
 ])
 def test_a_command_naming_its_own_junit_path_gets_ours_appended(
         leerie, tmp_path, monkeypatch, cmd, placed):
@@ -648,6 +663,269 @@ def test_an_appended_junit_path_is_the_report_pytest_writes(
                    capture_output=True, check=False)
     assert leerie._parse_runner_report(kind, tmp_path / "r.xml") == {
         "executed": 1, "collection_error": False}
+
+
+@pytest.mark.parametrize("cmd,rel", [
+    ("pytest --junitxml=own.xml -- tests/pytest", "tests/pytest"),
+    ("npx jest -- t/jest", "t/jest"),
+    # Compared normalised: `./` does not make the file a runner.
+    ("npx jest -- ./t/jest", "t/jest"),
+])
+def test_a_file_named_like_the_runner_is_never_the_runner(
+        leerie, tmp_path, cmd, rel):
+    """#284 review: a file argument named like the runner moved the stopper
+    scan past the template's own `--`, so ours landed after it as a file
+    argument (measured: pytest exit 4, no report). The rendered file is
+    excluded; the `--` then stops placement — no report, never a broken
+    run."""
+    assert leerie._acceptance_report_spec(cmd, tmp_path / "r", [rel]) is None
+
+
+def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
+    """A repo script run over a file named `pytest` is not pytest: its exit
+    5 must not read as pytest's "collected nothing" no-verdict."""
+    cmd = "./run-tests tests/pytest"
+    assert leerie._acceptance_no_verdict_exits(cmd, ["tests/pytest"]) == \
+        frozenset()
+    assert 5 in leerie._acceptance_no_verdict_exits(cmd)
+    # Nor does a runner named only in a comment.
+    assert leerie._acceptance_no_verdict_exits(
+        "./run-tests acc/test_a.py  # wraps pytest") == frozenset()
+
+
+@pytest.mark.parametrize("cmd,asked", [
+    # The runner in a container even though it is not the last command.
+    ("docker compose run --rm app pytest acc/test_a.py && docker compose down",
+     False),
+    ("docker run img pytest acc/test_a.py | tee out", False),
+    # Any occurrence counts: here the host pytest only prints its version.
+    ("pytest --version && docker run img pytest acc/test_a.py", False),
+    ("docker-compose run app pytest acc/test_a.py", False),
+    # A container queried for a value leaves the runner on the host.
+    ("DB_PORT=$(docker port db 5432) pytest acc/test_a.py", True),
+    ("DB_PORT=$(docker port db 5432) npx jest acc/a.test.js", True),
+    # A redirect belongs to its command: it hides no container CLI
+    # (#285 round-8 review).
+    ("docker compose run --rm web 2>&1 npx jest acc/a.test.js", False),
+    ("docker run -i img <in.txt npx jest acc/a.test.js", False),
+    ("docker compose up -d db 2>&1 && npx jest acc/a.test.js", True),
+    # A subshell's `)` and a following `&&` end the container's command.
+    ("(docker compose up -d db)&&pytest acc/test_a.py", True),
+    # A separator inside a `$(…)` ends the substitution's command only —
+    # whether the container CLI is inside it or before it.
+    ("X=$(cd db; docker port db 5432) pytest acc/test_a.py", True),
+    ("docker run img env T=$(date; true) pytest acc/test_a.py", False),
+    # Backticks are the older spelling of `$(…)`.
+    ("X=`cd db; docker port db` npx jest acc/a.test.js", True),
+    ("docker run img env T=`date; true` pytest acc/test_a.py", False),
+    # A line continuation does not end the container's command.
+    ("docker run --rm \\\n  -v $PWD:/app img \\\n  pytest acc/test_a.py",
+     False),
+    ("docker compose run app \\\n  npx jest acc/a.test.js", False),
+])
+def test_only_a_container_that_starts_the_runner_withholds_the_report(
+        leerie, tmp_path, monkeypatch, cmd, asked):
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    assert (leerie._acceptance_report_spec(cmd, tmp_path / "r")
+            is not None) is asked
+
+
+def test_a_newline_ends_the_runner_command(leerie, tmp_path):
+    """Appended after `echo done`, the flags would never reach jest; a
+    trailing newline alone does not count."""
+    assert leerie._acceptance_report_spec(
+        "npx jest acc/a.test.js\necho done", tmp_path / "r") is None
+    cmd, _env, _kind = leerie._acceptance_report_spec(
+        "npx jest acc/a.test.js\n", tmp_path / "r")
+    assert cmd.startswith("npx jest acc/a.test.js --json ")
+
+
+@pytest.mark.parametrize("cmd,placed", [
+    # Continuations are read as joined lines, and the template still runs
+    # exactly as written, the flags appended (#285 round-4 review: running
+    # an unfolded rewrite ran whatever the lexer got wrong).
+    ("npx jest \\\n  acc/a.test.js", True),
+    ("npx jest acc/a.test.js \\\n  --ci", True),
+    ("npx jest --testNamePattern=$(cat pat)#x acc/a.test.js", True),
+    # Appended flags would be commented out, or joined into the last word.
+    ("npx jest acc/a.test.js # c", False),
+    ("npx jest acc/a.test.js \\", False),
+    # A comment does not swallow the newline that ends the command.
+    ("npx jest acc/a.test.js # c\necho done", False),
+    # A heredoc body is text, not commands: never placed into — also when
+    # `<<` follows another operator character in one run (`|<<`).
+    ("cat > s.sh <<'EOF'\n# prep\nEOF\nnpx jest acc/a.test.js", False),
+    ("(cat)<<EOF\nx\nEOF\nnpx jest acc/a.test.js", False),
+    ("echo|<<EOF cat\nx\nEOF\nnpx jest acc/a.test.js", False),
+    # A trailing continuation joins nothing; left bare, its backslash would
+    # escape the space before the flags.
+    ("npx jest acc/a.test.js \\\n", True),
+    # A runner inside a substitution, or handed to a shell or `eval` as
+    # text: refused.
+    ("OUT=`npx jest acc/a.test.js`", False),
+    ('echo "$(echo " ; npx jest acc/a.test.js "y)"', False),
+    ("X=$(npx jest acc/a.test.js)", False),
+    ("sh -c jest", False),
+    ("sh -xc jest", False),
+    ("eval jest \\;", False),
+    # A shell, `eval`, `source` or `.` anywhere before the runner in its
+    # command, a redirect in between or not.
+    ("timeout 60 sh -c jest", False),
+    ("sh 2>/dev/null -c jest", False),
+    ("eval >o jest acc/a.test.js", False),
+    (". run.sh jest acc/a.test.js", False),
+    ("source run.sh jest acc/a.test.js", False),
+    # A redirect in an earlier command ends nothing that matters here.
+    ("cd web 2>/dev/null && npx jest acc/a.test.js", True),
+    # An escaped quote inside `${…}` opens nothing: the runner's command
+    # still ends at the `&&` (#285 round-7 review).
+    ("T=a; npx jest ${T//\\'/} && cd ${T//\\'/}", False),
+    # Substitutions among the runner's arguments are the substitutions'
+    # words: placement goes ahead.
+    ("npx jest --maxWorkers=`nproc` acc/a.test.js", True),
+    ('npx jest -t "$(echo "a b")" acc/a.test.js', True),
+])
+def test_continuations_and_comments_are_read_as_bash_reads_them(
+        leerie, tmp_path, cmd, placed):
+    spec = leerie._acceptance_report_spec(cmd, tmp_path / "r")
+    if not placed:
+        assert spec is None
+    else:
+        assert spec[0] == (f"{leerie._strip_trailing_blank(cmd)} --json "
+                           f"--outputFile={tmp_path / 'r'}")
+
+
+def test_a_trailing_carriage_return_stays_in_the_command_that_runs(
+        leerie, tmp_path):
+    """bash reads a trailing CR as part of the last word; validation must
+    run that same word, not a stripped one (#285 round-7 review)."""
+    cmd, _env, _kind = leerie._acceptance_report_spec(
+        "npx jest acc/a.test.js\r", tmp_path / "r")
+    assert cmd.startswith("npx jest acc/a.test.js\r --json ")
+
+
+def test_a_carriage_return_is_part_of_a_word_as_in_bash(leerie):
+    """bash splits words on space, tab and newline only: a CR stays in the
+    word, so `jest\\r` is not jest."""
+    tokens, _heredoc = leerie._shell_scan("echo a\r#b c")
+    assert [t for _k, t, _d in tokens] == ["echo", "a\r#b", "c"]
+
+
+@pytest.mark.parametrize("cmd", [
+    "jest acc/a.test.js", "cd . && jest acc/a.test.js",
+    # An earlier occurrence inside a substitution does not stop placement:
+    # the flags reach the last one.
+    "X=$(jest --version) jest acc/a.test.js",
+    "X=`jest --version` jest acc/a.test.js",
+    "jest \\\n  acc/a.test.js \\\n", "jest --maxWorkers=$(echo 2) acc/a.test.js",
+    "jest acc/a.test.js\r\n",
+])
+def test_placed_flags_arrive_as_the_runners_last_arguments(leerie, tmp_path,
+                                                           cmd):
+    """Behavioural: run the placed command through real bash with `jest`
+    defined to print its arguments; ours must be the last two."""
+    run_cmd, _env, _kind = leerie._acceptance_report_spec(
+        cmd, tmp_path / "r.json")
+    out = subprocess.run(
+        ["bash", "-c", "jest() { printf '%s\\n' \"$@\"; }\n" + run_cmd],
+        capture_output=True, text=True, check=False).stdout.splitlines()
+    assert out[-2:] == ["--json", f"--outputFile={tmp_path / 'r.json'}"]
+
+
+def _bash_argv(args: str) -> list[str]:
+    """The arguments bash passes for `args`, read back as bytes (a CR must
+    survive the round trip)."""
+    out = subprocess.run(["bash", "-c", "printf '%s\\0' " + args],
+                         capture_output=True, check=False).stdout
+    return out.decode().split("\0")[:-1]
+
+
+def _scanned_args(leerie, args: str) -> list[str]:
+    tokens, _heredoc = leerie._shell_scan("printf '%s\\0' " + args)
+    return [t for k, t, d in tokens if k == "word" and d == 0][2:]
+
+
+@pytest.mark.parametrize("args", [
+    "a \\\n  b", "a # c d", '"x\\\ny" z', "'p\\\nq' r", "u#v w",
+    "a\\ #b c", "a\r#b c", "$'a\\'b # c' d", "'a b' c", "\"a'b\" c",
+    # A quoted or escaped paren is a word, never an operator.
+    '-t "(" x', "-t \\( x",
+    # `$"…"` is a double-quoted string; a lone trailing backslash stays.
+    '$"x y" z', "a \\",
+])
+def test_scanned_words_are_the_words_bash_passes(leerie, args):
+    """Literal words: the scan's top-level words are bash's argv exactly."""
+    assert _scanned_args(leerie, args) == _bash_argv(args)
+
+
+@pytest.mark.parametrize("args", [
+    "$(echo m # n\n) o",
+    # A substitution's `)` ends a word part; `<(…)` substitutes too.
+    "$(echo a)#b", "<(echo a)#c d", "--w=`echo 2` x",
+    # A `#` inside `${…}` or `$((…))` is an operator, never a comment.
+    '"${x:-a #b}" c', '"${x#y}" z', "$# q", "$((16#ff))",
+    # Quotes nest inside a substitution inside quotes.
+    '"$(echo "a b")" c',
+    # Escaped braces and quotes inside `${…}` are literal characters.
+    "${U:-x\\}y} c", "${U:-\\'q} c", '${U:-\\"q} c',
+    # A comment inside backticks ends at the closing backtick.
+    "`echo a #b` c",
+])
+def test_expanding_words_split_where_bash_splits_them(leerie, args):
+    """Expanding words: the scan keeps a substitution as its brackets, so
+    only the word boundaries are compared — one word per argument bash
+    passes."""
+    assert len(_scanned_args(leerie, args)) == len(_bash_argv(args))
+
+
+@pytest.mark.parametrize("cmd,words", [
+    # A `#` inside `${…}` is never a comment.
+    ("echo ${x:-a #b} c", ["echo", "${x:-a #b}", "c"]),
+    # `<(…)` substitutes, so its `)` ends a word part and `#c` is mid-word.
+    ("echo <(echo a)#c d", ["echo", "<()#c", "d"]),
+])
+def test_expansions_keep_their_words_whole(leerie, cmd, words):
+    tokens, _heredoc = leerie._shell_scan(cmd)
+    assert [t for k, t, d in tokens if k == "word" and d == 0] == words
+
+
+def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
+    tokens, _heredoc = leerie._shell_scan("(echo a)#b")
+    assert tokens == [("op", "(", 0), ("word", "echo", 0),
+                      ("word", "a", 0), ("op", ")", 0)]
+
+
+@pytest.mark.parametrize("cmd,runner", [
+    # The first three find no runner under plain `shlex.split`: `(pytest`,
+    # `w&&pytest` and `(jest` are single words there.
+    ("(pytest acc/test_a.py)", "pytest"),
+    ("cd w&&pytest acc/test_a.py", "pytest"),
+    ("(jest acc/a.test.js)", "jest"),
+    # A shape the scan cannot close still names its runner — but not one
+    # named only in a comment.
+    ("X=$(case a in a) echo 1;; esac) pytest acc/t.py", "pytest"),
+    ("X=$(case a in a) echo 1;; esac) go test ./... # pytest later", None),
+    # A `#` inside a word is not a comment (shlex's comment handling would
+    # start one there).
+    ("uvx --from git+https://e.test/r.git#subdirectory=py pytest acc/t.py",
+     "pytest"),
+])
+def test_runner_detection_reads_operators_as_the_shell_does(
+        leerie, cmd, runner):
+    assert leerie._acceptance_runner(cmd, leerie._RUNNER_REPORTS) == runner
+
+
+def test_a_containerised_pytest_gets_no_environment_request_either(
+        leerie, tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    assert leerie._acceptance_report_spec(
+        "podman exec box python3 -m pytest acc/test_a.py",
+        tmp_path / "r.xml") is None
+    # A database container started first still leaves pytest on the host.
+    spec = leerie._acceptance_report_spec(
+        "docker compose up -d db && pytest acc/test_a.py",
+        tmp_path / "r.xml")
+    assert spec is not None and "--junitxml=" in spec[1]["PYTEST_ADDOPTS"]
 
 
 def _validate(leerie, st, repo, rel, mode="assertion"):
@@ -1834,6 +2112,28 @@ def test_an_unmeasured_shown_set_is_not_a_failure_without_names(leerie):
         res, sets, {1, 2}, 1, "c", held_back=True)
     assert "Every failing test is one you are not shown" in text
     assert "declared no case names" not in text
+
+
+def test_mixed_named_and_unnamed_failures_say_the_list_is_partial(leerie):
+    sets = [{"index": 1, "cases": {"acc/test_a.py": ["c1"],
+                                   "acc/test_u.py": []}}]
+    res = [{"index": 1, "passed": False,
+            "failing_files": ["acc/test_a.py", "acc/test_u.py"]}]
+    text = leerie._format_acceptance_failures_section(
+        res, sets, {1}, 1, "c", held_back=False)
+    assert "  - c1" in text
+    assert "other failing tests declared no case names" in text
+    # Only import-mode names: the note still follows them, never precedes.
+    imp = [{"index": 1, "modes": {"acc/test_a.py": "import"},
+            "cases": sets[0]["cases"]}]
+    imp_text = leerie._format_acceptance_failures_section(
+        res, imp, {1}, 1, "c", held_back=False)
+    assert imp_text.index("  - c1") < imp_text.index(
+        "other failing tests declared no case names")
+    only_named = leerie._format_acceptance_failures_section(
+        [dict(res[0], failing_files=["acc/test_a.py"])], sets, {1}, 1, "c",
+        held_back=False)
+    assert "declared no case names" not in only_named
 
 
 def test_shown_indices_hold_back_the_two_highest_from_four(leerie):
