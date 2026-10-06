@@ -39,26 +39,45 @@ report is among the files the task references; read it in full first.
 6. **Run them here.** Every defect file must FAIL on this unfixed tree
    and every control file must PASS. Run each file on its own with the
    repository's test runner and iterate until that holds. The harness
-   re-checks this by exit code and discards a defect file that passes
-   here.
+   re-checks this by exit code and, where the runner can write one, by
+   its report of which tests ran; it drops a defect file that passes
+   here. A file that runs no test at all, or that cannot be loaded,
+   discards your WHOLE set — every file in it — unless rule 7 applies.
+7. **Import defects.** When the report's defect IS that loading fails —
+   the entry point the report names is missing, or importing the module
+   raises — a defect file that cannot load on this tree is showing the
+   defect. Declare it `failure_mode: "import"`. Declare it only then: a
+   file that fails to load because of your own mistake (a typo, a guessed
+   helper name, a library this repository does not have) is never an
+   import defect, and would fail against every fix. The harness honours
+   the declaration only for Python test files, and only when that file
+   and every other Python file you wrote parse under the repository's own
+   interpreter (it checks); in any other language a file declared
+   `"import"` is dropped on its own
+   (the rest of the set stays), so it adds nothing — there, write a case
+   that loads and asserts on the missing behaviour instead.
 
 ## Output
 
 Return only the JSON object per your schema. For each file: `path`
-(relative to the repository root), `kind` (`defect` or `control`), and
+(relative to the repository root), `kind` (`defect` or `control`),
 `cases` — the name of each test case in the file, exactly as written in
-it. Case names are all the fixer will ever be told about a failure, so
-make each one state the behaviour it checks.
+it — and `failure_mode`: `"import"` only for a defect file per rule 7,
+otherwise `"assertion"` (always `"assertion"` for a control file). Case
+names are all the fixer will ever be told about a failure, so make each
+one state the behaviour it checks.
 
 ```json
 {
   "files": [
     {"path": "tests/acceptance_example/test_defect_export_panel.py",
      "kind": "defect",
-     "cases": ["export button below the summary panel is credited only after the download starts"]},
+     "cases": ["export button below the summary panel is credited only after the download starts"],
+     "failure_mode": "assertion"},
     {"path": "tests/acceptance_example/test_control_export_panel.py",
      "kind": "control",
-     "cases": ["a real navigation to the download page is still credited"]}
+     "cases": ["a real navigation to the download page is still credited"],
+     "failure_mode": "assertion"}
   ],
   "notes": "what you read and how you chose the variants"
 }

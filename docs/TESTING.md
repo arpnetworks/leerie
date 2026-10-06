@@ -4570,5 +4570,89 @@ dropping the both-unreadable clause.
 - `test_each_evaluation_installs_into_its_fresh_worktree`'s spy now returns the
   install's verdict, and the test asserts both evaluations measured.
 
+### Runner reports, writer-declared import defects, in-loop retry (2026-10-05)
+
+The first commit's 12 distinct reversions, each against its named test, all
+caught — they cover the report, import-defect and retry entries below.
+Later entries record their own falsification where one was run.
+
+- **Structured runner reports while validating**
+  (`test_runner_reports_are_read_mechanically`: JUnit and jest-compatible JSON,
+  pass / no tests / skipped only / collection error / setup error / unreadable;
+  `test_report_flags_are_placed_only_where_they_reach_the_runner`;
+  `test_pytest_is_asked_for_junit_through_its_environment`). A file whose
+  tests all skip exits 0, so only the report shows it ran nothing
+  (`test_a_file_whose_tests_all_skip_is_no_verdict_while_validating`).
+- **Writer-declared import defects** (`test_a_declared_import_defect_counts_as_failing`,
+  `test_an_import_defect_set_validates_and_passes_on_the_fix`).
+- **An import declaration is honoured only where parsing is checked
+  reliably** — Python only. First pinned by an in-process compile test,
+  since replaced by the project-interpreter probe (see the next subsection).
+  The writer prompt's JSON example is checked against the schema
+  (`test_the_writer_prompt_example_matches_the_schema`). A non-Python file
+  declared an import defect is dropped alone, not with its whole set
+  (`test_an_unhonourable_import_declaration_drops_only_its_file`; reverting
+  the drop turns it red).
+- **Retry inside the repair loop**
+  (`test_a_one_off_install_failure_mid_loop_keeps_the_next_round`), and the
+  post-loop retry skipped for a commit already retried
+  (`test_a_commit_already_retried_in_the_loop_is_not_retried_again`).
+
+### The parse probe, the collection-error signal, modes in the repair prompt (2026-10-05)
+
+6 distinct reversions run 7 times (one edit against two tests); 5 caught. The
+survivor — not deleting the probe file — is an equivalent mutant: the writer's
+new files are snapshotted before the probe exists, and its worktree is
+discarded after validation, so nothing ever reads the leftover. The deletion
+is kept for hygiene.
+
+- **pytest's fixed "collection failure" message marks a load failure**,
+  whatever `--junit-prefix` does to the classname
+  (`test_runner_reports_are_read_mechanically`, prefixed sample;
+  `test_a_junit_prefix_does_not_turn_a_load_failure_into_a_run`, real pytest).
+- **The import-declaration parse check runs under the project's own
+  interpreter and covers the writer's helpers**
+  (`test_an_import_declaration_over_unparseable_writer_files_is_not_honoured`:
+  the test file, then a helper beside it;
+  `test_the_parse_check_runs_under_the_projects_own_interpreter`;
+  `test_the_parse_probe_leaves_nothing_in_the_set`).
+- **The repair prompt names import-mode cases apart**
+  (`test_import_cases_are_named_as_import_failures_in_the_repair_section`).
+- **The probe follows the repository's own test-file naming**, and a probe
+  that cannot run is logged apart from one that finds a parse error
+  (`test_the_parse_probe_follows_a_repos_own_test_naming`, real pytest on a
+  `*_test.py` repo; `test_the_probe_name_matches_the_declared_files_convention`;
+  `test_an_unrunnable_probe_is_reported_as_such`). 3 reversions, 3 caught.
+- **The probe's last edges**: a declared name too long to extend
+  (`test_a_long_declared_name_still_gets_a_probe_name`), a probe the template
+  deselects reported as unrunnable rather than unparseable
+  (`test_a_probe_the_template_deselects_is_unrunnable_not_unparseable`), and a
+  `{files}` template running the probe whatever its name
+  (`test_a_files_template_runs_the_probe_whatever_its_name`). 3 reversions, 3
+  caught.
+- **The probe judges parsing only when its body ran**: a marker it writes
+  first separates "a target does not compile" (False,
+  `test_a_target_that_does_not_compile_is_a_parse_failure`) from "the runner
+  failed before reaching it" — a broken conftest, a conftest importing the
+  missing entry point, an unknown plugin flag (None, with the exit code;
+  `test_a_probe_that_never_reaches_its_check_says_so`). It replaces an
+  exit-code mapping that labelled pytest's 2/3/4 as parse failures.
+- **…and only when it ran to the end**: the marker records "ran" then "ok", so
+  a teardown error after a passing check, a probe the repository skips (exit
+  0, no marker), and a runner that does not exist (127) each read as what they
+  are (`test_a_probe_failure_that_is_not_about_parsing_says_what_it_was`).
+  An unwritable marker directory is named as such
+  (`test_an_unwritable_marker_directory_is_named_as_such`), and a probe the
+  template deselects reads "collected or selected no test (exit 5)"
+  (`test_a_probe_the_template_deselects_is_unrunnable_not_unparseable`).
+- **The repair prompt's import line states only what validation saw**: a
+  declared import defect whose file loaded on the base and failed an
+  assertion is recorded `"assertion"`
+  (`test_a_declared_import_defect_that_loaded_is_recorded_as_an_assertion`),
+  and the line describes the UNFIXED tree
+  (`test_import_cases_are_named_as_import_failures_in_the_repair_section`).
+  Report flags are never placed when the runner also appears before a
+  separator (`test_report_flags_are_placed_only_where_they_reach_the_runner`).
+
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

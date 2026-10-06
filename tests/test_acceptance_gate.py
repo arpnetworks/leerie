@@ -93,11 +93,14 @@ def _writer_stub(leerie, monkeypatch, files_by_set):
         k = int(kw["sid"].split("-")[-1])
         seen.append(kw)
         decl = []
-        for rel, (kind, text, cases) in files_by_set.get(k, {}).items():
+        for rel, spec in files_by_set.get(k, {}).items():
+            kind, text, cases = spec[:3]
+            mode = spec[3] if len(spec) > 3 else "assertion"
             p = Path(kw["cwd"]) / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text)
-            decl.append({"path": rel, "kind": kind, "cases": cases})
+            decl.append({"path": rel, "kind": kind, "cases": cases,
+                         "failure_mode": mode})
         return {"files": decl}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
@@ -518,6 +521,516 @@ def test_a_runner_cache_in_the_tree_is_never_touched(
     left = subprocess.run(["git", "-C", str(staging), "ls-files", "--others"],
                           capture_output=True, text=True).stdout
     assert "test_defect_" not in left
+
+
+_JUNIT_PASS = ('<testsuites><testsuite tests="1" errors="0">'
+               '<testcase classname="t" name="test_a"/></testsuite>'
+               '</testsuites>')
+_JUNIT_NONE = '<testsuites><testsuite tests="0"/></testsuites>'
+_JUNIT_SKIPPED = ('<testsuites><testsuite tests="1"><testcase classname="t" '
+                  'name="test_a"><skipped/></testcase></testsuite>'
+                  '</testsuites>')
+# pytest's fixed messages (src/_pytest/junitxml.py): "collection failure"
+# for a file it could not collect, 'failed on setup with "…"' for a setup
+# error on a case that ran.
+_JUNIT_COLLECT = ('<testsuites><testsuite tests="1" errors="1"><testcase '
+                  'classname="" name="t"><error message="collection failure"/>'
+                  '</testcase></testsuite></testsuites>')
+_JUNIT_COLLECT_PREFIXED = (
+    '<testsuites><testsuite tests="1" errors="1"><testcase classname="pfx" '
+    'name="t"><error message="collection failure"/></testcase></testsuite>'
+    '</testsuites>')
+_JUNIT_SETUP = ('<testsuites><testsuite tests="1" errors="1"><testcase '
+                'classname="t" name="test_a"><error message='
+                '\'failed on setup with "boom"\'/></testcase></testsuite>'
+                '</testsuites>')
+_JEST_PASS = json.dumps({"testResults": [{"status": "passed",
+    "assertionResults": [{"status": "passed"}, {"status": "failed"}]}]})
+_JEST_NONE = json.dumps({"testResults": []})
+_JEST_BROKEN = json.dumps({"testResults": [{"status": "failed",
+    "assertionResults": [], "message": "Test suite failed to run"}]})
+
+
+@pytest.mark.parametrize("kind,text,want", [
+    ("junit", _JUNIT_PASS, {"executed": 1, "collection_error": False}),
+    ("junit", _JUNIT_NONE, {"executed": 0, "collection_error": False}),
+    ("junit", _JUNIT_SKIPPED, {"executed": 0, "collection_error": False}),
+    ("junit", _JUNIT_COLLECT, {"executed": 0, "collection_error": True}),
+    # `--junit-prefix` fills in the classname; the message still says it.
+    ("junit", _JUNIT_COLLECT_PREFIXED,
+     {"executed": 0, "collection_error": True}),
+    # A setup error sits on a real, named case: a test that ran.
+    ("junit", _JUNIT_SETUP, {"executed": 1, "collection_error": False}),
+    ("jest-json", _JEST_PASS, {"executed": 2, "collection_error": False}),
+    ("jest-json", _JEST_NONE, {"executed": 0, "collection_error": False}),
+    ("jest-json", _JEST_BROKEN, {"executed": 0, "collection_error": True}),
+    ("junit", "<not xml", None),
+    ("jest-json", "{not json", None),
+])
+def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
+                                              want):
+    p = tmp_path / "report"
+    p.write_text(text)
+    assert leerie._parse_runner_report(kind, p) == want
+    assert leerie._parse_runner_report(kind, tmp_path / "absent") is None
+
+
+@pytest.mark.parametrize("cmd,placed", [
+    ("cd web && npx jest acc/a.test.js", True),
+    ("npx vitest run acc/a.test.ts", True),
+    ("npx jest acc/a.test.js | tee log", False),
+    ("npx jest acc/a.test.js > out.txt", False),
+    ("npx jest acc/a.test.js && echo done", False),
+    # The runner also appears after a separator: the flags would reach echo.
+    ("npx jest acc/a.test.js; echo jest", False),
+    ("npm test -- acc/a.test.js", False),
+])
+def test_report_flags_are_placed_only_where_they_reach_the_runner(
+        leerie, tmp_path, cmd, placed):
+    spec = leerie._acceptance_report_spec(cmd, tmp_path / "r.json")
+    assert (spec is not None) is placed
+    if placed:
+        assert spec[0].startswith(cmd) and "--outputFile=" in spec[0]
+        assert spec[1] is None and spec[2] == "jest-json"
+
+
+def test_pytest_is_asked_for_junit_through_its_environment(
+        leerie, tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-x")
+    cmd = "cd sub && python3 -m pytest -q acc/test_a.py | cat"
+    run_cmd, env, kind = leerie._acceptance_report_spec(
+        cmd, tmp_path / "r.xml")
+    assert run_cmd == cmd and kind == "junit"
+    assert env["PYTEST_ADDOPTS"] == f"-x --junitxml={tmp_path / 'r.xml'}"
+
+
+def _validate(leerie, st, repo, rel, mode="assertion"):
+    return asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), rel, st.run_dir / "logs" / "v.log",
+        "v", validating=True, failure_mode=mode))
+
+
+def test_a_file_whose_tests_all_skip_is_no_verdict_while_validating(
+        leerie, tmp_path):
+    """Exit code 0, but nothing ran: only the report shows it. As a control
+    it used to be accepted, proving nothing."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe.py").write_text(
+        "import pytest\n\n@pytest.mark.skip\ndef test_x():\n    pass\n")
+    assert _validate(leerie, st, repo, "test_probe.py") is None
+    # Evaluating a fix is unchanged: exit code alone.
+    assert asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "test_probe.py",
+        st.run_dir / "logs" / "v.log", "v")) is True
+
+
+_IMPORT_DEFECT = ("from calc import mul\n\n"
+                  "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+
+@pytest.mark.parametrize("mode,want", [("import", False),
+                                       ("assertion", None)])
+def test_a_declared_import_defect_counts_as_failing(leerie, tmp_path, mode,
+                                                    want):
+    """The report's defect is that `mul` does not exist: a defect file that
+    cannot load on the base is showing it — but only when the writer said
+    so (Language-to-JSON: the writer, not Python, reads the report)."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe.py").write_text(_IMPORT_DEFECT)
+    assert _validate(leerie, st, repo, "test_probe.py", mode) is want
+
+
+def test_a_junit_prefix_does_not_turn_a_load_failure_into_a_run(
+        leerie, tmp_path, monkeypatch):
+    """`--junit-prefix` gave pytest's collection-error case a classname, so
+    the old empty-classname rule read it as an executed test, and an
+    assertion-mode defect file that could not even load counted as
+    failing on the base."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--junit-prefix=pfx")
+    (repo / "test_probe.py").write_text(_IMPORT_DEFECT)
+    assert _validate(leerie, st, repo, "test_probe.py") is None
+
+
+def _import_writer(leerie, monkeypatch, files):
+    async def fake_claude_p(**kw):
+        wt = Path(kw["cwd"])
+        decl = []
+        for rel, (text, mode) in files.items():
+            (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            (wt / rel).write_text(text)
+            if mode:
+                decl.append({"path": rel, "kind": "defect",
+                             "cases": ["mul exists"], "failure_mode": mode})
+        return {"files": decl}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+
+@pytest.mark.parametrize("files", [
+    # The test file itself does not parse.
+    {"acc/test_defect_mul.py": ("from calc import mul(\n", "import")},
+    # It parses, but a helper the writer wrote beside it does not.
+    {"acc/test_defect_mul.py": (_IMPORT_DEFECT, "import"),
+     "acc/helpers_mul.py": ("def broken(:\n    pass\n", None)},
+])
+def test_an_import_declaration_over_unparseable_writer_files_is_not_honoured(
+        leerie, tmp_path, monkeypatch, capsys, files):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch, files)
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    assert acc["sets"] == []
+    out = capsys.readouterr().out
+    assert "declaration not honoured" in out and "does not parse" in out
+
+
+def test_the_parse_check_runs_under_the_projects_own_interpreter(
+        leerie, tmp_path, monkeypatch, capsys):
+    """The scoped command runs the probe, so its interpreter decides. Here
+    the project's "interpreter" (a wrapper) rejects the probe outright: an
+    in-process check by the orchestrator's own Python would have passed."""
+    repo, head = _repo(tmp_path)
+    wrapper = tmp_path / "project-python"
+    # The project's interpreter: it rejects the probe file, and otherwise
+    # behaves as python3. Invoked as `<it> -m pytest`, so the runner (and
+    # its report) is still recognised.
+    wrapper.write_text(
+        "#!/bin/sh\ncase \"$*\" in *leerie_probe*) exit 1;; esac\n"
+        "exec python3 \"$@\"\n")
+    wrapper.chmod(0o755)
+    (repo / ".leerie" / "config.toml").write_text(
+        f'test_scoped = "{wrapper} -m pytest -q -p no:cacheprovider '
+        '{test_files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch,
+                   {"acc/test_defect_mul.py": (_IMPORT_DEFECT, "import")})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    assert acc["sets"] == []
+    assert "declaration not honoured" in capsys.readouterr().out
+
+
+def test_the_parse_probe_follows_a_repos_own_test_naming(
+        leerie, tmp_path, monkeypatch):
+    """PR #282 review: the probe was always `test_leerie_parse_probe_*.py`,
+    which a `*_test.py` repo's scoped command will not render — so its
+    import declarations were never honoured."""
+    repo, head = _repo(tmp_path)
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_file_globs = "*_test.py"\n'
+        'test_scoped = "python3 -m pytest -q -p no:cacheprovider '
+        '-o python_files=*_test.py {test_files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch,
+                   {"acc/defect_mul_test.py": (_IMPORT_DEFECT, "import")})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["modes"] == {"acc/defect_mul_test.py": "import"}
+
+
+@pytest.mark.parametrize("globs,declared,want_end", [
+    ("", "acc/test_defect_mul.py", "acc/test_defect_mul_leerie_probe_"),
+    ("*_test.py", "acc/defect_mul_test.py", "acc/leerie_probe_"),
+    ("**/*_test.py", "acc/defect_mul_test.py", "acc/leerie_probe_"),
+    ("*.spec.py", "acc/defect_mul.spec.py", "acc/leerie_probe_"),
+    ("check_*.py", "acc/defect_mul.py", None),
+])
+def test_the_probe_name_matches_the_declared_files_convention(
+        leerie, tmp_path, globs, declared, want_end):
+    repo, head = _repo(tmp_path)
+    if globs:
+        (repo / ".leerie" / "config.toml").write_text(
+            f'test_file_globs = "{globs}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    got = leerie._acceptance_probe_rel(st, declared)
+    shaped = leerie._is_test_file(got, leerie.resolve_test_file_globs(repo))
+    if want_end is None:
+        # No test-shaped candidate: the first is returned anyway, and a
+        # `{test_files}` template then renders no command for it.
+        assert not shaped
+    else:
+        assert got.startswith(want_end) and shaped
+
+
+def test_a_long_declared_name_still_gets_a_probe_name(leerie, tmp_path):
+    """A declared name near NAME_MAX cannot be extended; the probe falls
+    back to a short hash-only name the globs still accept."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    got = leerie._acceptance_probe_rel(st, "tests/test_" + "a" * 233 + ".py")
+    assert len(Path(got).name.encode()) <= 200
+    assert leerie._is_test_file(got, [])
+
+
+def test_a_probe_the_template_deselects_is_unrunnable_not_unparseable(
+        leerie, tmp_path):
+    """pytest exits 5 when a `-k` in the template deselects the probe:
+    that says nothing about parsing."""
+    repo, head = _repo(tmp_path)
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_scoped = "python3 -m pytest -q -p no:cacheprovider '
+        '-k nothing_matches {test_files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe_me.py").write_text("x = 1\n")
+    got, why = asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "test_probe_me.py",
+        ["test_probe_me.py"], st.run_dir / "logs" / "p.log", "p"))
+    assert got is None and "collected or selected no test" in why
+    assert "exit 5" in why
+
+
+@pytest.mark.parametrize("conftest,addopts", [
+    # pytest cannot load the conftest (exit 4) before the probe's body runs,
+    # so the probe cannot judge parsing — None, not "does not parse".
+    ("def broken(:\n    pass\n", ""),
+    # Imports the very entry point an import defect lacks — every file
+    # parses (post-merge review of 11e9431).
+    ("from calc import mul\n", ""),
+    ("", "--no-such-plugin-flag"),                    # unknown option: exit 4
+])
+def test_a_probe_that_never_reaches_its_check_says_so(leerie, tmp_path,
+                                                     monkeypatch, conftest,
+                                                     addopts):
+    """pytest exits 2/3/4 before the probe's body runs, so whether the
+    targets parse is unknown: None, with the exit code in the reason —
+    never "does not parse"."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    if conftest:
+        (repo / "acc" / "conftest.py").write_text(conftest)
+    if addopts:
+        monkeypatch.setenv("PYTEST_ADDOPTS", addopts)
+    (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
+    got, why = asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+        ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
+    assert got is None
+    assert "before reaching the parse check" in why and "exit " in why
+    assert "does not parse" not in why
+
+
+_PASSING_THEN_TEARDOWN_FAILS = (
+    "import pytest\n\n@pytest.fixture(autouse=True)\ndef boom():\n"
+    "    yield\n    raise RuntimeError('teardown')\n")
+_SKIPS_EVERYTHING = (
+    "import pytest\n\ndef pytest_collection_modifyitems(items):\n"
+    "    for item in items:\n"
+    "        item.add_marker(pytest.mark.skip(reason='x'))\n")
+
+
+@pytest.mark.parametrize("conftest,template,want_reason", [
+    # The check passed ("ok"), then a teardown failed the run.
+    (_PASSING_THEN_TEARDOWN_FAILS, None, "passed but the test run failed"),
+    # Exit 0, but the probe's body never ran.
+    (_SKIPS_EVERYTHING, None, "collected or selected no test"),
+    # The runner does not exist.
+    ("", "no-such-runner-xyz {test_files}", "could not be run (exit 127)"),
+])
+def test_a_probe_failure_that_is_not_about_parsing_says_what_it_was(
+        leerie, tmp_path, conftest, template, want_reason):
+    """Post-merge review of 5f22a2e: a teardown error after the body read as
+    "does not parse"; a probe skipped by the repo read as True; exit 127
+    blamed a conftest."""
+    repo, head = _repo(tmp_path)
+    if template:
+        (repo / ".leerie" / "config.toml").write_text(
+            f'test_scoped = "{template}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    if conftest:
+        (repo / "acc" / "conftest.py").write_text(conftest)
+    (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
+    got, why = asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+        ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
+    assert got is None and want_reason in why
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root ignores directory permissions")
+def test_an_unwritable_marker_directory_is_named_as_such(leerie, tmp_path):
+    """The probe's body could not write its marker, which read as "failed
+    before reaching the parse check (… a conftest …)"."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
+    reports = st.run_dir / "acceptance" / "reports"
+    reports.mkdir(parents=True)
+    reports.chmod(0o555)
+    try:
+        got, why = asyncio.run(leerie._acceptance_parse_probe(
+            st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+            ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
+    finally:
+        reports.chmod(0o755)
+    assert got is None and "could not be prepared" in why
+    assert "conftest" not in why
+
+
+def test_a_target_that_does_not_compile_is_a_parse_failure(leerie, tmp_path):
+    """The probe's body ran (its marker exists) and a target failed to
+    compile: that, and only that, is "does not parse"."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
+    (repo / "acc" / "helpers_mul.py").write_text("def broken(:\n")
+    got, why = asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+        ["acc/test_defect_mul.py", "acc/helpers_mul.py"],
+        st.run_dir / "logs" / "p.log", "p"))
+    assert got is False and "does not parse" in why
+
+
+def test_a_files_template_runs_the_probe_whatever_its_name(leerie, tmp_path):
+    """A `{files}` template renders any name, so the probe runs even where
+    no candidate is test-shaped (round-18 LOW: it had returned None)."""
+    repo, head = _repo(tmp_path)
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_file_globs = "check_*.py"\n'
+        'test_scoped = "python3 -m pytest -q -p no:cacheprovider {files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "src").mkdir()
+    (repo / "src" / "defect_mul.py").write_text("x = 1\n")
+    assert asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "src/defect_mul.py",
+        ["src/defect_mul.py"], st.run_dir / "logs" / "p.log", "p")) == (
+            True, "")
+
+
+def test_an_unrunnable_probe_is_reported_as_such(leerie, tmp_path,
+                                                monkeypatch, capsys):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+
+    async def unrunnable(*a, **k):
+        return None, "no test command here could run the parse check"
+    monkeypatch.setattr(leerie, "_acceptance_parse_probe", unrunnable)
+    _import_writer(leerie, monkeypatch,
+                   {"acc/test_defect_mul.py": (_IMPORT_DEFECT, "import")})
+    asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    out = capsys.readouterr().out
+    assert "no test command here could run the parse check" in out
+    assert "does not parse" not in out
+
+
+def test_the_parse_probe_leaves_nothing_in_the_set(leerie, tmp_path,
+                                                  monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch, {
+        "acc/test_defect_mul.py": (_IMPORT_DEFECT, "import"),
+        "acc/helpers_mul.py": ("VALUE = 6\n", None)})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["defect_files"] == ["acc/test_defect_mul.py"]
+    assert s["support_files"] == ["acc/helpers_mul.py"]
+    stored = sorted(str(p.relative_to(s["dir"]))
+                    for p in Path(s["dir"]).rglob("*") if p.is_file())
+    assert not any("leerie_probe" in p for p in stored)
+
+
+def test_import_cases_are_named_as_import_failures_in_the_repair_section(
+        leerie):
+    sets = [{"index": 1, "modes": {"acc/test_defect_mul.py": "import"},
+             "cases": {"acc/test_defect_mul.py": ["mul exists"],
+                       "acc/test_defect_add.py": ["add sums"]}}]
+    res = [{"index": 1, "passed": False,
+            "failing_files": ["acc/test_defect_mul.py",
+                              "acc/test_defect_add.py"]}]
+    text = leerie._format_acceptance_failures_section(res, sets, {1}, 1, "x")
+    # A fact about the UNFIXED tree, never a claim about the current one
+    # (final review of #282: the entry point may exist by now).
+    head, _, tail = text.partition("could not even load against the UNFIXED")
+    assert "  - add sums" in head and "mul exists" not in head
+    assert "  - mul exists" in tail
+
+
+def test_an_unhonourable_import_declaration_drops_only_its_file(
+        leerie, tmp_path, monkeypatch, capsys):
+    """PR #282 review round 2: a non-Python file declared "import" cannot
+    load, which made its verdict None and discarded the WHOLE set — the
+    valid defect file and control with it — while the prompt promised only
+    the file was lost. It is now dropped alone, before running."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _writer_stub(leerie, monkeypatch, {1: {
+        "acc/test_defect_sum.py": ("defect", DEFECT_TEST, ["sums"]),
+        "acc/mul.test.ts": ("defect", "import { mul } from '../mathx';\n",
+                            ["mul exists"], "import"),
+        "acc/test_control_zero.py": ("control", CONTROL_TEST, ["zero"])}})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["defect_files"] == ["acc/test_defect_sum.py"]
+    assert s["control_files"] == ["acc/test_control_zero.py"]
+    assert "acc/mul.test.ts" not in s["support_files"]
+    assert "honoured only for Python test files" in capsys.readouterr().out
+
+
+def test_the_writer_prompt_example_matches_the_schema(leerie):
+    """test_prompt_schema_parity checks field NAMES appear in the prompt;
+    this checks the example's file items carry exactly the schema's fields
+    with values its enums allow."""
+    import re
+    prompt = leerie._load_prompt("acceptance_writer")
+    example = json.loads(re.search(r"```json\n(.*?)```", prompt,
+                                   re.S).group(1))
+    item = leerie.SCHEMAS["acceptance_writer"]["properties"]["files"][
+        "items"]
+    for f in example["files"]:
+        assert set(f) == set(item["properties"])
+        assert set(item["required"]) <= set(f)
+        for key, spec in item["properties"].items():
+            if "enum" in spec:
+                assert f[key] in spec["enum"]
+
+
+def test_a_declared_import_defect_that_loaded_is_recorded_as_an_assertion(
+        leerie, tmp_path, monkeypatch):
+    """Final review of #282: `modes` stored the writer's declaration as-is,
+    so a file that loaded fine on the base and failed an assertion was
+    later described to the repair rounds as an import failure."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch,
+                   {"acc/test_defect_sum.py": (DEFECT_TEST, "import")})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["defect_files"] == ["acc/test_defect_sum.py"]
+    assert s["modes"] == {"acc/test_defect_sum.py": "assertion"}
+
+
+def test_an_import_defect_set_validates_and_passes_on_the_fix(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _writer_stub(leerie, monkeypatch, {1: {
+        "acc/test_defect_mul.py": ("defect", _IMPORT_DEFECT, ["mul exists"],
+                                   "import"),
+        "acc/test_control_add.py": ("control", CONTROL_TEST, ["add zero"])}})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["defect_files"] == ["acc/test_defect_mul.py"]
+    assert s["modes"] == {"acc/test_defect_mul.py": "import"}
+    staging = _staging(st, repo)
+    (staging / "calc.py").write_text(
+        BUGGY + "\n\ndef mul(a, b):\n    return a * b\n")
+    _git(staging, "commit", "-qam", "conformer: add mul")
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), acc["sets"], "t"))
+    assert res[0]["passed"] is True
 
 
 def test_majority_rule(leerie):
@@ -1948,6 +2461,47 @@ def test_no_rollback_target_means_no_repair(leerie, tmp_path, monkeypatch):
     gate = st.data["acceptance"]["gate"]
     assert calls == []
     assert gate["residual"]["failing_sets"] == 5
+
+
+def test_a_one_off_install_failure_mid_loop_keeps_the_next_round(
+        leerie, tmp_path, monkeypatch):
+    """Round-9 LOW: the round's own evaluation failed to install once, read
+    as "nothing measured", and the loop stopped with a round left. It is
+    measured again inside the loop now."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    _counted_recipe(st, tmp_path, 2, 2)       # round 1's evaluation fails
+    calls = _run_gate(leerie, monkeypatch, st, lambda _p: None,
+                      measured=[{"passed": True, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    assert len(calls) == 2
+    assert gate["rounds"][0]["retried"] is True
+    assert leerie._acceptance_measured(gate["rounds"][0]["results"])
+
+
+def test_a_commit_already_retried_in_the_loop_is_not_retried_again(
+        leerie, tmp_path, monkeypatch):
+    """The post-loop retry is skipped for a commit the round's own retry
+    already measured: straight to the pre-repair control."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    _counted_recipe(st, tmp_path, 2, 99)      # every later install fails
+    labels = []
+    real = leerie._evaluate_acceptance_sets_inner
+
+    async def spy(st_, caps, tree, sets, label, **kw):
+        labels.append(label)
+        return await real(st_, caps, tree, sets, label, **kw)
+    monkeypatch.setattr(leerie, "_evaluate_acceptance_sets_inner", spy)
+    _run_gate(leerie, monkeypatch, st, _commit_fix,
+              measured=[{"passed": True, "measured": True},
+                        {"passed": True, "measured": True}])
+    assert labels == ["gate-initial", "gate-r1", "gate-r1-retry",
+                      "gate-before"]
 
 
 def test_gate_is_resume_idempotent(leerie, tmp_path, monkeypatch):
