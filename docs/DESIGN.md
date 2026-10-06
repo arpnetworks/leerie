@@ -5328,14 +5328,39 @@ acceptance sets (§8 *Held-out acceptance tests* — they need the installed
 dependencies, which is why the decision moves after provisioning), and the
 sets are run on HEAD. A majority passing ends the run as no work. A
 majority failing is a dispute: the failing case names become the
-`no_work_dispute` evidence and the run plans the work. But held-out tests
+`no_work_dispute` evidence and the run plans the work. Only the names from
+sets a repair round would be shown are used: the planners' words reach the
+implementers, and the held-back sets must stay unseen until the gate
+re-judges on them. When only held-back sets fail, the evidence gives the
+counts alone. But held-out tests
 can be wrong — on a finished task whose report states no expected behaviour,
 all three sets failed it — and a wrong dispute repeated on every re-run
 would be a new infinite loop. So a dispute is raised at most once per task:
 when the previous same-task run already disputed on acceptance evidence, a
 still-failing majority ends the run as no work with a loud warning and the
-residual recorded. The cost of a wrong dispute is bounded to one extra run.
+residual recorded. The cost of a wrong dispute is bounded to one extra run
+(two when the first dispute goes unacted, below).
 With no valid sets the judge's confirmation stands, as before.
+
+A dispute counts only once it is acted on. The run that disputed could
+still end as no work by another exit — its planners return nothing, or
+the satisfied-probe sweep drops every subtask — and the next run would
+then accept "no work" after a dispute no run ever acted on, leaving the
+defect the tests still show on HEAD unfixed for good. So executed
+evidence outranks the probe: whenever held-out sets exist and a majority
+of them fails on HEAD, the sweep is not offered the subtasks that fix
+the reported symptom (below). And a disputing run that still ends as no
+work by either of those two planning-time exits records its dispute as not
+acted on, which the next run does not count — once. That re-dispute is
+recorded as such, and if it too ends unacted it counts: two runs have
+then been shown the failing cases and twice produced no work for them —
+the planners found nothing, or none of what they planned was flagged as
+fixing the symptom and the probe judged all of it satisfied — which is
+the wrong-tests case the at-most-once rule exists for, and
+re-disputing it on every run would reopen that loop. So the cost of a wrong
+dispute is bounded to two extra runs, not one, when the first goes unacted.
+(A run that reaches implementation has acted on its dispute, whatever its
+outcome.)
 
 **A plan whose fixes are all already on HEAD ends as no work.** The
 satisfied-probe sweep could drop every subtask that fixes the reported
@@ -5344,7 +5369,12 @@ and test-only subtasks) are never judged satisfied by a read-only probe —
 three of the six measured CHURN pairs shipped such a test-only PR. When
 every subtask flagged `fixes_reported_symptom` was dropped as already
 satisfied and the held-out sets pass on HEAD, the run ends as no work;
-otherwise it proceeds as before.
+otherwise it proceeds as before. When the held-out sets FAIL on HEAD,
+those subtasks are never offered to the probe — the tests outrank its
+reading — so the plan cannot lose its fixes and ship without them. When
+the sets were validated on HEAD itself (a task's first run, nothing merged
+since), every one has a defect file that failed there, so the answer is
+already known: the fixes are protected without running the sets again.
 
 **The delivery gate: required items are verified on the tree that
 ships.** The no-work judge above enforces `required_items` against the
@@ -5998,8 +6028,9 @@ independent *sets*, each split into **defect files** (must fail on the
 validity base) and **control files** (correct behaviour that must keep
 passing), driving the behaviour through the module's stable entry points
 rather than internal helpers whose signatures a fix may change. Python
-validates each set mechanically, by exit code only (no runner-output
-parsing, so the mechanism is language-agnostic): a defect file that
+validates each set mechanically — by exit code, and where the runner can
+write one by its structured report of what ran (below), never by reading
+runner prose: a defect file that
 passes on the validity base cannot discriminate and is dropped; a set
 needs at least one discriminating defect file and every control passing.
 A set carries what its validation ran on: a writer that
@@ -6037,7 +6068,10 @@ jest and vitest exit 1 alike for "no tests", "could not load" and "a test
 failed"; cargo exits 101 for a build or a test failure; and `go test`
 exits 0 when nothing ran. So where the runner can write a structured
 report of the run — pytest's JUnit XML, the jest-compatible JSON of jest
-and vitest — validation asks for one and reads how many tests executed
+and vitest — validation asks for one (a test command that already names
+its own JUnit report path would override the request, so the request is
+then appended after it, where it is the one that counts; where nothing can
+be appended safely there is no report) and reads how many tests executed
 (a test whose fixture failed to set up counts as executed: it ran and
 failed) and whether the file loaded — pytest marks a file it could not
 collect with a fixed "collection failure" message, which no report option
@@ -6070,7 +6104,8 @@ Reading the report to know which case applies is the writer's job, never
 Python's (§12); the price is that a writer who declares a guessed import
 produces a test no fix can pass, which costs two repair rounds and a
 residual, never the run. Without a readable report (a runner with none
-known, or a report that was not written) validation falls back to the
+known, a report that was not written, or a runner the test command starts
+inside another container, whose files the orchestrator cannot read) validation falls back to the
 runner's own "ran no test" exits where they exist (pytest's), and
 otherwise to the exit code alone — so on `go test`, a file that ran
 nothing reads as passing: it cannot become a defect file (it does not
@@ -6088,7 +6123,10 @@ output special-cased it (one shown runner output patched the visible
 redirect parameter; failing names plus the contract got 2/4 page fixes
 at the root against 1/4). When four or more sets are valid, the two
 highest-indexed are never shown at all; every round is re-judged on all
-sets, so a fix fitted to the shown names still fails the hidden ones. A
+sets, so a fix fitted to the shown names still fails the hidden ones.
+When only hidden sets fail, the round is told exactly that — every failing
+test is one it is not shown — and works from the contract alone, rather
+than being promised a list of failing cases that is empty. A
 round whose verdict measures nothing where the one before it measured is
 measured once more before the rounds stop on it: every evaluation installs
 afresh, and a one-off install failure would otherwise end the repair with

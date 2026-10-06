@@ -13020,6 +13020,7 @@ def _probe_drop_reason(verdict: dict) -> str | None:
 async def _filter_satisfied_subtasks(
     plans: list[dict], repo_root: Path, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
+    protect: set[str] | None = None,
 ) -> dict[str, str] | None:
     """Mutate `plans` in place: drop any subtask whose success criteria
     are already met on the base tree (DESIGN §8 *Already-satisfied
@@ -13056,7 +13057,12 @@ async def _filter_satisfied_subtasks(
     to prefer that over a false-positive that would silently delete real
     work. The probe runs with `SATISFIED_PROBE_TOOLS` (a base-tree-only
     subset of INSPECT_TOOLS — no history-spanning git, see that
-    constant's rationale)."""
+    constant's rationale).
+
+    Ids in `protect` are never probed, so never dropped: the caller passes
+    the symptom-fixing subtasks while the held-out acceptance sets fail on
+    HEAD (`_fix_ids_held_out_sets_protect`, DESIGN §8 — executed evidence
+    outranks the probe's reading)."""
     if st.data.get("skip_satisfied_check"):
         log("phase 3: satisfied-check skipped (--skip-satisfied-check / "
             "LEERIE_SKIP_SATISFIED_CHECK / skip_satisfied_check=true)")
@@ -13068,11 +13074,18 @@ async def _filter_satisfied_subtasks(
     # judge "already met" against, so such a subtask always survives.
     probeable: list[dict] = []
     total = 0
+    protect = protect or set()
     for plan in plans:
         for s in plan.get("subtasks", []) or []:
             total += 1
+            if s.get("id") in protect:
+                continue
             if (s.get("success_criteria_seed") or "").strip():
                 probeable.append(s)
+    if protect:
+        log(f"phase 3: {len(protect)} subtask(s) fixing the reported symptom "
+            "kept out of the satisfied-probe — the held-out acceptance sets "
+            f"fail on HEAD: {', '.join(sorted(protect))}")
     if not probeable:
         return None
 
@@ -33014,28 +33027,50 @@ def _acceptance_report_spec(cmd: str, path: Path
     if runner is None:
         return None
     kind, how = _RUNNER_REPORTS[runner]
+    tokens = _shell_tokens(cmd)
     if how == "env":
-        prior = os.environ.get("PYTEST_ADDOPTS", "")
-        opt = f"--junitxml={shlex.quote(str(path))}"
-        return cmd, {**os.environ,
-                     "PYTEST_ADDOPTS": f"{prior} {opt}".strip()}, kind
+        flags = f"--junitxml={shlex.quote(str(path))}"
+        if tokens is None or not any(
+                t.split("=", 1)[0] in _PYTEST_JUNIT_OPTS for t in tokens):
+            prior = os.environ.get("PYTEST_ADDOPTS", "")
+            return cmd, {**os.environ,
+                         "PYTEST_ADDOPTS": f"{prior} {flags}".strip()}, kind
+        # The command names its own report path, which beats PYTEST_ADDOPTS
+        # (pytest reads that before the command line); appended after it,
+        # ours is the one pytest keeps.
+    else:
+        flags = how.format(path=shlex.quote(str(path)))
+    if tokens is None or not _flags_reach_runner(tokens, runner):
+        return None
+    return f"{cmd} {flags}", None, kind
+
+
+# pytest's spellings of its JUnit report option (fixed CLI surface).
+_PYTEST_JUNIT_OPTS = frozenset({"--junitxml", "--junit-xml"})
+
+
+def _shell_tokens(cmd: str) -> list[str] | None:
+    """`cmd` split as the shell would, operators as their own tokens, or
+    None when it does not lex (an unbalanced quote)."""
     lexer = shlex.shlex(cmd, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     try:
-        tokens = list(lexer)
+        return list(lexer)
     except ValueError:
         return None
+
+
+def _flags_reach_runner(tokens: list[str], runner: str) -> bool:
+    """Whether flags appended to the command reach `runner`: every
+    occurrence of it sits in the final simple command, with no pipe or
+    redirect after it — in `npx jest x; echo jest` the runner is the first
+    command and the flags would reach `echo`."""
     last_sep = max((i for i, t in enumerate(tokens)
                     if t in _SHELL_SEPARATORS), default=-1)
     runner_at = [i for i, t in enumerate(tokens)
                  if os.path.basename(t) == runner]
-    # Every occurrence must sit in the final simple command: in
-    # `npx jest x; echo jest`, the runner is the first command and the flags
-    # would reach `echo`.
-    if not runner_at or min(runner_at) <= last_sep or any(
-            t in _SHELL_REDIRECTS for t in tokens[min(runner_at):]):
-        return None
-    return (f"{cmd} {how.format(path=shlex.quote(str(path)))}", None, kind)
+    return bool(runner_at) and min(runner_at) > last_sep and not any(
+        t in _SHELL_REDIRECTS for t in tokens[min(runner_at):])
 
 
 def _parse_runner_report(kind: str, path: Path) -> dict | None:
@@ -33695,6 +33730,15 @@ def _acceptance_majority_fails(results: list[dict]) -> bool:
         <= len(measured)
 
 
+def _acceptance_shown_indices(sets: list[dict]) -> set[int]:
+    """Indices of the sets whose case names may leave the gate — to a repair
+    round or a planner. With four or more valid sets the two highest-indexed
+    are held back, so a fix fitted to the shown names still fails them
+    (DESIGN §8 *Held-out acceptance tests*); with fewer, all are shown."""
+    ordered = sorted(s_["index"] for s_ in sets)
+    return set(ordered[:-2]) if len(ordered) >= 4 else set(ordered)
+
+
 def _format_acceptance_failures_section(results: list[dict],
                                         sets: list[dict], shown: set[int],
                                         rnd: int, defect_shape: str,
@@ -33703,19 +33747,7 @@ def _format_acceptance_failures_section(results: list[dict],
     """Names, never output or source (DESIGN §8: a conformer shown the
     runner output special-cased it)."""
     by_index = {s_["index"]: s_ for s_ in sets}
-    lines = [
-        f"ACCEPTANCE FAILURES (held-out acceptance gate, round {rnd} of "
-        f"{rounds}): "
-        "independent tests written from the defect report alone, by workers "
-        "that never saw this run's code, FAIL on this integrated tree. You "
-        "cannot see the tests or their output; the failing cases are named "
-        "below. They encode the REPORT'S contract — fix the defect at its "
-        "root so the contract holds in general. "
-        + ("Fitting these names will fail the recheck, which also runs "
-           "further tests you are not shown. " if held_back else
-           "Fitting these names alone does not fix the defect. ")
-        + "Re-derive the cause from the report itself (the task names it).",
-    ]
+    case_lines: list[str] = []
     import_cases: list[str] = []
     for r in results:
         if r["passed"] or r["index"] not in shown:
@@ -33730,7 +33762,29 @@ def _format_acceptance_failures_section(results: list[dict],
             if (set_.get("modes") or {}).get(rel) == "import":
                 import_cases.extend(names)
             else:
-                lines.extend(f"  - {c}" for c in names)
+                case_lines.extend(f"  - {c}" for c in names)
+    head = (f"ACCEPTANCE FAILURES (held-out acceptance gate, round {rnd} of "
+            f"{rounds}): "
+            "independent tests written from the defect report alone, by "
+            "workers that never saw this run's code, FAIL on this integrated "
+            "tree. ")
+    if case_lines or import_cases:
+        head += ("You cannot see the tests or their output; the failing "
+                 "cases are named below. They encode the REPORT'S contract — "
+                 "fix the defect at its root so the contract holds in "
+                 "general. "
+                 + ("Fitting these names will fail the recheck, which also "
+                    "runs further tests you are not shown. " if held_back
+                    else "Fitting these names alone does not fix the defect. "))
+    else:
+        # Only held-back sets fail: say so, rather than promise a list that
+        # is empty (DESIGN §8).
+        head += ("Every failing test is one you are not shown, so no case "
+                 "names follow. They encode the REPORT'S contract — fix the "
+                 "defect at its root so the contract below holds in "
+                 "general. ")
+    lines = [head + "Re-derive the cause from the report itself (the task "
+             "names it).", *case_lines]
     if import_cases:
         lines.append("These cases' tests could not even load against the "
                      "UNFIXED tree: the module or entry point the report names "
@@ -33798,11 +33852,10 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
             f"{sum(1 for r in measured if not r['passed'])} of "
             f"{len(measured)} measured held-out set(s) fail on the integrated "
             "tree; repairing")
-        ordered = sorted(s_["index"] for s_ in sets)
-        hidden = set(ordered[-2:]) if len(ordered) >= 4 else set()
-        shown = set(ordered) - hidden
+        shown = _acceptance_shown_indices(sets)
+        hidden = {s_["index"] for s_ in sets} - shown
         if not hidden:
-            log(f"  only {len(ordered)} valid set(s): every failing set is "
+            log(f"  only {len(sets)} valid set(s): every failing set is "
                 "shown to the repair and none is held back — a weaker check")
         # Persisted so a resume mid-repair still rolls back to the tree the
         # repair started from, not to a later repair commit.
@@ -34102,11 +34155,10 @@ async def _acceptance_passes_on_head(st: "State", caps: dict) -> bool:
             and not _acceptance_majority_fails(res))
 
 
-def _prior_acceptance_dispute(st: "State") -> bool:
-    """Whether the most recent COMPLETED same-task run already raised an
-    acceptance dispute (DESIGN §8 *disputed at most once*). Same sibling
-    rules as `_prior_delivery_residual`: exact task match, newest first,
-    completed runs only."""
+def _prior_acceptance_dispute_record(st: "State") -> dict | None:
+    """The `acceptance_dispute` of the most recent COMPLETED same-task run,
+    or None. Same sibling rules as `_prior_delivery_residual`: exact task
+    match, newest first, completed runs only."""
     task = (st.data.get("task") or "").strip()
     try:
         candidates = sorted(
@@ -34114,7 +34166,7 @@ def _prior_acceptance_dispute(st: "State") -> bool:
              if d.is_dir() and d.name != st.run_dir.name),
             key=lambda d: d.stat().st_mtime, reverse=True)
     except OSError:
-        return False
+        return None
     for d in candidates:
         try:
             data = json.loads((d / "state.json").read_text())
@@ -34124,8 +34176,65 @@ def _prior_acceptance_dispute(st: "State") -> bool:
                 continue
         except (OSError, ValueError):
             continue
-        return bool(data.get("acceptance_dispute"))
-    return False
+        dispute = data.get("acceptance_dispute")
+        return dispute if isinstance(dispute, dict) and dispute else None
+    return None
+
+
+def _prior_acceptance_dispute(st: "State") -> bool:
+    """Whether the previous completed same-task run already raised an
+    acceptance dispute that counts (DESIGN §8 *disputed at most once*). An
+    unacted dispute — its run still ended as no work by another exit — does
+    not count, so the next run disputes again; but only once: a re-dispute
+    that also goes unacted counts, or wrong held-out tests would be
+    re-disputed on every run (DESIGN §8 *A dispute counts only once it is
+    acted on*)."""
+    dispute = _prior_acceptance_dispute_record(st)
+    return bool(dispute) and (not dispute.get("unacted")
+                              or bool(dispute.get("redispute")))
+
+
+def _mark_dispute_unacted(st: "State") -> None:
+    """Before a no-work exit other than the settle itself: mark this run's
+    own dispute (not a carried-forward acceptance) as never acted on, so
+    the next run disputes again rather than accepting (DESIGN §8 *A
+    dispute counts only once it is acted on*)."""
+    dispute = st.data.get("acceptance_dispute")
+    if isinstance(dispute, dict) and not dispute.get("accepted"):
+        dispute["unacted"] = True
+        st.save()
+
+
+async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
+                                         fix_ids: set[str]) -> set[str]:
+    """`fix_ids` when held-out sets exist, some were measured on HEAD, and
+    no strict majority of those passed (`_acceptance_majority_fails`, the
+    settle's rule; a tie protects), else empty — the subtasks the
+    satisfied-probe sweep must not be offered (DESIGN §8). Exit codes and
+    typed fields only. Fail-open: any error protects nothing, as before.
+    Under `skip_satisfied_check` there is no sweep to protect from, so the
+    sets are not run; nor are they when the planning worktree's HEAD is the
+    sets' `validity_base`, where every set failed during validation, so
+    `fix_ids` is returned outright."""
+    if not fix_ids or st.data.get("skip_satisfied_check"):
+        return set()
+    try:
+        acc = st.data.get("acceptance") or {}
+        base = acc.get("validity_base")
+        if acc.get("sets") and base:
+            # Sets validated on this very commit each have a defect file that
+            # failed here: the answer is known without running them again.
+            await _ensure_planning_worktree(st)
+            if await _branch_head_sha(str(_judgment_cwd(st))) == base:
+                return set(fix_ids)
+        res = await _acceptance_results_on_head(st, caps)
+    except Exception as e:
+        log(f"acceptance: the pre-sweep check raised {type(e).__name__}: "
+            f"{e} — the satisfied-probe sees every subtask")
+        return set()
+    if res is None or not _acceptance_measured(res):
+        return set()
+    return set(fix_ids) if _acceptance_majority_fails(res) else set()
 
 
 async def _finish_if_every_fix_already_on_head(st: "State", caps: dict,
@@ -34183,7 +34292,11 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     # Counts are over measured sets only: an unrunnable set is no evidence.
     measured = _acceptance_measured(res)
     failing_sets = sum(1 for r in measured if not r["passed"])
-    cases = [c for r in measured if not r["passed"]
+    # Names from shown sets only: the dispute evidence reaches the planners
+    # and through them the implementers, and the held-back sets must stay
+    # unseen until the gate re-judges on them (DESIGN §8).
+    shown = _acceptance_shown_indices(list(sets.values()))
+    cases = [c for r in measured if not r["passed"] and r["index"] in shown
              for rel in r["failing_files"]
              for c in sets[r["index"]]["cases"].get(rel, [])][:20]
     if _prior_acceptance_dispute(st):
@@ -34208,10 +34321,16 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     st.data["acceptance_dispute"] = {
         "failing_sets": failing_sets, "total_sets": len(measured),
         "cases": cases}
+    # Reaching here past an unacted prior dispute makes this the one
+    # allowed re-dispute; if it too goes unacted, the next run accepts.
+    if (_prior_acceptance_dispute_record(st) or {}).get("unacted"):
+        st.data["acceptance_dispute"]["redispute"] = True
     st.data["no_work_dispute"] = {
         "classifier_evidence": conf.get("classifier_evidence", ""),
         "judge_evidence": ("Held-out acceptance tests written from the "
-                           "report fail on HEAD: " + "; ".join(cases)),
+                           "report fail on HEAD: " + ("; ".join(cases) if cases
+                           else f"{failing_sets} of {len(measured)} sets, "
+                           "every failing case held back from planning")),
         "checked": []}
     st.data.pop("no_work_pending", None)
     st.save()
@@ -37772,6 +37891,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # time it ran.
             no_work_map = _detect_no_work(plans)
             if no_work_map is not None:
+                _mark_dispute_unacted(st)
                 _finish_no_work_run(st, no_work_map)
                 return
         else:
@@ -37909,9 +38029,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             fix_ids_before = {s_["id"] for p_ in plans
                               for s_ in (p_.get("subtasks") or [])
                               if s_.get("fixes_reported_symptom")}
+            protect = await _fix_ids_held_out_sets_protect(
+                st, caps, fix_ids_before)
             satisfied_no_work = await _filter_satisfied_subtasks(
-                plans, Path(os.getcwd()), st, caps, models, efforts)
+                plans, Path(os.getcwd()), st, caps, models, efforts,
+                protect=protect)
             if satisfied_no_work is not None:
+                _mark_dispute_unacted(st)
                 _finish_no_work_run(st, satisfied_no_work)
                 return
             if await _finish_if_every_fix_already_on_head(

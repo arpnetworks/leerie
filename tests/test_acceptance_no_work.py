@@ -167,6 +167,57 @@ def test_a_third_run_still_does_not_dispute(leerie, tmp_path, monkeypatch,
     assert _settle(leerie, monkeypatch, st, _results([False, False, False])) is True
 
 
+_FIVE = [{"index": k, "cases": {f"t/test_{k}.py": [f"case {k}"]}}
+         for k in range(1, 6)]
+
+
+@pytest.mark.parametrize("failing,named,evidence", [
+    # Five sets: 1-3 shown, 4-5 held back. Shown 1, 2 and held-back 4, 5
+    # fail: only the shown names leave the gate.
+    ({1, 2, 4, 5}, ["case 1", "case 2"], "case 1; case 2"),
+    # Shown 3 and held-back 4, 5 fail (3 of 5, a majority): one name.
+    ({3, 4, 5}, ["case 3"], "case 3"),
+])
+def test_dispute_evidence_names_only_shown_sets(
+        leerie, tmp_path, monkeypatch, finished, failing, named, evidence):
+    st = _st(leerie, tmp_path)
+
+    async def fake(st_, caps):
+        return [{"index": k, "passed": k not in failing,
+                 "failing_files": [f"t/test_{k}.py"] if k in failing else []}
+                for k in range(1, 6)]
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    st.data.update(acceptance={"sets": _FIVE}, no_work_pending=True,
+                   no_work_confirmation={"judge_evidence": "j"})
+    assert asyncio.run(leerie._settle_pending_no_work(
+        st, dict(leerie.DEFAULT_CAPS))) is False
+    assert st.data["acceptance_dispute"]["cases"] == named
+    assert st.data["no_work_dispute"]["judge_evidence"].endswith(evidence)
+
+
+def test_dispute_with_only_hidden_failures_gives_counts_alone(
+        leerie, tmp_path, monkeypatch, finished):
+    """Four sets, 3 and 4 held back. Those two fail and 1, 2 pass — a tie,
+    which counts as failing — so every failing case is held back and the
+    evidence carries the counts alone."""
+    st = _st(leerie, tmp_path)
+    four = _FIVE[:4]
+
+    async def fake(st_, caps):
+        return [{"index": k, "passed": k <= 2,
+                 "failing_files": [] if k <= 2 else [f"t/test_{k}.py"]}
+                for k in range(1, 5)]
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    st.data.update(acceptance={"sets": four}, no_work_pending=True,
+                   no_work_confirmation={"judge_evidence": "j"})
+    assert asyncio.run(leerie._settle_pending_no_work(
+        st, dict(leerie.DEFAULT_CAPS))) is False
+    ev = st.data["no_work_dispute"]["judge_evidence"]
+    assert "case 3" not in ev and "case 4" not in ev
+    assert "2 of 4 sets" in ev and "held back" in ev
+    assert st.data["acceptance_dispute"]["cases"] == []
+
+
 def test_unmeasurable_sets_keep_the_judges_confirmation(leerie, tmp_path,
                                                        monkeypatch, finished):
     st = _st(leerie, tmp_path)
@@ -220,6 +271,170 @@ def test_prior_dispute_reads_only_the_newest_completed_same_task_run(
     assert leerie._prior_acceptance_dispute(st) is False
     _sibling(st, "run-ok", dispute={"cases": ["x"]})
     assert leerie._prior_acceptance_dispute(st) is True
+
+
+def test_an_unacted_dispute_does_not_count(leerie, tmp_path):
+    """DESIGN §8 *A dispute counts only once it is acted on*: a disputing
+    run that still ended as no work leaves the next run free to dispute."""
+    st = _st(leerie, tmp_path)
+    _sibling(st, "run-prev", dispute={"failing_sets": 2, "cases": ["x"],
+                                      "unacted": True})
+    assert leerie._prior_acceptance_dispute(st) is False
+
+
+def test_a_wrong_dispute_that_goes_unacted_is_bounded(leerie, tmp_path,
+                                                      monkeypatch, finished):
+    """Round-1 review of #283: wrong held-out sets, planners correctly find
+    nothing. Run 1's dispute goes unacted; run 2 re-disputes (marked
+    `redispute`); when that goes unacted too, run 3 accepts — two extra
+    runs, never one per re-run forever."""
+    import os, time
+    st = _st(leerie, tmp_path)
+    _sibling(st, "run-1", dispute={"failing_sets": 2, "cases": ["x"],
+                                   "unacted": True})
+    assert leerie._prior_acceptance_dispute(st) is False
+    # Run 2 (this state) disputes again, recorded as the re-dispute.
+    assert _settle(leerie, monkeypatch, st, _results([False, False, True])) is False
+    assert st.data["acceptance_dispute"].get("redispute") is True
+    leerie._mark_dispute_unacted(st)
+    d2 = _sibling(st, "run-2", dispute=st.data["acceptance_dispute"])
+    t = time.time() + 10
+    os.utime(d2, (t, t))
+    # Run 3 accepts.
+    assert leerie._prior_acceptance_dispute(st) is True
+
+
+def test_a_first_dispute_is_not_a_redispute(leerie, tmp_path, monkeypatch,
+                                            finished):
+    st = _st(leerie, tmp_path)
+    assert _settle(leerie, monkeypatch, st, _results([False, False, True])) is False
+    assert "redispute" not in st.data["acceptance_dispute"]
+
+
+@pytest.mark.parametrize("dispute,marked", [
+    ({"failing_sets": 2, "cases": ["x"]}, True),
+    # A carried-forward acceptance is not this run's dispute to mark.
+    ({"failing_sets": 2, "cases": ["x"], "accepted": True}, False),
+    (None, False),
+])
+def test_mark_dispute_unacted(leerie, tmp_path, dispute, marked):
+    st = _st(leerie, tmp_path,
+             **({"acceptance_dispute": dispute} if dispute else {}))
+    leerie._mark_dispute_unacted(st)
+    got = (st.data.get("acceptance_dispute") or {}).get("unacted", False)
+    assert got is marked
+    # Persisted, since the next run reads it from state.json.
+    on_disk = json.loads(st.path.read_text()).get("acceptance_dispute") or {}
+    assert on_disk.get("unacted", False) is marked
+
+
+@pytest.mark.parametrize("res,fix_ids,want", [
+    (_results([False, False, True]), {"s0"}, {"s0"}),   # majority fails
+    (_results([True, True, False]), {"s0"}, set()),     # majority passes
+    (None, {"s0"}, set()),                              # no valid sets
+    ([dict(r, unmeasured=True) for r in _results([False] * 3)],
+     {"s0"}, set()),                                    # nothing measured
+    (_results([False, False, False]), set(), set()),    # no fix subtasks
+    (_results([True, False]), {"s0"}, {"s0"}),          # a tie protects
+])
+def test_pre_sweep_protect(leerie, tmp_path, monkeypatch, res, fix_ids, want):
+    st = _st(leerie, tmp_path)
+    ran = []
+
+    async def fake(st_, caps):
+        ran.append(1)
+        return res
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    assert asyncio.run(leerie._fix_ids_held_out_sets_protect(
+        st, dict(leerie.DEFAULT_CAPS), fix_ids)) == want
+    # No fix subtasks → the sets are not even run.
+    assert bool(ran) is bool(fix_ids)
+
+
+def test_pre_sweep_protect_skipped_with_the_sweep(leerie, tmp_path,
+                                                  monkeypatch):
+    """No sweep runs under `skip_satisfied_check`, so the sets are not run
+    on HEAD just to protect from it."""
+    st = _st(leerie, tmp_path, skip_satisfied_check=True)
+    ran = []
+
+    async def fake(st_, caps):
+        ran.append(1)
+        return _results([False, False, False])
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    assert asyncio.run(leerie._fix_ids_held_out_sets_protect(
+        st, dict(leerie.DEFAULT_CAPS), {"s0"})) == set()
+    assert ran == []
+
+
+@pytest.mark.parametrize("head,runs", [("base-sha", False),
+                                       ("later-sha", True)])
+def test_pre_sweep_protect_on_the_validity_base_skips_the_run(
+        leerie, tmp_path, monkeypatch, head, runs):
+    """On the commit the sets were validated on, every set already failed:
+    protect without running them again. Elsewhere, measure."""
+    st = _st(leerie, tmp_path, acceptance={"sets": _SETS,
+                                           "validity_base": "base-sha"},
+             planning_worktree=str(tmp_path))
+    ran = []
+
+    async def fake(st_, caps):
+        ran.append(1)
+        return _results([True, True, True])
+
+    async def no_wt(st_):
+        return None
+
+    async def sha(path):
+        return head
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    monkeypatch.setattr(leerie, "_ensure_planning_worktree", no_wt)
+    monkeypatch.setattr(leerie, "_branch_head_sha", sha)
+    got = asyncio.run(leerie._fix_ids_held_out_sets_protect(
+        st, dict(leerie.DEFAULT_CAPS), {"s0"}))
+    assert bool(ran) is runs
+    assert got == (set() if runs else {"s0"})
+
+
+def test_pre_sweep_protect_errors_protect_nothing(leerie, tmp_path,
+                                                  monkeypatch):
+    st = _st(leerie, tmp_path)
+
+    async def boom(st_, caps):
+        raise OSError("planning worktree vanished")
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", boom)
+    assert asyncio.run(leerie._fix_ids_held_out_sets_protect(
+        st, dict(leerie.DEFAULT_CAPS), {"s0"})) == set()
+
+
+def test_dispute_then_probe_drops_everything_keeps_the_fix(
+        leerie, tmp_path, monkeypatch, finished):
+    """The post-merge #282 scenario end to end over the real helpers: run 1
+    disputes; its sweep would call every subtask satisfied. The fix
+    subtask is protected, so the plan keeps it and no no-work exit fires."""
+    st = _st(leerie, tmp_path)
+    assert _settle(leerie, monkeypatch, st, _results([False, False, True])) is False
+    plans = [{"domain": "bug-fixing", "status": "ready", "subtasks": [
+        {"id": "fix-1", "fixes_reported_symptom": True,
+         "success_criteria_seed": "the symptom is gone"}]}]
+    fix_ids = {"fix-1"}
+    protect = asyncio.run(leerie._fix_ids_held_out_sets_protect(
+        st, dict(leerie.DEFAULT_CAPS), fix_ids))
+
+    async def satisfied(**kw):
+        return {"satisfied": True, "evidence": "looks done"}
+    monkeypatch.setattr(leerie, "claude_p", satisfied)
+    monkeypatch.setattr(leerie, "_branch_head_sha",
+                        lambda *_a, **_k: asyncio.sleep(0, "sha"))
+    st.data["planning_worktree"] = str(tmp_path)
+    got = asyncio.run(leerie._filter_satisfied_subtasks(
+        plans, tmp_path, st, dict(leerie.DEFAULT_CAPS), {}, {},
+        protect=protect))
+    assert got is None
+    assert [s["id"] for s in plans[0]["subtasks"]] == ["fix-1"]
+    assert asyncio.run(leerie._finish_if_every_fix_already_on_head(
+        st, dict(leerie.DEFAULT_CAPS), fix_ids, plans)) is False
+    assert finished == []
 
 
 # --- A4 and wiring -------------------------------------------------------------
@@ -290,3 +505,18 @@ def test_run_phases_wiring(leerie):
     i_sweep = src.index("await _filter_satisfied_subtasks(")
     i_a4 = src.index("await _finish_if_every_fix_already_on_head(")
     assert i_before < i_sweep < i_a4
+    # The protect set is computed after the fix ids and fed to the sweep.
+    i_protect = src.index("protect = await _fix_ids_held_out_sets_protect(")
+    assert i_before < i_protect < i_sweep
+    assert "protect=protect)" in src[i_sweep:i_a4]
+
+
+def test_both_other_no_work_exits_mark_the_dispute_unacted(leerie):
+    """Each `_finish_no_work_run` reached from the empty-plans and the
+    sweep exits is immediately preceded by `_mark_dispute_unacted`."""
+    lines = [l.strip() for l in
+             inspect.getsource(leerie._run_phases).splitlines()]
+    for exit_ in ("_finish_no_work_run(st, no_work_map)",
+                  "_finish_no_work_run(st, satisfied_no_work)"):
+        i = lines.index(exit_)
+        assert lines[i - 1] == "_mark_dispute_unacted(st)", exit_
