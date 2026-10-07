@@ -506,6 +506,7 @@ STATE_FIELDS = (
     "skip_completeness_check",
     "skip_integration_check",
     "skip_classification_check",
+    "stop_on_blocked",
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
@@ -1429,6 +1430,12 @@ SKIP_INTEGRATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # → skip_classification_check in leerie.toml → False.
 SKIP_CLASSIFICATION_CHECK_ENV = "LEERIE_SKIP_CLASSIFICATION_CHECK"
 SKIP_CLASSIFICATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
+
+# --stop-on-blocked: restore stop-and-wait for blocked subtasks (by default
+# they are auto-accepted). Resolution order: --stop-on-blocked CLI flag →
+# LEERIE_STOP_ON_BLOCKED env → stop_on_blocked in leerie.toml → False.
+STOP_ON_BLOCKED_ENV = "LEERIE_STOP_ON_BLOCKED"
+STOP_ON_BLOCKED_FILE = SOURCE_OF_TRUTH_FILE
 
 # <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
 # the mtime-keyed per-file parse results produced by _build_repo_map() so
@@ -7451,6 +7458,21 @@ def resolve_skip_classification_check(repo_root: Path, cli_value: bool) -> bool:
         env_var=SKIP_CLASSIFICATION_CHECK_ENV,
         file_key="skip_classification_check",
         file_name=SKIP_CLASSIFICATION_CHECK_FILE)
+
+
+def resolve_stop_on_blocked(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --stop-on-blocked preference. Order:
+    --stop-on-blocked CLI flag (action='store_true') →
+    LEERIE_STOP_ON_BLOCKED env var →
+    stop_on_blocked in leerie.toml → False.
+
+    When True, a blocked subtask halts the run for `accept-blocked` instead
+    of being auto-accepted. Off by default."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=STOP_ON_BLOCKED_ENV,
+        file_key="stop_on_blocked",
+        file_name=STOP_ON_BLOCKED_FILE)
 
 
 def _positive_int(s: str) -> int:
@@ -36181,9 +36203,11 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 + "; ".join(declared_unrun))
             log(f"  {sid}: {blocker}")
             st.data.setdefault("subtask_status", {})[sid] = "blocked"
-            log(f"  {sid}: BLOCKED — run `leerie accept-blocked "
-                f"{st.run_id} {sid}` once addressed, then `leerie "
-                "resume` to continue without re-running it")
+            log(f"  {sid}: BLOCKED — "
+                + (f"run `leerie accept-blocked {st.run_id} {sid}` once "
+                   "addressed, then `leerie resume` to continue without "
+                   "re-running it" if st.data.get("stop_on_blocked")
+                   else "will be auto-accepted at wave end"))
             st.save()
             return {"subtask_id": sid, "status": "blocked",
                     "blocker": blocker,
@@ -36472,9 +36496,11 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     + " (fix + resume)")
                 log(f"  {sid}: {blocker}")
                 st.data.setdefault("subtask_status", {})[sid] = "blocked"
-                log(f"  {sid}: BLOCKED — run `leerie accept-blocked "
-                    f"{st.run_id} {sid}` once addressed, then `leerie "
-                    "resume` to continue without re-running it")
+                log(f"  {sid}: BLOCKED — "
+                    + (f"run `leerie accept-blocked {st.run_id} {sid}` once "
+                       "addressed, then `leerie resume` to continue without "
+                       "re-running it" if st.data.get("stop_on_blocked")
+                       else "will be auto-accepted at wave end"))
                 st.save()
                 return {"subtask_id": sid, "status": "blocked",
                         "blocker": blocker, "summary": blocker}
@@ -37157,11 +37183,39 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             if integrated:
                 log(f"  integrated {len(integrated)} successful subtask(s) "
                     f"before reporting {len(blocked)} failure(s)")
-            st.data["blocked"] = {s: results[s].get("blocker")
-                                  or results[s].get("summary") for s in blocked}
+            if st.data.get("stop_on_blocked"):
+                st.data["blocked"] = {s: results[s].get("blocker")
+                                      or results[s].get("summary")
+                                      for s in blocked}
+                st.save()
+                die(f"wave {wi + 1} has unresolved subtasks: "
+                    f"{', '.join(blocked)}. "
+                    f"See {_operator_path(st.path)}; resolve and re-run with "
+                    "resume.")
+            # Default: settle exactly as the launcher's `accept-blocked` verb
+            # does (same accepted_blocked schema) so the run continues; the
+            # integrate_wave above already merged the successful subtasks.
+            accepted = st.data.setdefault("accepted_blocked", {})
+            reg = st.data.get("blocked")
+            for s in blocked:
+                blocker_text = (results[s].get("blocker")
+                                or results[s].get("summary"))
+                log(f"  WARNING: {s} {results[s].get('status')} — "
+                    f"auto-accepted and skipped (pass --stop-on-blocked to "
+                    f"halt instead): {blocker_text}")
+                accepted[s] = {
+                    "at": datetime.now(timezone.utc)
+                          .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "previous_status": results[s].get("status"),
+                    "blocker": blocker_text,
+                    "forced": False,
+                }
+                st.data.setdefault("subtask_status", {})[s] = "complete"
+                if isinstance(reg, dict):
+                    reg.pop(s, None)
+            if isinstance(reg, dict) and not reg:
+                st.data.pop("blocked", None)
             st.save()
-            die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
-                f"See {_operator_path(st.path)}; resolve and re-run with resume.")
 
         # Integration-integrity gate (DESIGN §6: "the completion signal is
         # completed_waves == len(waves)"). A wave must not be counted
@@ -38281,6 +38335,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             getattr(args, "skip_integration_check", False))
         st.data["skip_classification_check"] = bool(
             getattr(args, "skip_classification_check", False))
+        st.data["stop_on_blocked"] = bool(
+            getattr(args, "stop_on_blocked", False))
         st.data["skip_satisfied_check"] = bool(
             getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
@@ -38385,6 +38441,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                    # operator to re-run with.
                    "skip_classification_check": bool(
                        getattr(args, "skip_classification_check", False)),
+                   "stop_on_blocked": bool(
+                       getattr(args, "stop_on_blocked", False)),
                    "skip_satisfied_check": bool(
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
@@ -39328,6 +39386,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          f"Also {SKIP_CLASSIFICATION_CHECK_ENV} env or "
                          "skip_classification_check in leerie.toml. "
                          "Default: off.")
+    ap.add_argument("--stop-on-blocked", action="store_true",
+                    help="stop the run and wait for `accept-blocked` when a "
+                         "subtask is blocked, instead of auto-accepting it. "
+                         f"Also {STOP_ON_BLOCKED_ENV} env or "
+                         "stop_on_blocked in leerie.toml. Default: off.")
     ap.add_argument("--skip-satisfied-check", action="store_true",
                     help="skip the phase 3 per-subtask satisfied-probe that "
                          "drops subtasks already met on the base tree (DESIGN "
@@ -39798,6 +39861,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # phase_classification_gate reads it from there on entry.
     args.skip_classification_check = resolve_skip_classification_check(
         repo_root, getattr(args, "skip_classification_check", False))
+
+    # Resolve --stop-on-blocked; _orchestrate() folds it into state.json.
+    args.stop_on_blocked = resolve_stop_on_blocked(
+        repo_root, getattr(args, "stop_on_blocked", False))
 
     # Resolve --skip-satisfied-check (DESIGN §8 *Already-satisfied subtask
     # elimination*). Same precedence shape as the other skip flags.
