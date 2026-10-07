@@ -2226,6 +2226,31 @@ backslash**: the transfer landed in a directory named `<dest>\`, rsync
 exited 0, and the test failed with "untracked.txt missing" and no error
 anywhere. Only the pattern half escapes.
 
+## Rebaser marker checkpoint
+
+`tests/test_check_rebaser_worktree_state.py` builds real repos and real
+`git worktree add` copies — `.git` is a file there, which is what hid the
+old `<worktree>/.git/rebase-merge` probe. Each marker case keeps the line
+it guards against:
+
+- `test_rebased_claim_with_divider_rows_passes`: `=====…` divider rows
+  (plain-text mailer templates) on both sides of a real rebase. A
+  whole-tree `^={7}` grep rejected every rebase in such a repo.
+- `test_markers_in_minus_diff_lockfile_fail`: `--check` skips `-diff`
+  paths, which merge still writes markers into.
+- `test_upstream_setext_heading_passes` / `test_markers_fail_when_base_already_has_a_separator_line`:
+  the base-side filter, as a pair. The first fails if the filter is
+  dropped; the second fails if it is applied per file rather than per
+  line (verified by substituting a "skip files whose base copy has a
+  marker-shaped line" filter).
+- `test_unresolvable_pre_rebase_sha_fails_closed` /
+  `test_unresolvable_rebase_state_fails_closed`: git exiting 128 with
+  empty stdout must not read as clean.
+
+`tests/test_run_rebaser.py`'s mismatch case has its fake worker write the
+markers, because markers already at the pre-rebase tip are not the
+rebase's doing.
+
 ## EC2 credential-resolution wiring
 
 The launcher's credential-resolution wiring within that same `RUNTIME=ec2`
