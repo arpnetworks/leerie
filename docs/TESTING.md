@@ -4995,3 +4995,158 @@ Six reversions, each caught: a redirect ending the command, no `source`
 or `.`, a fallback that keeps comments, `$"…"` keeping its `$`, a
 backtick comment running to the newline, and no `${…}` escapes.
 
+
+#### Edge cases in reading test commands, after 0.37.0 (2026-10-06)
+
+The ninth review of #285's last commit (which merged as 97aa2b2 and
+shipped in 0.37.0) and fuzzing against real bash left these, fixed here:
+
+- **`>|` is a redirect** (`_split_shell_ops`): a `|` test per character
+  read it as a pipe, so `docker run img >|out npx jest …` and
+  `sh >|o -c jest` hid the container CLI and the shell. Operator runs now
+  split into bash's operators longest first. Cases in
+  `test_only_a_container_that_starts_the_runner_withholds_the_report` and
+  `test_continuations_and_comments_are_read_as_bash_reads_them`, with
+  `ls ;>o npx jest …` still placing.
+- **`eval`, `source` and `.` only as the command word**
+  (`_takes_runner_as_text`): a bare `.` argument (`npx --prefix . jest`)
+  no longer refuses placement; `FOO=1 . run.sh jest` still does.
+- **Backtick bodies read as bash reads them**: the body up to the closing
+  backtick, its backslash before `$`, `` ` ``, `\` (and `"` in double
+  quotes) removed, scanned as a command of its own. `` `echo a\\";` `` was
+  the one command of 6,104 valid fuzzed ones the scan rejected; after the
+  change none of 14,315 (three seeds) is. A case in
+  `test_expanding_words_split_where_bash_splits_them` pins it.
+- **`$'…'` decodes like bash** (`_ansi_c_escape`; seven cases in
+  `test_scanned_words_are_the_words_bash_passes`).
+- **The detection fallback keeps a mid-word `#`**
+  (`test_runner_detection_reads_operators_as_the_shell_does`).
+- **Word boundaries from syntax alone**: `_bash_argv` sets `IFS=` and
+  `set -f`, so bash no longer splits an unquoted expansion's result — which
+  the scan cannot know — and the escaped-`}` case now fails without the
+  `${…}` escape fix (`"${U:-x\} y} c"`).
+
+Seven reversions, each caught: no backslash removal in backtick bodies,
+the old per-character control test, builtins anywhere, a fallback with
+`shlex`'s comments, keeping `$'…'` escapes verbatim, no `${…}` escapes,
+and a heredoc only as a bare `<<`.
+
+##### Review round 1 of the edge-case fixes (2026-10-07)
+
+- **The command word is found as bash finds it** (`_command_word`): the
+  first version took a redirect's target (`>o eval jest \;`), an fd number
+  (`2>/dev/null eval …`) or a prefix (`!`, `time -p`, `command`,
+  `builtin`) for the command, so `eval`, `source` and `.` hid behind them
+  again — 140 of 2,934 fuzzed placements sent flags to `eval` or a sourced
+  script. `_ASSIGNMENT_RE` now also matches `NAME+=` and `NAME[i]=`. Nine
+  cases in `test_continuations_and_comments_are_read_as_bash_reads_them`.
+- **`\c` spans what bash spans** (`$'\c'`, `$'\c\\'`, `$'\c\''`,
+  `$'\c?'` in `test_scanned_words_are_the_words_bash_passes`), and `\U`
+  beyond Unicode no longer raises
+  (`test_expanding_words_split_where_bash_splits_them`, which also gained
+  `$${`, read as the PID parameter).
+- **A quoted `'#x'` is not a comment in the detection fallback**
+  (`test_runner_detection_reads_operators_as_the_shell_does`).
+
+Eleven reversions, each caught: no redirect-target skip, no fd skip, no
+prefixes, no `time -p`, the old assignment pattern, `$'\c'` consuming the
+quote, no `\c\` case, `\c?` as 0x1f, `chr` beyond Unicode, `$$` as `$`
+then `${`, and a fallback that drops quotes.
+
+Fuzz, not committed: 15,000 templates with shells, `eval`, `source`, `.`,
+containers and wrappers behind random redirects, assignments and
+prefixes; of the 5,880 placed, none put the flags into `eval`, a sourced
+script, a shell or a container stub under real bash.
+
+##### Review round 2 of the edge-case fixes (2026-10-07)
+
+- **Four shapes the command-word finder still missed** — a separator and
+  a redirect fused in one operator run (`true;>o eval jest \;`, where the
+  command now starts at the run, `_ends_in_redirect`), a `{fd}>x`
+  redirect (`_FD_WORD_RE`), prefix options (`command -p`, `time -p --`,
+  `builtin --`) and `coproc`. Seven cases in
+  `test_continuations_and_comments_are_read_as_bash_reads_them`, one of
+  them a fused run that still places.
+- **The detection fallback** (`_first_comment`, replaced in round 3 by
+  `_strip_comments`) cuts at the first comment
+  found by a quote-aware pass, then splits POSIX-style: round 1's
+  `posix=False` split a quoted word at its spaces (`-run='Foo pytest'`
+  named pytest) and read a quoted `#` as a comment. Two cases in
+  `test_runner_detection_reads_operators_as_the_shell_does`.
+
+Six reversions, each caught: no fused-run start, no `{fd}`, no prefix
+options, no `coproc`, the `posix=False` fallback, and a comment finder
+blind to quotes.
+
+##### Review round 3 of the edge-case fixes (2026-10-07)
+
+- **A comment ends at its newline in the detection fallback too**
+  (`_strip_comments`, which replaces round 2's `_first_comment`): round 1
+  and 2 cut the command from the first comment to its end, so a runner on
+  a later line was lost. The pass also tracks `$'…'`, `${…}`, backticks
+  and substitution parens, so `$(echo u)#sub` and `${A:-a #b}` hide
+  nothing; `_rough_words` replaces `shlex.split` there, which fails on
+  `$'…'`. Six cases in
+  `test_runner_detection_reads_operators_as_the_shell_does`.
+- **A command word an expansion builds** (`$E jest`, `$(echo eval) jest`)
+  is treated as a builtin that takes the runner as text: it may be one.
+- **More shells and container CLIs**: `ash`, `mksh`, `yash`, `fish`,
+  `csh`, `tcsh`; `finch`, `ctr`, `buildah`, `apptainer`, `singularity`.
+  Four cases across the placement and container tests (the two
+  expansion-word cases above make six).
+
+Eight reversions, each caught: a comment to the end of the command, a
+substitution's `)` as an operator, `${…}` ignored, `$'…'` ignored,
+expansion command words allowed, the old shell list, the old container
+list, and `shlex.split` in the fallback. Two more pieces of the first
+draft (a second `${…}` check and a backtick boundary) survived their
+reversions as redundant and were dropped.
+
+##### Review round 4 of the edge-case fixes (2026-10-07)
+
+- **A backtick in a comment is part of the comment**: `_strip_comments`
+  now knows whether it is inside a backtick body, and only there does a
+  backtick end a comment. Round 3's version stopped at any backtick, so
+  `# see `foo`, don't` opened a quote that hid the next line's runner
+  (a regression against main). It also reads `$$` as the PID and keeps
+  the word boundary across a line continuation; `_rough_words` reads `$$`
+  too. Five cases in `test_runner_detection_reads_operators_as_the_shell_does`.
+- **The expansion rule narrowed** (`_may_expand_to_builtin`): a `/` outside
+  `${…}`, `$(…)` and backticks means no builtin lookup, so
+  `$VENV/bin/python -m pytest --junitxml=…` places again; `$NPX jest` and
+  `$PYTHON -m pytest --junitxml=…` are still refused, at their report's
+  cost (cases in `test_a_command_naming_its_own_junit_path_gets_ours_appended`
+  and `test_continuations_and_comments_are_read_as_bash_reads_them`).
+- **Brace expansion** (`{eval,} jest`, `{sh,} -c jest`,
+  `{docker,} run img pytest …`) withholds the report in the container
+  check; more shells (`rbash`) and container or remote CLIs (`oc`,
+  `lima`, `colima`, `podman-remote`, `nerdctl.lima`, `lxc`, `distrobox`,
+  `toolbox`, `flatpak`, `ssh`, `fly`, `gcloud`, `su`).
+
+Eight reversions, each caught: a backtick ending any comment, no `$$` in
+the stripper, a continuation clearing the boundary, no `$$` in
+`_rough_words`, no `/` narrowing, no brace check, no `ssh`, and no
+`lima`. A first-draft brace check in `_takes_runner_as_text`
+survived its reversion — the container check already withholds the whole
+report — and was dropped.
+
+##### Review round 5 of the edge-case fixes (2026-10-07)
+
+No HIGH or MEDIUM. Fixed:
+
+- **A JSON value in an assignment is not a brace expansion**
+  (`TS_NODE_COMPILER_OPTIONS='{"module":…,"strict":true}' npx jest`):
+  bash brace-expands no `NAME=` word, so the container check skips them.
+- **`$${` and `\${` open no `${…}`** in the fallback's comment pass.
+- **A `/` inside a nested expansion** (`${E:-${F}/}`) is no longer taken
+  for a literal one (`_outside_expansions`).
+- **Commands that run as another user** (`sudo`, `runuser`, `doas`) and
+  `incus`, `devcontainer`, `podman-compose`, `multipass` withhold the
+  report, as `su` already did.
+
+Five reversions, each caught. Disclosed rather than fixed, both contrived:
+an unquoted expansion whose value holds a space can split a command word
+(`E='eval '; $E/x jest`), and a heredoc body with an odd number of
+backticks can mislead the fallback's backtick tracking. A package or
+folder named like a listed CLI before the runner (`yarn workspace
+toolbox jest`) loses its report.

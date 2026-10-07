@@ -6089,33 +6089,47 @@ flags appended, and only when the appended words would land as the last
 arguments of the runner's own simple command. The command is split into
 words and operators by a close reading of bash's rules — quotes kept in
 mind (a quoted `"("` is a word, not a paren; an escaped quote inside
-`${…}` opens nothing), a line continuation joining lines, a comment
-starting only at a word, a newline ending a command as `;` does — noting
-how deep in command substitutions each token sits. It is a reading, not
-bash: the tests pin it against bash's own argv. The file under test never
-counts as the runner, even when named like one. There is no report when,
-from the runner on, anything but words follows at the top level (a
-separator, pipe, redirect, or a `)` closing a subshell the runner runs in
-— a `$(…)` among its arguments is not that), when a `--` after it would
-make the flags file arguments, when the appended word would fall into a
-trailing comment or be joined by a trailing backslash, when the command
-has a heredoc (its body is text, not commands), when the runner runs
-inside a substitution, or when a shell, `eval`, `source` or `.` comes
-before it in its command — each takes what follows as text or as a
-script, not as a program and its arguments (`sh -c jest`, `timeout 60 sh
--c jest`, `bash run.sh jest`, `eval jest`). A redirect (`2>&1`, `<in.txt`)
-belongs to its command and ends nothing, so neither this nor the container
-check below can be hidden behind one. The placement
-is syntactic: the flags reach the runner when its command is the runner
-or a wrapper that passes arguments on (`npx jest`, `uv run pytest`). A
-command that merely names the runner as an argument (`./run.sh jest`) is
-not told apart and receives the flags itself, as it has since reports
-were introduced. A runner started through a container CLI — `docker`,
-`docker-compose`, `podman`, `nerdctl` or `kubectl` earlier in the simple
+`${…}` opens nothing; a backtick body is read as bash reads it, as a
+command of its own once its backslashes are undone), a line continuation
+joining lines, a comment starting only at a word, a newline ending a
+command as `;` does — noting how deep in command substitutions each token
+sits. It is a reading, not bash: the tests pin it against bash's own argv.
+The file under test never counts as the runner, even when named like one.
+There is no report when, from the runner on, anything but words follows at
+the top level (a separator, pipe, redirect, or a `)` closing a subshell
+the runner runs in — a `$(…)` among its arguments is not that), when a
+`--` after it would make the flags file arguments, when the appended word
+would fall into a trailing comment or be joined by a trailing backslash,
+when the command has a heredoc (its body is text, not commands), when the
+runner runs inside a substitution, or when a shell comes before it in its
+command, or `eval`, `source` or `.` is that command (found as bash finds
+it: past redirects and their fds, assignments, and the `!`, `time`,
+`command`, `builtin` and `coproc` prefixes with their options) or a
+command word an expansion or a brace expansion builds (`$E jest` and
+`{eval,} jest` could be `eval`; a `/` in the word outside the expansion
+rules that out, `$VENV/bin/python`, while `$NPX jest` loses its report
+rather than risk it) — each takes what follows as text or as a script, not
+as a program and its arguments (`sh -c jest`, `timeout 60 sh -c jest`,
+`fish run.fish jest`, `bash run.sh jest`, `eval jest`), while a bare `.`
+argument is just a path (`npx --prefix . jest`). Operators are read as
+bash reads them, longest first, so a redirect (`2>&1`, `<in.txt`, `>|out`)
+belongs to its command and ends nothing, and neither this nor the
+container check below can be hidden behind one. The placement is
+syntactic: the flags reach the runner when its command is the runner or a
+wrapper that passes arguments on (`npx jest`, `uv run pytest`). A command
+that merely names the runner as an argument (`./run.sh jest`) is not told
+apart and receives the flags itself, as it has since reports were
+introduced. A runner started through a container or remote CLI, or as
+another user — `docker`, `podman`, `nerdctl`, `kubectl`, `oc`, `lima`,
+`finch`, `apptainer`, `ssh`, `su`, `sudo` and the rest of
+`_CONTAINER_CLIS`, or a brace expansion that could build one (never a
+`NAME=` value, which bash does not brace-expand) — earlier in the simple
 command of any occurrence of the runner, not a container started by an
-earlier command nor one queried inside a `$(…)` for a value — is not
-asked at all: it cannot see the orchestrator's environment, and
-a report path it cannot create would fail a run whose tests pass.
+earlier command nor one queried inside a `$(…)` for a value — is not asked
+at all: it cannot see the orchestrator's environment, and a report path it
+cannot create would fail a run whose tests pass. Matching is by name, so a
+package or folder named like one of these before the runner (`yarn
+workspace toolbox jest`) also loses the report.
 
 A file that ran no test, or could not be loaded, is no verdict and
 discards its set (the gate then has less to check, never a false failure)
