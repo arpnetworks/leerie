@@ -14586,7 +14586,8 @@ def run_rebaser(
     structured = result
     claimed_status = structured.get("status")
     mismatch = asyncio.run(check_rebaser_worktree_state(
-        worktree, claimed_status, pre_rebase_sha))
+        worktree, claimed_status, pre_rebase_sha,
+        base_ref=f"origin/{pr_base_branch}"))
     if mismatch is not None:
         # The worker's self-report doesn't match observable git state —
         # per §12, do not trust the claim. Downgrade to "failed" so the
@@ -15376,53 +15377,137 @@ async def check_integrator_commit(staging: Path) -> str | None:
     return None
 
 
-async def _rebase_state_dirs(worktree: Path) -> list[str]:
-    """Names of git's in-progress-rebase dirs present for `worktree`.
-    Resolved via `git rev-parse --git-path` because in a `git worktree add`
-    checkout `.git` is a file and the rebase state lives under
-    `<common-dir>/worktrees/<name>/`, not `<worktree>/.git/`."""
+async def _rebase_state_dirs(worktree: Path) -> list[str] | None:
+    """Names of git's in-progress-rebase dirs present for `worktree`, or
+    `None` when git cannot say. Resolved via `git rev-parse --git-path`
+    because in a `git worktree add` checkout `.git` is a file and the rebase
+    state lives under `<common-dir>/worktrees/<name>/`, not
+    `<worktree>/.git/`."""
     present = []
     for name in ("rebase-merge", "rebase-apply"):
         r = await run_proc(["git", "rev-parse", "--git-path", name],
                            cwd=str(worktree))
-        if r.returncode == 0 and (worktree / r.stdout.strip()).exists():
+        if r.returncode != 0:
+            return None
+        if (worktree / r.stdout.strip()).exists():
             present.append(name)
     return present
 
 
+def _is_conflict_marker(line: str, size: int) -> bool:
+    """git's `is_conflict_marker` (diff.c): `size` copies of one of `<=>|`,
+    then whitespace or end of line."""
+    return (len(line) >= size and line[0] in "<=>|"
+            and line[:size] == line[0] * size
+            and (len(line) == size or line[size] in " \t\r\n"))
+
+
+async def _conflict_marker_size(worktree: Path, path: str) -> int:
+    r = await run_proc(
+        ["git", "check-attr", "-z", "conflict-marker-size", "--", path],
+        cwd=str(worktree))
+    fields = r.stdout.split("\0") if r.returncode == 0 else []
+    value = fields[2] if len(fields) > 2 else ""
+    return int(value) if value.isdigit() and int(value) > 0 else 7
+
+
+async def _introduced_conflict_markers(
+        worktree: Path, since: str) -> set[tuple[str, int]] | None:
+    """`(path, line)` of every conflict marker in `worktree`'s working tree
+    on a line absent from `since`, or `None` when git cannot diff against
+    `since`.
+
+    `git diff --check` applies git's own marker rule (including diff3's
+    `|||||||` and the `conflict-marker-size` attribute) but skips every path
+    diff treats as binary — and a `-diff` attribute, the usual lockfile
+    setting, makes a text file binary to diff while merge still writes
+    markers into it. Those paths (`-\t-\t` in `--numstat`) are diffed again
+    with `--text` and the same rule applied here, except real binaries (a NUL
+    in the first 8000 bytes, merge's own test), which merge never writes
+    markers into."""
+    check = await run_proc(
+        ["git", "-c", "core.quotePath=off", "diff", "--no-color",
+         "--no-renames", "--check", since, "--"],
+        cwd=str(worktree))
+    # 0 clean, 2 markers or whitespace errors; anything else is git failing
+    if check.returncode not in (0, 2):
+        return None
+    found = {(m.group(1), int(m.group(2))) for m in re.finditer(
+        r"^(.+):(\d+): leftover conflict marker$", check.stdout,
+        re.MULTILINE)}
+
+    numstat = await run_proc(
+        ["git", "diff", "--numstat", "-z", "--no-renames", since, "--"],
+        cwd=str(worktree))
+    if numstat.returncode != 0:
+        return None
+    unchecked = [entry[4:] for entry in numstat.stdout.split("\0")
+                 if entry.startswith("-\t-\t")]
+    for path in unchecked:
+        try:
+            with open(worktree / path, "rb") as f:
+                if b"\0" in f.read(8000):
+                    continue
+        except OSError:  # deleted by the rebase
+            continue
+        size = await _conflict_marker_size(worktree, path)
+        diff = await run_proc(
+            ["git", "diff", "--text", "--no-textconv", "--no-ext-diff",
+             "--no-color", "--no-renames", "-U0", since, "--", path],
+            cwd=str(worktree))
+        if diff.returncode != 0:
+            return None
+        lineno = None
+        for line in diff.stdout.split("\n"):
+            hunk = re.match(r"^@@ -\S+ \+(\d+)", line)
+            if hunk:
+                lineno = int(hunk.group(1))
+            elif lineno is not None and line.startswith("+"):
+                if _is_conflict_marker(line[1:], size):
+                    found.add((path, lineno))
+                lineno += 1
+    return found
+
+
 async def check_rebaser_worktree_state(
-        worktree: Path, status: str, pre_rebase_sha: str) -> str | None:
+        worktree: Path, status: str, pre_rebase_sha: str,
+        base_ref: str | None = None) -> str | None:
     """Mechanically verify the `rebaser` worker's claimed outcome (DESIGN §6
     *Finalization* "Rebase-onto-base before push"). Returns an error string
     on a mismatch, `None` if the claim checks out.
 
     Per §12 ("the orchestrator does not trust an integrator's 'resolved'
     claim; it confirms the merge was actually completed"), applied to
-    rebaser: a "rebased" claim requires an actually-clean, not-mid-rebase
-    tree; an "irreconcilable"/"failed" claim requires the worktree's tip to
-    be byte-identical to its pre-rebase sha (the abort must have actually
+    rebaser: a "rebased" claim requires a not-mid-rebase tree carrying no
+    conflict marker that the rebase itself produced; an
+    "irreconcilable"/"failed" claim requires the worktree's tip to be
+    byte-identical to its pre-rebase sha (the abort must have actually
     happened, restoring the original state). This does not re-judge whether
     the *resolution itself* was semantically correct — only that the claimed
     git-level outcome is real, mirroring `check_integrator_commit`'s
-    state-not-content discipline above."""
+    state-not-content discipline above. Anything git cannot answer is a
+    mismatch, never a pass."""
     if status == "rebased":
-        # Only markers the rebase introduced count, by git's own marker
-        # definition — a `=====…` divider row already on base is content,
-        # not a conflict. Diffing the working tree against the pre-rebase
-        # tip catches uncommitted leftovers too; `--check`'s rc also covers
-        # whitespace errors, so the marker lines are read from its output.
-        check = await run_proc(
-            ["git", "-c", "core.quotePath=off", "diff", "--no-color",
-             "--check", pre_rebase_sha, "--"],
-            cwd=str(worktree))
-        marked = sorted({
-            m.group(1) for m in re.finditer(
-                r"^(.+):\d+: leftover conflict marker$",
-                check.stdout, re.MULTILINE)})
-        if marked:
+        # A marker the rebase produced is on neither side it combined: absent
+        # from the pre-rebase tip and from the base it replayed onto. A
+        # marker-shaped line either side already carries (a `=====…` divider,
+        # a setext heading) is content. A missing or stale `base_ref` only
+        # drops that second filter, leaving the stricter pre-tip scan.
+        markers = await _introduced_conflict_markers(worktree, pre_rebase_sha)
+        if markers is None:
+            return ("could not scan for conflict markers after rebaser "
+                    "claimed 'rebased'")
+        if markers and base_ref:
+            off_base = await _introduced_conflict_markers(worktree, base_ref)
+            if off_base is not None:
+                markers &= off_base
+        if markers:
             return (f"rebaser claimed 'rebased' but conflict markers remain "
-                    f"in: {marked}")
+                    f"in: {sorted({path for path, _ in markers})}")
         in_progress = await _rebase_state_dirs(worktree)
+        if in_progress is None:
+            return ("could not verify the worktree is not mid-rebase after "
+                    "rebaser claimed 'rebased'")
         if in_progress:
             return (f"rebaser claimed 'rebased' but worktree is still "
                     f"mid-rebase ({in_progress[0]} present)")
@@ -15431,6 +15516,9 @@ async def check_rebaser_worktree_state(
     # irreconcilable / failed: the worktree must be back to its pre-rebase
     # tip — nothing left mid-rebase, nothing partially applied.
     in_progress = await _rebase_state_dirs(worktree)
+    if in_progress is None:
+        return (f"could not verify the worktree is not mid-rebase after "
+                f"rebaser claimed {status!r}")
     if in_progress:
         return (f"rebaser claimed {status!r} but worktree is still "
                 f"mid-rebase ({in_progress[0]} present) — abort did not "

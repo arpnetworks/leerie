@@ -158,7 +158,7 @@ def test_real_worktree_mid_rebase_is_detected(leerie, tmp_path, claim):
     """In a `git worktree add` copy `.git` is a file, so rebase state lives
     under the common dir; a `<worktree>/.git/rebase-merge` probe can never
     see it."""
-    _, worktree, pre_sha = _diverged_branches(tmp_path)
+    _, worktree, _ = _diverged_branches(tmp_path)
     _commit(worktree, "receipt.text.erb", "Receipt\nTotal: 3\n", "clash")
     pre_sha = _rev_parse(worktree, "HEAD")
     r = subprocess.run(["git", "-C", str(worktree), "rebase", "main"],
@@ -231,3 +231,97 @@ def test_failed_claim_still_mid_rebase_fails(leerie, tmp_path):
         leerie.check_rebaser_worktree_state(repo, "failed", pre_sha))
     assert result is not None
     assert "mid-rebase" in result
+
+
+# --- paths the marker scan must not lose -----------------------------------
+
+def _rebase_leaving_markers(tmp_path: Path, name: str, attrs: str | None,
+                            base_text: str, upstream_text: str,
+                            run_text: str) -> tuple[Path, str]:
+    """Rebase `run` onto `main` with a conflict in `name`, "resolve" it by
+    committing the markers, and finish the rebase. Returns (worktree,
+    pre-rebase sha)."""
+    repo = init_git_repo(tmp_path / "repo")
+    if attrs is not None:
+        _commit(repo, ".gitattributes", attrs, "attrs")
+    _commit(repo, name, base_text, "base")
+    run_git_repo_first(repo, "branch", "run")
+    _commit(repo, name, upstream_text, "upstream")
+    wt = tmp_path / "wt"
+    run_git_repo_first(repo, "worktree", "add", "-q", str(wt), "run")
+    _commit(wt, name, run_text, "run")
+    pre = _rev_parse(wt, "HEAD")
+    subprocess.run(["git", "-C", str(wt), "rebase", "main"],
+                   capture_output=True)
+    run_git_repo_first(wt, "add", name)
+    subprocess.run(["git", "-C", str(wt), "-c", "core.editor=true", "rebase",
+                    "--continue"], check=True, capture_output=True)
+    assert "<<<<<<<" in (wt / name).read_text()
+    return wt, pre
+
+
+def test_markers_in_minus_diff_lockfile_fail(leerie, tmp_path):
+    """`git diff --check` skips `-diff` paths (diff sees them as binary) but
+    merge still writes markers into them — the lockfile case."""
+    wt, pre = _rebase_leaving_markers(
+        tmp_path, "x.lock", "x.lock -diff\n", "v1\n", "upstream\n", "run\n")
+    result = asyncio.run(leerie.check_rebaser_worktree_state(
+        wt, "rebased", pre, base_ref="main"))
+    assert result is not None and "x.lock" in result
+
+
+def test_markers_fail_when_base_already_has_a_separator_line(leerie,
+                                                             tmp_path):
+    """The base-side filter drops only lines the base itself carries; a
+    leftover conflict next to a legitimate `=======` line is still caught."""
+    wt, pre = _rebase_leaving_markers(
+        tmp_path, "notes.md", None, "Notes\n=======\nv1\n",
+        "Notes\n=======\nupstream\n", "Notes\n=======\nrun\n")
+    result = asyncio.run(leerie.check_rebaser_worktree_state(
+        wt, "rebased", pre, base_ref="main"))
+    assert result is not None and "notes.md" in result
+
+
+def test_upstream_setext_heading_passes(leerie, tmp_path):
+    """A marker-shaped line the base added after the fork is base content,
+    not a leftover conflict."""
+    repo = init_git_repo(tmp_path / "repo")
+    run_git_repo_first(repo, "branch", "run")
+    _commit(repo, "CHANGES.md", "Changes\n=======\n", "upstream heading")
+    wt = tmp_path / "wt"
+    run_git_repo_first(repo, "worktree", "add", "-q", str(wt), "run")
+    _commit(wt, "b.txt", "b\n", "run work")
+    pre = _rev_parse(wt, "HEAD")
+    run_git_repo_first(wt, "rebase", "-q", "main")
+    assert asyncio.run(leerie.check_rebaser_worktree_state(
+        wt, "rebased", pre, base_ref="main")) is None
+    # without the base ref the stricter pre-tip scan alone applies
+    assert asyncio.run(leerie.check_rebaser_worktree_state(
+        wt, "rebased", pre, base_ref="origin/does-not-exist")) is not None
+
+
+def test_unresolvable_pre_rebase_sha_fails_closed(leerie, tmp_path):
+    """git exits 128 and prints nothing; that must not read as clean."""
+    repo = init_git_repo(tmp_path / "repo")
+    (repo / "a.txt").write_text("<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n")
+    result = asyncio.run(
+        leerie.check_rebaser_worktree_state(repo, "rebased", "0" * 40))
+    assert result is not None and "could not scan" in result
+
+
+@pytest.mark.parametrize("claim", ["rebased", "irreconcilable"])
+def test_unresolvable_rebase_state_fails_closed(leerie, tmp_path,
+                                                monkeypatch, claim):
+    repo = init_git_repo(tmp_path / "repo")
+    pre_sha = _rev_parse(repo, "HEAD")
+    real_run_proc = leerie.run_proc
+
+    async def failing_git_path(cmd, **kw):
+        if cmd[:3] == ["git", "rev-parse", "--git-path"]:
+            return subprocess.CompletedProcess(cmd, 128, "", "fatal")
+        return await real_run_proc(cmd, **kw)
+
+    monkeypatch.setattr(leerie, "run_proc", failing_git_path)
+    result = asyncio.run(
+        leerie.check_rebaser_worktree_state(repo, claim, pre_sha))
+    assert result is not None and "could not verify" in result

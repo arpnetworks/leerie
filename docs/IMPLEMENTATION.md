@@ -7825,8 +7825,23 @@ Required fields, current shape:
   `resolution_summary`, `diagnosis` (required in practice when
   `irreconcilable`). A scoped, fully-agentic §12 exception (DESIGN §6
   *Finalization* "Rebase-onto-base before push") — the worker performs the
-  whole rebase workflow itself, and `check_rebaser_worktree_state()`
-  mechanically re-verifies the claimed status against actual git state.
+  whole rebase workflow itself, and `check_rebaser_worktree_state(worktree,
+  status, pre_rebase_sha, base_ref=None)` mechanically re-verifies the
+  claimed status against actual git state (`run_rebaser` passes
+  `base_ref=origin/<pr_base_branch>`). On `rebased`, a conflict marker is
+  a `(path, line)` that `_introduced_conflict_markers` reports against
+  **both** `pre_rebase_sha` and `base_ref`; an unresolvable `base_ref`
+  drops only the second scan. That helper reads `git diff --check
+  <since>` (git's own marker rule: `conflict-marker-size`, diff3's
+  `|||||||`), then re-diffs with `--text -U0` each path `--check` skipped
+  as binary (`-\t-\t` in `--numstat -z`; a `-diff` lockfile still
+  receives merge markers) unless the file has a NUL in its first 8000
+  bytes, applying the same rule (`_is_conflict_marker`) to its added
+  lines. In-progress rebase state is located with `git rev-parse
+  --git-path rebase-merge|rebase-apply` (`_rebase_state_dirs`), since
+  `.git` is a file in the disposable worktree. Every git failure —
+  `--check` exiting other than 0/2, `--numstat`, the per-path diff, or
+  `--git-path` — returns a "could not scan/verify" mismatch.
 - **acceptance_writer** — required: `files[]`, each `{path, kind: defect|control,
   cases[], failure_mode: assertion|import}`; optional `notes`. Python keeps a
   defect file only if it fails on the validity base and a control file only if

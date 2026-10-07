@@ -2292,10 +2292,14 @@ be a real regression:
   none of their call sites pass a real-repo `cwd`).
 - **Post-hoc mechanical verification of the claimed outcome**, not the
   reasoning behind it: on `status: "rebased"`, `host_finalize` confirms
-  the worktree has no conflict markers and is not mid-rebase; on
+  the worktree is not mid-rebase and carries no conflict marker the
+  rebase produced — one present on neither side it combined, the
+  pre-rebase tip or the base it replayed onto, so a marker-shaped line
+  either side already carries is content, not a leftover; on
   `status ∈ {irreconcilable, failed}`, it confirms the worktree's tip is
   unchanged from the pre-rebase run branch — the same "don't trust an
-  integrator's self-report" discipline §12 already establishes.
+  integrator's self-report" discipline §12 already establishes. A check
+  git cannot answer is a mismatch, never a pass.
 - **`working_branch` bookkeeping.** A rebase changes the run branch's
   parent chain, so a naive `working_branch..run_branch` diff after
   rebasing would silently pick up unrelated upstream commits. Only on a
